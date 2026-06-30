@@ -1,0 +1,24 @@
+# Runtime state
+catalog.json
+config.json
+state.json
+logs/
+.ficelle-evals/
+
+# Python build/cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.pytest_cache/
+.coverage
+
+# Local/editor
+.DS_Store
+*.log
+
+# MCP tool scratch output
+.playwright-mcp/

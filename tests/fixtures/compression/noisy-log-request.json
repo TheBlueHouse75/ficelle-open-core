@@ -1,0 +1,29 @@
+{
+  "model": "ficelle/auto-fast",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Find the root cause in this test log."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_tests",
+          "type": "function",
+          "function": {
+            "name": "run_tests",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_tests",
+      "content": "pytest -q\ncollecting ... collected 184 items\nprogress 001/184 ok\nprogress 002/184 ok\nprogress 003/184 ok\nprogress 004/184 ok\nprogress 005/184 ok\nWARNING retrying provider catalog fetch after timeout\nprogress 006/184 ok\nprogress 007/184 ok\nprogress 008/184 ok\ntests/test_router.py::test_settings_round_trip FAILED\nTraceback (most recent call last):\n  File \"tests/test_router.py\", line 3181, in test_settings_round_trip\n    assert saved[\"settings\"][\"config\"][\"max_attempts_per_request\"] == 2\nAssertionError: assert 3 == 2\nprogress 009/184 ok\nprogress 010/184 ok\nWARNING retrying provider catalog fetch after timeout\nprogress 011/184 ok\nprogress 012/184 ok\nprogress 013/184 ok\nprogress 014/184 ok\nprogress 015/184 ok\nprogress 016/184 ok\nprogress 017/184 ok\nprogress 018/184 ok\nprogress 019/184 ok\nprogress 020/184 ok\nWARNING retrying provider catalog fetch after timeout\nprogress 021/184 ok\nprogress 022/184 ok\nprogress 023/184 ok\nprogress 024/184 ok\nprogress 025/184 ok\nprogress 026/184 ok\nprogress 027/184 ok\nprogress 028/184 ok\nprogress 029/184 ok\nprogress 030/184 ok\nWARNING retrying provider catalog fetch after timeout\nprogress 031/184 ok\nprogress 032/184 ok\nprogress 033/184 ok\nprogress 034/184 ok\nprogress 035/184 ok\nprogress 036/184 ok\nprogress 037/184 ok\nprogress 038/184 ok\nprogress 039/184 ok\nprogress 040/184 ok\nprogress 041/184 ok\nprogress 042/184 ok\nWARNING retrying provider catalog fetch after timeout\nprogress 043/184 ok\nprogress 044/184 ok\nprogress 045/184 ok\nprogress 046/184 ok\nprogress 047/184 ok\nprogress 048/184 ok\nprogress 049/184 ok\nprogress 050/184 ok\nprogress 051/184 ok\nprogress 052/184 ok\nprogress 053/184 ok\nprogress 054/184 ok\nprogress 055/184 ok\nprogress 056/184 ok\nprogress 057/184 ok\nprogress 058/184 ok\nprogress 059/184 ok\nprogress 060/184 ok\nWARNING retrying provider catalog fetch after timeout\nprogress 061/184 ok\nprogress 062/184 ok\nprogress 063/184 ok\nprogress 064/184 ok\nprogress 065/184 ok\nprogress 066/184 ok\nFAILED tests/test_router.py::test_settings_round_trip - AssertionError: assert 3 == 2\n1 failed, 183 passed in 42.18s\nexit status 1"
+    }
+  ],
+  "temperature": 0
+}

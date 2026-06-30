@@ -1,0 +1,29 @@
+{
+  "model": "ficelle/auto-tools",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Group these matches by file and identify the relevant implementation area."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_rg",
+          "type": "function",
+          "function": {
+            "name": "search_repo",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_rg",
+      "content": "src/ficelle/router.py:557:DEFAULT_CONFIG: dict[str, Any] = {\nsrc/ficelle/router.py:1556:def normalize_router_settings(raw: Any, *, strict: bool = False) -> dict[str, Any]:\nsrc/ficelle/router.py:1595:def validate_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:\nsrc/ficelle/router.py:1604:def router_settings_payload(config: dict[str, Any]) -> dict[str, Any]:\nsrc/ficelle/router.py:1634:def save_router_settings(config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:\nsrc/ficelle/router.py:1650:def rollback_router_settings_from_audit(audit_id: str, config: dict[str, Any]) -> dict[str, Any]:\nsrc/ficelle/router.py:6825:            if path == \"/admin/settings\":\nsrc/ficelle/router.py:7115:        if path == \"/admin/settings\":\nsrc/ficelle/router.py:7120:                saved = save_router_settings(self.config, settings)\nsrc/ficelle/router.py:7122:                    \"admin.settings.save\",\nsrc/ficelle/router.py:7131:                self._send_json(200, {\"settings\": {\"config\": saved}, \"audit_id\": audit[\"id\"]})\nsrc/ficelle/router.py:7138:        if path == \"/admin/settings/rollback\":\nsrc/ficelle/assets/admin/app.js:701:        '<div class=\"settings-row compact\">' +\nsrc/ficelle/assets/admin/app.js:706:        '<div class=\"settings-grid\">' +\nsrc/ficelle/assets/admin/app.js:761:    function settingsNumber(id, field, value, min, max) {\nsrc/ficelle/assets/admin/app.js:768:    // Drives both the rendered fields and readSettingsDraft so the list is edited in one place.\nsrc/ficelle/assets/admin/app.js:820:    function readSettingsDraft() {\nsrc/ficelle/assets/admin/app.js:1115:    async function saveSettings() {\ntests/test_router.py:2948:def test_validate_settings_payload_normalizes_defaults(monkeypatch, tmp_path):\ntests/test_router.py:2974:def test_validate_settings_payload_rejects_out_of_range(monkeypatch, tmp_path, payload, message):\ntests/test_router.py:2999:def test_save_and_rollback_router_settings_round_trip(monkeypatch, tmp_path):\ntests/test_router.py:3045:def test_admin_state_exposes_router_settings(monkeypatch, tmp_path):\ntests/test_router.py:3159:def test_admin_settings_endpoints_save_get_and_rollback(router_server):\ntests/test_router.py:3186:    assert rows[0][\"action\"] == \"admin.settings.save\"\ntests/test_router.py:3202:        \"/admin/settings/rollback\","
+    }
+  ],
+  "temperature": 0
+}

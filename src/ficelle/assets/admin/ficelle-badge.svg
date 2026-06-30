@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" role="img" aria-label="Ficelle">
+  <rect x="2" y="2" width="44" height="44" rx="13" fill="#17110B"></rect>
+  <path d="M9 46 V34 C9 26.5 15.5 22.5 24 22.5 C32.5 22.5 39 26.5 39 34 V46 Z" fill="#F26A1B"></path>
+  <g transform="rotate(-12 16 19)"><circle cx="16" cy="19" r="7.4" fill="#EC5A16"></circle><circle cx="16" cy="19" r="5.6" fill="#FFF8F0"></circle></g>
+  <g transform="rotate(12 32 19)"><circle cx="32" cy="19" r="7.4" fill="#EC5A16"></circle><circle cx="32" cy="19" r="5.6" fill="#FFF8F0"></circle></g>
+  <circle cx="17" cy="20.2" r="2.8" fill="#16110C"></circle>
+  <circle cx="31" cy="20.2" r="2.8" fill="#16110C"></circle>
+  <circle cx="18" cy="19.1" r="0.9" fill="#FFFFFF"></circle>
+  <circle cx="32" cy="19.1" r="0.9" fill="#FFFFFF"></circle>
+</svg>

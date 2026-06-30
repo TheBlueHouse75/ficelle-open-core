@@ -1,0 +1,29 @@
+{
+  "model": "ficelle/auto-json",
+  "messages": [
+    {
+      "role": "user",
+      "content": "This looks like JSON but should be rejected by the json_array strategy."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_malformed_json",
+          "type": "function",
+          "function": {
+            "name": "collect_malformed_metrics",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_malformed_json",
+      "content": "[{\"endpoint\":\"/api/search\",\"status\":200,\"note\":\"valid prefix\"},{\"endpoint\":\"/api/report\",\"status\":500,,{\"endpoint\":\"/api/export\",\"status\":200,\"note\":\"invalid middle comma\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/report\",\"status\":500,\"region\":\"iad\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"region\":\"iad\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"region\":\"iad\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"region\":\"iad\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"region\":\"iad\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"region\":\"iad\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/export\",\"status\":200,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/export\",\"status\":200,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/export\",\"status\":200,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/export\",\"status\":200,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\",\"note\":\"tail noise after malformed token\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\",\"note\":\"tail noise after malformed token\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\",\"note\":\"tail noise after malformed token\"},{\"endpoint\":\"/api/search\",\"status\":200,\"region\":\"iad\",\"cache\":\"miss\",\"note\":\"tail noise after malformed token\"}]"
+    }
+  ],
+  "temperature": 0
+}

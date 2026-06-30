@@ -1,0 +1,33 @@
+{
+  "model": "ficelle/auto-json",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Return a compact JSON summary of the tool data."
+    },
+    {
+      "role": "user",
+      "content": "Summarize the slow endpoints and repeated failures."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_metrics",
+          "type": "function",
+          "function": {
+            "name": "collect_metrics",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_metrics",
+      "content": "[{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1180,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1210,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1195,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1224,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":504,\"latency_ms\":30000,\"region\":\"iad\",\"cache\":\"miss\",\"error\":\"upstream timeout\"},{\"endpoint\":\"/api/export\",\"status\":200,\"latency_ms\":840,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/export\",\"status\":200,\"latency_ms\":822,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/export\",\"status\":200,\"latency_ms\":835,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/report\",\"status\":500,\"latency_ms\":9420,\"region\":\"iad\",\"cache\":\"miss\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"latency_ms\":9388,\"region\":\"iad\",\"cache\":\"miss\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"latency_ms\":9511,\"region\":\"iad\",\"cache\":\"miss\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":200,\"latency_ms\":4100,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1188,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1192,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1201,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1187,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1215,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1199,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/search\",\"status\":429,\"latency_ms\":2800,\"region\":\"iad\",\"cache\":\"miss\",\"error\":\"free quota temporarily exhausted\"},{\"endpoint\":\"/api/search\",\"status\":200,\"latency_ms\":1176,\"region\":\"iad\",\"cache\":\"miss\"},{\"endpoint\":\"/api/report\",\"status\":500,\"latency_ms\":9470,\"region\":\"iad\",\"cache\":\"miss\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"latency_ms\":9444,\"region\":\"iad\",\"cache\":\"miss\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"latency_ms\":9462,\"region\":\"iad\",\"cache\":\"miss\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/report\",\"status\":500,\"latency_ms\":9520,\"region\":\"iad\",\"cache\":\"miss\",\"error\":\"database connection reset\"},{\"endpoint\":\"/api/export\",\"status\":200,\"latency_ms\":831,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/export\",\"status\":200,\"latency_ms\":829,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/export\",\"status\":200,\"latency_ms\":842,\"region\":\"cdg\",\"cache\":\"hit\"},{\"endpoint\":\"/api/export\",\"status\":200,\"latency_ms\":838,\"region\":\"cdg\",\"cache\":\"hit\"}]"
+    }
+  ],
+  "temperature": 0
+}

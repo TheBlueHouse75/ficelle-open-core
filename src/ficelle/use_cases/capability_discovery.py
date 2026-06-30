@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+
+class ProbeResponseValidator(Protocol):
+    def validate_response(
+        self,
+        test_type: str,
+        expected: str,
+        text: str,
+        payload: Any | None = None,
+    ) -> tuple[bool, str]:
+        ...
+
+
+def record_background_job_error_in_state(
+    state: dict[str, Any],
+    job_name: str,
+    exc: BaseException,
+    *,
+    state_key: str,
+    safe_detail: Callable[[Any], str | None],
+    now_iso: Callable[[], str],
+) -> None:
+    section = state.get(state_key)
+    if not isinstance(section, dict):
+        section = {}
+    section["last_error"] = {
+        "job": safe_detail(job_name),
+        "type": safe_detail(type(exc).__name__),
+        "message": safe_detail(str(exc)),
+        "trace": [safe_detail(f"{type(exc).__name__}: {exc}")],
+        "seen_at": now_iso(),
+    }
+    state[state_key] = section
+
+
+def clear_background_job_error_in_state(state: dict[str, Any], *, state_key: str) -> bool:
+    section = state.get(state_key)
+    if not isinstance(section, dict) or "last_error" not in section:
+        return False
+    section.pop("last_error", None)
+    state[state_key] = section
+    return True
+
+
+def probeable_capability_profiles(
+    config: dict[str, Any],
+    *,
+    profile_ids: list[str],
+    benchmark_body: Callable[[str, dict[str, Any] | None], tuple[dict[str, Any], str, str]],
+) -> list[str]:
+    """Return discovery profiles that have an available probe body."""
+    out: list[str] = []
+    for profile_id in profile_ids:
+        try:
+            benchmark_body(profile_id, config)
+        except Exception:
+            continue
+        out.append(profile_id)
+    return out
+
+
+def model_due_capabilities(
+    model: dict[str, Any],
+    profile_ids: list[str],
+    state: dict[str, Any],
+    *,
+    verified_capability_row: Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]],
+) -> list[str]:
+    """Return probeable capabilities without a fresh verified/failed verdict."""
+    return [profile_id for profile_id in profile_ids if not verified_capability_row(profile_id, model, state)]
+
+
+def discovery_eligible_models(
+    catalog: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    model_on_cooldown: Callable[[dict[str, Any], dict[str, Any]], tuple[bool, str | None]],
+    model_is_quarantined: Callable[[dict[str, Any], dict[str, Any]], bool],
+) -> list[dict[str, Any]]:
+    """Return invokable catalog models that discovery can safely probe."""
+    out: list[dict[str, Any]] = []
+    for model in catalog.get("models", []) if isinstance(catalog, dict) else []:
+        if not isinstance(model, dict) or not model.get("invokable"):
+            continue
+        on_cooldown, _ = model_on_cooldown(model, state)
+        if on_cooldown or model_is_quarantined(model, state):
+            continue
+        out.append(model)
+    return out
+
+
+def models_needing_discovery(
+    catalog: dict[str, Any],
+    state: dict[str, Any],
+    profile_ids: list[str],
+    *,
+    model_on_cooldown: Callable[[dict[str, Any], dict[str, Any]], tuple[bool, str | None]],
+    model_is_quarantined: Callable[[dict[str, Any], dict[str, Any]], bool],
+    verified_capability_row: Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return eligible models with at least one due discovery capability."""
+    return [
+        model
+        for model in discovery_eligible_models(
+            catalog,
+            state,
+            model_on_cooldown=model_on_cooldown,
+            model_is_quarantined=model_is_quarantined,
+        )
+        if model_due_capabilities(model, profile_ids, state, verified_capability_row=verified_capability_row)
+    ]
+
+
+@dataclass(frozen=True)
+class CapabilityDiscoveryJob:
+    benchmark_body: Callable[[str, dict[str, Any] | None], tuple[dict[str, Any], str, str]]
+    invoke_model: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], Any]
+    classify_failure: Callable[[int, str, dict[str, Any]], str]
+    set_cooldown: Callable[..., None]
+    record_benchmark_result: Callable[[str, dict[str, Any], dict[str, Any]], None]
+    record_verified_capability: Callable[[str, dict[str, Any], dict[str, Any]], None]
+    record_success: Callable[[dict[str, Any], float], None]
+    extract_message_text: Callable[[Any], str]
+    safe_detail: Callable[..., str]
+    now_iso: Callable[[], str]
+    route_blocking_reasons: frozenset[str]
+    registry: ProbeResponseValidator
+
+    def probe_model_capability(self, model: dict[str, Any], profile_id: str, config: dict[str, Any]) -> str:
+        try:
+            body, test_type, expected = self.benchmark_body(profile_id, config)
+        except Exception:
+            return "skip"
+        started = time.time()
+        try:
+            response = self.invoke_model(model, body, config)
+        except Exception as exc:
+            self.set_cooldown(
+                model,
+                "unavailable",
+                config,
+                detail=f"discovery {type(exc).__name__}",
+                profile_id=profile_id,
+            )
+            return "skip"
+        result: dict[str, Any] = {
+            "profile_id": profile_id,
+            "model_id": model.get("id"),
+            "upstream_id": model.get("upstream_id"),
+            "source": model.get("source"),
+            "test_type": test_type,
+            "ran_at": self.now_iso(),
+        }
+        if not (200 <= response.status_code < 300):
+            return self._record_http_capability_result(model, profile_id, config, response, result)
+        try:
+            payload = response.json()
+            text = self.extract_message_text(payload)
+            passed, message = self.registry.validate_response(test_type, expected, text, payload)
+        except Exception as exc:
+            self.set_cooldown(
+                model,
+                "unavailable",
+                config,
+                detail=f"discovery parse {type(exc).__name__}",
+                profile_id=profile_id,
+            )
+            return "skip"
+        result.update({
+            "status": "pass" if passed else "fail",
+            "message": self.safe_detail(message),
+            "text_preview": self.safe_detail(text, 160),
+            "latency_seconds": round(time.time() - started, 3),
+        })
+        self.record_benchmark_result(profile_id, model, result)
+        self.record_verified_capability(profile_id, model, result)
+        if passed:
+            self.record_success(model, round(time.time() - started, 3))
+        return "verified" if passed else "failed"
+
+    def _record_http_capability_result(
+        self,
+        model: dict[str, Any],
+        profile_id: str,
+        config: dict[str, Any],
+        response: Any,
+        result: dict[str, Any],
+    ) -> str:
+        reason = self.classify_failure(response.status_code, response.text[:1000], model)
+        if response.status_code in (400, 422):
+            result.update({"status": "fail", "message": f"HTTP {response.status_code}: {reason}"})
+            self.record_benchmark_result(profile_id, model, result)
+            self.record_verified_capability(profile_id, model, result)
+            return "failed"
+        self.set_cooldown(
+            model,
+            reason,
+            config,
+            detail=f"discovery HTTP {response.status_code}: {reason}",
+            profile_id=profile_id,
+        )
+        return "blocked" if reason in self.route_blocking_reasons else "skip"
+
+    def run_auto_benchmark_cycle(
+        self,
+        config: dict[str, Any],
+        *,
+        auto_benchmark_enabled: Callable[[dict[str, Any]], bool],
+        load_or_refresh_catalog: Callable[[dict[str, Any]], dict[str, Any]],
+        load_state: Callable[[], dict[str, Any]],
+        write_runtime_state: Callable[[dict[str, Any]], None],
+        probeable_capability_profiles: Callable[[dict[str, Any]], list[str]],
+        models_needing_discovery: Callable[
+            [dict[str, Any], dict[str, Any], list[str]],
+            list[dict[str, Any]],
+        ],
+        model_due_capabilities: Callable[[dict[str, Any], list[str], dict[str, Any]], list[str]],
+        auto_benchmark_models_per_cycle: Callable[[dict[str, Any]], int],
+        probe_model_capability: Callable[[dict[str, Any], str, dict[str, Any]], str] | None = None,
+    ) -> dict[str, Any]:
+        if not auto_benchmark_enabled(config):
+            return {"status": "disabled"}
+        catalog = load_or_refresh_catalog(config)
+        state = load_state()
+        if not isinstance(state, dict):
+            state = {}
+        profile_ids = probeable_capability_profiles(config)
+        model_limit = auto_benchmark_models_per_cycle(config)
+        models = models_needing_discovery(catalog, state, profile_ids)[:model_limit]
+        if not models:
+            return {"status": "idle", "models": 0}
+        probe_one = probe_model_capability or self.probe_model_capability
+        verified = failed = 0
+        for model in models:
+            for profile_id in model_due_capabilities(model, profile_ids, state):
+                verdict = probe_one(model, profile_id, config)
+                if verdict == "verified":
+                    verified += 1
+                elif verdict == "failed":
+                    failed += 1
+                elif verdict == "blocked":
+                    break
+        state = load_state()
+        if not isinstance(state, dict):
+            state = {}
+        state["auto_benchmark"] = {
+            "last_run_at": self.now_iso(),
+            "models": len(models),
+            "verified": verified,
+            "failed": failed,
+        }
+        write_runtime_state(state)
+        return {"status": "ran", "models": len(models), "verified": verified, "failed": failed}

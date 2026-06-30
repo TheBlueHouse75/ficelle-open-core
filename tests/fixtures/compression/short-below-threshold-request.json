@@ -1,0 +1,29 @@
+{
+  "model": "ficelle/auto-fast",
+  "messages": [
+    {
+      "role": "user",
+      "content": "This should stay original because it is below the default compression threshold."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_short_log",
+          "type": "function",
+          "function": {
+            "name": "run_short_check",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_short_log",
+      "content": "pytest -q\n1 passed in 0.12s"
+    }
+  ],
+  "temperature": 0
+}

@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "description": "Thin capability seed for the open core. The full curated capability reference (the high-confidence prior) is data-as-moat and ships in the closed ficelle-pro package; a core-only install relies on the OpenRouter oracle for its prior. See docs/open-core-split.md.",
+  "aliases": {},
+  "models": {}
+}

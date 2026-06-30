@@ -1,0 +1,28 @@
+{
+  "model": "ficelle/auto-tools",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Review this diff for risky behavior changes."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_diff",
+          "type": "function",
+          "function": {
+            "name": "read_diff",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_diff",
+      "content": "diff --git a/src/ficelle/router.py b/src/ficelle/router.py\nindex 1111111..2222222 100644\n--- a/src/ficelle/router.py\n+++ b/src/ficelle/router.py\n@@ -1556,6 +1556,18 @@ def normalize_router_settings(raw: Any, *, strict: bool = False) -> dict[str, Any]:\n     source = raw if isinstance(raw, dict) else {}\n+    compression = normalize_compression_settings(source.get(\"compression\"), strict=strict)\n     return {\n         \"max_attempts_per_request\": settings_int(\n             source,\n@@ -1588,6 +1600,7 @@ def normalize_router_settings(raw: Any, *, strict: bool = False) -> dict[str, Any]:\n         ),\n         \"quota_probe_backoff_seconds\": normalize_settings_backoff(source.get(\"quota_probe_backoff_seconds\"), strict=strict),\n+        \"compression\": compression,\n     }\n@@ -1604,6 +1617,7 @@ def router_settings_payload(config: dict[str, Any]) -> dict[str, Any]:\n def router_settings_payload(config: dict[str, Any]) -> dict[str, Any]:\n     return {\"config\": normalize_router_settings(config, strict=False)}\n+\n+def compression_settings_payload(config: dict[str, Any]) -> dict[str, Any]:\n+    return normalize_compression_settings(config.get(\"compression\"), strict=False)\n@@ -7118,6 +7132,7 @@ def do_POST(self) -> None:\n                 before = normalize_router_settings(self.config, strict=False)\n                 settings = validate_settings_payload(body)\n                 saved = save_router_settings(self.config, settings)\n+                compression_mode = saved.get(\"compression\", {}).get(\"mode\", \"off\")\n                 audit = append_admin_audit(\n                     \"admin.settings.save\",\n                     before={\"settings\": before},\n@@ -7125,6 +7140,7 @@ def do_POST(self) -> None:\n                     after={\"settings\": saved},\n-                    metadata={\"resource\": \"settings\"},\n+                    metadata={\"resource\": \"settings\", \"compression_mode\": compression_mode},\n                 )\ndiff --git a/src/ficelle/assets/admin/app.js b/src/ficelle/assets/admin/app.js\nindex 3333333..4444444 100644\n--- a/src/ficelle/assets/admin/app.js\n+++ b/src/ficelle/assets/admin/app.js\n@@ -811,6 +811,18 @@ function renderSettings() {\n+      '<section class=\"panel-block\">' +\n+        '<h3>Context compression</h3>' +\n+        '<select id=\"setCompressionMode\" data-settings-field=\"compression.mode\">' +\n+          '<option value=\"off\">Off</option>' +\n+          '<option value=\"dry_run\">Dry run</option>' +\n+          '<option value=\"live_zone\">Live zone</option>' +\n+        '</select>' +\n+        '<input id=\"setCompressionMinChars\" type=\"number\" min=\"0\" max=\"1000000\" data-settings-field=\"compression.min_chars\">' +\n+        '<input id=\"setCompressionMaxBlocks\" type=\"number\" min=\"0\" max=\"32\" data-settings-field=\"compression.max_compressed_blocks\">' +\n+      '</section>' +\n"
+    }
+  ]
+}

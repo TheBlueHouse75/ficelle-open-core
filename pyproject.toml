@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ficelle-router"
+version = "0.1.2"
+description = "Local OpenAI-compatible strict-zero model router for Hermes"
+readme = "README.md"
+license = "BUSL-1.1"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build>=1.2"]
+
+[project.scripts]
+ficelle = "ficelle.cli:main"
+ficelle-setup = "ficelle.install:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ficelle = ["assets/hermes-plugin/*/*", "assets/fonts/*", "assets/logos/*", "assets/admin/*", "assets/admin/**/*", "data/*.json", "data/benchmark/*"]
+
+[tool.pytest.ini_options]
+# ficelle-pro/src holds the optional closed pack; in the monorepo it makes `pytest`
+# (and CI) find ficelle_pro without a manual install. In a core-only checkout (the
+# public mirror) the dir is absent and the entry is harmlessly ignored.
+pythonpath = ["src"]
