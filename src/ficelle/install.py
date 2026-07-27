@@ -20,6 +20,7 @@ from ficelle.service import active_home_pointer_path, persist_active_service_con
 
 MANAGED_CONFIG_BEGIN = "# BEGIN FICELLE MANAGED CONFIG"
 MANAGED_CONFIG_END = "# END FICELLE MANAGED CONFIG"
+PROVIDER_PLUGIN_NAME = "ficelle"
 COMPRESSION_PLUGIN_NAME = "ficelle-compression"
 COMPRESSION_TOOLSET_NAME = "ficelle"
 LEGACY_MIGRATION_MARKER = ".ficelle-legacy-migrated"
@@ -822,6 +823,7 @@ def hermes_plugins_enabled_block() -> str:
     return "\n".join([
         "plugins:",
         "  enabled:",
+        f"    - \"{PROVIDER_PLUGIN_NAME}\"",
         f"    - \"{COMPRESSION_PLUGIN_NAME}\"",
         "",
     ])
@@ -950,7 +952,12 @@ def ensure_hermes_toolset_enabled(text: str, toolset_name: str = COMPRESSION_TOO
 
 
 def ensure_hermes_compression_plugin_enabled(text: str) -> str:
-    return ensure_hermes_toolset_enabled(ensure_hermes_plugin_enabled(text))
+    with_provider = ensure_hermes_plugin_enabled(text, PROVIDER_PLUGIN_NAME)
+    with_compression = ensure_hermes_plugin_enabled(
+        with_provider,
+        COMPRESSION_PLUGIN_NAME,
+    )
+    return ensure_hermes_toolset_enabled(with_compression)
 
 
 def replace_managed_block(text: str, replacement: str) -> str:

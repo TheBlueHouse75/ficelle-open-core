@@ -498,6 +498,8 @@ def test_ensure_hermes_compression_plugin_enabled_does_not_duplicate_toolsets():
 
     assert updated.count("plugins:") == 1
     assert updated.count("toolsets:") == 1
+    assert '    - "ficelle"' in updated
+    assert '    - "ficelle-compression"' in updated
     assert "  - hermes-cli\n  - \"ficelle\"" in updated
 
 
