@@ -21,13 +21,16 @@ import tempfile
 import time
 import urllib.request
 import uuid
+import zipfile
 from contextlib import contextmanager
+from email.parser import Parser
 from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 
+from ficelle import __version__ as CORE_VERSION
 from ficelle.install import CommandResult, pip_is_unavailable
 from ficelle.json_store import atomic_write_json, load_json
 from ficelle.runtime_paths import RuntimePaths
@@ -41,6 +44,7 @@ _ACTIVE_INSTALL_STATUSES = frozenset({"queued", "installing", "restarting"})
 # The private, license-gated wheel endpoint — same default as the standalone bootstrap script
 # (scripts/bootstrap-ficelle.py); overridable for staging/testing via FICELLE_WHEEL_URL.
 DEFAULT_WHEEL_URL = "https://install.ficelle.ai/api/releases/latest/wheel"
+PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
 
 # pip rejects an invalid wheel filename, so the download is saved under the real wheel name the
 # service advertises (Content-Disposition); this generic-but-valid name is the fallback.
@@ -312,9 +316,49 @@ def install_pro_wheel(
     *,
     runner: Callable[[list[str]], CommandResult | int] | None = None,
 ) -> None:
-    """pip-install ``wheel`` into the current interpreter's environment (pulls the core too)."""
+    """Install ``wheel`` into the existing Core environment without consulting PyPI."""
+    verify_pro_core_compatibility(wheel)
     run = runner or _pip_run
-    pip_command = [sys.executable, "-m", "pip", "install", "--force-reinstall", str(wheel)]
+    dependency_command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        *PRO_RUNTIME_REQUIREMENTS,
+    ]
+    dependency_result = _command_result(
+        dependency_command,
+        run(dependency_command),
+    )
+    if dependency_result.returncode != 0:
+        if not pip_is_unavailable(dependency_result):
+            raise ProInstallError("pip install of the Pro runtime failed")
+        uv = _uv_executable()
+        if not uv:
+            raise ProInstallError("pip is unavailable and uv could not be found")
+        uv_dependency_command = [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            *PRO_RUNTIME_REQUIREMENTS,
+        ]
+        if _command_result(
+            uv_dependency_command,
+            run(uv_dependency_command),
+        ).returncode != 0:
+            raise ProInstallError("uv install of the Pro runtime failed")
+
+    pip_command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--force-reinstall",
+        "--no-deps",
+        str(wheel),
+    ]
     pip_result = _command_result(pip_command, run(pip_command))
     if pip_result.returncode == 0:
         return
@@ -323,10 +367,46 @@ def install_pro_wheel(
     uv = _uv_executable()
     if not uv:
         raise ProInstallError("pip is unavailable and uv could not be found")
-    uv_command = [uv, "pip", "install", "--python", sys.executable, "--reinstall", str(wheel)]
+    uv_command = [
+        uv,
+        "pip",
+        "install",
+        "--python",
+        sys.executable,
+        "--reinstall",
+        "--no-deps",
+        str(wheel),
+    ]
     uv_result = _command_result(uv_command, run(uv_command))
     if uv_result.returncode != 0:
         raise ProInstallError("uv install of the Pro pack failed")
+
+
+def verify_pro_core_compatibility(wheel: Path) -> None:
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            metadata_name = next(
+                name
+                for name in archive.namelist()
+                if name.endswith(".dist-info/METADATA")
+            )
+            metadata = Parser().parsestr(
+                archive.read(metadata_name).decode("utf-8")
+            )
+    except (OSError, UnicodeError, zipfile.BadZipFile, StopIteration) as exc:
+        raise ProInstallError(
+            "Pro wheel metadata could not be verified"
+        ) from exc
+    requirements = metadata.get_all("Requires-Dist", [])
+    expected = f"ficelle-router=={CORE_VERSION}"
+    normalized = {
+        requirement.replace(" ", "").lower()
+        for requirement in requirements
+    }
+    if expected not in normalized:
+        raise ProInstallError(
+            f"Pro wheel is incompatible with Ficelle Core {CORE_VERSION}"
+        )
 
 
 def _pip_run(command: list[str]) -> CommandResult:

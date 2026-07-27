@@ -24,12 +24,23 @@ paid call.
 
 ## Quick start
 
-Install the versioned open Core from PyPI:
+Install the versioned open Core from its GitHub Release:
 
 ```bash
-uv tool install ficelle-router==0.1.3
-ficelle-setup --skip-package --target generic
-ficelle models
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.3/scripts/bootstrap-ficelle.py | python3 -
+~/.local/bin/ficelle models
+```
+
+The installer uses an isolated runtime and auto-detects Hermes; Ficelle remains fully
+standalone when Hermes is absent. To install Pro after purchase without putting the
+key in shell history, enter it silently before running the same command:
+
+```bash
+(
+  read -s FICELLE_LICENSE_KEY
+  export FICELLE_LICENSE_KEY
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.3/scripts/bootstrap-ficelle.py | python3 -
+)
 ```
 
 Point your client at `http://127.0.0.1:8646/v1`, configure a provider key (e.g.

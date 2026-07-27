@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -41,6 +42,21 @@ class _FakeResponse:
             return data
         data, self._data = self._data[:size], self._data[size:]
         return data
+
+
+def write_pro_wheel(path: Path, core_requirement: str | None = None) -> None:
+    requirement = core_requirement or (
+        f"ficelle-router=={pro_install.CORE_VERSION}"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "ficelle_pro-0.1.3.dist-info/METADATA",
+            "Metadata-Version: 2.4\n"
+            "Name: ficelle-pro\n"
+            "Version: 0.1.3\n"
+            f"Requires-Dist: {requirement}\n"
+            "Requires-Dist: cryptography>=42\n",
+        )
 
 
 class _FakeHeaders:
@@ -110,20 +126,37 @@ def test_download_pro_wheel_never_leaks_key_on_failure(tmp_path: Path) -> None:
 
 def test_install_pro_wheel_invokes_pip_with_current_interpreter(tmp_path: Path) -> None:
     wheel = tmp_path / "ficelle_pro-latest.whl"
-    wheel.write_bytes(b"x")
-    seen: dict[str, list[str]] = {}
+    write_pro_wheel(wheel)
+    seen: list[list[str]] = []
 
     def runner(command: list[str]) -> int:
-        seen["command"] = command
+        seen.append(command)
         return 0
 
     pro_install.install_pro_wheel(wheel, runner=runner)
-    assert seen["command"] == [sys.executable, "-m", "pip", "install", "--force-reinstall", str(wheel)]
+    assert seen == [
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "cryptography>=42",
+        ],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            "--no-deps",
+            str(wheel),
+        ],
+    ]
 
 
 def test_install_pro_wheel_raises_when_pip_fails(tmp_path: Path) -> None:
     wheel = tmp_path / "w.whl"
-    wheel.write_bytes(b"x")
+    write_pro_wheel(wheel)
     try:
         pro_install.install_pro_wheel(wheel, runner=lambda command: 1)
     except pro_install.ProInstallError:
@@ -134,27 +167,43 @@ def test_install_pro_wheel_raises_when_pip_fails(tmp_path: Path) -> None:
 
 def test_install_pro_wheel_falls_back_to_uv_when_pip_is_unavailable(tmp_path: Path, monkeypatch) -> None:
     wheel = tmp_path / "ficelle_pro-1-py3-none-any.whl"
-    wheel.write_bytes(b"x")
+    write_pro_wheel(wheel)
     commands: list[list[str]] = []
 
     monkeypatch.setattr(pro_install, "_uv_executable", lambda: "/opt/homebrew/bin/uv")
 
     def runner(command: list[str]) -> CommandResult | int:
         commands.append(command)
-        if len(commands) == 1:
+        if command[0] == sys.executable:
             return CommandResult(command, 1, stderr=f"{sys.executable}: No module named pip")
         return 0
 
     pro_install.install_pro_wheel(wheel, runner=runner)
 
-    assert commands[0][:4] == [sys.executable, "-m", "pip", "install"]
+    assert commands[0] == [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "cryptography>=42",
+    ]
     assert commands[1] == [
         "/opt/homebrew/bin/uv",
         "pip",
         "install",
         "--python",
         sys.executable,
+        "cryptography>=42",
+    ]
+    assert commands[2][:4] == [sys.executable, "-m", "pip", "install"]
+    assert commands[3] == [
+        "/opt/homebrew/bin/uv",
+        "pip",
+        "install",
+        "--python",
+        sys.executable,
         "--reinstall",
+        "--no-deps",
         str(wheel),
     ]
 
@@ -273,7 +322,7 @@ def test_install_status_failure_is_explicit(monkeypatch) -> None:
     assert pro_install.best_effort_write_install_status("failed") is False
 
 
-def test_install_pro_downloads_then_pips_that_wheel() -> None:
+def test_install_pro_downloads_then_pips_that_wheel(monkeypatch) -> None:
     installed: dict[str, str] = {}
 
     def opener(request: object, timeout: float) -> _FakeResponse:
@@ -283,6 +332,11 @@ def test_install_pro_downloads_then_pips_that_wheel() -> None:
         installed["wheel"] = command[-1]  # the last arg is the wheel path
         return 0
 
+    monkeypatch.setattr(
+        pro_install,
+        "verify_pro_core_compatibility",
+        lambda wheel: None,
+    )
     pro_install.install_pro("FICL-x", opener=opener, runner=runner)
     # Regression: the download used to be saved as the invalid "ficelle_pro-latest.whl", which pip
     # rejects ("Invalid wheel filename"); it must now be a valid wheel name.
@@ -302,10 +356,17 @@ def test_install_pro_verifies_pinned_checksum(monkeypatch) -> None:
         installed.append(command)
         return 0
 
+    monkeypatch.setattr(
+        pro_install,
+        "verify_pro_core_compatibility",
+        lambda wheel: None,
+    )
     # A matching pin installs.
     monkeypatch.setenv("FICELLE_WHEEL_SHA256", hashlib.sha256(body).hexdigest())
     pro_install.install_pro("FICL-x", opener=opener, runner=runner)
-    assert len(installed) == 1
+    assert len(installed) == 2
+    assert installed[0][-1] == "cryptography>=42"
+    assert installed[1][-1].endswith("-py3-none-any.whl")
     # A wrong pin is refused BEFORE pip runs.
     monkeypatch.setenv("FICELLE_WHEEL_SHA256", "0" * 64)
     installed.clear()
@@ -316,6 +377,17 @@ def test_install_pro_verifies_pinned_checksum(monkeypatch) -> None:
     else:
         raise AssertionError("expected ProInstallError on checksum mismatch")
     assert installed == []  # pip never ran on the tampered wheel
+
+
+def test_pro_wheel_must_match_the_installed_core(tmp_path: Path) -> None:
+    compatible = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    write_pro_wheel(compatible)
+    pro_install.verify_pro_core_compatibility(compatible)
+
+    incompatible = tmp_path / "ficelle_pro-0.2.0-py3-none-any.whl"
+    write_pro_wheel(incompatible, "ficelle-router==0.2.0")
+    with pytest.raises(pro_install.ProInstallError, match="incompatible"):
+        pro_install.verify_pro_core_compatibility(incompatible)
 
 
 def test_install_pro_requires_a_key() -> None:

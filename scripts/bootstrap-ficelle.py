@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""Bootstrap Ficelle Pro from a private wheel without cloning the repository.
+"""Install Ficelle Core, and optionally Ficelle Pro, without cloning the repository.
 
 This script is intentionally stdlib-only so it can be served as:
 
-    curl -fsSL https://install.ficelle.ai/bootstrap.py | python3 - --license-key ...
+    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.3/scripts/bootstrap-ficelle.py | python3
 
-It delivers the **Pro** install (open core + closed pack). The wheel it downloads is
-the licensed ``ficelle-pro`` pack; installing it pulls the open-core ``ficelle-router``
-package from PyPI as its dependency, so both land together. It then runs the core's
-packaged setup entrypoint and confirms both packages import. It never prints license
-keys or provider secrets.
-
-The free tier needs no bootstrap: ``uv tool install ficelle-router`` (or
-``pip install ficelle-router``) installs the open core alone.
+Without a license key it installs the versioned open Core from the public GitHub
+release. With ``--license-key`` it also downloads the licensed Pro wheel, installs it
+without consulting PyPI, activates the entitlement, and verifies both packages. It
+never prints license keys or provider secrets.
 """
 from __future__ import annotations
 
@@ -27,11 +23,22 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
+from email.parser import Parser
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
+CORE_VERSION = "0.1.3"
+DEFAULT_CORE_WHEEL_URL = (
+    "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
+    f"v{CORE_VERSION}/ficelle_router-{CORE_VERSION}-py3-none-any.whl"
+)
+DEFAULT_CORE_SHA256 = (
+    "3c8b23bfaecdfbc23c843d853765eaa4f932520a1f4df37c0fa88443b5b1d381"
+)
 DEFAULT_WHEEL_URL = "https://install.ficelle.ai/api/releases/latest/wheel"
+PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
 DEFAULT_HERMES_HOME = Path.home() / ".hermes"
 INSTALL_TARGETS = ("auto", "generic", "hermes", "openclaw")
 InstallTarget = Literal["auto", "generic", "hermes", "openclaw"]
@@ -52,10 +59,13 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 @dataclass(frozen=True)
 class BootstrapOptions:
+    core_wheel_url: str
+    core_sha256: str | None
     wheel_url: str
     license_key: str | None
     sha256: str | None
     python: str | None
+    venv: Path
     target: InstallTarget
     ficelle_home: Path
     hermes_home: Path
@@ -214,6 +224,48 @@ def validate_python(python: Path) -> Path:
     return python
 
 
+def venv_python(venv: Path) -> Path:
+    return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def prepare_target_python(
+    options: BootstrapOptions,
+    target: ResolvedInstallTarget,
+    selected_python: Path,
+) -> tuple[Path, bool]:
+    """Use an isolated runtime unless the caller selected Python or Hermes owns it."""
+    if options.python is not None:
+        return selected_python, False
+    if (
+        target == "hermes"
+        and hermes_runtime_result(selected_python).returncode == 0
+    ):
+        return selected_python, False
+
+    python = venv_python(options.venv)
+    if python.exists():
+        return validate_python(python), True
+    result = run_command(
+        [str(selected_python), "-m", "venv", str(options.venv)],
+        dry_run=options.dry_run,
+    )
+    if result.returncode != 0 and shutil.which("uv"):
+        result = run_command(
+            [
+                "uv",
+                "venv",
+                "--python",
+                str(selected_python),
+                str(options.venv),
+            ],
+            dry_run=options.dry_run,
+        )
+    ensure_success(result, action="isolated Python environment creation")
+    if options.dry_run:
+        return python, True
+    return validate_python(python), True
+
+
 def resolve_install_context(
     options: BootstrapOptions,
 ) -> tuple[ResolvedInstallTarget, Path]:
@@ -320,6 +372,17 @@ def open_same_origin(request: urllib.request.Request, *, timeout: float) -> obje
     )
 
 
+def open_wheel(
+    request: urllib.request.Request,
+    *,
+    timeout: float,
+    authenticated: bool,
+) -> object:
+    if authenticated:
+        return open_same_origin(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -338,6 +401,33 @@ def verify_sha256(path: Path, expected: str | None) -> None:
     print(f"SHA256 verified: {actual}")
 
 
+def verify_pro_core_compatibility(wheel: Path, *, dry_run: bool) -> None:
+    if dry_run:
+        return
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            metadata_name = next(
+                name
+                for name in archive.namelist()
+                if name.endswith(".dist-info/METADATA")
+            )
+            metadata = Parser().parsestr(
+                archive.read(metadata_name).decode("utf-8")
+            )
+    except (OSError, UnicodeError, zipfile.BadZipFile, StopIteration) as exc:
+        raise SystemExit("Pro wheel metadata could not be verified") from exc
+    requirements = metadata.get_all("Requires-Dist", [])
+    expected = f"ficelle-router=={CORE_VERSION}"
+    normalized = {
+        requirement.replace(" ", "").lower()
+        for requirement in requirements
+    }
+    if expected not in normalized:
+        raise SystemExit(
+            f"Pro wheel is incompatible with Ficelle Core {CORE_VERSION}"
+        )
+
+
 def copy_local_wheel(source: Path, destination: Path, *, dry_run: bool) -> Path:
     if dry_run:
         print(f"DRY RUN: copy wheel {source} -> {destination}")
@@ -349,15 +439,28 @@ def copy_local_wheel(source: Path, destination: Path, *, dry_run: bool) -> Path:
     return destination
 
 
-def download_wheel(options: BootstrapOptions, download_dir: Path) -> Path:
-    url = options.wheel_url
+def download_url_wheel(
+    url: str,
+    download_dir: Path,
+    *,
+    license_key: str | None,
+    dry_run: bool,
+) -> Path:
     parsed = urllib.parse.urlsplit(url)
     destination = download_dir / wheel_filename_from_url(url)
 
     if parsed.scheme == "file":
-        return copy_local_wheel(Path(urllib.request.url2pathname(parsed.path)), destination, dry_run=options.dry_run)
+        return copy_local_wheel(
+            Path(urllib.request.url2pathname(parsed.path)),
+            destination,
+            dry_run=dry_run,
+        )
     if parsed.scheme == "":
-        return copy_local_wheel(Path(url).expanduser(), destination, dry_run=options.dry_run)
+        return copy_local_wheel(
+            Path(url).expanduser(),
+            destination,
+            dry_run=dry_run,
+        )
     if not uses_secure_http_transport(url):
         raise SystemExit(
             "refusing to download a Ficelle wheel over an insecure URL "
@@ -365,18 +468,22 @@ def download_wheel(options: BootstrapOptions, download_dir: Path) -> Path:
         )
 
     print(f"Downloading Ficelle wheel: {redact_url(url)}")
-    if options.license_key:
+    if license_key:
         print("Using license key for authenticated download: [REDACTED]")
-    if options.dry_run:
+    if dry_run:
         print(f"DRY RUN: download wheel -> {destination}")
         return destination
 
     headers = {"Accept": "application/octet-stream"}
-    if options.license_key:
-        headers["Authorization"] = f"Bearer {options.license_key}"
+    if license_key:
+        headers["Authorization"] = f"Bearer {license_key}"
     request = urllib.request.Request(url, headers=headers)
     try:
-        with open_same_origin(request, timeout=120) as response:
+        with open_wheel(
+            request,
+            timeout=120,
+            authenticated=bool(license_key),
+        ) as response:
             destination = download_dir / wheel_filename_from_response(response, url)
             destination.parent.mkdir(parents=True, exist_ok=True)
             with destination.open("wb") as handle:
@@ -391,20 +498,100 @@ def download_wheel(options: BootstrapOptions, download_dir: Path) -> Path:
     return destination
 
 
+def download_wheel(options: BootstrapOptions, download_dir: Path) -> Path:
+    return download_url_wheel(
+        options.wheel_url,
+        download_dir,
+        license_key=options.license_key,
+        dry_run=options.dry_run,
+    )
+
+
+def download_core_wheel(options: BootstrapOptions, download_dir: Path) -> Path:
+    return download_url_wheel(
+        options.core_wheel_url,
+        download_dir,
+        license_key=None,
+        dry_run=options.dry_run,
+    )
+
+
 def install_wheel(
     options: BootstrapOptions,
     python: Path,
     wheel: Path,
     target: ResolvedInstallTarget,
+    *,
+    no_deps: bool = False,
 ) -> None:
     env = command_env(options, target)
-    result = run_command([str(python), "-m", "pip", "install", "--force-reinstall", str(wheel)], dry_run=options.dry_run, env=env)
+    pip_command = [
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "--force-reinstall",
+    ]
+    if no_deps:
+        pip_command.append("--no-deps")
+    pip_command.append(str(wheel))
+    result = run_command(
+        pip_command,
+        dry_run=options.dry_run,
+        env=env,
+    )
     if result.returncode == 0:
         return
     if pip_is_unavailable(result) and shutil.which("uv"):
         print("python -m pip is unavailable; retrying wheel install with uv pip.")
-        result = run_command(["uv", "pip", "install", "--python", str(python), "--reinstall", str(wheel)], dry_run=options.dry_run, env=env)
+        uv_command = [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--reinstall",
+        ]
+        if no_deps:
+            uv_command.append("--no-deps")
+        uv_command.append(str(wheel))
+        result = run_command(
+            uv_command,
+            dry_run=options.dry_run,
+            env=env,
+        )
     ensure_success(result, action="wheel install")
+
+
+def install_requirements(
+    options: BootstrapOptions,
+    python: Path,
+    target: ResolvedInstallTarget,
+    requirements: Sequence[str],
+) -> None:
+    env = command_env(options, target)
+    pip_command = [str(python), "-m", "pip", "install", *requirements]
+    result = run_command(
+        pip_command,
+        dry_run=options.dry_run,
+        env=env,
+    )
+    if result.returncode == 0:
+        return
+    if pip_is_unavailable(result) and shutil.which("uv"):
+        result = run_command(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                *requirements,
+            ],
+            dry_run=options.dry_run,
+            env=env,
+        )
+    ensure_success(result, action="Pro runtime dependency install")
 
 
 def setup_command(
@@ -455,15 +642,22 @@ def run_packaged_setup(
     ensure_success(result, action="Ficelle setup")
 
 
-def verify_two_package_install(
+def verify_install(
     options: BootstrapOptions,
     python: Path,
     target: ResolvedInstallTarget,
+    *,
+    expect_pro: bool,
 ) -> None:
-    """Confirm both halves of a Pro install import: the open core and the closed pack."""
+    """Confirm the requested Core or Core+Pro install imports."""
     if options.dry_run:
         return
-    code = "import ficelle, ficelle_pro; print('ficelle +', getattr(ficelle_pro, '__version__', '?'))"
+    code = (
+        "import ficelle, ficelle_pro, ficelle_pro.licensing; "
+        "print('ficelle +', getattr(ficelle_pro, '__version__', '?'))"
+        if expect_pro
+        else "import ficelle; print('ficelle core')"
+    )
     result = run_command(
         [str(python), "-c", code],
         dry_run=options.dry_run,
@@ -471,9 +665,7 @@ def verify_two_package_install(
     )
     if result.returncode != 0:
         raise SystemExit(
-            "post-install check failed: the open core (ficelle) and/or the Pro pack (ficelle_pro) "
-            "did not import. The core resolves from PyPI as a dependency of the ficelle-pro wheel — "
-            "confirm ficelle-router is published and reachable from the target environment."
+            "post-install check failed: the requested Ficelle package set did not import"
         )
 
 
@@ -503,8 +695,41 @@ def run_license_activation(
         )
 
 
+def expose_cli(python: Path, *, isolated: bool, dry_run: bool) -> None:
+    if not isolated or os.name == "nt":
+        return
+    destination_dir = Path.home() / ".local" / "bin"
+    for name in ("ficelle", "ficelle-setup"):
+        source = python.parent / name
+        destination = destination_dir / name
+        if dry_run:
+            print(f"DRY RUN: link {destination} -> {source}")
+            continue
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink() and destination.resolve() == source.resolve():
+            continue
+        if destination.exists() or destination.is_symlink():
+            print(
+                f"WARN: keeping existing command at {destination}; "
+                f"the Ficelle command is {source}",
+                file=sys.stderr,
+            )
+            continue
+        destination.symlink_to(source)
+    if str(destination_dir) not in os.getenv("PATH", "").split(os.pathsep):
+        print(
+            f"Add {destination_dir} to PATH to run `ficelle` directly. "
+            f"Until then use {python.parent / 'ficelle'}."
+        )
+
+
 def run_bootstrap(options: BootstrapOptions) -> int:
-    target, python = resolve_install_context(options)
+    target, selected_python = resolve_install_context(options)
+    python, isolated = prepare_target_python(
+        options,
+        target,
+        selected_python,
+    )
     print(f"Install target: {target}")
     print(f"Target Python: {python}")
     print(f"Ficelle home: {options.ficelle_home}")
@@ -513,32 +738,78 @@ def run_bootstrap(options: BootstrapOptions) -> int:
 
     if options.dry_run:
         download_dir = Path(tempfile.gettempdir()) / "ficelle-bootstrap-dry-run"
-        wheel = download_wheel(options, download_dir)
-        print("DRY RUN: skip checksum because no wheel was downloaded.")
-        install_wheel(options, python, wheel, target)
-        run_packaged_setup(options, python, wheel, target)
+        core_wheel = download_core_wheel(options, download_dir)
+        print("DRY RUN: skip checksums because no wheel was downloaded.")
+        install_wheel(options, python, core_wheel, target)
+        if options.license_key:
+            pro_wheel = download_wheel(options, download_dir)
+            verify_pro_core_compatibility(
+                pro_wheel,
+                dry_run=options.dry_run,
+            )
+            install_requirements(
+                options,
+                python,
+                target,
+                PRO_RUNTIME_REQUIREMENTS,
+            )
+            install_wheel(options, python, pro_wheel, target, no_deps=True)
+        run_packaged_setup(options, python, core_wheel, target)
+        expose_cli(python, isolated=isolated, dry_run=True)
         return 0
 
     with tempfile.TemporaryDirectory(prefix="ficelle-bootstrap-") as tmp:
         download_dir = Path(tmp)
-        wheel = download_wheel(options, download_dir)
-        verify_sha256(wheel, options.sha256)
-        install_wheel(options, python, wheel, target)
-        run_packaged_setup(options, python, wheel, target)
-        verify_two_package_install(options, python, target)
+        core_wheel = download_core_wheel(options, download_dir)
+        verify_sha256(core_wheel, options.core_sha256)
+        install_wheel(options, python, core_wheel, target)
+        wheels = [core_wheel]
+        if options.license_key:
+            pro_wheel = download_wheel(options, download_dir)
+            verify_sha256(pro_wheel, options.sha256)
+            verify_pro_core_compatibility(pro_wheel, dry_run=False)
+            install_requirements(
+                options,
+                python,
+                target,
+                PRO_RUNTIME_REQUIREMENTS,
+            )
+            install_wheel(options, python, pro_wheel, target, no_deps=True)
+            wheels.append(pro_wheel)
+        run_packaged_setup(options, python, core_wheel, target)
+        expose_cli(python, isolated=isolated, dry_run=False)
+        verify_install(
+            options,
+            python,
+            target,
+            expect_pro=bool(options.license_key),
+        )
         run_license_activation(options, python, target)
         if options.keep_wheel:
             keep_dir = options.ficelle_home / "artifacts"
             keep_dir.mkdir(parents=True, exist_ok=True)
-            kept = keep_dir / wheel.name
-            shutil.copy2(wheel, kept)
-            print(f"Kept wheel artifact: {kept}")
+            for wheel in wheels:
+                kept = keep_dir / wheel.name
+                shutil.copy2(wheel, kept)
+                print(f"Kept wheel artifact: {kept}")
     print("Ficelle bootstrap complete.")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Install Ficelle from a private wheel without cloning the repo.")
+    parser = argparse.ArgumentParser(
+        description="Install Ficelle Core and optionally Ficelle Pro without cloning the repo."
+    )
+    parser.add_argument(
+        "--core-wheel-url",
+        default=os.getenv("FICELLE_CORE_WHEEL_URL", DEFAULT_CORE_WHEEL_URL),
+        help="Versioned public Core wheel URL or local path.",
+    )
+    parser.add_argument(
+        "--core-sha256",
+        default=os.getenv("FICELLE_CORE_WHEEL_SHA256", DEFAULT_CORE_SHA256),
+        help="Expected Core wheel SHA256.",
+    )
     parser.add_argument("--wheel-url", default=os.getenv("FICELLE_WHEEL_URL", DEFAULT_WHEEL_URL), help="Private wheel URL or local wheel path. Default: Ficelle install service endpoint.")
     parser.add_argument("--license-key", default=os.getenv("FICELLE_LICENSE_KEY") or os.getenv("FICELLE_INSTALL_TOKEN"), help="Ficelle license/install token. Also read from FICELLE_LICENSE_KEY or FICELLE_INSTALL_TOKEN.")
     parser.add_argument("--sha256", default=os.getenv("FICELLE_WHEEL_SHA256"), help="Expected wheel SHA256. Strongly recommended for release validation.")
@@ -547,6 +818,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--python",
         default=os.getenv("FICELLE_PYTHON") or os.getenv("HERMES_PYTHON"),
         help="Target Python. Defaults to FICELLE_PYTHON, then legacy HERMES_PYTHON; otherwise target-aware detection applies.",
+    )
+    parser.add_argument(
+        "--venv",
+        default=os.getenv(
+            "FICELLE_VENV",
+            str(Path.home() / ".local" / "share" / "ficelle" / "venv"),
+        ),
+        help="Isolated runtime used when no explicit or Hermes Python is selected.",
     )
     parser.add_argument("--ficelle-home", default=None, help="Ficelle state root. Default: FICELLE_HOME or ~/.ficelle")
     parser.add_argument("--hermes-home", default=str(DEFAULT_HERMES_HOME), help="Hermes home directory. Default: ~/.hermes")
@@ -562,10 +841,13 @@ def build_parser() -> argparse.ArgumentParser:
 def options_from_args(args: argparse.Namespace) -> BootstrapOptions:
     configured_ficelle_home = args.ficelle_home or os.getenv("FICELLE_HOME")
     return BootstrapOptions(
+        core_wheel_url=args.core_wheel_url,
+        core_sha256=args.core_sha256,
         wheel_url=args.wheel_url,
         license_key=args.license_key,
         sha256=args.sha256,
         python=args.python,
+        venv=Path(args.venv).expanduser().resolve(),
         target=args.target,
         ficelle_home=Path(
             configured_ficelle_home or Path.home() / ".ficelle"

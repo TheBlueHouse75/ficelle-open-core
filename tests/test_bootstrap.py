@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import sys
+import zipfile
 from email.message import Message
 from pathlib import Path
 
@@ -35,10 +36,15 @@ class _WheelResponse(io.BytesIO):
 
 def make_options(tmp_path, **overrides):
     values = {
+        "core_wheel_url": str(
+            tmp_path / "ficelle_router-0.1.2-py3-none-any.whl"
+        ),
+        "core_sha256": None,
         "wheel_url": str(tmp_path / "ficelle_router-0.1.2-py3-none-any.whl"),
         "license_key": None,
         "sha256": None,
         "python": None,
+        "venv": tmp_path / ".local" / "share" / "ficelle" / "venv",
         "target": "generic",
         "ficelle_home": tmp_path / ".ficelle",
         "hermes_home": tmp_path / ".hermes",
@@ -52,6 +58,21 @@ def make_options(tmp_path, **overrides):
     }
     values.update(overrides)
     return bootstrap.BootstrapOptions(**values)
+
+
+def write_pro_wheel(path: Path, core_requirement: str) -> None:
+    metadata = (
+        "Metadata-Version: 2.4\n"
+        "Name: ficelle-pro\n"
+        "Version: 0.1.3\n"
+        f"Requires-Dist: {core_requirement}\n"
+        "Requires-Dist: cryptography>=42\n"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "ficelle_pro-0.1.3.dist-info/METADATA",
+            metadata,
+        )
 
 
 def test_redact_url_hides_query_tokens():
@@ -215,6 +236,56 @@ def test_install_wheel_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_pat
     ]
 
 
+def test_pro_requirements_fall_back_to_uv_when_pip_is_missing(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+    options = make_options(tmp_path)
+
+    def fake_run(command, *, dry_run, env=None):
+        calls.append(command)
+        if command[:3] == ["/tmp/ficelle-python", "-m", "pip"]:
+            return bootstrap.CommandResult(
+                command,
+                1,
+                stderr="/tmp/ficelle-python: No module named pip",
+            )
+        return bootstrap.CommandResult(command, 0)
+
+    monkeypatch.setattr(bootstrap, "run_command", fake_run)
+    monkeypatch.setattr(
+        bootstrap.shutil,
+        "which",
+        lambda name: "/opt/homebrew/bin/uv" if name == "uv" else None,
+    )
+
+    bootstrap.install_requirements(
+        options,
+        Path("/tmp/ficelle-python"),
+        "generic",
+        bootstrap.PRO_RUNTIME_REQUIREMENTS,
+    )
+
+    assert calls == [
+        [
+            "/tmp/ficelle-python",
+            "-m",
+            "pip",
+            "install",
+            "cryptography>=42",
+        ],
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            "/tmp/ficelle-python",
+            "cryptography>=42",
+        ],
+    ]
+
+
 def test_download_local_wheel_verifies_sha256_path(tmp_path):
     source = tmp_path / "source" / "ficelle_router-0.1.2-py3-none-any.whl"
     source.parent.mkdir()
@@ -246,6 +317,14 @@ def test_default_wheel_endpoint_uses_valid_fallback_filename():
     )
 
 
+def test_default_core_wheel_is_versioned_and_pinned():
+    assert "/releases/download/v0.1.3/" in bootstrap.DEFAULT_CORE_WHEEL_URL
+    assert bootstrap.DEFAULT_CORE_WHEEL_URL.endswith(
+        "/ficelle_router-0.1.3-py3-none-any.whl"
+    )
+    assert len(bootstrap.DEFAULT_CORE_SHA256) == 64
+
+
 def test_wheel_filename_rejects_non_version_placeholder():
     assert (
         bootstrap.safe_wheel_filename("ficelle_pro-latest-py3-none-any.whl")
@@ -263,8 +342,8 @@ def test_wheel_filename_rejects_invalid_versions():
 def test_remote_download_honors_valid_content_disposition(monkeypatch, tmp_path):
     monkeypatch.setattr(
         bootstrap,
-        "open_same_origin",
-        lambda request, timeout: _WheelResponse(
+        "open_wheel",
+        lambda request, timeout, authenticated: _WheelResponse(
             "ficelle_pro-1.2.3-py3-none-any.whl"
         ),
     )
@@ -283,8 +362,10 @@ def test_remote_download_honors_valid_content_disposition(monkeypatch, tmp_path)
 def test_remote_download_rejects_unsafe_advertised_filename(monkeypatch, tmp_path):
     monkeypatch.setattr(
         bootstrap,
-        "open_same_origin",
-        lambda request, timeout: _WheelResponse("../../not-a-wheel.whl"),
+        "open_wheel",
+        lambda request, timeout, authenticated: _WheelResponse(
+            "../../not-a-wheel.whl"
+        ),
     )
     options = make_options(tmp_path, wheel_url=bootstrap.DEFAULT_WHEEL_URL)
 
@@ -297,12 +378,12 @@ def test_remote_download_rejects_unsafe_advertised_filename(monkeypatch, tmp_pat
 def test_remote_download_refuses_insecure_non_loopback_url(monkeypatch, tmp_path):
     called = False
 
-    def open_url(request, timeout):
+    def open_url(request, timeout, authenticated):
         nonlocal called
         called = True
         return _WheelResponse("ficelle_pro-1.0-py3-none-any.whl")
 
-    monkeypatch.setattr(bootstrap, "open_same_origin", open_url)
+    monkeypatch.setattr(bootstrap, "open_wheel", open_url)
     options = make_options(
         tmp_path,
         wheel_url="http://packages.example.test/ficelle_pro-1.0-py3-none-any.whl",
@@ -321,8 +402,8 @@ def test_remote_download_refuses_insecure_non_loopback_url(monkeypatch, tmp_path
 def test_remote_download_allows_loopback_http(monkeypatch, tmp_path):
     monkeypatch.setattr(
         bootstrap,
-        "open_same_origin",
-        lambda request, timeout: _WheelResponse(
+        "open_wheel",
+        lambda request, timeout, authenticated: _WheelResponse(
             "ficelle_pro-1.0-py3-none-any.whl"
         ),
     )
@@ -358,6 +439,44 @@ def test_redirect_handler_refuses_cross_origin_with_license_key():
         raise AssertionError("expected a cross-origin redirect to be refused")
 
 
+def test_public_wheel_uses_normal_redirects_but_authenticated_wheel_does_not(
+    monkeypatch,
+):
+    request = bootstrap.urllib.request.Request(
+        bootstrap.DEFAULT_CORE_WHEEL_URL
+    )
+    calls = []
+    public_response = object()
+    private_response = object()
+    monkeypatch.setattr(
+        bootstrap.urllib.request,
+        "urlopen",
+        lambda req, timeout: calls.append(("public", req, timeout))
+        or public_response,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "open_same_origin",
+        lambda req, timeout: calls.append(("private", req, timeout))
+        or private_response,
+    )
+
+    assert bootstrap.open_wheel(
+        request,
+        timeout=120,
+        authenticated=False,
+    ) is public_response
+    assert bootstrap.open_wheel(
+        request,
+        timeout=120,
+        authenticated=True,
+    ) is private_response
+    assert [kind for kind, _request, _timeout in calls] == [
+        "public",
+        "private",
+    ]
+
+
 def test_sha256_verification_rejects_mismatch(tmp_path):
     wheel = tmp_path / "ficelle_router-0.1.2-py3-none-any.whl"
     wheel.write_bytes(b"wheel-bytes")
@@ -368,6 +487,30 @@ def test_sha256_verification_rejects_mismatch(tmp_path):
         assert "SHA256 mismatch" in str(exc)
     else:
         raise AssertionError("expected checksum mismatch")
+
+
+def test_pro_wheel_must_require_the_bootstrap_core_version(tmp_path):
+    compatible = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    write_pro_wheel(
+        compatible,
+        f"ficelle-router=={bootstrap.CORE_VERSION}",
+    )
+    bootstrap.verify_pro_core_compatibility(
+        compatible,
+        dry_run=False,
+    )
+
+    incompatible = tmp_path / "ficelle_pro-0.2.0-py3-none-any.whl"
+    write_pro_wheel(incompatible, "ficelle-router==0.2.0")
+    try:
+        bootstrap.verify_pro_core_compatibility(
+            incompatible,
+            dry_run=False,
+        )
+    except SystemExit as exc:
+        assert "incompatible" in str(exc)
+    else:
+        raise AssertionError("expected incompatible Pro wheel to be refused")
 
 
 def test_resolve_install_context_probes_explicit_python_once(monkeypatch, tmp_path):
@@ -460,6 +603,91 @@ def test_python_probe_converts_execution_error_to_unusable(monkeypatch, tmp_path
 
     assert result.returncode == 1
     assert "PermissionError" in result.stderr
+
+
+def test_generic_install_creates_an_isolated_runtime(
+    monkeypatch,
+    tmp_path,
+):
+    options = make_options(tmp_path, target="generic")
+    selected = Path("/usr/bin/python3")
+    created = []
+    runtime = bootstrap.venv_python(options.venv)
+
+    def fake_run(command, *, dry_run, env=None):
+        created.append(command)
+        runtime.parent.mkdir(parents=True)
+        runtime.touch()
+        return bootstrap.CommandResult(list(command), 0)
+
+    monkeypatch.setattr(bootstrap, "run_command", fake_run)
+    monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
+
+    python, isolated = bootstrap.prepare_target_python(
+        options,
+        "generic",
+        selected,
+    )
+
+    assert isolated is True
+    assert python == runtime
+    assert created == [
+        [str(selected), "-m", "venv", str(options.venv)]
+    ]
+
+
+def test_generic_install_falls_back_to_uv_venv(monkeypatch, tmp_path):
+    options = make_options(tmp_path, target="generic")
+    selected = Path("/usr/bin/python3")
+    runtime = bootstrap.venv_python(options.venv)
+    calls = []
+
+    def fake_run(command, *, dry_run, env=None):
+        calls.append(command)
+        if command[:3] == [str(selected), "-m", "venv"]:
+            return bootstrap.CommandResult(command, 1)
+        runtime.parent.mkdir(parents=True)
+        runtime.touch()
+        return bootstrap.CommandResult(command, 0)
+
+    monkeypatch.setattr(bootstrap, "run_command", fake_run)
+    monkeypatch.setattr(
+        bootstrap.shutil,
+        "which",
+        lambda name: "/usr/local/bin/uv" if name == "uv" else None,
+    )
+    monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
+
+    assert bootstrap.prepare_target_python(
+        options,
+        "generic",
+        selected,
+    ) == (runtime, True)
+    assert calls == [
+        [str(selected), "-m", "venv", str(options.venv)],
+        [
+            "uv",
+            "venv",
+            "--python",
+            str(selected),
+            str(options.venv),
+        ],
+    ]
+
+
+def test_explicit_python_is_never_replaced_by_an_isolated_runtime(tmp_path):
+    selected = Path("/custom/python")
+    options = make_options(
+        tmp_path,
+        target="generic",
+        python=str(selected),
+    )
+
+    assert bootstrap.prepare_target_python(
+        options,
+        "generic",
+        selected,
+    ) == (selected, False)
 
 
 def test_run_license_activation_passes_key_via_env_not_argv(monkeypatch, tmp_path):
@@ -562,22 +790,129 @@ def test_generic_environment_removes_inherited_hermes_home(monkeypatch, tmp_path
 
 
 def test_keep_wheel_uses_ficelle_home_artifacts(monkeypatch, tmp_path):
-    source = tmp_path / "ficelle_pro-1.0-py3-none-any.whl"
+    source = tmp_path / "ficelle_router-1.0-py3-none-any.whl"
     source.write_bytes(b"wheel")
     options = make_options(
         tmp_path,
         target="generic",
         python=sys.executable,
-        wheel_url=str(source),
+        core_wheel_url=str(source),
         keep_wheel=True,
     )
     monkeypatch.setattr(bootstrap, "install_wheel", lambda *args: None)
     monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args: None)
-    monkeypatch.setattr(bootstrap, "verify_two_package_install", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "verify_install", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "run_license_activation", lambda *args: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "verify_pro_core_compatibility",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "install_requirements",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError(
+                "Pro dependencies must not be installed without a license key"
+            )
+        ),
+    )
 
     assert bootstrap.run_bootstrap(options) == 0
 
     kept = options.ficelle_home / "artifacts" / source.name
     assert kept.read_bytes() == b"wheel"
     assert not (options.hermes_home / "ficelle" / "artifacts").exists()
+
+
+def test_core_only_bootstrap_never_downloads_or_installs_pro(
+    monkeypatch,
+    tmp_path,
+):
+    core = tmp_path / "ficelle_router-0.1.3-py3-none-any.whl"
+    core.write_bytes(b"core")
+    options = make_options(
+        tmp_path,
+        python=sys.executable,
+        core_wheel_url=str(core),
+    )
+    installed = []
+    monkeypatch.setattr(
+        bootstrap,
+        "install_wheel",
+        lambda _options, _python, wheel, _target, **kwargs: installed.append(
+            (wheel, kwargs)
+        ),
+    )
+    monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "verify_install", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bootstrap, "run_license_activation", lambda *args: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "install_requirements",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError(
+                "Pro dependencies must not be installed without a license key"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "download_wheel",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("Pro wheel must not be downloaded without a license key")
+        ),
+    )
+
+    assert bootstrap.run_bootstrap(options) == 0
+
+    assert [(wheel.name, kwargs) for wheel, kwargs in installed] == [
+        (core.name, {})
+    ]
+
+
+def test_pro_bootstrap_installs_core_then_pro_without_dependencies(
+    monkeypatch,
+    tmp_path,
+):
+    core = tmp_path / "ficelle_router-0.1.3-py3-none-any.whl"
+    pro = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    core.write_bytes(b"core")
+    pro.write_bytes(b"pro")
+    options = make_options(
+        tmp_path,
+        python=sys.executable,
+        core_wheel_url=str(core),
+        wheel_url=str(pro),
+        license_key="FICL-SECRET",
+    )
+    installed = []
+    requirements = []
+    monkeypatch.setattr(
+        bootstrap,
+        "verify_pro_core_compatibility",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "install_wheel",
+        lambda _options, _python, wheel, _target, **kwargs: installed.append(
+            (wheel, kwargs)
+        ),
+    )
+    monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "verify_install", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bootstrap, "run_license_activation", lambda *args: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "install_requirements",
+        lambda _options, _python, _target, values: requirements.extend(values),
+    )
+
+    assert bootstrap.run_bootstrap(options) == 0
+
+    assert [(wheel.name, kwargs) for wheel, kwargs in installed] == [
+        (core.name, {}),
+        (pro.name, {"no_deps": True}),
+    ]
+    assert requirements == ["cryptography>=42"]
