@@ -1666,7 +1666,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      performance: { eyebrow: "Observe", title: "Performance", desc: "What actually happened: winning models, fallbacks, success rates, and latency per virtual model." },
 	      requests: { eyebrow: "Observe", title: "Requests", desc: "Every routed request, newest first: profile, provider, upstream model, outcome, error type, and latency — with health aggregates over a window." },
 	      audit: { eyebrow: "Observe", title: "Audit", desc: "Every local change, newest first. Virtual model saves can be undone." },
-      export: { eyebrow: "Ship it", title: "Export", desc: "Generate the Hermes config snippet for your chosen virtual models. No provider secrets included." }
+      export: { eyebrow: "Ship it", title: "Export", desc: "Generate a generic OpenAI-compatible client configuration. No provider secrets included." }
     };
     function setView(name) {
       name = String(name).split("?")[0];  // tolerate a deep-link query, e.g. #/license?key=…
@@ -1902,10 +1902,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       } catch (e) { showToast(e.message || String(e)); }
     }
     async function exportConfig() {
-      const r = await fetch("/admin/export/hermes-config"); const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "export failed");
-      $("configExport").value = p.yaml || ""; showToast("Snippet ready.");
+      const r = await fetch("/admin/export/generic"); const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "export failed");
+      $("configExport").value = JSON.stringify(p.config || {}, null, 2); showToast("Configuration ready.");
     }
-    async function copyExport() { const t = $("configExport").value; if (!t) { showToast("Build the snippet first."); return; } await navigator.clipboard.writeText(t); showToast("YAML copied."); }
+    async function copyExport() { const t = $("configExport").value; if (!t) { showToast("Build the snippet first."); return; } await navigator.clipboard.writeText(t); showToast("JSON copied."); }
 
     /* ---------- theme ---------- */
     const THEME_KEY = "ficelle.theme";

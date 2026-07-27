@@ -122,7 +122,7 @@ auxiliary:
   web_extract:      { provider: "ficelle", model: "ficelle/auto-json" }
 ```
 
-Export the recommended YAML with `ficelle export`.
+Export the recommended YAML with `ficelle export --target hermes`.
 
 ## Experimental OpenClaw integration
 
@@ -136,3 +136,11 @@ The open core is licensed under the **Business Source License 1.1** (see the `LI
 you may use, modify, redistribute, and self-host it; you may not offer it to third parties
 as a competing hosted service. Each released version converts to the Apache License 2.0
 four years after its publication.
+
+## Contributing and support
+
+See
+[`CONTRIBUTING.md`](https://github.com/TheBlueHouse75/ficelle-open-core/blob/main/CONTRIBUTING.md)
+for the development workflow. Report security issues privately using
+[`SECURITY.md`](https://github.com/TheBlueHouse75/ficelle-open-core/blob/main/SECURITY.md).
+For installation or billing support, email `support@weesperneonflow.ai`.

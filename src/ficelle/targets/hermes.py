@@ -97,7 +97,7 @@ class HermesTargetAdapter:
             verification_commands=(
                 ("ficelle", "health"),
                 ("ficelle", "models"),
-                ("ficelle", "export"),
+                ("ficelle", "export", "--target", "hermes"),
             ),
         )
 
@@ -113,7 +113,11 @@ class HermesTargetAdapter:
         checks: list[SmokeCheck] = [
             SmokeCheck("service-health", ("ficelle", "health"), "Core service responds locally."),
             SmokeCheck("model-list", ("ficelle", "models"), "Core service exposes virtual models."),
-            SmokeCheck("hermes-export", ("ficelle", "export"), "Hermes export renders without secrets."),
+            SmokeCheck(
+                "hermes-export",
+                ("ficelle", "export", "--target", "hermes"),
+                "Hermes export renders without secrets.",
+            ),
         ]
         if context.credentials_expected:
             checks.append(

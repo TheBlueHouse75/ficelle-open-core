@@ -1065,7 +1065,7 @@ def run_install(options: InstallOptions) -> int:
         if options.configure_hermes:
             print("Hermes config step complete or snippet written. Restart Hermes gateway after merging config changes.")
         else:
-            print("Next: run `ficelle export` or rerun setup with `--configure-hermes` for a safe config snippet/apply step.")
+            print("Next: run `ficelle export --target hermes` or rerun setup with `--configure-hermes` for a safe config snippet/apply step.")
         print("Rollback: `ficelle-setup --target hermes --rollback` restores the latest available integration backups.")
         print("Do not make Ficelle the main Hermes model until dogfood/canaries stay green.")
     else:

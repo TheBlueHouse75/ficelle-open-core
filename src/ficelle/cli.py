@@ -508,7 +508,13 @@ def main(argv: list[str] | None = None) -> int:
     doctor_parser.add_argument("--text", action="store_true", dest="text_output", help="Print a compact human-readable summary")
     sub.add_parser("models")
     sub.add_parser("health")
-    sub.add_parser("export")
+    export_parser = sub.add_parser("export", help="Export a client configuration")
+    export_parser.add_argument(
+        "--target",
+        choices=["generic", "hermes"],
+        default="generic",
+        help="Client target (default: generic)",
+    )
     set_key_parser = sub.add_parser("set-key", help="Store a provider API key (prompted, hidden input)")
     set_key_parser.add_argument("provider")
     remove_key_parser = sub.add_parser("remove-key", help="Remove a stored provider API key")
@@ -546,7 +552,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "health":
         return http_json("/health")
     if args.command == "export":
-        return http_json("/admin/export/hermes-config")
+        return http_json(f"/admin/export/{args.target}")
     if args.command == "set-key":
         return set_key(args.provider)
     if args.command == "remove-key":
