@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ficelle-router"
 version = "0.1.2"
-description = "Local OpenAI-compatible strict-zero model router for Hermes"
+description = "Local OpenAI-compatible strict-zero model router for AI agents"
 readme = "README.md"
 license = "BUSL-1.1"
 requires-python = ">=3.11"

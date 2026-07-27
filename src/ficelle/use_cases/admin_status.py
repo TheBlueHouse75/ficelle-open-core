@@ -194,6 +194,7 @@ class AdminStateBuilder:
         )
         host = config.get("host") or "127.0.0.1"
         port = self.ports.safe_int(config.get("port"), 8646)
+        base_url = f"http://{host}:{port}/v1"
         return {
             "catalog": self.ports.catalog_with_auto_scores(catalog, config, state),
             "virtual_profiles": profiles,
@@ -211,7 +212,8 @@ class AdminStateBuilder:
                 "allow_paid_fallback": False,
                 "catalog_ttl_seconds": self.ports.safe_int(config.get("catalog_ttl_seconds"), 3600),
                 "canary_profiles": canary_profiles or list(self.default_canary_profiles),
-                "hermes_base_url": f"http://{host}:{port}/v1",
+                "base_url": base_url,
+                "hermes_base_url": base_url,
             },
         }
 

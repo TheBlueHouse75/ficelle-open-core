@@ -1,7 +1,7 @@
 """Derived request-log index over ``routes.jsonl``.
 
 ``write_route_log`` (in ``router.py``) already appends one redacted JSON line per
-chat-completion route to ``~/.hermes/ficelle/logs/routes.jsonl`` — never prompts
+chat-completion route to the Ficelle runtime log — never prompts
 or secrets. This module builds a small, reconstructible SQLite index from that
 file so the admin dashboard can list and aggregate request health without
 touching the routing hot path.
@@ -23,13 +23,14 @@ it) so it can be unit-tested in isolation, mirroring ``compression.py``.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from ficelle.runtime_paths import RuntimePaths
 
 SCHEMA_VERSION = 1
 
@@ -51,9 +52,9 @@ WINDOW_SECONDS: dict[str, int] = {
 }
 DEFAULT_WINDOW = "24h"
 
-_HERMES_HOME = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
-DEFAULT_DB_PATH = _HERMES_HOME / "ficelle" / "requests.sqlite"
-DEFAULT_ROUTE_LOG_PATH = _HERMES_HOME / "ficelle" / "logs" / "routes.jsonl"
+_RUNTIME_PATHS = RuntimePaths.from_env()
+DEFAULT_DB_PATH = _RUNTIME_PATHS.request_log_store_path
+DEFAULT_ROUTE_LOG_PATH = _RUNTIME_PATHS.route_log_path
 
 # Column order shared by the schema and the INSERT statement.
 _COLUMNS = (
@@ -224,14 +225,30 @@ def window_seconds_from_label(label: Any) -> int:
 # --------------------------------------------------------------------------- #
 def _catch_up(conn: sqlite3.Connection, source_path: Path | None) -> int:
     """Ingest new complete lines from the route log since the stored byte offset."""
-    path = source_path or DEFAULT_ROUTE_LOG_PATH
+    path = (
+        source_path
+        if source_path is not None
+        else _RUNTIME_PATHS.read_path(DEFAULT_ROUTE_LOG_PATH)
+    )
     if not path.exists():
         return 0
     try:
-        current_size = path.stat().st_size
+        source_stat = path.stat()
     except OSError:
         return 0
-    offset = _meta_int(conn, "ingest_offset", 0)
+    current_size = source_stat.st_size
+    source_identity = (
+        f"{path.resolve()}:{source_stat.st_dev}:{source_stat.st_ino}"
+    )
+    previous_source_identity = _meta_text(conn, "ingest_source_identity")
+    if previous_source_identity != source_identity:
+        # A canonical log superseding a legacy source (or an external rotation)
+        # must be read from byte zero. The SQLite index is derived and request_id
+        # uniqueness makes replay safe.
+        offset = 0
+        _set_meta(conn, "ingest_source_identity", source_identity)
+    else:
+        offset = _meta_int(conn, "ingest_offset", 0)
     if current_size < offset:
         # File was truncated or rotated externally; re-read from the start.
         # UNIQUE(request_id) + INSERT OR IGNORE keeps this from duplicating rows.
@@ -480,6 +497,11 @@ def _meta_int(conn: sqlite3.Connection, key: str, default: int) -> int:
         return default
     value = _safe_int(row["value"], None)
     return value if value is not None else default
+
+
+def _meta_text(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return str(row["value"]) if row is not None else None
 
 
 def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:

@@ -1,10 +1,12 @@
 """Local service backends for Ficelle."""
 from __future__ import annotations
 
+import json
+import os
 import plistlib
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -14,6 +16,102 @@ ReadyCheck = Callable[[], bool]
 StaleServerTerminator = Callable[[], list[int]]
 StaleServerReporter = Callable[[list[int]], None]
 UidProvider = Callable[[], str]
+
+
+def active_home_pointer_path() -> Path:
+    """Return the user-scoped metadata file for the active service context."""
+    return Path.home() / ".config" / "ficelle" / "active-home"
+
+
+def read_active_service_context(
+    pointer: Path | None = None,
+) -> tuple[Path, Path, Path | None] | None:
+    """Read persisted credential, runtime, and optional Hermes roots."""
+    path = pointer or active_home_pointer_path()
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = {"ficelle_home": raw}
+    if not isinstance(payload, dict):
+        return None
+    ficelle_home = Path(str(payload.get("ficelle_home") or "")).expanduser()
+    if not ficelle_home.is_absolute() or not ficelle_home.is_dir():
+        return None
+    raw_runtime_dir = payload.get("runtime_dir")
+    runtime_dir = (
+        Path(str(raw_runtime_dir)).expanduser()
+        if isinstance(raw_runtime_dir, str) and raw_runtime_dir
+        else ficelle_home
+    )
+    if not runtime_dir.is_absolute() or not runtime_dir.is_dir():
+        return None
+    raw_hermes_home = payload.get("hermes_home")
+    hermes_home = (
+        Path(str(raw_hermes_home)).expanduser()
+        if isinstance(raw_hermes_home, str) and raw_hermes_home
+        else None
+    )
+    if hermes_home is not None and not hermes_home.is_absolute():
+        return None
+    return ficelle_home, runtime_dir, hermes_home
+
+
+def persist_active_service_context(
+    ficelle_home: Path,
+    pointer: Path | None = None,
+    *,
+    runtime_dir: Path | None = None,
+    hermes_home: Path | None = None,
+) -> bool:
+    """Atomically persist the active service roots."""
+    path = pointer or active_home_pointer_path()
+    home = ficelle_home.expanduser()
+    if not home.is_absolute() or not home.is_dir():
+        return False
+    active_runtime_dir = runtime_dir.expanduser() if runtime_dir is not None else home
+    if not active_runtime_dir.is_absolute() or not active_runtime_dir.is_dir():
+        return False
+    expanded_hermes_home = hermes_home.expanduser() if hermes_home is not None else None
+    if expanded_hermes_home is not None and not expanded_hermes_home.is_absolute():
+        return False
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(
+                {
+                    "ficelle_home": str(home),
+                    "runtime_dir": str(active_runtime_dir),
+                    "hermes_home": str(expanded_hermes_home)
+                    if expanded_hermes_home is not None
+                    else None,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def hermes_home_from_environment() -> Path | None:
+    """Return the optional Hermes integration root passed by target-aware setup."""
+    value = os.getenv("HERMES_HOME")
+    return Path(value).expanduser() if value else None
 
 
 class ServiceBackend(Protocol):
@@ -44,18 +142,55 @@ class ServiceBackend(Protocol):
 
 @dataclass(frozen=True)
 class ServicePaths:
-    hermes_home: Path
-    ficelle_dir: Path
+    ficelle_home: Path
+    runtime_dir: Path
     label: str
     plist: Path
     systemd_unit: Path
     install_python: Path
-    log_dir: Path
+    hermes_home: Path | None = field(default_factory=hermes_home_from_environment)
+    active_home_pointer: Path | None = None
+
+    @property
+    def log_dir(self) -> Path:
+        return self.ficelle_home / "logs"
+
+
+def service_environment(paths: ServicePaths) -> dict[str, str]:
+    environment = {"FICELLE_HOME": str(paths.ficelle_home)}
+    if paths.runtime_dir != paths.ficelle_home:
+        environment["FICELLE_RUNTIME_DIR"] = str(paths.runtime_dir)
+    if paths.hermes_home is not None:
+        environment["HERMES_HOME"] = str(paths.hermes_home)
+    return environment
+
+
+def _systemd_environment_line(name: str, value: str) -> str:
+    """Quote a complete systemd environment assignment."""
+    assignment = json.dumps(f"{name}={value}", ensure_ascii=False)
+    return f"Environment={assignment}"
 
 
 def write_text_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def persist_service_context(paths: ServicePaths) -> bool:
+    if paths.active_home_pointer is None:
+        return True
+    if persist_active_service_context(
+        paths.ficelle_home,
+        paths.active_home_pointer,
+        runtime_dir=paths.runtime_dir,
+        hermes_home=paths.hermes_home,
+    ):
+        return True
+    sys.stderr.write(
+        f"Ficelle service started, but its active context could not be persisted at "
+        f"{paths.active_home_pointer}.\n"
+    )
+    return False
 
 
 class LaunchAgentServiceBackend:
@@ -88,16 +223,15 @@ class LaunchAgentServiceBackend:
             "KeepAlive": {"SuccessfulExit": False},
             "StandardOutPath": str(self.paths.log_dir / "ficelle.log"),
             "StandardErrorPath": str(self.paths.log_dir / "ficelle.error.log"),
-            "WorkingDirectory": str(self.paths.ficelle_dir),
-            "EnvironmentVariables": {
-                "HERMES_HOME": str(self.paths.hermes_home),
-            },
+            "WorkingDirectory": str(self.paths.ficelle_home),
+            "EnvironmentVariables": service_environment(self.paths),
         }
 
     def bootout(self) -> subprocess.CompletedProcess[str]:
         return self.run_command(["launchctl", "bootout", f"gui/{self.uid_provider()}/{self.paths.label}"])
 
     def install(self) -> int:
+        self.paths.ficelle_home.mkdir(parents=True, exist_ok=True)
         self.paths.log_dir.mkdir(parents=True, exist_ok=True)
         self.paths.plist.parent.mkdir(parents=True, exist_ok=True)
         with self.paths.plist.open("wb") as fh:
@@ -112,6 +246,8 @@ class LaunchAgentServiceBackend:
         self.run_command(["launchctl", "kickstart", "-k", f"gui/{self.uid_provider()}/{self.paths.label}"])
         if not self.wait_for_ready():
             sys.stderr.write("Ficelle LaunchAgent started but /admin/status.json did not become ready.\n")
+            return 1
+        if not persist_service_context(self.paths):
             return 1
         print(f"installed {self.paths.plist}")
         return 0
@@ -166,6 +302,10 @@ class SystemdUserServiceBackend:
         return self.paths.systemd_unit.name
 
     def unit_payload(self) -> str:
+        environment = [
+            _systemd_environment_line(name, value)
+            for name, value in service_environment(self.paths).items()
+        ]
         return "\n".join(
             [
                 "[Unit]",
@@ -175,8 +315,8 @@ class SystemdUserServiceBackend:
                 "",
                 "[Service]",
                 "Type=simple",
-                f"WorkingDirectory={self.paths.ficelle_dir}",
-                f"Environment=HERMES_HOME={self.paths.hermes_home}",
+                f"WorkingDirectory={self.paths.ficelle_home}",
+                *environment,
                 f"ExecStart={self.paths.install_python} -m ficelle.router --serve",
                 "Restart=on-failure",
                 "RestartSec=2",
@@ -190,11 +330,14 @@ class SystemdUserServiceBackend:
     def daemon_reload(self) -> subprocess.CompletedProcess[str]:
         return self.run_command(["systemctl", "--user", "daemon-reload"])
 
-    def install(self) -> int:
+    def write_unit(self) -> subprocess.CompletedProcess[str]:
+        self.paths.ficelle_home.mkdir(parents=True, exist_ok=True)
         self.paths.log_dir.mkdir(parents=True, exist_ok=True)
-        self.paths.ficelle_dir.mkdir(parents=True, exist_ok=True)
         write_text_file(self.paths.systemd_unit, self.unit_payload())
-        reload_result = self.daemon_reload()
+        return self.daemon_reload()
+
+    def install(self) -> int:
+        reload_result = self.write_unit()
         if reload_result.returncode != 0:
             sys.stderr.write(reload_result.stderr or reload_result.stdout)
             return reload_result.returncode
@@ -206,12 +349,18 @@ class SystemdUserServiceBackend:
         if not self.wait_for_ready():
             sys.stderr.write("Ficelle systemd user service started but /admin/status.json did not become ready.\n")
             return 1
+        if not persist_service_context(self.paths):
+            return 1
         print(f"installed {self.paths.systemd_unit}")
         return 0
 
     def restart(self) -> int:
         if not self.paths.systemd_unit.exists():
             return self.install()
+        reload_result = self.write_unit()
+        if reload_result.returncode != 0:
+            sys.stderr.write(reload_result.stderr or reload_result.stdout)
+            return reload_result.returncode
         self.report_stale_servers(self.terminate_stale_servers())
         result = self.run_command(["systemctl", "--user", "restart", self.unit_name])
         if result.returncode != 0:
@@ -219,6 +368,8 @@ class SystemdUserServiceBackend:
             return result.returncode
         if not self.wait_for_ready():
             sys.stderr.write("Ficelle systemd user service restarted but /admin/status.json did not become ready.\n")
+            return 1
+        if not persist_service_context(self.paths):
             return 1
         return 0
 

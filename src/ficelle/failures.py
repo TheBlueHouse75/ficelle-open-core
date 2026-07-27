@@ -240,7 +240,7 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
     if reason_counts.get("empty_assistant_message") or reason_counts.get("invalid_success_json"):
         actions.append("Inspect route logs and verified capabilities; this upstream returned HTTP 200 without a usable assistant message.")
     if not actions:
-        actions.append("Inspect ~/.hermes/ficelle/logs/routes.jsonl with the request_id, then clear cooldowns only after the upstream issue is understood.")
+        actions.append("Inspect ~/.ficelle/logs/routes.jsonl with the request_id, then clear cooldowns only after the upstream issue is understood.")
     return actions
 
 

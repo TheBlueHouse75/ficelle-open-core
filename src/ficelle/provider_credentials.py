@@ -67,13 +67,25 @@ def generic_provider_credential_activation_fingerprint(
     *,
     env_get: Callable[[str], str | None],
     parse_env_file: Callable[[Path], dict[str, str]],
-    credential_env_file: Path,
+    credential_env_files: tuple[Path, ...],
     keychain_paths: tuple[Path, ...],
 ) -> dict[str, Any]:
     env_names, _services = generic_provider_credential_aliases(source, provider_cfg)
     env_configured = any(bool(env_get(env_name)) for env_name in env_names)
-    env_values = parse_env_file(credential_env_file)
-    env_file_configured = any(bool(env_values.get(env_name)) for env_name in env_names)
+    env_file_configured = False
+    env_file_state: list[str] = []
+    for index, env_file in enumerate(credential_env_files):
+        env_values = parse_env_file(env_file)
+        env_file_configured = env_file_configured or any(
+            bool(env_values.get(env_name)) for env_name in env_names
+        )
+        try:
+            stat = env_file.stat()
+        except OSError:
+            continue
+        env_file_state.append(
+            f"{index}:{env_file.name}:{stat.st_mtime_ns}:{stat.st_size}"
+        )
     keychain_state: list[str] = []
     for keychain_path in keychain_paths:
         try:
@@ -84,6 +96,7 @@ def generic_provider_credential_activation_fingerprint(
     return {
         "env_configured": env_configured,
         "env_file_configured": env_file_configured,
+        "env_file_state": env_file_state,
         "keychain_state": keychain_state,
     }
 

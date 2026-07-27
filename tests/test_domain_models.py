@@ -32,7 +32,11 @@ def free_model(model_id: str, **overrides):
 
 
 def load_router(monkeypatch, tmp_path):
+    ficelle_home = tmp_path / ".ficelle"
+    ficelle_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("FICELLE_HOME", str(ficelle_home))
+    monkeypatch.setenv("FICELLE_RUNTIME_DIR", str(ficelle_home))
     import ficelle.router as router
 
     return importlib.reload(router)

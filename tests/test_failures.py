@@ -184,7 +184,7 @@ def test_upstream_failure_error_is_actionable_and_safe():
 
 def test_upstream_failure_actions_include_default_operator_guidance():
     assert upstream_failure_actions({}) == [
-        "Inspect ~/.hermes/ficelle/logs/routes.jsonl with the request_id, then clear cooldowns only after the upstream issue is understood."
+        "Inspect ~/.ficelle/logs/routes.jsonl with the request_id, then clear cooldowns only after the upstream issue is understood."
     ]
     assert any("provider cooldown" in action for action in upstream_failure_actions({"rate_limited": 1}))
 

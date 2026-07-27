@@ -23,6 +23,16 @@ class ConfigStore:
     config_path: Path
     defaults: dict[str, Any]
     normalize: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    fallback_config_path: Path | None = None
+
+    def read_path(self) -> Path:
+        if self.config_path.exists() or self.fallback_config_path is None:
+            return self.config_path
+        return (
+            self.fallback_config_path
+            if self.fallback_config_path.exists()
+            else self.config_path
+        )
 
     def merged(self, existing: Any | None = None) -> dict[str, Any]:
         config = deep_merge(self.defaults, existing if isinstance(existing, dict) else {})
@@ -32,9 +42,10 @@ class ConfigStore:
         return config
 
     def load(self) -> dict[str, Any]:
-        existing = load_json(self.config_path, {})
+        read_path = self.read_path()
+        existing = load_json(read_path, {})
         config = self.merged(existing)
-        if not self.config_path.exists():
+        if not read_path.exists():
             atomic_write_json(self.config_path, config)
         return config
 
@@ -44,7 +55,7 @@ class ConfigStore:
         return normalized
 
     def update(self, mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
-        existing = load_json(self.config_path, {})
+        existing = load_json(self.read_path(), {})
         config = self.merged(existing)
         mutator(config)
         return self.save(config)

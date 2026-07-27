@@ -112,21 +112,32 @@ def test_openrouter_validator_is_registered_in_provider_credentials_module() -> 
 
 def test_provider_credential_activation_fingerprint_reports_configured_sources(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
+    legacy_env_file = tmp_path / "legacy.env"
     keychain = tmp_path / "login.keychain-db"
     missing_keychain = tmp_path / "missing.keychain-db"
+    env_file.write_text("CANONICAL_ONLY=1\n")
+    legacy_env_file.write_text("OPENROUTER_API_KEY=env-file-key\n")
     keychain.write_text("keychain-state")
 
     fingerprint = generic_provider_credential_activation_fingerprint(
         "openrouter",
         {"api_key_env": "OPENROUTER_API_KEY"},
         env_get=lambda env_name: "env-key" if env_name == "OPENROUTER_API_KEY" else None,
-        parse_env_file=lambda path: {"OPENROUTER_API_KEY": "env-file-key"} if path == env_file else {},
-        credential_env_file=env_file,
+        parse_env_file=lambda path: (
+            {"OPENROUTER_API_KEY": "env-file-key"}
+            if path == legacy_env_file
+            else {}
+        ),
+        credential_env_files=(env_file, legacy_env_file),
         keychain_paths=(missing_keychain, keychain),
     )
 
     assert fingerprint["env_configured"] is True
     assert fingerprint["env_file_configured"] is True
+    assert fingerprint["env_file_state"] == [
+        f"0:{env_file.name}:{env_file.stat().st_mtime_ns}:{env_file.stat().st_size}",
+        f"1:{legacy_env_file.name}:{legacy_env_file.stat().st_mtime_ns}:{legacy_env_file.stat().st_size}",
+    ]
     expected_keychain_state = f"{keychain.name}:{keychain.stat().st_mtime_ns}:{keychain.stat().st_size}"
     assert fingerprint["keychain_state"] == [expected_keychain_state]
 

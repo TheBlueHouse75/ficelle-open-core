@@ -1,10 +1,10 @@
-"""Local OpenAI-compatible model router for Hermes.
+"""Local OpenAI-compatible strict-zero model router for AI agents.
 
 MVP scope:
 - discovers OpenRouter + Nous/RMS catalog entries that are strict-zero/free, support tools,
   and meet the configured context threshold;
-- reuses existing Hermes credentials without printing secrets;
-- exposes /v1/models and /v1/chat/completions for Hermes custom provider usage;
+- resolves provider credentials without printing secrets;
+- exposes /v1/models and /v1/chat/completions for OpenAI-compatible clients;
 - never falls back to paid models.
 """
 
@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from ficelle import license_ops, request_log
@@ -361,7 +361,7 @@ except ImportError:  # pragma: no cover - exercised only in core-only installs
 from ficelle.use_cases.hermes_export import HermesExportBuilder
 from ficelle.targets import TargetAdapter, TargetExport, TargetExportContext, target_export
 from ficelle.targets.generic import GenericClientTargetAdapter
-from ficelle.targets.hermes import HermesTargetAdapter
+from ficelle.targets.hermes import HermesTargetAdapter, build_hermes_runtime_resolver
 from ficelle.targets.openclaw import OpenClawTargetAdapter
 from ficelle.targets.online import (
     ONLINE_CONTROL_PLANE_TARGET_VERSION,
@@ -473,19 +473,20 @@ STATE_BACKUP_DIR = RUNTIME_PATHS.state_backup_dir
 # Benchmark-vs-capability-reference contradictions (Phase A, R7): where the prior was wrong.
 CAPABILITY_DISCREPANCY_LOG_PATH = RUNTIME_PATHS.capability_discrepancy_log_path
 COMPRESSION_STORE_PATH = RUNTIME_PATHS.compression_store_path
-REQUEST_LOG_STORE_PATH = ROUTER_DIR / "requests.sqlite"
+REQUEST_LOG_STORE_PATH = RUNTIME_PATHS.request_log_store_path
 HERMES_AGENT_DIR = RUNTIME_PATHS.hermes_agent_dir
 HERMES_CONFIG_PATH = RUNTIME_PATHS.hermes_config_path
 COMPRESSION_PENDING_MARKER = CHAT_COMPLETION_COMPRESSION_PENDING_MARKER
 
-# Ficelle's own home for host-portable credential files. Defaults to the Hermes home
-# so existing setups are unchanged; a standalone host (OpenClaw, VPS, the native app)
-# can point it at e.g. ~/.ficelle via FICELLE_HOME without code changes (R5).
+# Ficelle's runtime state may still be discovered in the legacy Hermes layout until
+# setup migrates it. Credential WRITES are different: all new writes go to the
+# Ficelle-owned home, while resolution below keeps read-only legacy fallbacks.
 FICELLE_HOME = RUNTIME_PATHS.ficelle_home
 CREDENTIAL_ENV_FILE = RUNTIME_PATHS.credential_env_file
-# Lives under FICELLE_HOME for host portability; the "hermes-secrets" filename is kept
-# stable for the non-interactive Keychain-unlock contract (incident 2026-06-16).
-HERMES_SECRETS_KEYCHAIN = RUNTIME_PATHS.hermes_secrets_keychain
+LEGACY_CREDENTIAL_ENV_FILE = RUNTIME_PATHS.legacy_credential_env_file
+FICELLE_SECRETS_KEYCHAIN = RUNTIME_PATHS.ficelle_secrets_keychain
+LEGACY_FICELLE_SECRETS_KEYCHAIN = RUNTIME_PATHS.legacy_ficelle_secrets_keychain
+LEGACY_HERMES_SECRETS_KEYCHAIN = RUNTIME_PATHS.legacy_hermes_secrets_keychain
 _STATE_STORE = StateStore(
     STATE_PATH,
     STATE_LOCK_PATH,
@@ -493,6 +494,8 @@ _STATE_STORE = StateStore(
     backup_keep=STATE_BACKUP_KEEP,
     backup_min_interval_seconds=STATE_BACKUP_MIN_INTERVAL_SECONDS,
     history_keys=RUNTIME_STATE_HISTORY_KEYS,
+    fallback_state_path=RUNTIME_PATHS.runtime_read_dir / STATE_PATH.name,
+    fallback_backup_dir=RUNTIME_PATHS.runtime_read_dir / STATE_BACKUP_DIR.name,
 )
 _REQUEST_LOG_LOCK = threading.Lock()
 _CATALOG_PUBLISH_THREAD_LOCK = threading.RLock()
@@ -685,7 +688,6 @@ TARGET_EXPORT_VIRTUAL_MODELS = (
     "ficelle/auto-video",
     "ficelle/auto-audio",
 )
-HERMES_PICKER_VIRTUAL_MODELS = list(TARGET_EXPORT_VIRTUAL_MODELS)
 
 
 def is_virtual_profile_id(model_id: str) -> bool:
@@ -851,7 +853,7 @@ LONG_CONTEXT_BENCHMARK_MIN_TOKENS = 1000
 LONG_CONTEXT_BENCHMARK_MAX_TOKENS = 256000
 LONG_CONTEXT_BENCHMARK_CHARS_PER_TOKEN = 4
 
-DEFAULT_BENCHMARK_PROFILES = list(HERMES_PICKER_VIRTUAL_MODELS)
+DEFAULT_BENCHMARK_PROFILES = list(TARGET_EXPORT_VIRTUAL_MODELS)
 DEFAULT_CORE_CANARY_PROFILES = [
     "ficelle/auto-orchestrator",
     "ficelle/auto-tools",
@@ -1129,6 +1131,21 @@ def load_json(path: Path, default: Any) -> Any:
     return store_load_json(path, default)
 
 
+def runtime_read_path(path: Path) -> Path:
+    """Resolve a canonical runtime path through the read-only compatibility root."""
+    return RUNTIME_PATHS.read_path(path)
+
+
+def load_runtime_json(path: Path, default: Any) -> Any:
+    """Read a canonical runtime JSON file with canonical-first legacy fallback."""
+    return load_json(runtime_read_path(path), default)
+
+
+def load_runtime_state() -> dict[str, Any]:
+    """Return the effective runtime state without ever mutating its read source."""
+    return _STATE_STORE.snapshot()
+
+
 def atomic_write_json(path: Path, data: Any) -> None:
     store_atomic_write_json(path, data)
 
@@ -1229,7 +1246,7 @@ def start_admin_job(job_name: str, metadata: dict[str, Any] | None = None) -> st
 
 def finish_admin_job(job_name: str, job_id: str) -> None:
     key = safe_state_key(job_name)
-    current = load_json(STATE_PATH, {})
+    current = load_runtime_state()
     if not admin_job_matches(current, key, job_id):
         return
 
@@ -1249,7 +1266,8 @@ def active_admin_jobs(source: Any, *, now: float | None = None) -> dict[str, Any
     )
 
 
-def read_admin_audit_raw(limit: int = 50, path: Path = ADMIN_AUDIT_LOG_PATH) -> list[dict[str, Any]]:
+def read_admin_audit_raw(limit: int = 50, path: Path | None = None) -> list[dict[str, Any]]:
+    path = runtime_read_path(ADMIN_AUDIT_LOG_PATH) if path is None else path
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []
@@ -1265,7 +1283,7 @@ def read_admin_audit_raw(limit: int = 50, path: Path = ADMIN_AUDIT_LOG_PATH) -> 
     return list(reversed(rows[-max(1, limit):]))
 
 
-def read_admin_audit(limit: int = 50, path: Path = ADMIN_AUDIT_LOG_PATH) -> list[dict[str, Any]]:
+def read_admin_audit(limit: int = 50, path: Path | None = None) -> list[dict[str, Any]]:
     return [redact_sensitive_json(row) for row in read_admin_audit_raw(limit=limit, path=path)]
 
 
@@ -1458,6 +1476,7 @@ def runtime_config_store() -> ConfigStore:
         CONFIG_PATH,
         DEFAULT_CONFIG,
         normalize=lambda config: normalize_config_fusion(config, strict=False),
+        fallback_config_path=RUNTIME_PATHS.runtime_read_dir / CONFIG_PATH.name,
     )
 
 
@@ -1979,14 +1998,13 @@ def env_file_delete_key(path: Path, key: str) -> bool:
     return True
 
 
-def _unlock_hermes_keychain() -> Path | None:
-    """Return the dedicated Hermes keychain path, but ONLY when it exists and
+def _unlock_dedicated_keychain(keychain_path: Path) -> Path | None:
+    """Return a dedicated keychain path, but ONLY when it exists and
     could be unlocked non-interactively with the empty password it is meant to
     carry. Returning ``None`` on any unlock failure is deliberate: it stops the
     caller from running ``security find-generic-password`` against a *locked*
     keychain, which pops a blocking GUI password dialog in the launchd-managed
     daemon and never resolves (incident 2026-06-16)."""
-    keychain_path = HERMES_SECRETS_KEYCHAIN
     if not keychain_path.exists():
         return None
     try:
@@ -2004,33 +2022,124 @@ def _unlock_hermes_keychain() -> Path | None:
     return keychain_path
 
 
-def read_keychain_secret(service: str) -> str:
-    """Look up a generic-password secret without ever triggering an interactive
-    GUI unlock dialog. We probe the login keychain (auto-unlocked at session
-    login) and the dedicated Hermes keychain only when it could be unlocked
-    non-interactively. An *unscoped* lookup is avoided on purpose: it searches
-    every keychain in the user's search list and pops a blocking password
-    dialog for any locked one (incident 2026-06-16)."""
-    login_keychain = Path.home() / "Library" / "Keychains" / "login.keychain-db"
-    commands = [["security", "find-generic-password", "-s", service, "-w", str(login_keychain)]]
-    hermes_keychain = _unlock_hermes_keychain()
-    if hermes_keychain is not None:
-        commands.append(["security", "find-generic-password", "-s", service, "-w", str(hermes_keychain)])
-    for command in commands:
-        try:
-            result = subprocess.run(
-                command,
-                text=True,
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-        except Exception:
+def _unlock_ficelle_keychain() -> Path | None:
+    """Return Ficelle's canonical write keychain when it unlocks non-interactively."""
+    return _unlock_dedicated_keychain(FICELLE_SECRETS_KEYCHAIN)
+
+
+def _credential_env_file_paths() -> tuple[Path, ...]:
+    """Canonical credential file followed by unique read-only migration fallbacks."""
+    return tuple(dict.fromkeys((CREDENTIAL_ENV_FILE, LEGACY_CREDENTIAL_ENV_FILE)))
+
+
+def _legacy_credential_env_file_paths() -> tuple[Path, ...]:
+    """Unique read-only credential files that are not the canonical Ficelle file."""
+    return tuple(
+        path
+        for path in _credential_env_file_paths()
+        if path != CREDENTIAL_ENV_FILE
+    )
+
+
+def _legacy_credential_keychain_paths() -> tuple[Path, ...]:
+    """Unique read-only keychains that are not Ficelle's canonical write keychain."""
+    candidates = (
+        LEGACY_FICELLE_SECRETS_KEYCHAIN,
+        LEGACY_HERMES_SECRETS_KEYCHAIN,
+    )
+    return tuple(
+        dict.fromkeys(
+            path
+            for path in candidates
+            if path != FICELLE_SECRETS_KEYCHAIN
+        )
+    )
+
+
+def _credential_keychain_paths() -> tuple[Path, ...]:
+    """Canonical write keychain followed by unique read-only upgrade fallbacks."""
+    return (FICELLE_SECRETS_KEYCHAIN, *_legacy_credential_keychain_paths())
+
+
+def _login_keychain_path() -> Path:
+    return Path.home() / "Library" / "Keychains" / "login.keychain-db"
+
+
+def _read_scoped_keychain_secret(service: str, keychain: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w", str(keychain)],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def read_canonical_keychain_secret(service: str) -> str:
+    """Read login then Ficelle's dedicated keychain without consulting legacy paths."""
+    candidate = _read_scoped_keychain_secret(service, _login_keychain_path())
+    if candidate:
+        return candidate
+    keychain = _unlock_ficelle_keychain()
+    return _read_scoped_keychain_secret(service, keychain) if keychain is not None else ""
+
+
+def unlock_and_read_legacy_keychain_secret(service: str) -> str:
+    """Unlock and read unique legacy keychains without changing stored secrets."""
+    for keychain_path in _legacy_credential_keychain_paths():
+        keychain = _unlock_dedicated_keychain(keychain_path)
+        if keychain is None:
             continue
-        candidate = result.stdout.strip() if result.returncode == 0 else ""
+        candidate = _read_scoped_keychain_secret(service, keychain)
         if candidate:
             return candidate
     return ""
+
+
+def _scoped_keychain_secret_exists(service: str, keychain: Path) -> bool:
+    """Probe a scoped keychain entry without asking `security` for its value."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", service, str(keychain)],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def unlock_and_list_legacy_keychain_secret_sources(
+    services: Sequence[str],
+) -> list[tuple[str, Path]]:
+    """Unlock legacy keychains and list matching service/path pairs without values."""
+    sources: list[tuple[str, Path]] = []
+    for keychain_path in _legacy_credential_keychain_paths():
+        keychain = _unlock_dedicated_keychain(keychain_path)
+        if keychain is None:
+            continue
+        for service in services:
+            if _scoped_keychain_secret_exists(service, keychain):
+                sources.append((service, keychain))
+    return sources
+
+
+def read_keychain_secret(service: str) -> str:
+    """Compatibility lookup across canonical then legacy scoped keychains.
+
+    An unscoped lookup is deliberately avoided because it can prompt for locked
+    keychains in a launchd-managed process.
+    """
+    return (
+        read_canonical_keychain_secret(service)
+        or unlock_and_read_legacy_keychain_secret(service)
+    )
 
 
 class SecretStore:
@@ -2049,6 +2158,9 @@ class SecretStore:
 
     def get(self, service: str) -> str | None:
         raise NotImplementedError
+
+    def get_legacy(self, service: str) -> str | None:
+        return None
 
     def set(self, service: str, secret: str) -> bool:
         return False
@@ -2091,7 +2203,13 @@ def keychain_store_delete(service: str) -> bool:
     an item was removed; never raises."""
     try:
         result = subprocess.run(
-            ["security", "delete-generic-password", "-s", service],
+            [
+                "security",
+                "delete-generic-password",
+                "-s",
+                service,
+                str(_login_keychain_path()),
+            ],
             text=True,
             capture_output=True,
             timeout=10,
@@ -2108,13 +2226,18 @@ class KeychainStore(SecretStore):
     label = "keychain"
 
     def get(self, service: str) -> str | None:
-        return read_keychain_secret(service) or None
+        return read_canonical_keychain_secret(service) or None
+
+    def get_legacy(self, service: str) -> str | None:
+        return unlock_and_read_legacy_keychain_secret(service) or None
 
     def set(self, service: str, secret: str) -> bool:
         return keychain_store_write(service, secret)
 
     def delete(self, service: str) -> bool:
-        return keychain_store_delete(service)
+        login_deleted = keychain_store_delete(service)
+        dedicated_deleted = dedicated_keychain_delete(service)
+        return login_deleted or dedicated_deleted
 
 
 def secret_tool_lookup(service: str) -> str:
@@ -2316,26 +2439,14 @@ def default_secret_store() -> SecretStore:
 
 
 def dedicated_keychain_read(service: str) -> str:
-    """Read a secret from the dedicated, empty-password Hermes keychain (macOS). Returns
+    """Read a secret from the dedicated, empty-password Ficelle keychain (macOS). Returns
     "" when the keychain is absent/not unlockable or the item is missing."""
-    keychain = _unlock_hermes_keychain()
-    if keychain is None:
-        return ""
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-w", str(keychain)],
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return ""
-    return result.stdout.strip() if result.returncode == 0 else ""
+    keychain = _unlock_ficelle_keychain()
+    return _read_scoped_keychain_secret(service, keychain) if keychain is not None else ""
 
 
 def dedicated_keychain_write(service: str, secret: str) -> bool:
-    """Write to the dedicated, empty-password Hermes keychain (macOS), which unlocks
+    """Write to the dedicated, empty-password Ficelle keychain (macOS), which unlocks
     non-interactively — so the launchd daemon never pops the GUI prompt the login
     keychain would. Returns False when the keychain is absent (caller falls back to
     .env).
@@ -2345,7 +2456,7 @@ def dedicated_keychain_write(service: str, secret: str) -> bool:
     the same caveat as ``keychain_store_write``, and no broader than what the same user
     can already read from the keychain. Linux ``secret_tool_write`` avoids this (stdin).
     """
-    keychain = _unlock_hermes_keychain()
+    keychain = _unlock_ficelle_keychain()
     if keychain is None:
         return False
     try:
@@ -2362,9 +2473,9 @@ def dedicated_keychain_write(service: str, secret: str) -> bool:
 
 
 def dedicated_keychain_delete(service: str) -> bool:
-    """Delete an item from the dedicated Hermes keychain (macOS). Returns False when the
+    """Delete an item from the dedicated Ficelle keychain (macOS). Returns False when the
     keychain is absent or the item is missing."""
-    keychain = _unlock_hermes_keychain()
+    keychain = _unlock_ficelle_keychain()
     if keychain is None:
         return False
     try:
@@ -2381,7 +2492,7 @@ def dedicated_keychain_delete(service: str) -> bool:
 
 
 class DedicatedKeychainStore(SecretStore):
-    """macOS dedicated, empty-password Hermes keychain. Unlike the login keychain it
+    """macOS dedicated, empty-password Ficelle keychain. Unlike the login keychain it
     unlocks non-interactively, so the launchd daemon can write to it without a GUI
     prompt (incident 2026-06-16). Used only for server-side writes; resolution reads
     cover it already through ``read_keychain_secret``."""
@@ -2425,14 +2536,13 @@ def resolve_credentials(
     store: SecretStore | None = None,
     validator: Callable[[Any], bool] | None = None,
 ) -> tuple[str | None, str]:
-    """Single owner of credential resolution order: env -> .env -> OS secret store.
+    """Resolve env, canonical file/store, then read-only legacy fallbacks.
 
     ``env_names`` are tried in order against the process environment and the
-    ``.env`` file; ``services`` are tried against the secret store. ``validator``
-    optionally gates each candidate (e.g. the OpenRouter ``sk-or-`` format check):
-    an invalid value from a higher-priority source is recorded but never masks a
-    valid value from a lower-priority one. Returns ``(key, source)`` with redacted
-    source/reason labels only — the secret never appears in the reason.
+    canonical ``.env`` file; ``services`` are then tried against the canonical OS
+    store. Legacy Hermes ``.env`` and keychains are consulted last. ``validator``
+    optionally gates each candidate (e.g. the OpenRouter ``sk-or-`` format check).
+    Returns ``(key, source)`` with redacted source/reason labels only.
     """
     store = store if store is not None else default_secret_store()
     invalid_sources: list[str] = []
@@ -2451,9 +2561,9 @@ def resolve_credentials(
         if accept(value, source):
             return str(value).strip(), source
 
-    env_values = parse_env_file(CREDENTIAL_ENV_FILE)
+    canonical_env_values = parse_env_file(CREDENTIAL_ENV_FILE)
     for env_name in env_names:
-        value = env_values.get(env_name)
+        value = canonical_env_values.get(env_name)
         source = f"{CREDENTIAL_ENV_FILE}:{env_name}"
         if accept(value, source):
             return str(value).strip(), source
@@ -2464,9 +2574,49 @@ def resolve_credentials(
         if accept(value, source):
             return str(value).strip(), source
 
+    for credential_file in _legacy_credential_env_file_paths():
+        env_values = parse_env_file(credential_file)
+        for env_name in env_names:
+            value = env_values.get(env_name)
+            source = f"{credential_file}:{env_name}"
+            if accept(value, source):
+                return str(value).strip(), source
+
+    legacy_get = getattr(store, "get_legacy", None)
+    if callable(legacy_get):
+        for service in services:
+            value = legacy_get(service)
+            source = f"{store.label}:{service}"
+            if accept(value, source):
+                return str(value).strip(), source
+
     if invalid_sources:
         return None, f"invalid {env_names[0]} from {', '.join(invalid_sources)}"
     return None, f"missing {env_names[0]}"
+
+
+def legacy_provider_credential_sources(
+    source: str,
+    config: dict[str, Any],
+) -> list[str]:
+    """Return redacted, read-only labels for configured legacy credential sources."""
+    provider_cfg = (config.get("providers") or {}).get(source) or {}
+    env_names, services = generic_provider_credential_aliases(source, provider_cfg)
+    configured: list[str] = []
+    for credential_file in _legacy_credential_env_file_paths():
+        env_values = parse_env_file(credential_file)
+        configured.extend(
+            f"{credential_file}:{env_name}"
+            for env_name in env_names
+            if env_values.get(env_name)
+        )
+    configured.extend(
+        f"keychain:{keychain_path}:{service}"
+        for service, keychain_path in unlock_and_list_legacy_keychain_secret_sources(
+            services
+        )
+    )
+    return configured
 
 
 # Per-OS secret-store backends report their store via ``SecretStore.label``; map those
@@ -2490,24 +2640,13 @@ def credential_source_label(source: str | None) -> str | None:
         return None
     if source.startswith("env:"):
         return "env"
-    if source.startswith(f"{CREDENTIAL_ENV_FILE}:"):
-        return ".env"
+    for credential_file in _credential_env_file_paths():
+        if source.startswith(f"{credential_file}:"):
+            return ".env"
     for label, display in _CREDENTIAL_STORE_DISPLAY.items():
         if source.startswith(f"{label}:"):
             return display
     return "external"
-
-
-def _insert_hermes_paths() -> None:
-    candidates = [
-        HERMES_AGENT_DIR,
-        HERMES_AGENT_DIR / "venv" / "lib" / "python3.11" / "site-packages",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            value = str(candidate)
-            if value not in sys.path:
-                sys.path.insert(0, value)
 
 
 def generic_provider_credential_activation_fingerprint(source: str, provider_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -2516,43 +2655,23 @@ def generic_provider_credential_activation_fingerprint(source: str, provider_cfg
         provider_cfg,
         env_get=os.getenv,
         parse_env_file=parse_env_file,
-        credential_env_file=CREDENTIAL_ENV_FILE,
-        keychain_paths=(Path.home() / "Library" / "Keychains" / "login.keychain-db", HERMES_SECRETS_KEYCHAIN),
+        credential_env_files=_credential_env_file_paths(),
+        keychain_paths=(
+            _login_keychain_path(),
+            *_credential_keychain_paths(),
+        ),
     )
 
 
-# External credential resolvers (R4): an ordered list of optional hooks consulted as
-# the lowest-priority credential source, after env/.env/OS store. A host (Hermes/RMS,
-# OpenClaw, a future cloud secret manager) registers its own; Ficelle ships a default
-# that resolves Nous through the Hermes runtime, so removing the inline import does not
-# regress Nous on a Ficelle-only upgrade. Each resolver takes a provider id and returns
-# (api_key, base_url, source), or None when it does not handle that provider.
+# External credential resolvers (R4): optional integration hooks consulted as the
+# lowest-priority credential source, after env/.env/OS store. Each resolver takes a
+# provider id and returns (api_key, base_url, source), or None when it does not handle it.
 CredentialResolver = Callable[[str], "tuple[str | None, str | None, str] | None"]
 
 
-def hermes_runtime_resolver(provider: str) -> tuple[str | None, str | None, str] | None:
-    """Default built-in resolver: resolve Nous credentials through ``hermes_cli.auth``
-    when it is importable. Returns None for any other provider so it composes in the
-    resolver list. Never raises and never exposes secrets."""
-    if provider != "nous":
-        return None
-    _insert_hermes_paths()
-    try:
-        from hermes_cli.auth import resolve_nous_runtime_credentials  # type: ignore
-
-        creds = resolve_nous_runtime_credentials(timeout_seconds=15.0, force_refresh=False)
-        api_key = str(creds.get("api_key") or "").strip()
-        base_url = str(creds.get("base_url") or "").strip().rstrip("/")
-        source = str(creds.get("source") or "hermes_cli.auth")
-        if api_key and base_url:
-            return api_key, base_url, source
-        return None, base_url or None, "nous credentials resolved without usable api_key/base_url"
-    except Exception as exc:
-        # Intentionally only type + message, never state contents.
-        return None, None, f"{type(exc).__name__}: {exc}"
-
-
-_external_credential_resolvers: list[CredentialResolver] = [hermes_runtime_resolver]
+_external_credential_resolvers: list[CredentialResolver] = [
+    build_hermes_runtime_resolver(HERMES_AGENT_DIR)
+]
 
 
 def register_credential_resolver(resolver: CredentialResolver, *, prepend: bool = False) -> None:
@@ -2775,7 +2894,7 @@ def _build_capability_reference() -> dict[str, Any]:
     target an oracle-only model. Both layers are capability metadata only — no pricing/endpoint.
     """
     curated = _normalize_capability_reference(load_json(_curated_capability_seed_path(), {}), drop_dangling_aliases=False)
-    oracle = _normalize_capability_reference(load_json(CAPABILITY_ORACLE_CACHE_PATH, {}), drop_dangling_aliases=False)
+    oracle = _normalize_capability_reference(load_runtime_json(CAPABILITY_ORACLE_CACHE_PATH, {}), drop_dangling_aliases=False)
     # Backfill the confidence tier per layer so an older oracle cache written without it still
     # reports a tier (oracle = medium, curated seed = high). reference_confidence and the Phase B
     # gate read this; setdefault preserves any tier already present in the source document.
@@ -3010,7 +3129,7 @@ def refresh_capability_oracle_if_stale(config: dict[str, Any]) -> dict[str, Any]
     ``ficelle refresh``) — never on the route path, which reads the persisted catalog/cache offline.
     On any fetch failure the existing cache is kept (graceful degradation).
     """
-    cache = load_json(CAPABILITY_ORACLE_CACHE_PATH, {})
+    cache = load_runtime_json(CAPABILITY_ORACLE_CACHE_PATH, {})
     if not capability_oracle_is_stale(cache):
         return cache if isinstance(cache, dict) else {}
     timeout = float(config.get("catalog_timeout_seconds") or 30)
@@ -3276,9 +3395,12 @@ def store_provider_key(source: str, config: dict[str, Any], secret: str, *, stor
 
 
 def remove_provider_key(source: str, config: dict[str, Any], *, store: SecretStore | None = None) -> list[str]:
-    """Delete a provider's key from the OS store and the ``.env`` file (full
-    de-provision). Returns the redacted targets cleared. A key exported as a process
-    env var cannot be unset by Ficelle; the caller should warn if it still resolves."""
+    """Delete a provider's key from Ficelle's canonical OS store and ``.env`` file.
+
+    Returns the redacted targets cleared. Process environment variables and read-only
+    legacy fallbacks are intentionally left untouched; callers report any remaining
+    legacy sources separately.
+    """
     store = store if store is not None else default_secret_store()
     return remove_provider_key_use_case(
         source,
@@ -3627,7 +3749,7 @@ def build_admin_state_builder() -> AdminStateBuilder:
         AdminStateBuildPorts(
             load_or_refresh_catalog=load_or_refresh_catalog,
             run_due_quota_probes=run_due_quota_probes,
-            load_runtime_state=lambda: load_json(STATE_PATH, {}),
+            load_runtime_state=load_runtime_state,
             normalized_virtual_profiles=normalized_virtual_profiles,
             build_admin_status=build_admin_status,
             catalog_with_auto_scores=catalog_with_auto_scores,
@@ -3972,8 +4094,9 @@ def compression_route_event(raw: Any) -> dict[str, Any] | None:
     return redact_sensitive_json(event)
 
 
-def read_compression_route_events(limit: int = 50, path: Path = ROUTE_LOG_PATH) -> list[dict[str, Any]]:
+def read_compression_route_events(limit: int = 50, path: Path | None = None) -> list[dict[str, Any]]:
     limit = max(1, min(safe_int(limit, 50), 200))
+    path = runtime_read_path(ROUTE_LOG_PATH) if path is None else path
     if not path.exists():
         return []
     events: list[dict[str, Any]] = []
@@ -3995,9 +4118,7 @@ def read_compression_route_events(limit: int = 50, path: Path = ROUTE_LOG_PATH) 
 
 
 def compression_admin_payload(config: dict[str, Any], limit: int = 50) -> dict[str, Any]:
-    runtime_state = load_json(STATE_PATH, {})
-    if not isinstance(runtime_state, dict):
-        runtime_state = {}
+    runtime_state = load_runtime_state()
     observability = compression_observability(config, runtime_state)
     events = read_compression_route_events(limit=limit)
     return redact_sensitive_json(
@@ -4027,7 +4148,7 @@ def request_log_query_payload(path: str) -> dict[str, Any]:
         with _REQUEST_LOG_LOCK:
             rows = request_log.query(
                 store_path=REQUEST_LOG_STORE_PATH,
-                source_path=ROUTE_LOG_PATH,
+                source_path=runtime_read_path(ROUTE_LOG_PATH),
                 limit=admin_query_limit(path, default=request_log.DEFAULT_QUERY_LIMIT),
                 profile=first("profile"),
                 source=first("source"),
@@ -4049,7 +4170,7 @@ def request_log_summary_payload(path: str) -> dict[str, Any]:
         with _REQUEST_LOG_LOCK:
             return request_log.summary(
                 store_path=REQUEST_LOG_STORE_PATH,
-                source_path=ROUTE_LOG_PATH,
+                source_path=runtime_read_path(ROUTE_LOG_PATH),
                 window_seconds=window,
             )
     except Exception as exc:
@@ -4098,7 +4219,7 @@ def build_admin_status(catalog: dict[str, Any], config: dict[str, Any], state: d
 
 
 def load_cached_catalog_for_admin_status(config: dict[str, Any]) -> dict[str, Any]:
-    catalog = load_json(CATALOG_PATH, {})
+    catalog = load_runtime_json(CATALOG_PATH, {})
     return load_cached_catalog_for_admin_status_use_case(
         catalog,
         config,
@@ -4154,7 +4275,7 @@ def admin_status(config: dict[str, Any], *, run_quota_probes: bool = True) -> di
         if not stale_reason_keeps_last_known(stale_reason) and not license_transition:
             catalog["models"] = []
             catalog["providers"] = {}
-    state = load_json(STATE_PATH, {})
+    state = load_runtime_state()
     return build_admin_status(
         catalog,
         effective_config,
@@ -4301,7 +4422,7 @@ def _load_or_refresh_catalog_for_effective_config(config: dict[str, Any], force:
     catalog = load_or_refresh_catalog_use_case(
         config,
         catalog_path=CATALOG_PATH,
-        load_json=load_json,
+        load_json=load_runtime_json,
         refresh_catalog=_refresh_catalog_for_effective_config,
         catalog_config_fingerprint=catalog_config_fingerprint,
         now_seconds=time.time,
@@ -4356,7 +4477,7 @@ def _run_catalog_license_transition_refresh(
             effective_config,
         )
         with advisory_file_lock(CATALOG_LOCK_PATH, _CATALOG_PUBLISH_THREAD_LOCK):
-            current = load_json(CATALOG_PATH, {})
+            current = load_runtime_json(CATALOG_PATH, {})
             cache_is_unchanged = (
                 isinstance(current, dict)
                 and current.get("generated_at") == cached.get("generated_at")
@@ -4397,7 +4518,7 @@ def _cached_catalog_for_license_transition(
     canonical_config: dict[str, Any],
     effective_config: dict[str, Any],
 ) -> dict[str, Any] | None:
-    catalog = load_json(CATALOG_PATH, {})
+    catalog = load_runtime_json(CATALOG_PATH, {})
     if not isinstance(catalog, dict) or not catalog.get("models"):
         return None
     cached_structural_fingerprint = catalog.get("config_structural_fingerprint")
@@ -5131,8 +5252,7 @@ def source_has_active_quota_cooldown(state: dict[str, Any], source: str) -> bool
 
 
 def fresh_runtime_state() -> dict[str, Any]:
-    state = load_json(STATE_PATH, {})
-    return state if isinstance(state, dict) else {}
+    return load_runtime_state()
 
 
 def probe_quota_cooldown(key: str, model: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
@@ -5719,7 +5839,7 @@ def fusion_panel_result_detail(result: dict[str, Any]) -> dict[str, Any]:
 def fusion_eligibility_ports() -> FusionEligibilityPorts:
     return FusionEligibilityPorts(
         select_models=select_models,
-        load_state=lambda: load_json(STATE_PATH, {}),
+        load_state=load_runtime_state,
         provider_allowed_for_fusion=provider_allowed_for_fusion,
         model_failed_profile_evidence=model_failed_profile_evidence,
         fusion_model_id=FUSION_MODEL_ID,
@@ -6637,7 +6757,7 @@ def run_auto_benchmark_cycle(config: dict[str, Any]) -> dict[str, Any]:
         config,
         auto_benchmark_enabled=auto_benchmark_enabled,
         load_or_refresh_catalog=load_or_refresh_catalog,
-        load_state=lambda: load_json(STATE_PATH, {}),
+        load_state=load_runtime_state,
         write_runtime_state=write_runtime_state,
         probeable_capability_profiles=probeable_capability_profiles,
         models_needing_discovery=models_needing_discovery,
@@ -6665,9 +6785,7 @@ def record_background_job_error(job_name: str, exc: BaseException, *, state_key:
 
 
 def clear_background_job_error(state_key: str = "auto_benchmark") -> bool:
-    state = load_json(STATE_PATH, {})
-    if not isinstance(state, dict):
-        return False
+    state = load_runtime_state()
     section = state.get(state_key)
     if not isinstance(section, dict) or "last_error" not in section:
         return False
@@ -6731,7 +6849,7 @@ def find_catalog_model(catalog: dict[str, Any], model_id: str) -> dict[str, Any]
 
 def build_hermes_export_builder() -> HermesExportBuilder:
     return HermesExportBuilder(
-        picker_virtual_models=HERMES_PICKER_VIRTUAL_MODELS,
+        picker_virtual_models=TARGET_EXPORT_VIRTUAL_MODELS,
         fusion_model_id=FUSION_MODEL_ID,
         fusion_visible_in_model_list=fusion_visible_in_model_list,
         safe_int=safe_int,
@@ -6941,8 +7059,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 if FusionRunner is None:
                     self._send_json(404, {"error": {"message": "Fusion is a Ficelle Pro feature", "type": "not_found"}})
                     return
-                state = load_json(STATE_PATH, {})
-                self._send_json(200, fusion_admin_payload(self.config, state if isinstance(state, dict) else {}))
+                state = load_runtime_state()
+                self._send_json(200, fusion_admin_payload(self.config, state))
                 return
             if path == "/admin/settings":
                 self._send_json(200, router_settings_payload(self.config))
@@ -7260,7 +7378,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 if not source:
                     raise ValueError("source is required")
                 runtime_config = effective_runtime_config(self.config)
-                cached_catalog = load_json(CATALOG_PATH, {})
+                cached_catalog = load_runtime_json(CATALOG_PATH, {})
                 cached_catalog = cached_catalog if isinstance(cached_catalog, dict) else {}
                 cached_catalog = filter_cached_catalog_to_enabled_providers(cached_catalog, runtime_config)
                 if source not in known_provider_sources(runtime_config, cached_catalog):
@@ -7293,9 +7411,28 @@ class RouterHandler(BaseHTTPRequestHandler):
                 # where none is available (R9). Cross-platform, never macOS-only.
                 if body.get("remove"):
                     cleared = remove_provider_key(source, self.config, store=server_secret_store())
+                    remaining_legacy_sources = legacy_provider_credential_sources(
+                        source,
+                        self.config,
+                    )
                     refresh_catalog(self.config)
-                    write_admin_audit("admin.providers.remove_key", after={"cleared": cleared}, metadata={"source": source})
-                    self._send_json(200, {"source": source, "removed": cleared, "auth": provider_auth_row(source, self.config)})
+                    write_admin_audit(
+                        "admin.providers.remove_key",
+                        after={
+                            "cleared": cleared,
+                            "remaining_legacy_sources": remaining_legacy_sources,
+                        },
+                        metadata={"source": source},
+                    )
+                    self._send_json(
+                        200,
+                        {
+                            "source": source,
+                            "removed": cleared,
+                            "remaining_legacy_sources": remaining_legacy_sources,
+                            "auth": provider_auth_row(source, self.config),
+                        },
+                    )
                     return
                 key = str(body.get("key") or "").strip()
                 if not key:
@@ -7365,8 +7502,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                     after={"fusion": saved},
                     metadata={"enabled": saved["enabled"], "visible_in_models": saved["visible_in_models"]},
                 )
-                state = load_json(STATE_PATH, {})
-                self._send_json(200, {"fusion": saved, "observability": fusion_observability({"fusion": saved}, state if isinstance(state, dict) else {}), "audit_id": audit["id"]})
+                state = load_runtime_state()
+                self._send_json(200, {"fusion": saved, "observability": fusion_observability({"fusion": saved}, state), "audit_id": audit["id"]})
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
@@ -7381,8 +7518,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 body = self._read_body()
                 audit_id = str(body.get("audit_id") or body.get("id") or "").strip()
                 fusion = rollback_fusion_from_audit(audit_id, self.config)
-                state = load_json(STATE_PATH, {})
-                self._send_json(200, {"fusion": fusion, "observability": fusion_observability({"fusion": fusion}, state if isinstance(state, dict) else {})})
+                state = load_runtime_state()
+                self._send_json(200, {"fusion": fusion, "observability": fusion_observability({"fusion": fusion}, state)})
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
@@ -7709,7 +7846,7 @@ def serve(config: dict[str, Any]) -> None:
 
 
 def main_args(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Ficelle local model router for Hermes")
+    parser = argparse.ArgumentParser(description="Ficelle local strict-zero model router")
     parser.add_argument("--refresh", action="store_true", help="Refresh catalog and print redacted summary")
     parser.add_argument("--auth-status", action="store_true", help="Print credential availability without secrets")
     parser.add_argument("--serve", action="store_true", help="Run the OpenAI-compatible HTTP server")

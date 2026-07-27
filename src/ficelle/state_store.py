@@ -146,6 +146,8 @@ class StateStore:
     backup_keep: int = 20
     backup_min_interval_seconds: int = 600
     history_keys: tuple[str, ...] = RUNTIME_STATE_HISTORY_KEYS
+    fallback_state_path: Path | None = None
+    fallback_backup_dir: Path | None = None
     thread_lock: threading.RLock = field(default_factory=threading.RLock)
     last_update_reason: str | None = field(default=None, init=False)
 
@@ -154,16 +156,26 @@ class StateStore:
         with advisory_file_lock(self.lock_path, self.thread_lock):
             yield
 
+    def read_state_path(self) -> Path:
+        if self.state_path.exists() or self.fallback_state_path is None:
+            return self.state_path
+        return (
+            self.fallback_state_path
+            if self.fallback_state_path.exists()
+            else self.state_path
+        )
+
     def load(self, default: Any | None = None) -> Any:
-        return load_json(self.state_path, {} if default is None else default)
+        return load_json(self.read_state_path(), {} if default is None else default)
 
     def snapshot(self) -> dict[str, Any]:
         state = self.load({})
         return state if isinstance(state, dict) else {}
 
-    def backup_files(self) -> list[Path]:
+    @staticmethod
+    def _backup_files(directory: Path) -> list[Path]:
         try:
-            candidates = list(self.backup_dir.iterdir())
+            candidates = list(directory.iterdir())
         except OSError:
             return []
         files: list[tuple[float, str, Path]] = []
@@ -177,8 +189,20 @@ class StateStore:
             files.append((stat.st_mtime, path.name, path))
         return [path for _, _, path in sorted(files)]
 
+    def canonical_backup_files(self) -> list[Path]:
+        return self._backup_files(self.backup_dir)
+
+    def fallback_backup_files(self) -> list[Path]:
+        if self.fallback_backup_dir is None or self.fallback_backup_dir == self.backup_dir:
+            return []
+        return self._backup_files(self.fallback_backup_dir)
+
+    def backup_files(self) -> list[Path]:
+        canonical = self.canonical_backup_files()
+        return canonical if canonical else self.fallback_backup_files()
+
     def rotate_backups(self, keep: int | None = None) -> None:
-        files = self.backup_files()
+        files = self.canonical_backup_files()
         for path in files[: max(0, len(files) - (self.backup_keep if keep is None else keep))]:
             try:
                 path.unlink()
@@ -188,7 +212,7 @@ class StateStore:
     def backup(self) -> Path | None:
         if not self.state_path.exists():
             return None
-        latest_backup = self.backup_files()[-1:] or []
+        latest_backup = self.canonical_backup_files()[-1:] or []
         if latest_backup:
             try:
                 age = time.time() - latest_backup[0].stat().st_mtime
@@ -225,7 +249,7 @@ class StateStore:
     def write(self, state: dict[str, Any]) -> None:
         with self.lock():
             self.backup()
-            current = load_json(self.state_path, {})
+            current = self.load({})
             atomic_write_json(self.state_path, self.merge_for_write(current, state))
 
     def update(
@@ -235,7 +259,7 @@ class StateStore:
     ) -> dict[str, Any]:
         with self.lock():
             self.backup()
-            current = load_json(self.state_path, {})
+            current = self.load({})
             state = copy.deepcopy(current) if isinstance(current, dict) else {}
             updated = mutator(state)
             next_state = updated if isinstance(updated, dict) else state
@@ -249,15 +273,16 @@ class StateStore:
         if not isinstance(runtime_state, dict):
             runtime_state = {}
         backups = self.backup_files()
+        selected_backup_dir = backups[0].parent if backups else self.backup_dir
         latest_backup = backups[-1] if backups else None
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "state": state_file_summary(self.state_path),
+            "state": state_file_summary(self.read_state_path()),
             "protected_history_keys": list(self.history_keys),
             "benchmark_results": runtime_state_history_counts(runtime_state, "benchmark_results"),
             "verified_capabilities": runtime_state_history_counts(runtime_state, "verified_capabilities"),
             "backups": {
-                "dir": str(self.backup_dir),
+                "dir": str(selected_backup_dir),
                 "keep": self.backup_keep,
                 "min_interval_seconds": self.backup_min_interval_seconds,
                 "count": len(backups),

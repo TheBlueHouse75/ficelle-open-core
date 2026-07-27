@@ -140,6 +140,7 @@ def test_admin_state_builder_assembles_operator_payload_and_runs_quota_probe():
         "allow_paid_fallback": False,
         "catalog_ttl_seconds": 60,
         "canary_profiles": ["ficelle/auto-fast"],
+        "base_url": "http://127.0.0.2:9999/v1",
         "hermes_base_url": "http://127.0.0.2:9999/v1",
     }
 

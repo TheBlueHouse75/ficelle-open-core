@@ -126,6 +126,39 @@ def test_truncation_or_rotation_rebuilds_without_duplicates(paths):
     assert rows == ["r1", "r2", "r3"]  # old rows kept (INSERT OR IGNORE), new row added
 
 
+def test_source_switch_resets_offset_and_ingests_canonical_from_start(tmp_path):
+    legacy_log = tmp_path / "legacy" / "routes.jsonl"
+    canonical_log = tmp_path / "canonical" / "routes.jsonl"
+    db = tmp_path / "canonical" / "requests.sqlite"
+    now = time.time()
+    _write(legacy_log, [_line("legacy-1", now=now), _line("legacy-2", now=now)])
+
+    rl.query(store_path=db, source_path=legacy_log)
+    _write(
+        canonical_log,
+        [
+            _line("canonical-1", now=now, selected_upstream="canonical/one"),
+            _line("canonical-2", now=now, selected_upstream="canonical/two"),
+            _line("canonical-3", now=now, selected_upstream="canonical/three"),
+        ],
+    )
+
+    rows = rl.query(store_path=db, source_path=canonical_log, limit=10)
+
+    assert {row["request_id"] for row in rows} == {
+        "legacy-1",
+        "legacy-2",
+        "canonical-1",
+        "canonical-2",
+        "canonical-3",
+    }
+    with sqlite3.connect(db) as conn:
+        source_identity = conn.execute(
+            "SELECT value FROM meta WHERE key = 'ingest_source_identity'"
+        ).fetchone()[0]
+    assert str(canonical_log.resolve()) in source_identity
+
+
 def test_filters(paths):
     log, db = paths
     now = time.time()

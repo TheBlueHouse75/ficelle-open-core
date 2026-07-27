@@ -11,18 +11,83 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from ficelle import license_ops, router
-from ficelle.service import LaunchAgentServiceBackend, ServiceBackend, ServicePaths, select_service_backend
+from ficelle.runtime_paths import RuntimePaths
+from ficelle.service import (
+    LaunchAgentServiceBackend,
+    ServiceBackend,
+    ServicePaths,
+    active_home_pointer_path,
+    read_active_service_context,
+    select_service_backend,
+)
 
-HERMES_HOME = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
-FICELLE_DIR = HERMES_HOME / "ficelle"
 LABEL = "com.ficelle.router"
 PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+SYSTEMD_UNIT = Path.home() / ".config" / "systemd" / "user" / f"{LABEL}.service"
+ACTIVE_HOME_POINTER = active_home_pointer_path()
+
+
+def cli_runtime_context() -> tuple[RuntimePaths, Path | None]:
+    """Resolve env first, then persisted service context, then legacy/default discovery."""
+    source = os.environ.copy()
+    if not source.get("FICELLE_HOME") and not source.get("FICELLE_RUNTIME_DIR"):
+        context = read_active_service_context(ACTIVE_HOME_POINTER)
+        if context is not None:
+            ficelle_home, runtime_dir, hermes_home = context
+            source["FICELLE_HOME"] = str(ficelle_home)
+            source["FICELLE_RUNTIME_DIR"] = str(runtime_dir)
+            if not source.get("HERMES_HOME"):
+                if hermes_home is not None:
+                    source["HERMES_HOME"] = str(hermes_home)
+                else:
+                    source.pop("HERMES_HOME", None)
+    paths = RuntimePaths.from_env(environ=source)
+    hermes_home = (
+        Path(source["HERMES_HOME"]).expanduser()
+        if source.get("HERMES_HOME")
+        else None
+    )
+    return paths, hermes_home
+
+
+RUNTIME_PATHS, ACTIVE_HERMES_HOME = cli_runtime_context()
+FICELLE_HOME = RUNTIME_PATHS.ficelle_home
+RUNTIME_DIR = RUNTIME_PATHS.runtime_read_dir
 INSTALL_PYTHON = Path(sys.executable)
-LOG_DIR = HERMES_HOME / "logs"
+
+
+@contextmanager
+def active_runtime_environment() -> Iterator[None]:
+    """Temporarily expose the selected roots to runtime modules, including lazy imports."""
+    previous = {
+        name: os.environ.get(name)
+        for name in ("FICELLE_HOME", "FICELLE_RUNTIME_DIR", "HERMES_HOME")
+    }
+    try:
+        os.environ["FICELLE_HOME"] = str(FICELLE_HOME)
+        if RUNTIME_DIR != FICELLE_HOME:
+            os.environ["FICELLE_RUNTIME_DIR"] = str(RUNTIME_DIR)
+        else:
+            os.environ.pop("FICELLE_RUNTIME_DIR", None)
+        if ACTIVE_HERMES_HOME is not None:
+            os.environ["HERMES_HOME"] = str(ACTIVE_HERMES_HOME)
+        else:
+            os.environ.pop("HERMES_HOME", None)
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+with active_runtime_environment():
+    from ficelle import license_ops, router  # noqa: E402
 
 
 def _run(cmd: list[str], *, check: bool = False, timeout: int = 60) -> subprocess.CompletedProcess[str]:
@@ -35,13 +100,14 @@ def _uid() -> str:
 
 def service_paths() -> ServicePaths:
     return ServicePaths(
-        hermes_home=HERMES_HOME,
-        ficelle_dir=FICELLE_DIR,
+        ficelle_home=FICELLE_HOME,
+        runtime_dir=RUNTIME_DIR,
         label=LABEL,
         plist=PLIST,
-        systemd_unit=Path.home() / ".config" / "systemd" / "user" / f"{LABEL}.service",
+        systemd_unit=SYSTEMD_UNIT,
         install_python=INSTALL_PYTHON,
-        log_dir=LOG_DIR,
+        hermes_home=ACTIVE_HERMES_HOME,
+        active_home_pointer=ACTIVE_HOME_POINTER,
     )
 
 
@@ -234,11 +300,21 @@ def http_json(path: str, *, method: str = "GET", payload: dict[str, Any] | None 
 def doctor_status() -> dict[str, Any]:
     config = router.load_config()
     service = read_admin_status()
+    config_read_path = router.runtime_read_path(router.CONFIG_PATH)
+    catalog_read_path = router.runtime_read_path(router.CATALOG_PATH)
+    state_read_path = router.runtime_read_path(router.STATE_PATH)
     return {
         "status": "ok" if service.get("ready") else "degraded",
         "config": str(router.CONFIG_PATH),
-        "catalog_exists": router.CATALOG_PATH.exists(),
-        "state_exists": router.STATE_PATH.exists(),
+        "catalog_exists": catalog_read_path.exists(),
+        "state_exists": state_read_path.exists(),
+        "runtime": {
+            "write_dir": str(router.ROUTER_DIR),
+            "read_dir": str(router.RUNTIME_PATHS.runtime_read_dir),
+            "config_read_path": str(config_read_path),
+            "catalog_read_path": str(catalog_read_path),
+            "state_read_path": str(state_read_path),
+        },
         "service": service,
         "auth": router.auth_status(config),
     }
@@ -282,10 +358,20 @@ def remove_key(provider: str) -> int:
         print(f"Unknown provider: {provider}", file=sys.stderr)
         return 2
     cleared = router.remove_provider_key(provider, config)
+    remaining_legacy_sources = router.legacy_provider_credential_sources(
+        provider,
+        config,
+    )
     if cleared:
         print(f"Removed {provider} key from: {', '.join(cleared)}.")
     else:
         print(f"No stored {provider} key found in the OS store or .env.")
+    if remaining_legacy_sources:
+        print(
+            "Legacy credential fallback sources still apply; remove them manually from: "
+            f"{', '.join(remaining_legacy_sources)}. "
+            f"{provider} may remain configured until cleanup is complete."
+        )
     router.main_args(["--refresh"])
     return 0
 
@@ -389,20 +475,21 @@ def cmd_install_pro() -> int:
     # and install the Pro pack, then restart the service so it loads. Running detached — not as the
     # daemon — is what makes the restart safe (the daemon can't boot itself out and relaunch). The
     # key arrives via FICELLE_LICENSE_KEY, never argv, which the daemon/logs would echo.
-    from ficelle import pro_install
+    with active_runtime_environment():
+        from ficelle import pro_install
 
-    license_key = os.environ.pop("FICELLE_LICENSE_KEY", "").strip()
-    queued_install = os.environ.pop("FICELLE_INSTALL_QUEUED", "") == "1"
-    if not license_key:
-        pro_install.best_effort_write_install_status("failed", "No license key was provided.")
-        print("install-pro: no license key (set FICELLE_LICENSE_KEY).")
-        return 2
-    try:
-        with pro_install.exclusive_install_lock(wait=queued_install):
-            return _run_pro_install_locked(pro_install, license_key)
-    except pro_install.ProInstallInProgress:
-        print("A Ficelle Pro installation is already running.")
-        return 0
+        license_key = os.environ.pop("FICELLE_LICENSE_KEY", "").strip()
+        queued_install = os.environ.pop("FICELLE_INSTALL_QUEUED", "") == "1"
+        if not license_key:
+            pro_install.best_effort_write_install_status("failed", "No license key was provided.")
+            print("install-pro: no license key (set FICELLE_LICENSE_KEY).")
+            return 2
+        try:
+            with pro_install.exclusive_install_lock(wait=queued_install):
+                return _run_pro_install_locked(pro_install, license_key)
+        except pro_install.ProInstallInProgress:
+            print("A Ficelle Pro installation is already running.")
+            return 0
 
 
 def main(argv: list[str] | None = None) -> int:

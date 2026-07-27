@@ -1886,7 +1886,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     async function removeProviderKey(src) {
       try { const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/key", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify({ remove: true }) });
-        const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed"); showToast((p.removed && p.removed.length) ? (providerLabel(src) + " key removed.") : "No stored key found."); await loadState();
+        const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed");
+        const legacySources = Array.isArray(p.remaining_legacy_sources) ? p.remaining_legacy_sources : [];
+        if (legacySources.length) {
+          showToast("Legacy credential fallback sources still apply. Remove them manually from: " + legacySources.join(", ") + ". The provider may remain configured until cleanup is complete.");
+        } else {
+          showToast((p.removed && p.removed.length) ? (providerLabel(src) + " stored key removed.") : "No Ficelle-managed key found.");
+        }
+        await loadState();
       } catch (e) { showToast(e.message || String(e)); }
     }
     async function updateQuarantine(id, action) {

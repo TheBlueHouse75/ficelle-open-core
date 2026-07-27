@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import platform
 import uuid
+from pathlib import Path
 from typing import Any
 
 from ficelle.runtime_paths import RuntimePaths
@@ -73,8 +74,9 @@ def load_or_create_machine_fingerprint() -> str:
     Stable while the runtime home persists; a home wipe yields a new id and a re-activation,
     which the service absorbs with a generous activation limit + manual reset.
     """
+    machine_id_read_path = _RUNTIME_PATHS.read_path(MACHINE_ID_PATH)
     try:
-        existing = MACHINE_ID_PATH.read_text(encoding="utf-8").strip()
+        existing = machine_id_read_path.read_text(encoding="utf-8").strip()
     except OSError:
         existing = ""
     if existing:
@@ -100,10 +102,14 @@ def load_or_create_machine_fingerprint() -> str:
         candidate.unlink(missing_ok=True)
 
 
+def _entitlement_read_path() -> Path:
+    return _RUNTIME_PATHS.read_path(ENTITLEMENT_PATH)
+
+
 def cached_entitlement() -> Any:
     """The verified, cached Entitlement, or None when unlicensed. Raises LicenseNotInstalled."""
     licensing = _licensing()
-    return licensing.load_cached_entitlement(ENTITLEMENT_PATH)
+    return licensing.load_cached_entitlement(_entitlement_read_path())
 
 
 def is_entitled(now: float | None = None) -> bool:
@@ -120,7 +126,7 @@ def is_entitled(now: float | None = None) -> bool:
         return False
     if not licensing.LICENSE_PUBLIC_KEY_B64:
         return True
-    entitlement = licensing.load_cached_entitlement(ENTITLEMENT_PATH)
+    entitlement = licensing.load_cached_entitlement(_entitlement_read_path())
     return entitlement is not None and entitlement.is_entitled(now)
 
 
@@ -191,7 +197,7 @@ def refresh() -> Any:
     (nothing cached to refresh, service rejected/unreachable, or verification failed).
     """
     licensing = _licensing()
-    cached = licensing.load_cached_entitlement(ENTITLEMENT_PATH)
+    cached = licensing.load_cached_entitlement(_entitlement_read_path())
     if cached is None:
         raise LicenseOperationError("no active license to refresh; run: ficelle license activate <license-key>")
     try:
@@ -212,7 +218,7 @@ def deactivate() -> bool:
     a license it cannot drop. Raises LicenseNotInstalled (core-only).
     """
     licensing = _licensing()
-    cached = licensing.load_cached_entitlement(ENTITLEMENT_PATH)
+    cached = licensing.load_cached_entitlement(_entitlement_read_path())
     service_ok = True
     if cached is not None:
         try:
@@ -221,5 +227,7 @@ def deactivate() -> bool:
             )
         except (licensing.LicenseError, LicenseOperationError):
             service_ok = False
-    ENTITLEMENT_PATH.unlink(missing_ok=True)
+    # An empty canonical cache is an explicit deactivation tombstone: read_path()
+    # must not resurrect an untouched legacy token after the local cache is cleared.
+    licensing.store_entitlement_token(ENTITLEMENT_PATH, "")
     return service_ok

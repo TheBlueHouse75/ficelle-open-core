@@ -4,7 +4,7 @@ See ``docs/prds/open-core-extraction-prd.md``. The public ``ficelle`` core must
 import AND run the free-tier path without the closed Pro assets. Importing alone is
 not enough: a missing engine's config-layer symbols would be dereferenced in
 ``load_config()`` (config normalization), so each check exercises the real free path
-in a fresh interpreter with an isolated ``HERMES_HOME``.
+in a fresh interpreter with isolated ``FICELLE_HOME`` and ``HERMES_HOME``.
 
 Optional closed assets:
 
@@ -53,7 +53,7 @@ def _run_core_with_modules_blocked(
     """Run ``body`` in a fresh interpreter with ``blocked`` modules unavailable.
 
     ``sys.modules[name] = None`` makes any ``import name`` raise ModuleNotFoundError,
-    faithfully simulating a core-only install. ``HERMES_HOME`` is isolated so
+    faithfully simulating a core-only install. Ficelle and Hermes homes are isolated so
     ``load_config`` never touches the real runtime config.
     """
     code = textwrap.dedent(
@@ -67,7 +67,12 @@ def _run_core_with_modules_blocked(
     )
     existing = os.environ.get("PYTHONPATH")
     pythonpath = os.pathsep.join([*_SRC_PATHS, existing] if existing else _SRC_PATHS)
-    env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": pythonpath}
+    env = {
+        **os.environ,
+        "FICELLE_HOME": str(home / ".ficelle"),
+        "HERMES_HOME": str(home),
+        "PYTHONPATH": pythonpath,
+    }
     return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
 
 
@@ -132,7 +137,11 @@ def test_admin_state_reports_pro_absent_without_pack(tmp_path: Path) -> None:
     # a core-only install so the UI shows the upsell placeholder, not hollow controls.
     # Block the whole ficelle_pro package (not just submodules) to model a real
     # core-only install, where pro_installed() — i.e. `import ficelle_pro` — fails.
-    body = "assert router.admin_state(router.load_config())['pro_installed'] is False"
+    body = (
+        "import os; from pathlib import Path; "
+        "assert router.FICELLE_HOME == Path(os.environ['FICELLE_HOME']); "
+        "assert router.admin_state(router.load_config())['pro_installed'] is False"
+    )
     result = _run_core_with_modules_blocked(("ficelle_pro",), tmp_path, body)
     assert result.returncode == 0, result.stderr
 

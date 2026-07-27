@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import sys
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
 
 from ficelle.targets.base import (
     SmokeCheck,
@@ -13,6 +16,60 @@ from ficelle.targets.base import (
     TargetSmokeContext,
 )
 from ficelle.use_cases.hermes_export import HermesExportBuilder
+
+
+HermesCredentialResult = tuple[str | None, str | None, str] | None
+HermesCredentialResolver = Callable[[str], HermesCredentialResult]
+
+
+def _insert_hermes_paths(hermes_agent_dir: Path) -> None:
+    candidates = (
+        hermes_agent_dir,
+        hermes_agent_dir / "venv" / "lib" / "python3.11" / "site-packages",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            value = str(candidate)
+            if value not in sys.path:
+                sys.path.insert(0, value)
+
+
+def hermes_runtime_resolver(
+    provider: str,
+    *,
+    hermes_agent_dir: Path,
+) -> HermesCredentialResult:
+    """Resolve Nous credentials through Hermes when its optional runtime is importable."""
+    if provider != "nous":
+        return None
+    _insert_hermes_paths(hermes_agent_dir)
+    try:
+        from hermes_cli.auth import resolve_nous_runtime_credentials  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        return None
+
+    try:
+        credentials = resolve_nous_runtime_credentials(
+            timeout_seconds=15.0,
+            force_refresh=False,
+        )
+        api_key = str(credentials.get("api_key") or "").strip()
+        base_url = str(credentials.get("base_url") or "").strip().rstrip("/")
+        source = str(credentials.get("source") or "hermes_cli.auth")
+        if api_key and base_url:
+            return api_key, base_url, source
+        return (
+            None,
+            base_url or None,
+            "nous credentials resolved without usable api_key/base_url",
+        )
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+
+def build_hermes_runtime_resolver(hermes_agent_dir: Path) -> HermesCredentialResolver:
+    """Bind the integration resolver to one Hermes installation without importing it."""
+    return partial(hermes_runtime_resolver, hermes_agent_dir=hermes_agent_dir)
 
 
 @dataclass(frozen=True)
@@ -45,11 +102,11 @@ class HermesTargetAdapter:
         )
 
     def install_assets(self, context: TargetInstallContext) -> TargetInstallResult:
-        warnings = ("dry-run only; use ficelle-setup for Hermes asset installation",) if context.dry_run else ()
         return TargetInstallResult(
             target_id=self.target_id,
-            installed_assets=("ficelle", "ficelle-compression"),
-            warnings=warnings,
+            warnings=(
+                "Run `ficelle-setup --target hermes` to install or preview Hermes assets.",
+            ),
         )
 
     def smoke_checks(self, context: TargetSmokeContext) -> Sequence[SmokeCheck]:

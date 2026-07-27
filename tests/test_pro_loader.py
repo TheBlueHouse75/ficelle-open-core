@@ -35,6 +35,7 @@ def _run_pro_subprocess(
     env = _subprocess_env()
     if hermes_home is not None:
         env["HERMES_HOME"] = str(hermes_home)
+        env["FICELLE_HOME"] = str(hermes_home / ".ficelle")
     return subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
@@ -68,12 +69,15 @@ def test_pro_admin_views_served_and_injected(tmp_path: Path) -> None:
 
 
 def test_admin_state_exposes_pro_installed_flag(tmp_path: Path) -> None:
-    # admin_state must surface pro_installed for the frontend gating. Run in an isolated
-    # HERMES_HOME so it never touches the real runtime config; the dev/test path has the
-    # pack, so the flag is True and matches pro_installed().
+    # admin_state must surface pro_installed for the frontend gating. Run with isolated
+    # Ficelle and Hermes homes so it never touches the real runtime config; the dev/test
+    # path has the pack, so the flag is True and matches pro_installed().
     code = (
+        "import os; "
+        "from pathlib import Path; "
         "import ficelle.router as router; "
         "from ficelle.pro import pro_installed; "
+        "assert router.FICELLE_HOME == Path(os.environ['FICELLE_HOME']); "
         "assert router.admin_state(router.load_config())['pro_installed'] == pro_installed()"
     )
     result = _run_pro_subprocess(code, hermes_home=tmp_path)
