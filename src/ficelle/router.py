@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 from urllib.parse import parse_qs, urlparse
 
-from ficelle import request_log
+from ficelle import license_ops, request_log
 from ficelle.config_store import ConfigStore
 try:
     from ficelle_pro.compression import (
@@ -103,7 +103,12 @@ from ficelle.routing_policy import (
     model_has_any,
     model_matches_profile_requirements as policy_model_matches_profile_requirements,
 )
-from ficelle.state_store import StateStore, parse_iso_timestamp, runtime_evidence_timestamp_value
+from ficelle.state_store import (
+    StateStore,
+    advisory_file_lock,
+    parse_iso_timestamp,
+    runtime_evidence_timestamp_value,
+)
 import ficelle.state_store as state_store_module
 from ficelle.use_cases.benchmark import (
     BenchmarkMediaError,
@@ -153,9 +158,10 @@ from ficelle.use_cases.capability_discovery import (
     record_background_job_error_in_state,
 )
 from ficelle.use_cases.catalog_refresh import (
+    CatalogRefreshRunner,
     CatalogRefreshPorts,
     load_or_refresh_catalog as load_or_refresh_catalog_use_case,
-    refresh_catalog as refresh_catalog_use_case,
+    publish_catalog as publish_catalog_use_case,
 )
 from ficelle.use_cases.catalog_fingerprint import (
     CatalogFingerprintPorts,
@@ -457,6 +463,7 @@ RUNTIME_PATHS = RuntimePaths.from_env(package_dir=PACKAGE_DIR)
 HERMES_HOME = RUNTIME_PATHS.hermes_home
 ROUTER_DIR = RUNTIME_PATHS.router_dir
 CATALOG_PATH = RUNTIME_PATHS.catalog_path
+CATALOG_LOCK_PATH = CATALOG_PATH.with_suffix(".lock")
 STATE_PATH = RUNTIME_PATHS.state_path
 CONFIG_PATH = RUNTIME_PATHS.config_path
 ROUTE_LOG_PATH = RUNTIME_PATHS.route_log_path
@@ -488,6 +495,10 @@ _STATE_STORE = StateStore(
     history_keys=RUNTIME_STATE_HISTORY_KEYS,
 )
 _REQUEST_LOG_LOCK = threading.Lock()
+_CATALOG_PUBLISH_THREAD_LOCK = threading.RLock()
+# Held from background transition-thread creation until that worker exits; it only
+# deduplicates license-transition refreshes and does not serialize general catalog writes.
+_LICENSE_TRANSITION_REFRESH_IN_FLIGHT_LOCK = threading.Lock()
 
 FONTS_DIR = PACKAGE_DIR / "assets" / "fonts"
 LOGOS_DIR = PACKAGE_DIR / "assets" / "logos"
@@ -565,6 +576,12 @@ def _pro_admin_dir() -> Path | None:
     symbols instead, like the routing gates).
     """
     return _pro_asset_dir("assets", "admin")
+
+
+def _load_pro_install_module() -> Any:
+    from ficelle import pro_install
+
+    return pro_install
 
 
 def load_logo_bytes(name: str) -> bytes | None:
@@ -1448,6 +1465,32 @@ def load_config() -> dict[str, Any]:
     return runtime_config_store().load()
 
 
+def effective_runtime_config(
+    config: dict[str, Any],
+    *,
+    entitled: bool | None = None,
+) -> dict[str, Any]:
+    is_entitled = license_ops.is_entitled() if entitled is None else entitled
+    if PROVIDER_PACK and not is_entitled:
+        return config_without_provider_pack(config)
+    return copy.deepcopy(config)
+
+
+def config_without_provider_pack(config: dict[str, Any]) -> dict[str, Any]:
+    filtered = copy.deepcopy(config)
+    providers = filtered.get("providers") if isinstance(filtered.get("providers"), dict) else {}
+    filtered["providers"] = {
+        provider_id: provider
+        for provider_id, provider in providers.items()
+        if provider_id not in PROVIDER_PACK
+    }
+    return filtered
+
+
+def load_runtime_config() -> dict[str, Any]:
+    return effective_runtime_config(load_config())
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -1469,11 +1512,22 @@ def configured_virtual_model_ids(config: dict[str, Any]) -> list[str]:
     return sorted(VIRTUAL_MODELS | configured)
 
 
-def fusion_visible_in_model_list(config: dict[str, Any]) -> bool:
-    # The Fusion engine ships only in the closed ficelle_pro pack; on a core-only
-    # install FusionRunner is None. Never advertise ficelle/auto-fusion then —
-    # listing it would route to a missing engine (see run_fusion_chat_completion).
-    if FusionRunner is None:
+# Returned by every /admin/license* route when the closed pack is absent (the free open core
+# has no license to manage). One constant since four handlers share the exact body.
+_LICENSE_PRO_ONLY_404 = {"error": {"message": "License management is a Ficelle Pro feature", "type": "not_found"}}
+
+
+def fusion_visible_in_model_list(
+    config: dict[str, Any],
+    *,
+    entitled: bool | None = None,
+) -> bool:
+    # The Fusion engine ships only in the closed ficelle_pro pack; on a core-only install
+    # FusionRunner is None. Also require a valid Pro license — never advertise
+    # ficelle/auto-fusion when the engine is missing or the license is inactive/expired,
+    # since routing to it would otherwise return a missing-engine or license error.
+    is_entitled = license_ops.is_entitled() if entitled is None else entitled
+    if FusionRunner is None or not is_entitled:
         return False
     return fusion_visible_in_model_list_use_case(
         config,
@@ -1482,9 +1536,13 @@ def fusion_visible_in_model_list(config: dict[str, Any]) -> bool:
     )
 
 
-def listed_virtual_model_ids(config: dict[str, Any]) -> list[str]:
+def listed_virtual_model_ids(
+    config: dict[str, Any],
+    *,
+    entitled: bool | None = None,
+) -> list[str]:
     model_ids = configured_virtual_model_ids(config)
-    if fusion_visible_in_model_list(config):
+    if fusion_visible_in_model_list(config, entitled=entitled):
         model_ids = [*model_ids, FUSION_MODEL_ID]
     return sorted(dict.fromkeys(model_ids))
 
@@ -4066,25 +4124,42 @@ def filter_cached_catalog_to_enabled_providers(catalog: dict[str, Any], config: 
     )
 
 
+def license_variant_structural_fingerprints(config: dict[str, Any]) -> set[str]:
+    return {
+        catalog_config_structural_fingerprint(config),
+        catalog_config_structural_fingerprint(config_without_provider_pack(config)),
+    }
+
+
 def admin_status(config: dict[str, Any], *, run_quota_probes: bool = True) -> dict[str, Any]:
-    catalog = load_cached_catalog_for_admin_status(config)
-    stale_reason = cached_catalog_stale_reason(catalog, config)
+    effective_config = effective_runtime_config(config)
+    catalog = load_cached_catalog_for_admin_status(effective_config)
+    stale_reason = cached_catalog_stale_reason(catalog, effective_config)
     if stale_reason is None:
         if run_quota_probes:
-            run_due_quota_probes(config, catalog)
+            run_due_quota_probes(effective_config, catalog)
     else:
-        filtered_catalog = filter_cached_catalog_to_enabled_providers(catalog, config)
+        filtered_catalog = filter_cached_catalog_to_enabled_providers(catalog, effective_config)
         catalog = {**filtered_catalog, "stale": True, "stale_reason": stale_reason}
+        cached_structural_fingerprint = catalog.get("config_structural_fingerprint")
+        license_transition = (
+            stale_reason == "config_structural_fingerprint_mismatch"
+            and cached_structural_fingerprint in license_variant_structural_fingerprints(config)
+        )
         # A catalog that is merely aging or whose non-structural config/credentials changed
         # still describes a valid set of models, so keep the last-known catalog (reported
         # stale/"degraded" downstream, not a false "0 models / fail" that makes an idle-but-
         # healthy instance look down). A structurally changed or unparseable catalog is
         # emptied — the recoverable-reason policy lives next to the classifier.
-        if not stale_reason_keeps_last_known(stale_reason):
+        if not stale_reason_keeps_last_known(stale_reason) and not license_transition:
             catalog["models"] = []
             catalog["providers"] = {}
     state = load_json(STATE_PATH, {})
-    return build_admin_status(catalog, config, state if isinstance(state, dict) else {})
+    return build_admin_status(
+        catalog,
+        effective_config,
+        state if isinstance(state, dict) else {},
+    )
 
 
 def admin_page_html() -> str:
@@ -4191,27 +4266,171 @@ def catalog_refresh_ports() -> CatalogRefreshPorts:
     )
 
 
-def refresh_catalog(config: dict[str, Any]) -> dict[str, Any]:
-    return refresh_catalog_use_case(
-        config,
-        ports=catalog_refresh_ports(),
+def _build_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, Any]:
+    return CatalogRefreshRunner(
+        catalog_refresh_ports(),
         virtual_models=VIRTUAL_MODELS,
+    ).refresh_catalog(config)
+
+
+def _publish_catalog_unlocked(catalog: dict[str, Any]) -> None:
+    publish_catalog_use_case(
+        catalog,
         catalog_path=CATALOG_PATH,
         atomic_write_json=atomic_write_json,
         update_state=_STATE_STORE.update,
     )
 
 
-def load_or_refresh_catalog(config: dict[str, Any], force: bool = False) -> dict[str, Any]:
-    return load_or_refresh_catalog_use_case(
+def _publish_catalog(catalog: dict[str, Any]) -> None:
+    with advisory_file_lock(CATALOG_LOCK_PATH, _CATALOG_PUBLISH_THREAD_LOCK):
+        _publish_catalog_unlocked(catalog)
+
+
+def _refresh_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, Any]:
+    catalog = _build_catalog_for_effective_config(config)
+    _publish_catalog(catalog)
+    return catalog
+
+
+def refresh_catalog(config: dict[str, Any]) -> dict[str, Any]:
+    return _refresh_catalog_for_effective_config(effective_runtime_config(config))
+
+
+def _load_or_refresh_catalog_for_effective_config(config: dict[str, Any], force: bool = False) -> dict[str, Any]:
+    catalog = load_or_refresh_catalog_use_case(
         config,
         catalog_path=CATALOG_PATH,
         load_json=load_json,
-        refresh_catalog=refresh_catalog,
+        refresh_catalog=_refresh_catalog_for_effective_config,
         catalog_config_fingerprint=catalog_config_fingerprint,
         now_seconds=time.time,
         force=force,
     )
+    return filter_cached_catalog_to_enabled_providers(catalog, config)
+
+
+def _preserve_cached_models_for_failed_providers(
+    refreshed: dict[str, Any],
+    cached: dict[str, Any],
+    effective_config: dict[str, Any],
+) -> dict[str, Any]:
+    providers = refreshed.get("providers")
+    if not isinstance(providers, dict):
+        return refreshed
+    failed_sources = {
+        source
+        for source, summary in providers.items()
+        if isinstance(summary, dict) and summary.get("error")
+    }
+    if not failed_sources:
+        return refreshed
+    cached = filter_cached_catalog_to_enabled_providers(cached, effective_config)
+    refreshed_models = [
+        model for model in refreshed.get("models", []) if isinstance(model, dict)
+    ]
+    known_ids = {str(model.get("id") or "") for model in refreshed_models}
+    preserved = [
+        model
+        for model in cached.get("models", [])
+        if (
+            isinstance(model, dict)
+            and model.get("source") in failed_sources
+            and str(model.get("id") or "") not in known_ids
+        )
+    ]
+    if not preserved:
+        return refreshed
+    return {**refreshed, "models": [*refreshed_models, *preserved]}
+
+
+def _run_catalog_license_transition_refresh(
+    effective_config: dict[str, Any],
+    cached: dict[str, Any],
+) -> None:
+    try:
+        refreshed = _build_catalog_for_effective_config(effective_config)
+        catalog_to_publish = _preserve_cached_models_for_failed_providers(
+            refreshed,
+            cached,
+            effective_config,
+        )
+        with advisory_file_lock(CATALOG_LOCK_PATH, _CATALOG_PUBLISH_THREAD_LOCK):
+            current = load_json(CATALOG_PATH, {})
+            cache_is_unchanged = (
+                isinstance(current, dict)
+                and current.get("generated_at") == cached.get("generated_at")
+                and current.get("config_fingerprint") == cached.get("config_fingerprint")
+                and current.get("config_structural_fingerprint")
+                == cached.get("config_structural_fingerprint")
+            )
+            if cache_is_unchanged:
+                _publish_catalog_unlocked(catalog_to_publish)
+    except Exception:
+        # Keep serving the last-known filtered catalog. Because its fingerprint still
+        # represents the previous license variant, the next request can retry.
+        pass
+    finally:
+        _LICENSE_TRANSITION_REFRESH_IN_FLIGHT_LOCK.release()
+
+
+def _start_catalog_license_transition_refresh(
+    effective_config: dict[str, Any],
+    cached: dict[str, Any],
+) -> None:
+    if not _LICENSE_TRANSITION_REFRESH_IN_FLIGHT_LOCK.acquire(blocking=False):
+        return
+    worker = threading.Thread(
+        target=_run_catalog_license_transition_refresh,
+        args=(copy.deepcopy(effective_config), copy.deepcopy(cached)),
+        name="ficelle-catalog-license-refresh",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        _LICENSE_TRANSITION_REFRESH_IN_FLIGHT_LOCK.release()
+        raise
+
+
+def _cached_catalog_for_license_transition(
+    canonical_config: dict[str, Any],
+    effective_config: dict[str, Any],
+) -> dict[str, Any] | None:
+    catalog = load_json(CATALOG_PATH, {})
+    if not isinstance(catalog, dict) or not catalog.get("models"):
+        return None
+    cached_structural_fingerprint = catalog.get("config_structural_fingerprint")
+    effective_fingerprint = catalog_config_structural_fingerprint(effective_config)
+    if (
+        cached_structural_fingerprint == effective_fingerprint
+        or cached_structural_fingerprint
+        not in license_variant_structural_fingerprints(canonical_config)
+    ):
+        return None
+    filtered = filter_cached_catalog_to_enabled_providers(catalog, effective_config)
+    fallback = {
+        **filtered,
+        "stale": True,
+        "stale_reason": "config_structural_fingerprint_mismatch",
+    }
+    _start_catalog_license_transition_refresh(effective_config, fallback)
+    return fallback
+
+
+def load_or_refresh_catalog(
+    config: dict[str, Any],
+    force: bool = False,
+    *,
+    entitled: bool | None = None,
+) -> dict[str, Any]:
+    effective_config = effective_runtime_config(config, entitled=entitled)
+    if force:
+        return _load_or_refresh_catalog_for_effective_config(effective_config, force=True)
+    cached_transition = _cached_catalog_for_license_transition(config, effective_config)
+    if cached_transition is not None:
+        return cached_transition
+    return _load_or_refresh_catalog_for_effective_config(effective_config)
 
 
 def cooldown_key(model: dict[str, Any]) -> str:
@@ -4448,7 +4667,17 @@ def _increment_count(counts: dict[str, int], key: Any) -> None:
     counts[name] = counts.get(name, 0) + 1
 
 
-def prepare_compression_route_body(body: dict[str, Any], config: dict[str, Any]) -> CompressionRoutePlan:
+def prepare_compression_route_body(
+    body: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    entitled: bool | None = None,
+) -> CompressionRoutePlan:
+    # Compression is a closed Pro engine. When the license is inactive/expired, fail closed by
+    # behaving exactly as a core-only install does: no compression metadata or error counters.
+    is_entitled = license_ops.is_entitled() if entitled is None else entitled
+    if not is_entitled:
+        return CompressionRoutePlan(body=body, metadata=None)
     return prepare_chat_compression_route_body(
         body,
         config,
@@ -5206,7 +5435,7 @@ def selection_policy() -> SelectionPolicy:
 def model_selection_runner() -> ModelSelectionRunner:
     return ModelSelectionRunner(
         ModelSelectionPorts(
-            load_config=load_config,
+            load_config=load_runtime_config,
             fresh_runtime_state=fresh_runtime_state,
             due_quota_probe_keys_for_request=due_quota_probe_keys_for_request,
             run_due_quota_probes=run_due_quota_probes,
@@ -5225,7 +5454,13 @@ def select_models_result(
     *,
     purpose: SelectionPurpose = "route",
 ) -> SelectionResult:
-    return model_selection_runner().select_models_result(requested_model, catalog, config, purpose=purpose)
+    runtime_config = config if config is not None else load_runtime_config()
+    return model_selection_runner().select_models_result(
+        requested_model,
+        catalog,
+        runtime_config,
+        purpose=purpose,
+    )
 
 
 def select_models_result_from_state(
@@ -5771,6 +6006,8 @@ def run_fusion_chat_completion(
     request_id: str,
     request_started: float,
     recursion_depth: int,
+    *,
+    entitled: bool | None = None,
 ) -> tuple[int, dict[str, Any], dict[str, str]]:
     # Fusion is a closed Pro engine (ficelle_pro). On a core-only install the runner
     # and preflight symbols are None, so reject cleanly instead of crashing with a
@@ -5779,6 +6016,15 @@ def run_fusion_chat_completion(
         return (
             404,
             {"error": {"message": f"model not found: {FUSION_MODEL_ID} (Fusion requires Ficelle Pro)", "type": "not_found"}},
+            {},
+        )
+    is_entitled = license_ops.is_entitled() if entitled is None else entitled
+    if not is_entitled:
+        # Pack present but the license is inactive/expired/past-grace: fail closed with an
+        # explicit license error (R10), not a generic upstream/model failure.
+        return (
+            402,
+            {"error": {"message": "Ficelle Pro license is inactive or expired — run `ficelle license status` and refresh billing.", "type": "license_required"}},
             {},
         )
     preflight = build_fusion_request_preflight().prepare(
@@ -6064,30 +6310,67 @@ def has_deliverable_message(payload: Any) -> bool:
     return benchmark_has_deliverable_message(payload)
 
 
+def sse_error_event(code: str, detail: str | None = None) -> bytes:
+    """A terminal SSE error frame for a mid-stream upstream failure.
+
+    Once bytes are streamed the HTTP status is already 200 and no fallback is possible, so the
+    failure is surfaced to the client as an explicit error event before the connection closes —
+    otherwise a truncated stream is indistinguishable from a complete response. Shape mirrors an
+    OpenAI-style streamed error; ``detail`` is already redacted by ``safe_detail``.
+    """
+    payload = {"error": {"message": detail or code, "type": "stream_error", "code": code}}
+    return b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n"
+
+
 def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: Any) -> dict[str, Any]:
-    stream_started = False
+    response_committed = False
     chunk_count = 0
     bytes_sent = 0
+    stream_tail = b""
     try:
         for chunk in chunks:
             if not chunk:
                 continue
-            stream_started = True
+            # The writer may emit HTTP headers before attempting the first body write. Mark
+            # the response as committed before calling it so a body failure cannot trigger a
+            # fallback on an already-started HTTP 200; update byte/tail metrics only after the
+            # chunk itself was accepted.
+            response_committed = True
+            write_chunk(chunk)
             chunk_count += 1
             bytes_sent += len(chunk)
-            write_chunk(chunk)
+            stream_tail = (stream_tail + chunk)[-2:]
             flush()
     except Exception as exc:
+        reason = "mid_stream_failure" if response_committed else "pre_stream_failure"
+        detail = safe_detail(exc)
+        if response_committed:
+            # The HTTP response may already be committed (headers sent, no retry possible):
+            # emit an explicit terminal error frame so the client sees a failure instead of a
+            # silently truncated stream.
+            # Best-effort — the client may already be gone (broken pipe); the failure is still
+            # reported to the caller via the returned dict regardless.
+            try:
+                if stream_tail.endswith(b"\n\n"):
+                    boundary = b""
+                elif stream_tail.endswith(b"\n"):
+                    boundary = b"\n"
+                else:
+                    boundary = b"\n\n"
+                write_chunk(boundary + sse_error_event(reason, detail))
+                flush()
+            except Exception:
+                pass
         return {
             "status": "fail",
-            "reason": "mid_stream_failure" if stream_started else "pre_stream_failure",
-            "stream_started": stream_started,
+            "reason": reason,
+            "stream_started": response_committed,
             "chunk_count": chunk_count,
             "bytes_sent": bytes_sent,
             "error_type": type(exc).__name__,
-            "message": safe_detail(exc),
+            "message": detail,
         }
-    if not stream_started:
+    if not response_committed:
         return {
             "status": "fail",
             "reason": "empty_stream",
@@ -6670,6 +6953,21 @@ class RouterHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(200, compression_admin_payload(self.config, limit=admin_query_limit(self.path)))
                 return
+            if path == "/admin/license":
+                # Gated on pack presence, NOT on entitlement: the License page must stay reachable
+                # while a license is expired/past-due so the user can see why and refresh (R10).
+                try:
+                    payload = license_ops.current_status()
+                except license_ops.LicenseNotInstalled:
+                    self._send_json(404, _LICENSE_PRO_ONLY_404)
+                    return
+                payload["service_url"] = license_ops.service_url()
+                self._send_json(200, payload)
+                return
+            if path == "/admin/license/install":
+                pro_install = _load_pro_install_module()
+                self._send_json(200, pro_install.read_install_status())
+                return
             if path == "/admin/audit":
                 self._send_json(200, {"entries": read_admin_audit(limit=admin_query_limit(self.path))})
                 return
@@ -6716,10 +7014,12 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_export_payload(export)
                 return
             if path == "/v1/models":
-                catalog = load_or_refresh_catalog(self.config)
+                entitled = license_ops.is_entitled()
+                effective_config = effective_runtime_config(self.config, entitled=entitled)
+                catalog = load_or_refresh_catalog(self.config, entitled=entitled)
                 data = []
                 now = int(time.time())
-                for mid in listed_virtual_model_ids(self.config):
+                for mid in listed_virtual_model_ids(effective_config, entitled=entitled):
                     data.append({"id": mid, "object": "model", "created": now, "owned_by": "ficelle"})
                 for model in catalog.get("models", []):
                     if not isinstance(model, dict):
@@ -6759,6 +7059,114 @@ class RouterHandler(BaseHTTPRequestHandler):
                 summary = catalog_summary(catalog)
                 write_admin_audit("admin.refresh", after={"summary": summary})
                 self._send_json(200, {"summary": summary})
+            except Exception as exc:
+                self._send_json(500, safe_error_body(exc))
+            return
+
+        # License management (Pro). Shared with `ficelle license` via ficelle.license_ops; the
+        # audit records only the resulting status/plan, never the license key (security section).
+        if path == "/admin/license/activate":
+            try:
+                body = self._read_body()
+                license_key = str(body.get("license_key") or body.get("key") or "").strip()
+                if not license_key:
+                    self._send_json(400, {"error": {"message": "license_key is required", "type": "invalid_request"}})
+                    return
+                entitlement = license_ops.activate(license_key)
+                write_admin_audit("admin.license.activate", after={"status": entitlement.status, "plan": entitlement.plan})
+                self._send_json(200, license_ops.status_dict(entitlement))
+            except license_ops.LicenseNotInstalled:
+                self._send_json(404, _LICENSE_PRO_ONLY_404)
+            except license_ops.LicenseOperationError as exc:
+                self._send_json(400, {"error": {"message": str(exc), "type": "license_error"}})
+            except ValueError as exc:
+                self._send_json(400, bad_request_body(exc))
+            except Exception as exc:
+                self._send_json(500, safe_error_body(exc))
+            return
+
+        if path == "/admin/license/refresh":
+            try:
+                entitlement = license_ops.refresh()
+                write_admin_audit("admin.license.refresh", after={"status": entitlement.status})
+                self._send_json(200, license_ops.status_dict(entitlement))
+            except license_ops.LicenseNotInstalled:
+                self._send_json(404, _LICENSE_PRO_ONLY_404)
+            except license_ops.LicenseOperationError as exc:
+                self._send_json(400, {"error": {"message": str(exc), "type": "license_error"}})
+            except Exception as exc:
+                self._send_json(500, safe_error_body(exc))
+            return
+
+        if path == "/admin/license/deactivate":
+            try:
+                service_ok = license_ops.deactivate()
+                write_admin_audit("admin.license.deactivate", metadata={"service_ok": service_ok})
+                self._send_json(200, {"deactivated": True, "service_ok": service_ok})
+            except license_ops.LicenseNotInstalled:
+                self._send_json(404, _LICENSE_PRO_ONLY_404)
+            except Exception as exc:
+                self._send_json(500, safe_error_body(exc))
+            return
+
+        if path == "/admin/license/install":
+            # The in-app Pro unlock (paste your key, no terminal). Unlike the other /admin/license
+            # routes this is available on a core-only install, since it IS the installer. It spawns
+            # `ficelle install-pro` DETACHED so the helper outlives the restart it will trigger (the
+            # daemon can't boot itself out and relaunch). The key rides in the child's environment —
+            # never argv or logs — and the audit records only that an install was triggered.
+            try:
+                body = self._read_body()
+                license_key = str(body.get("license_key") or body.get("key") or "").strip()
+            except ValueError as exc:
+                self._send_json(400, bad_request_body(exc))
+                return
+            if not license_key:
+                self._send_json(
+                    400,
+                    {
+                        "error": {
+                            "message": "license_key is required",
+                            "type": "invalid_request",
+                        }
+                    },
+                )
+                return
+            try:
+                pro_install = _load_pro_install_module()
+            except Exception as exc:
+                self._send_json(500, safe_error_body(exc))
+                return
+
+            try:
+                pro_install.queue_install()
+                try:
+                    subprocess.Popen(
+                        pro_install.detached_install_command(),
+                        env={
+                            **os.environ,
+                            "FICELLE_LICENSE_KEY": license_key,
+                            "FICELLE_INSTALL_QUEUED": "1",
+                        },
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except Exception:
+                    pro_install.best_effort_write_install_status("failed", "The Ficelle Pro installer could not start.")
+                    raise
+                write_admin_audit("admin.license.install", metadata={"triggered": True})
+                self._send_json(202, {"status": "installing", "restart_expected": True})
+            except pro_install.ProInstallInProgress:
+                self._send_json(
+                    409,
+                    {
+                        "error": {
+                            "message": "A Ficelle Pro installation is already running.",
+                            "type": "install_in_progress",
+                        }
+                    },
+                )
             except Exception as exc:
                 self._send_json(500, safe_error_body(exc))
             return
@@ -6851,14 +7259,16 @@ class RouterHandler(BaseHTTPRequestHandler):
                 source = str(body.get("source") or body.get("provider") or "").strip()
                 if not source:
                     raise ValueError("source is required")
+                runtime_config = effective_runtime_config(self.config)
                 cached_catalog = load_json(CATALOG_PATH, {})
                 cached_catalog = cached_catalog if isinstance(cached_catalog, dict) else {}
-                if source not in known_provider_sources(self.config, cached_catalog):
+                cached_catalog = filter_cached_catalog_to_enabled_providers(cached_catalog, runtime_config)
+                if source not in known_provider_sources(runtime_config, cached_catalog):
                     raise ValueError(f"unknown provider: {source}")
-                catalog = load_or_refresh_catalog(self.config)
-                if source not in known_provider_sources(self.config, catalog):
+                catalog = _load_or_refresh_catalog_for_effective_config(runtime_config)
+                if source not in known_provider_sources(runtime_config, catalog):
                     raise ValueError(f"unknown provider: {source}")
-                result = run_due_quota_probes(self.config, catalog, force=True, source=source)
+                result = run_due_quota_probes(runtime_config, catalog, force=True, source=source)
                 write_admin_audit("admin.providers.probe", after={"result": result}, metadata={"source": source})
                 self._send_json(200, result)
             except ValueError as exc:
@@ -7089,17 +7499,26 @@ class RouterHandler(BaseHTTPRequestHandler):
             chat_request = normalize_chat_completion_request(body)
             requested_model = chat_request.requested_model
             safe_requested_model = chat_request.safe_requested_model
+            entitled = license_ops.is_entitled()
+            effective_config = effective_runtime_config(self.config, entitled=entitled)
             chat_router = ChatCompletionRouter(
-                config=self.config,
-                load_catalog=load_or_refresh_catalog,
+                config=effective_config,
+                load_catalog=lambda _config: load_or_refresh_catalog(
+                    self.config,
+                    entitled=entitled,
+                ),
                 select_candidates=select_models,
                 is_fusion_profile=lambda model: canonical_virtual_model_id(model) == FUSION_MODEL_ID,
-                is_virtual_model=lambda model: model in configured_virtual_model_ids(self.config),
+                is_virtual_model=lambda model: model in configured_virtual_model_ids(effective_config),
                 response_headers=ficelle_response_headers,
                 record_last_route=record_last_route,
                 write_route_log=write_route_log,
                 max_attempts_for_request=max_attempts_for_request,
-                prepare_compression_route_body=prepare_compression_route_body,
+                prepare_compression_route_body=lambda request_body, config: prepare_compression_route_body(
+                    request_body,
+                    config,
+                    entitled=entitled,
+                ),
                 now=time.time,
             )
             def attempt_ports_factory(attempt_plan: ChatCompletionAttemptPlan) -> ChatCompletionAttemptPorts:
@@ -7137,7 +7556,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     invoke_model=invoke_model,
                     apply_cooldown=lambda cooldown: apply_chat_attempt_cooldown(
                         cooldown,
-                        self.config,
+                        effective_config,
                         request_id=request_id,
                         profile_id=safe_requested_model,
                     ),
@@ -7167,11 +7586,12 @@ class RouterHandler(BaseHTTPRequestHandler):
                 recursion_depth = safe_int(self.headers.get("X-Ficelle-Fusion-Depth"), 0)
                 status, payload, headers = run_fusion_chat_completion(
                     body,
-                    self.config,
+                    effective_config,
                     catalog,
                     request_id,
                     request_started,
                     recursion_depth,
+                    entitled=entitled,
                 )
                 self._send_json(status, payload, headers=headers)
                 return

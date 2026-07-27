@@ -439,6 +439,25 @@ def load_or_refresh_catalog(
     return catalog
 
 
+def publish_catalog(
+    catalog: dict[str, Any],
+    *,
+    catalog_path: Path,
+    atomic_write_json: AtomicWriteJson,
+    update_state: UpdateState,
+) -> None:
+    atomic_write_json(catalog_path, catalog)
+
+    def mutate(state: dict[str, Any]) -> None:
+        state.setdefault("cooldowns", {})
+        state.setdefault("quota_cooldowns", {})
+        state.setdefault("quota_probe_results", {})
+        state.setdefault("quarantine", {})
+        state["last_catalog_refresh_at"] = catalog["generated_at"]
+
+    update_state(mutate, "refresh_catalog")
+
+
 def refresh_catalog(
     config: dict[str, Any],
     *,
@@ -452,14 +471,10 @@ def refresh_catalog(
         ports,
         virtual_models=virtual_models,
     ).refresh_catalog(config)
-    atomic_write_json(catalog_path, catalog)
-
-    def mutate(state: dict[str, Any]) -> None:
-        state.setdefault("cooldowns", {})
-        state.setdefault("quota_cooldowns", {})
-        state.setdefault("quota_probe_results", {})
-        state.setdefault("quarantine", {})
-        state["last_catalog_refresh_at"] = catalog["generated_at"]
-
-    update_state(mutate, "refresh_catalog")
+    publish_catalog(
+        catalog,
+        catalog_path=catalog_path,
+        atomic_write_json=atomic_write_json,
+        update_state=update_state,
+    )
     return catalog

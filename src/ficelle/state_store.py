@@ -22,6 +22,21 @@ except Exception:  # pragma: no cover - Windows fallback for local imports/tests
 RUNTIME_STATE_HISTORY_KEYS = ("benchmark_results", "verified_capabilities")
 
 
+@contextmanager
+def advisory_file_lock(path: Path, thread_lock: threading.RLock) -> Iterator[None]:
+    """Serialize a critical section across threads and, where supported, processes."""
+    with thread_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+", encoding="utf-8") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def parse_iso_timestamp(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
@@ -136,16 +151,8 @@ class StateStore:
 
     @contextmanager
     def lock(self) -> Iterator[None]:
-        with self.thread_lock:
-            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.lock_path.open("a+", encoding="utf-8") as handle:
-                if fcntl is not None:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    if fcntl is not None:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with advisory_file_lock(self.lock_path, self.thread_lock):
+            yield
 
     def load(self, default: Any | None = None) -> Any:
         return load_json(self.state_path, {} if default is None else default)

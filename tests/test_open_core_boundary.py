@@ -137,6 +137,19 @@ def test_admin_state_reports_pro_absent_without_pack(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_core_lists_auto_profiles_without_pro(tmp_path: Path) -> None:
+    # AC#1: a core-only install must still list every ficelle/auto-* virtual profile
+    # (the free tier routes through these), while never advertising auto-fusion.
+    body = (
+        "cfg = router.load_config(); ids = set(router.listed_virtual_model_ids(cfg)); "
+        "missing = router.VIRTUAL_MODELS - ids; "
+        "assert not missing, sorted(missing); "
+        "assert router.FUSION_MODEL_ID not in ids"
+    )
+    result = _run_core_with_modules_blocked(("ficelle_pro",), tmp_path, body)
+    assert result.returncode == 0, result.stderr
+
+
 def test_core_does_not_serve_pro_admin_assets(tmp_path: Path) -> None:
     # The Fusion/Compression view assets ship in ficelle_pro and are served under
     # /admin/static/pro/. A core-only install must not resolve them, and the path

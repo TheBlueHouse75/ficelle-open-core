@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from ficelle import router
+from ficelle import license_ops, router
 from ficelle.service import LaunchAgentServiceBackend, ServiceBackend, ServicePaths, select_service_backend
 
 HERMES_HOME = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
@@ -290,6 +290,121 @@ def remove_key(provider: str) -> int:
     return 0
 
 
+def _print_license_status(entitlement: Any, *, json_output: bool) -> int:
+    if json_output:
+        print(json.dumps(license_ops.status_dict(entitlement)))
+        return 0
+    if entitlement is None:
+        print("License: not activated. Run: ficelle license activate <license-key>")
+        return 1
+    serving = "yes" if entitlement.is_entitled() else "no (expired / past grace — refresh billing)"
+    print(f"License: {entitlement.status} (plan {entitlement.plan or 'n/a'}) — Pro serving: {serving}")
+    return 0
+
+
+def cmd_license(args: argparse.Namespace) -> int:
+    # All license operations are shared with the admin daemon (/admin/license) and live in
+    # ficelle.license_ops. ensure_installed() is the core-only gate: the closed pack ships the
+    # license client, so the free open core reports cleanly and exits non-zero.
+    json_output = bool(getattr(args, "json_output", False))
+    if json_output and args.action != "status":
+        print("--json is supported only for `ficelle license status`.", file=sys.stderr)
+        return 2
+    try:
+        license_ops.ensure_installed()
+    except license_ops.LicenseNotInstalled:
+        if json_output:
+            print(json.dumps(license_ops.status_dict(None)))
+            return 1
+        print("Ficelle Pro is not installed (this is the free open core); no license to manage.")
+        return 1
+    if args.action == "status":
+        return _print_license_status(
+            license_ops.cached_entitlement(), json_output=json_output
+        )
+    if args.action == "activate":
+        # Env fallback lets automation (the bootstrap handoff) pass the key without putting it on
+        # the command line, where it would be echoed to logs (bootstrap's run_command prints argv).
+        key = args.key or os.getenv("FICELLE_LICENSE_KEY", "")
+        if not key:
+            print("usage: ficelle license activate <license-key>")
+            return 2
+        try:
+            entitlement = license_ops.activate(key)
+        except license_ops.LicenseOperationError as exc:
+            print(f"license activation failed: {exc}")
+            return 1
+        print(f"License activated: {entitlement.status} (plan {entitlement.plan or 'n/a'}).")
+        return 0
+    if args.action == "refresh":
+        try:
+            entitlement = license_ops.refresh()
+        except license_ops.LicenseOperationError as exc:
+            print(f"license refresh failed: {exc}")
+            return 1
+        print(f"License refreshed: {entitlement.status}.")
+        return 0
+    if args.action == "deactivate":
+        if license_ops.deactivate():
+            print("License deactivated locally.")
+        else:
+            print("warning: service deactivation failed; cleared the local license anyway.")
+        return 0
+    return 2
+
+
+def _run_pro_install_locked(pro_install: Any, license_key: str) -> int:
+    """Run the installer and persist its terminal state while the caller holds the lock."""
+    if not pro_install.best_effort_write_install_status("installing"):
+        print("Pro install failed: could not persist installer status.")
+        return 1
+    try:
+        pro_install.install_pro(license_key)
+        pro_install.best_effort_write_install_status("restarting")
+        print("Ficelle Pro pack installed; restarting the service to load it…")
+        restart_status = current_service_backend().restart()
+        if restart_status == 0:
+            pro_install.best_effort_write_install_status("installed")
+        else:
+            pro_install.best_effort_write_install_status(
+                "failed",
+                "Ficelle Pro was installed, but the service restart failed.",
+            )
+        return restart_status
+    except pro_install.ProInstallError as exc:
+        pro_install.best_effort_write_install_status("failed", str(exc))
+        print(f"Pro install failed: {exc}")
+        return 1
+    except Exception as exc:
+        pro_install.best_effort_write_install_status(
+            "failed",
+            "The Ficelle Pro installer stopped unexpectedly.",
+        )
+        print(f"Pro install failed unexpectedly ({type(exc).__name__}).")
+        return 1
+
+
+def cmd_install_pro() -> int:
+    # Detached helper for the in-app Pro unlock (spawned by POST /admin/license/install): download
+    # and install the Pro pack, then restart the service so it loads. Running detached — not as the
+    # daemon — is what makes the restart safe (the daemon can't boot itself out and relaunch). The
+    # key arrives via FICELLE_LICENSE_KEY, never argv, which the daemon/logs would echo.
+    from ficelle import pro_install
+
+    license_key = os.environ.pop("FICELLE_LICENSE_KEY", "").strip()
+    queued_install = os.environ.pop("FICELLE_INSTALL_QUEUED", "") == "1"
+    if not license_key:
+        pro_install.best_effort_write_install_status("failed", "No license key was provided.")
+        print("install-pro: no license key (set FICELLE_LICENSE_KEY).")
+        return 2
+    try:
+        with pro_install.exclusive_install_lock(wait=queued_install):
+            return _run_pro_install_locked(pro_install, license_key)
+    except pro_install.ProInstallInProgress:
+        print("A Ficelle Pro installation is already running.")
+        return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ficelle", description="Ficelle local OpenAI-compatible model router")
     sub = parser.add_subparsers(dest="command")
@@ -311,6 +426,11 @@ def main(argv: list[str] | None = None) -> int:
     set_key_parser.add_argument("provider")
     remove_key_parser = sub.add_parser("remove-key", help="Remove a stored provider API key")
     remove_key_parser.add_argument("provider")
+    license_parser = sub.add_parser("license", help="Manage the Ficelle Pro license (Pro only)")
+    license_parser.add_argument("action", choices=["activate", "status", "refresh", "deactivate"])
+    license_parser.add_argument("key", nargs="?", help="License key (for activate)")
+    license_parser.add_argument("--json", action="store_true", dest="json_output", help="Machine-readable status (JSON)")
+    sub.add_parser("install-pro", help="Install/upgrade to Ficelle Pro from a license key (detached helper; key via FICELLE_LICENSE_KEY)")
     args = parser.parse_args(argv)
     if args.command == "serve":
         return router.main_args(["--serve"])
@@ -344,6 +464,10 @@ def main(argv: list[str] | None = None) -> int:
         return set_key(args.provider)
     if args.command == "remove-key":
         return remove_key(args.provider)
+    if args.command == "license":
+        return cmd_license(args)
+    if args.command == "install-pro":
+        return cmd_install_pro()
     parser.print_help()
     return 0
 

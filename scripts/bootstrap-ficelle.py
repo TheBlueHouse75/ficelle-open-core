@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,18 @@ from typing import Mapping, Sequence
 
 DEFAULT_WHEEL_URL = "https://install.ficelle.ai/api/releases/latest/wheel"
 DEFAULT_HERMES_HOME = Path.home() / ".hermes"
+FALLBACK_WHEEL_FILENAME = "ficelle_pro-0-py3-none-any.whl"
+# Deliberately accepts only the PEP 440 subset emitted by Ficelle's release service.
+# Any valid-but-unrecognized form safely falls back to FALLBACK_WHEEL_FILENAME.
+_WHEEL_FILENAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9_.]+-"
+    r"[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?"
+    r"(?:\.post[0-9]+)?(?:\.dev[0-9]+)?"
+    r"(?:\+[A-Za-z0-9]+(?:[._][A-Za-z0-9]+)*)?"
+    r"(?:-[0-9][A-Za-z0-9_.]*)?"
+    r"-[A-Za-z0-9_.]+-[A-Za-z0-9_.]+-[A-Za-z0-9_.]+\.whl$"
+)
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 @dataclass(frozen=True)
@@ -146,12 +159,74 @@ def detect_hermes_python(options: BootstrapOptions) -> Path:
     raise SystemExit("No usable Python 3.11+ found. Pass --python /path/to/hermes/venv/bin/python. Tried: " + "; ".join(failures))
 
 
+def safe_wheel_filename(value: str | None) -> str | None:
+    name = str(value or "").strip().replace("\\", "/").split("/")[-1]
+    if (
+        not name
+        or name.startswith(".")
+        or not name.isprintable()
+        or len(name) > 128
+        or not _WHEEL_FILENAME_PATTERN.fullmatch(name)
+    ):
+        return None
+    return name
+
+
 def wheel_filename_from_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
-    name = Path(parsed.path).name
-    if name.endswith(".whl"):
-        return name
-    return "ficelle_router_latest-py3-none-any.whl"
+    return safe_wheel_filename(Path(parsed.path).name) or FALLBACK_WHEEL_FILENAME
+
+
+def wheel_filename_from_response(response: object, url: str) -> str:
+    headers = getattr(response, "headers", None)
+    get_filename = getattr(headers, "get_filename", None)
+    if callable(get_filename):
+        try:
+            advertised = safe_wheel_filename(get_filename())
+        except Exception:
+            advertised = None
+        if advertised:
+            return advertised
+    return wheel_filename_from_url(url)
+
+
+def effective_origin(url: str) -> tuple[str, str | None, int | None]:
+    parsed = urllib.parse.urlsplit(url)
+    default_port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else None
+    return parsed.scheme.lower(), parsed.hostname, parsed.port or default_port
+
+
+def uses_secure_http_transport(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and (parsed.hostname or "") in _LOOPBACK_HOSTS
+
+
+class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevent an authenticated wheel redirect from leaking the license key to another origin."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if effective_origin(req.full_url) != effective_origin(newurl):
+            raise urllib.error.URLError(
+                "refusing a cross-origin redirect for the Ficelle wheel"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_same_origin(request: urllib.request.Request, *, timeout: float) -> object:
+    return urllib.request.build_opener(SameOriginRedirectHandler()).open(
+        request,
+        timeout=timeout,
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -190,8 +265,13 @@ def download_wheel(options: BootstrapOptions, download_dir: Path) -> Path:
 
     if parsed.scheme == "file":
         return copy_local_wheel(Path(urllib.request.url2pathname(parsed.path)), destination, dry_run=options.dry_run)
-    if parsed.scheme == "" and Path(url).expanduser().exists():
+    if parsed.scheme == "":
         return copy_local_wheel(Path(url).expanduser(), destination, dry_run=options.dry_run)
+    if not uses_secure_http_transport(url):
+        raise SystemExit(
+            "refusing to download a Ficelle wheel over an insecure URL "
+            "(use HTTPS, or HTTP on loopback for local development)"
+        )
 
     print(f"Downloading Ficelle wheel: {redact_url(url)}")
     if options.license_key:
@@ -205,7 +285,8 @@ def download_wheel(options: BootstrapOptions, download_dir: Path) -> Path:
         headers["Authorization"] = f"Bearer {options.license_key}"
     request = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with open_same_origin(request, timeout=120) as response:
+            destination = download_dir / wheel_filename_from_response(response, url)
             destination.parent.mkdir(parents=True, exist_ok=True)
             with destination.open("wb") as handle:
                 shutil.copyfileobj(response, handle)
@@ -226,7 +307,7 @@ def install_wheel(options: BootstrapOptions, python: Path, wheel: Path) -> None:
         return
     if pip_is_unavailable(result) and shutil.which("uv"):
         print("python -m pip is unavailable; retrying wheel install with uv pip.")
-        result = run_command(["uv", "pip", "install", "--python", str(python), "--force-reinstall", str(wheel)], dry_run=options.dry_run, env=env)
+        result = run_command(["uv", "pip", "install", "--python", str(python), "--reinstall", str(wheel)], dry_run=options.dry_run, env=env)
     ensure_success(result, action="wheel install")
 
 
@@ -274,6 +355,28 @@ def verify_two_package_install(options: BootstrapOptions, python: Path) -> None:
         )
 
 
+def run_license_activation(options: BootstrapOptions, python: Path) -> None:
+    """Activate this machine's Pro entitlement after a confirmed install (R7), best-effort.
+
+    The license key is passed through the environment, never on argv — run_command echoes the
+    command it runs, so a key on the command line would leak to stdout/logs (the bootstrap must
+    never print the license key). A failure here does not fail the bootstrap: the packages are
+    installed, so the user can re-run `ficelle license activate` once the key/network are ready.
+    """
+    if options.dry_run or not options.license_key:
+        return
+    env = command_env(options)
+    env["FICELLE_LICENSE_KEY"] = options.license_key
+    result = run_command([str(python), "-m", "ficelle", "license", "activate"], dry_run=options.dry_run, env=env)
+    if result.returncode == 0:
+        print("Pro license activated on this machine.")
+    else:
+        print(
+            "Note: packages installed, but license activation did not complete. "
+            "Run `ficelle license activate <license-key>` once your key and network are ready."
+        )
+
+
 def run_bootstrap(options: BootstrapOptions) -> int:
     python = detect_hermes_python(options)
     print(f"Target Python: {python}")
@@ -294,6 +397,7 @@ def run_bootstrap(options: BootstrapOptions) -> int:
         install_wheel(options, python, wheel)
         run_packaged_setup(options, python, wheel)
         verify_two_package_install(options, python)
+        run_license_activation(options, python)
         if options.keep_wheel:
             keep_dir = options.hermes_home / "ficelle" / "artifacts"
             keep_dir.mkdir(parents=True, exist_ok=True)

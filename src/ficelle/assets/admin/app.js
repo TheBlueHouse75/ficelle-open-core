@@ -13,6 +13,22 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     // Optional closed-pack views (Fusion/Compression). Populated by /admin/static/pro/pro-views.js
     // when ficelle_pro is installed; absent on a core-only install (placeholder shown instead).
     const proViews = (window.__ficelleProViews = window.__ficelleProViews || {});
+    // A license key deep-linked from the purchase success page (#/license?key=…),
+    // captured once at load before setView() rewrites the hash to a clean #/license. Pre-fills the
+    // License key field so activation is one click — pre-fill only, never auto-submitted. Query
+    // parameters are intentionally unsupported because the HTTP request line may be logged.
+    const deepLinkedKey = deepLinkKey();
+    // Scrub legacy ?key= links without extracting or using the value. The first request may
+    // already have reached server logs, but this prevents persistence in history and referrers.
+    if (location.search) {
+      try {
+        const cleaned = new URL(location.href);
+        if (cleaned.searchParams.has("key")) {
+          cleaned.searchParams.delete("key");
+          history.replaceState(null, "", cleaned.pathname + cleaned.search + cleaned.hash);
+        }
+      } catch (e) { /* malformed URL — ignore */ }
+    }
 
     /* ---------- formatting helpers ---------- */
 
@@ -1011,6 +1027,119 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	    }
 	    // Fusion run-detail/panel helpers moved to the closed-pack module (pro-views.js).
 	    function renderFusion() { proViews.renderFusion?.(proApi); }
+	    // License view: the full activate/refresh/deactivate page lives in the closed-pack module
+	    // (pro-views.js) when the pack is present; core-only shows the in-app unlock form below.
+	    function renderLicense() {
+	      if (proViews.renderLicense) { proViews.renderLicense(proApi); return; }
+	      renderCoreLicenseInstall();
+	    }
+	    // Core-only License view: an in-app Pro unlock. Enter the key → the daemon installs the Pro
+	    // pack (POST /admin/license/install spawns a detached helper) and restarts → this page reloads
+	    // into the full License page. Lives in the open core (not pro-views.js) so it runs without the
+	    // pack. Idempotent: it never wipes an unlock already in progress.
+	    function renderCoreLicenseInstall() {
+	      const view = $("view-license");
+	      if (!view || $("unlockProBtn")) return;
+	      view.innerHTML =
+	        '<div class="card"><div class="card-head"><div>' +
+	          "<h2>Unlock Ficelle Pro</h2>" +
+	          '<div class="ch-sub">Enter your license key — Ficelle installs and activates Pro on this machine, no terminal needed.</div>' +
+	        "</div></div><div class=\"card-body\">" +
+	          '<div class="page-actions">' +
+	            '<input type="text" class="key-input" id="proKeyInput" placeholder="Enter your license key" autocomplete="off" spellcheck="false" />' +
+	            '<button class="btn primary" type="button" id="unlockProBtn">Unlock Pro</button>' +
+	          "</div>" +
+	          '<div class="ch-sub" id="proInstallProgress" style="margin-top:12px"></div>' +
+	          '<p class="ch-sub" style="margin-top:14px">No key yet? <a href="https://ficelle.ai" target="_blank" rel="noopener">Get Ficelle Pro</a>.</p>' +
+	        "</div></div>";
+	      $("unlockProBtn").addEventListener("click", unlockPro);
+	      if (deepLinkedKey) $("proKeyInput").value = deepLinkedKey;
+	    }
+	    let proInstalledForActivation = false;
+	    async function unlockPro() {
+	      const key = ($("proKeyInput") ? $("proKeyInput").value : "").trim();
+	      const progress = $("proInstallProgress");
+	      const btn = $("unlockProBtn");
+	      const resetUnlock = function (message, label) {
+	        if (progress) progress.textContent = message;
+	        if (btn) { btn.disabled = false; btn.textContent = label || "Unlock Pro"; }
+	      };
+	      if (!key) { if (progress) progress.textContent = "Enter your license key."; return; }
+	      if (!proInstalledForActivation) {
+	        if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
+	        if (progress) progress.textContent = "Starting the Ficelle Pro install…";
+	        try {
+	          const r = await fetch("/admin/license/install", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ license_key: key }) });
+	          if (!r.ok) {
+	            const p = await r.json().catch(() => ({}));
+	            resetUnlock((p && p.error && p.error.message) || "The install could not start.");
+	            return;
+	          }
+	        } catch (e) {
+	          resetUnlock("The install could not start.");
+	          return;
+	        }
+	        if (progress) progress.textContent = "Installing Ficelle Pro and restarting the service — this can take a minute…";
+	        const install = await pollUntilProReady(150000);
+	        if (install.error) {
+	          resetUnlock(install.error);
+	          return;
+	        }
+	        if (!install.ready) {
+	          resetUnlock("Taking longer than expected. Reload the page, or press Unlock to retry.");
+	          return;
+	        }
+	        proInstalledForActivation = true;
+	      }
+	      // The pack is loaded; activate with the key we still hold, then reload into the full page.
+	      if (btn) { btn.disabled = true; btn.textContent = "Activating…"; }
+	      if (progress) progress.textContent = "Activating your Ficelle Pro license…";
+	      try {
+	        const activation = await fetch("/admin/license/activate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ license_key: key }) });
+	        if (!activation.ok) {
+	          const payload = await activation.json().catch(() => ({}));
+	          resetUnlock((payload && payload.error && payload.error.message) || "Ficelle Pro installed, but license activation failed. Try again.", "Retry activation");
+	          return;
+	        }
+	      } catch (e) {
+	        resetUnlock("Ficelle Pro installed, but license activation failed. Check the service and try again.", "Retry activation");
+	        return;
+	      }
+	      if (progress) progress.textContent = "Ficelle Pro is ready. Reloading…";
+	      setTimeout(function () { window.location.reload(); }, 900);
+	    }
+	    async function pollUntilProReady(timeoutMs) {
+	      const sleep = function (ms) { return new Promise(function (res) { setTimeout(res, ms); }); };
+	      const deadline = Date.now() + timeoutMs;
+	      while (Date.now() < deadline) {
+	        await sleep(2500);
+	        try {
+	          const installResponse = await fetch("/admin/license/install", { cache: "no-store" });
+	          if (installResponse.ok) {
+	            const install = await installResponse.json();
+	            if (install && install.status === "failed") {
+	              return { ready: false, error: install.message || "The Ficelle Pro install failed." };
+	            }
+	          }
+	          // /admin/state is always 200 (no 404 console noise while polling) and reports
+	          // pro_installed, which flips true once the restarted daemon has loaded the pack.
+	          const r = await fetch("/admin/state", { cache: "no-store" });
+	          if (r.ok) { const s = await r.json(); if (s && s.pro_installed) return { ready: true }; }
+	        } catch (e) { /* daemon restarting — keep polling */ }
+	      }
+	      return { ready: false };
+	    }
+	    function deepLinkKey() {
+	      try {
+	        const hash = location.hash || "";
+	        const qi = hash.indexOf("?");
+	        if (qi >= 0) {
+	          const fromHash = new URLSearchParams(hash.slice(qi + 1)).get("key");
+	          if (fromHash) return fromHash.trim();
+	        }
+	      } catch (e) { /* malformed URL — ignore */ }
+	      return "";
+	    }
 
 	    function settingsNumber(id, field, value, min, max, step = "1") {
 	      return '<input id="' + esc(id) + '" type="number" min="' + min + '" max="' + max + '" step="' + esc(step) + '" data-settings-field="' + esc(field) + '" value="' + esc(value) + '">';
@@ -1521,7 +1650,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      if (!state) return;
 	      setProviderLabels(state.provider_labels);
 	      renderProfileList(); renderActiveProfile(); renderFilterBar(); renderSelected(); renderExcluded(); renderAvailable();
-	      renderProviders(); renderFusion(); renderSettings(); renderCompression(); renderHealth(); renderPerformance(); renderAudit(); renderNavCounts();
+	      renderProviders(); renderFusion(); renderSettings(); renderCompression(); renderLicense(); renderHealth(); renderPerformance(); renderAudit(); renderNavCounts();
       syncLongRunningActions();
 	    }
 
@@ -1532,6 +1661,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 		      fusion: { eyebrow: "Compound model", title: "Fusion", desc: "Configure auto-fusion and inspect its metadata-only observability in one place." },
       settings: { eyebrow: "Configure", title: "Settings", desc: "Global routing controls: how many upstream models Ficelle tries per request, how long failures are benched, and network time limits. These apply across every virtual model." },
       compression: { eyebrow: "Configure", title: "Compression", desc: "Tune native request compression and inspect metadata-only savings, CCR storage, retrievals, errors, and recent route events." },
+      license: { eyebrow: "Configure", title: "License", desc: "Activate, refresh, or release this machine’s Ficelle Pro license, and check its current status." },
 	      health: { eyebrow: "Observe", title: "Health", desc: "Canary status and the guardrails currently holding models or providers out of rotation." },
 	      performance: { eyebrow: "Observe", title: "Performance", desc: "What actually happened: winning models, fallbacks, success rates, and latency per virtual model." },
 	      requests: { eyebrow: "Observe", title: "Requests", desc: "Every routed request, newest first: profile, provider, upstream model, outcome, error type, and latency — with health aggregates over a window." },
@@ -1539,6 +1669,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       export: { eyebrow: "Ship it", title: "Export", desc: "Generate the Hermes config snippet for your chosen virtual models. No provider secrets included." }
     };
     function setView(name) {
+      name = String(name).split("?")[0];  // tolerate a deep-link query, e.g. #/license?key=…
       if (!viewMeta[name]) name = "routing";
       setCurrentView(name);
       document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.dataset.view === name));
@@ -1812,6 +1943,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       // shared core layout primitives + icons (also used by the core Settings view)
       fusionSetting, fusionSettingsGroup, settingsNumber, settingsToggle, settingsCompressionMode,
       SETTINGS_COMPRESSION_STRATEGIES, ic, ICONS,
+      // license key deep-linked from the purchase success page (pre-fills the License field)
+      deepLinkedKey,
       // store live bindings (getters) + setters
       getState: () => state,
       getDraftFusion: () => draftFusion, setDraftFusion,
@@ -1827,5 +1960,6 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     proViews.__boot = () => render();
 
     initTheme(); initNav(); initStaticControls();
-    setView((location.hash || "#/routing").replace("#/", ""));
+    // A deep-linked key means the user just bought Pro — land on the License view to unlock.
+    setView(deepLinkedKey ? "license" : (location.hash || "#/routing").replace("#/", ""));
     loadState().catch((e) => showToast(e.message || String(e)));

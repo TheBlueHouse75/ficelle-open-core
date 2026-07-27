@@ -27,6 +27,22 @@ def _subprocess_env() -> dict[str, str]:
     return {**os.environ, "PYTHONPATH": os.pathsep.join(paths)}
 
 
+def _run_pro_subprocess(
+    code: str,
+    *,
+    hermes_home: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = _subprocess_env()
+    if hermes_home is not None:
+        env["HERMES_HOME"] = str(hermes_home)
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
 def test_pro_present_in_dev_environment() -> None:
     # The monorepo dev/test env has ficelle-pro on the path. A genuinely core-only
     # environment (e.g. the public mirror) legitimately lacks it, so skip there.
@@ -47,10 +63,7 @@ def test_pro_admin_views_served_and_injected(tmp_path: Path) -> None:
         "assert a is not None and a[1].startswith('application/javascript'), a; "
         "assert '/admin/static/pro/pro-views.js' in router.admin_page_html()"
     )
-    env = {**_subprocess_env(), "HERMES_HOME": str(tmp_path)}
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=env
-    )
+    result = _run_pro_subprocess(code, hermes_home=tmp_path)
     assert result.returncode == 0, result.stderr
 
 
@@ -63,10 +76,28 @@ def test_admin_state_exposes_pro_installed_flag(tmp_path: Path) -> None:
         "from ficelle.pro import pro_installed; "
         "assert router.admin_state(router.load_config())['pro_installed'] == pro_installed()"
     )
-    env = {**_subprocess_env(), "HERMES_HOME": str(tmp_path)}
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=env
+    result = _run_pro_subprocess(code, hermes_home=tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+def test_pro_present_provides_full_pool_and_engines(tmp_path: Path) -> None:
+    # AC#2: with the pack installed, the curated provider pool is composed into the
+    # default config and both closed engines (fusion + native compression) are present.
+    if not pro_installed():
+        pytest.skip("ficelle-pro not installed (core-only environment)")
+    code = (
+        "import ficelle.router as router; "
+        "from ficelle_pro.provider_pack import PROVIDER_PACK; "
+        "assert PROVIDER_PACK, 'curated pack is empty'; "
+        "providers = set(router.DEFAULT_CONFIG['providers']); "
+        # Real composition: the pool is the core reference set PLUS the curated pack,
+        # so it must contain both and be strictly larger than core-only.
+        "assert set(router.CORE_PROVIDERS) | set(PROVIDER_PACK) <= providers; "
+        "assert len(providers) > len(router.CORE_PROVIDERS); "
+        "assert router.FusionRunner is not None; "
+        "assert router.compress_block is not None"
     )
+    result = _run_pro_subprocess(code, hermes_home=tmp_path)
     assert result.returncode == 0, result.stderr
 
 
@@ -77,7 +108,5 @@ def test_pro_absent_is_detected() -> None:
         "from ficelle.pro import load_pro, pro_installed; "
         "assert load_pro() is None; assert pro_installed() is False; print('ok')"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=_subprocess_env()
-    )
+    result = _run_pro_subprocess(code)
     assert result.returncode == 0, result.stderr
