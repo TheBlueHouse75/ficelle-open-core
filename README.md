@@ -24,19 +24,12 @@ paid call.
 
 ## Quick start
 
-Before the Core package is published to PyPI, install from an existing source checkout:
+Install the versioned open Core from PyPI:
 
 ```bash
-cd /path/to/ficelle-open-core
-python3 scripts/install-ficelle.py --target generic
-ficelle models
-```
-
-After PyPI publication and clean-machine validation, the shorter public flow will be:
-
-```bash
-uv tool install ficelle-router
+uv tool install ficelle-router==0.1.3
 ficelle-setup --skip-package --target generic
+ficelle models
 ```
 
 Point your client at `http://127.0.0.1:8646/v1`, configure a provider key (e.g.
