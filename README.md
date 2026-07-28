@@ -64,8 +64,8 @@ client = OpenAI(
 ```
 
 `ficelle-setup --target auto` selects Hermes only when it detects a reliable local
-Hermes signal; otherwise it selects the same standalone generic target. Explicit targets
-are `generic`, `hermes`, and experimental `openclaw`.
+Hermes signal; otherwise it selects the same standalone generic target. The explicit
+launch targets are `generic` and `hermes`.
 
 ## How it works
 
@@ -106,8 +106,15 @@ without it.
 
 ## Optional Hermes integration
 
-Hermes is not required. `ficelle-setup --target hermes` installs the Ficelle provider and
-compression plugins with backups. Hermes config is still opt-in:
+Hermes is not required. If you want the integration and Hermes is not installed yet, use
+its official installer, which launches the setup wizard:
+
+```bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+```
+
+Then `ficelle-setup --target hermes` installs the Ficelle provider and compression
+plugins with backups. Hermes config is still opt-in:
 `ficelle-setup --target hermes --configure-hermes`. To restore the latest available
 plugin/config backups, run `ficelle-setup --target hermes --rollback`; paths without
 backups are left untouched.
@@ -123,12 +130,6 @@ auxiliary:
 ```
 
 Export the recommended YAML with `ficelle export --target hermes`.
-
-## Experimental OpenClaw integration
-
-`ficelle-setup --target openclaw` installs Ficelle standalone and leaves Hermes untouched.
-Review and merge the export from `/admin/export/openclaw` manually; this integration is
-experimental.
 
 ## License
 
