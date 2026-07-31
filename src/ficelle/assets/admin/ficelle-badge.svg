@@ -1,10 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" role="img" aria-label="Ficelle">
   <rect x="2" y="2" width="44" height="44" rx="13" fill="#17110B"></rect>
-  <path d="M9 46 V34 C9 26.5 15.5 22.5 24 22.5 C32.5 22.5 39 26.5 39 34 V46 Z" fill="#F26A1B"></path>
-  <g transform="rotate(-12 16 19)"><circle cx="16" cy="19" r="7.4" fill="#EC5A16"></circle><circle cx="16" cy="19" r="5.6" fill="#FFF8F0"></circle></g>
-  <g transform="rotate(12 32 19)"><circle cx="32" cy="19" r="7.4" fill="#EC5A16"></circle><circle cx="32" cy="19" r="5.6" fill="#FFF8F0"></circle></g>
-  <circle cx="17" cy="20.2" r="2.8" fill="#16110C"></circle>
-  <circle cx="31" cy="20.2" r="2.8" fill="#16110C"></circle>
-  <circle cx="18" cy="19.1" r="0.9" fill="#FFFFFF"></circle>
-  <circle cx="32" cy="19.1" r="0.9" fill="#FFFFFF"></circle>
+  <g transform="translate(0 2)">
+    <g fill="none" stroke="#F26A1B" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M24 8 C14 8 10.5 14 10.5 18.5 C10.5 24 16 26.5 24 26.5 C32 26.5 37.5 24 37.5 18.5 C37.5 14 34 8 24 8 Z"></path>
+      <path d="M24 26.5 C24 32 19.5 33 19.5 36.5 C19.5 40 24 41 24 41"></path>
+      <path d="M24 26.5 C24 32 28.5 33 28.5 36.5 C28.5 40 24 41 24 41"></path>
+    </g>
+    <circle cx="19" cy="17.5" r="2.9" fill="#FBF3EA"></circle>
+    <circle cx="29" cy="17.5" r="2.9" fill="#FBF3EA"></circle>
+    <circle cx="17.9" cy="16.6" r="0.8" fill="#17110B"></circle>
+    <circle cx="27.9" cy="16.6" r="0.8" fill="#17110B"></circle>
+  </g>
 </svg>

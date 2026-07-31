@@ -1,9 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" role="img" aria-label="Ficelle">
-  <path d="M3 47 V31 C3 21.5 12 16.5 24 16.5 C36 16.5 45 21.5 45 31 V47 Z" fill="#F26A1B"></path>
-  <g transform="rotate(-13 12.5 12.5)"><circle cx="12.5" cy="12.5" r="9.2" fill="#EC5A16"></circle><circle cx="12.5" cy="12.5" r="6.9" fill="#FFF8F0"></circle></g>
-  <g transform="rotate(13 35.5 12.5)"><circle cx="35.5" cy="12.5" r="9.2" fill="#EC5A16"></circle><circle cx="35.5" cy="12.5" r="6.9" fill="#FFF8F0"></circle></g>
-  <circle cx="13.9" cy="13.9" r="3.5" fill="#16110C"></circle>
-  <circle cx="34.1" cy="13.9" r="3.5" fill="#16110C"></circle>
-  <circle cx="15.1" cy="12.8" r="1.05" fill="#FFFFFF"></circle>
-  <circle cx="35.3" cy="12.8" r="1.05" fill="#FFFFFF"></circle>
+  <g fill="none" stroke="#F26A1B" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M24 6 C13 6 9 13 9 18 C9 24 15 27 24 27 C33 27 39 24 39 18 C39 13 35 6 24 6 Z"></path>
+    <path d="M24 27 C24 33 19 34 19 38 C19 42 24 43 24 43"></path>
+    <path d="M24 27 C24 33 29 34 29 38 C29 42 24 43 24 43"></path>
+  </g>
+  <circle cx="18.5" cy="16.5" r="3.3" fill="#FBF3EA"></circle>
+  <circle cx="29.5" cy="16.5" r="3.3" fill="#FBF3EA"></circle>
+  <circle cx="18.5" cy="16.9" r="1.9" fill="#16110C"></circle>
+  <circle cx="29.5" cy="16.9" r="1.9" fill="#16110C"></circle>
+  <circle cx="19.4" cy="15.8" r="0.7" fill="#FFFFFF"></circle>
+  <circle cx="30.4" cy="15.8" r="0.7" fill="#FFFFFF"></circle>
 </svg>
