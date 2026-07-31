@@ -15,6 +15,9 @@ dist/
 .venv/
 .pytest_cache/
 .coverage
+# Local uv artifact: CI installs with `pip install -e '.[dev]'`, so nothing reads
+# this lock. Track it only if the workflows move to `uv sync --frozen`.
+uv.lock
 
 # Local/editor
 .DS_Store
