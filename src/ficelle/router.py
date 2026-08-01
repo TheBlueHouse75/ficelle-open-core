@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 from urllib.parse import parse_qs, urlparse
 
-from ficelle import license_ops, request_log
+from ficelle import license_ops, request_log, update as update_service
 from ficelle.config_store import ConfigStore
 try:
     from ficelle_pro.compression import (
@@ -3773,6 +3773,7 @@ def admin_state(config: dict[str, Any]) -> dict[str, Any]:
     # core-only install (the views themselves gate structurally — pro-views.js ships
     # and renders them only when the pack is present). False on a core-only install.
     payload["pro_installed"] = pro_installed()
+    payload["update"] = update_service.public_update_status()
     return payload
 
 
@@ -7046,6 +7047,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             if path == "/admin/status.json":
                 self._send_json(200, admin_status(self.config))
                 return
+            if path == "/admin/update":
+                self._send_json(200, update_service.public_update_status())
+                return
             if path == "/admin/targets":
                 self._send_json(200, targets_contract_payload(self.config))
                 return
@@ -7177,6 +7181,31 @@ class RouterHandler(BaseHTTPRequestHandler):
                 summary = catalog_summary(catalog)
                 write_admin_audit("admin.refresh", after={"summary": summary})
                 self._send_json(200, {"summary": summary})
+            except Exception as exc:
+                self._send_json(500, safe_error_body(exc))
+            return
+
+        if path == "/admin/update":
+            try:
+                body = self._read_body()
+                action = str(body.get("action") or "install").strip().lower()
+                if action == "check":
+                    status = update_service.check_for_updates(force=True)
+                    self._send_json(200, update_service.public_update_status(status))
+                    return
+                if action != "install":
+                    raise ValueError("action must be check or install")
+                update_service.spawn_update()
+                write_admin_audit("admin.update.install", metadata={"triggered": True})
+                self._send_json(202, {"status": "queued", "restart_expected": True})
+            except update_service.UpdateInProgress as exc:
+                self._send_json(409, {"error": {"message": str(exc), "type": "update_in_progress"}})
+            except update_service.UpdateUnavailable as exc:
+                self._send_json(409, {"error": {"message": str(exc), "type": "update_unavailable"}})
+            except ValueError as exc:
+                self._send_json(400, bad_request_body(exc))
+            except update_service.UpdateError as exc:
+                self._send_json(500, {"error": {"message": str(exc), "type": "update_error"}})
             except Exception as exc:
                 self._send_json(500, safe_error_body(exc))
             return
@@ -7841,6 +7870,7 @@ def serve(config: dict[str, Any]) -> None:
     # admin mutates), so it is always started and just idles when `auto_benchmark_enabled` is off —
     # letting the Settings toggle take effect without a restart. Daemon so it dies with the process.
     threading.Thread(target=auto_benchmark_loop, args=(config,), name="ficelle-auto-benchmark", daemon=True).start()
+    threading.Thread(target=update_service.update_check_loop, name="ficelle-update-check", daemon=True).start()
     print(f"Ficelle listening on http://{host}:{port}/v1")
     server.serve_forever()
 

@@ -8,7 +8,10 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 def uses_secure_http_transport(url: str) -> bool:
     """Whether credentials may be sent to ``url`` without crossing cleartext networking."""
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
     return parsed.scheme == "https" or (
         parsed.scheme == "http"
         and (parsed.hostname or "") in _LOOPBACK_HOSTS

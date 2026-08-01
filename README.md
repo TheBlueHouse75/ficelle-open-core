@@ -67,6 +67,48 @@ client = OpenAI(
 Hermes signal; otherwise it selects the same standalone generic target. The explicit
 launch targets are `generic` and `hermes`.
 
+## Updates
+
+Ficelle checks for a newer verified Core release in the background after startup. The
+local Admin Control Center displays the release notes and offers a one-click install;
+the equivalent CLI commands are:
+
+```bash
+ficelle update --check
+ficelle update --install
+```
+
+The updater downloads the release wheel, verifies its SHA-256, keeps a backup of the
+installed package, runs import/service smoke checks, and restarts the managed user
+service. A failed update restores the previous package. It never stores a Pro license
+key. A paid release can advertise a compatible authenticated Pro artifact in Ficelle's
+compact release manifest. For production, `authorization: "entitlement"` lets the
+license service authorize the already-cached signed entitlement token; Core never sends
+the user's license key or persists a new update secret. `authorization: "bearer"` is
+available for managed deployments through the short-lived `FICELLE_UPDATE_PRO_TOKEN`.
+
+The default check source is the latest GitHub Release. A deployment can point the Core at
+its own HTTPS manifest with `FICELLE_UPDATE_MANIFEST_URL`. The compact manifest shape is:
+
+```json
+{
+  "version": "0.1.4",
+  "release_url": "https://ficelle.ai/releases/0.1.4",
+  "core": {
+    "wheel_url": "https://downloads.example/ficelle_router-0.1.4-py3-none-any.whl",
+    "sha256": "<64 hexadecimal characters>"
+  },
+  "pro": {
+    "wheel_url": "https://downloads.example/ficelle_pro-0.1.4-py3-none-any.whl",
+    "sha256": "<64 hexadecimal characters>",
+    "authorization": "bearer"
+  }
+}
+```
+
+Update checks are non-blocking and can be disabled for a managed environment with
+`FICELLE_DISABLE_UPDATE_CHECK=1`.
+
 ## How it works
 
 ```text

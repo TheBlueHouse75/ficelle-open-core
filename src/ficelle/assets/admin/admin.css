@@ -233,6 +233,20 @@
     .page-desc { color: var(--text-soft); margin: 9px 0 0; max-width: 62ch; font-size: 13.5px; }
     .page-actions { display: flex; gap: 9px; flex-wrap: wrap; justify-content: flex-end; flex: none; }
 
+    .update-banner {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      margin: 0 0 16px; padding: 13px 15px; border: 1px solid var(--brand-line);
+      border-radius: var(--radius); background: var(--brand-wash); color: var(--text-soft);
+      box-shadow: 0 10px 28px -22px var(--brand);
+    }
+    .update-banner[hidden] { display: none; }
+    .update-banner .update-copy { min-width: 0; }
+    .update-banner .update-title { color: var(--text); font-weight: 650; font-size: 13px; }
+    .update-banner .update-detail { margin-top: 3px; color: var(--text-muted); font-size: 12px; line-height: 1.45; }
+    .update-banner .update-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+    .update-banner.is-progress { border-color: color-mix(in srgb, var(--info) 42%, transparent); background: color-mix(in srgb, var(--info) 9%, var(--surface-1)); }
+    .update-banner.is-error { border-color: color-mix(in srgb, var(--danger) 42%, transparent); background: color-mix(in srgb, var(--danger) 8%, var(--surface-1)); }
+
     /* ============ Buttons ============
        Pill shape + the website's "solid drop" primary: the shadow is a flat
        offset of --brand-soft, so pressing the button visibly sinks into it. */
@@ -772,4 +786,6 @@
     @media (max-width: 560px) {
       .page-head { flex-direction: column; align-items: flex-start; }
       .page-actions { width: 100%; }
+      .update-banner { align-items: flex-start; flex-direction: column; }
+      .update-banner .update-actions { width: 100%; }
     }

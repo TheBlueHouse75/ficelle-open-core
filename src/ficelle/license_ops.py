@@ -106,6 +106,20 @@ def _entitlement_read_path() -> Path:
     return _RUNTIME_PATHS.read_path(ENTITLEMENT_PATH)
 
 
+def cached_entitlement_token() -> str | None:
+    """Return the locally cached signed entitlement for an update service handoff.
+
+    The token is never included in status payloads or logs. It is distinct from the user's
+    license key and is only consumed by the update client when a release manifest explicitly
+    requests ``authorization: entitlement`` over the configured HTTPS license service origin.
+    """
+    try:
+        token = _entitlement_read_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return token or None
+
+
 def cached_entitlement() -> Any:
     """The verified, cached Entitlement, or None when unlicensed. Raises LicenseNotInstalled."""
     licensing = _licensing()

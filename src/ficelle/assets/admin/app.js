@@ -1649,10 +1649,130 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	    function render() {
 	      if (!state) return;
 	      setProviderLabels(state.provider_labels);
+	      renderUpdateBanner();
 	      renderProfileList(); renderActiveProfile(); renderFilterBar(); renderSelected(); renderExcluded(); renderAvailable();
 	      renderProviders(); renderFusion(); renderSettings(); renderCompression(); renderLicense(); renderHealth(); renderPerformance(); renderAudit(); renderNavCounts();
       syncLongRunningActions();
 	    }
+
+    let updateInstallInFlight = false;
+    let updateStatusTimer = null;
+    let updateStatusRefreshInFlight = false;
+    function renderUpdateBanner() {
+      const banner = $("updateBanner");
+      if (!banner) return;
+      const update = state?.update || {};
+      const status = String(update.status || "not_checked");
+      const available = Boolean(update.update_available);
+      banner.className = "update-banner";
+      banner.hidden = true;
+      if (available && status === "available") {
+        banner.hidden = false;
+        const version = esc(update.latest_version || "the latest release");
+        const message = update.pro_update_required
+          ? "A compatible Pro artifact is required for this installed Pro build."
+          : "Install the verified release and restart the local service.";
+        banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle ' + version + ' is available</div><div class="update-detail">' + esc(message) + (update.release_url ? ' <a href="' + esc(update.release_url) + '" target="_blank" rel="noopener">Release notes</a>.' : "") + '</div></div>' +
+          '<div class="update-actions">' + (update.pro_update_required ? '<span class="badge warn">Pro update needed</span>' : '<button class="btn primary sm" type="button" id="installUpdateBtn"' + (updateInstallInFlight ? " disabled" : "") + '>' + (updateInstallInFlight ? "Installing…" : "Install update") + '</button>') + '</div>';
+        const button = $("installUpdateBtn");
+        if (button) button.addEventListener("click", installUpdate);
+        return;
+      }
+      if (["queued", "installing", "restarting"].includes(status) || updateInstallInFlight) {
+        banner.hidden = false;
+        banner.classList.add("is-progress");
+        const detail = status === "restarting" ? "The service is restarting; this page may briefly lose connection." : "The verified package is being installed in the background.";
+        banner.innerHTML = '<div class="update-copy"><div class="update-title">Updating Ficelle…</div><div class="update-detail">' + esc(detail) + '</div></div><div class="update-actions"><span class="badge info">In progress</span></div>';
+        return;
+      }
+      if (status === "failed" && update.message) {
+        banner.hidden = false;
+        banner.classList.add("is-error");
+        banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle update failed</div><div class="update-detail">' + esc(update.message) + '</div></div><div class="update-actions"><button class="btn sm" type="button" id="checkUpdateBtn">Check again</button></div>';
+        const button = $("checkUpdateBtn");
+        if (button) button.addEventListener("click", checkUpdate);
+      }
+    }
+
+    async function refreshUpdateStatus() {
+      if (!state || updateStatusRefreshInFlight) return;
+      updateStatusRefreshInFlight = true;
+      try {
+        const r = await fetch("/admin/update", { cache: "no-store" });
+        if (!r.ok) return;
+        state.update = await r.json();
+        renderUpdateBanner();
+      } catch (_) {
+        // The update check is optional; a transient local request failure must not affect the UI.
+      } finally {
+        updateStatusRefreshInFlight = false;
+      }
+    }
+
+    function startUpdateStatusPolling() {
+      void refreshUpdateStatus();
+      if (updateStatusTimer) return;
+      updateStatusTimer = setInterval(() => { void refreshUpdateStatus(); }, 15000);
+    }
+
+    async function checkUpdate() {
+      try {
+        const r = await fetch("/admin/update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "check" }) });
+        const p = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(p?.error?.message || "Update check failed.");
+        state.update = p;
+        renderUpdateBanner();
+      } catch (e) { showToast(e.message || "Update check failed."); }
+    }
+
+    async function installUpdate() {
+      if (updateInstallInFlight) return;
+      updateInstallInFlight = true;
+      renderUpdateBanner();
+      try {
+        const r = await fetch("/admin/update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "install" }) });
+        const p = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(p?.error?.message || "The update could not start.");
+        showToast("Ficelle update started. The service will restart shortly.");
+        await pollUntilUpdateReady(180000);
+      } catch (e) {
+        updateInstallInFlight = false;
+        showToast(e.message || "The update could not start.");
+        try { await loadState(); } catch (_) { renderUpdateBanner(); }
+      }
+    }
+
+    async function pollUntilUpdateReady(timeoutMs) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        try {
+          const r = await fetch("/admin/update", { cache: "no-store" });
+          if (r.ok) {
+            const update = await r.json();
+            state.update = update;
+            if (update.status === "failed") {
+              updateInstallInFlight = false;
+              renderUpdateBanner();
+              showToast(update.message || "The update failed.");
+              return;
+            }
+            if (["installed", "up_to_date"].includes(update.status)) {
+              updateInstallInFlight = false;
+              await loadState();
+              showToast("Ficelle is up to date.");
+              return;
+            }
+            renderUpdateBanner();
+          }
+        } catch (e) {
+          // The daemon is expected to disappear briefly while the helper restarts it.
+        }
+      }
+      updateInstallInFlight = false;
+      renderUpdateBanner();
+      showToast("The update is taking longer than expected. Check the banner again shortly.");
+    }
 
     /* ---------- view router ---------- */
     const viewMeta = {
@@ -1727,11 +1847,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      setDraftFusion(cloneJson(state.fusion?.config || {}));
 		      setDraftSettings(cloneJson(state.settings?.config || {}));
 	      for (const pid of profileOrder) { draftProfiles[pid] ||= { mode: "auto", models: [], excluded_models: [], auto_tail: true, requirements: defaultReq() }; draftProfiles[pid].excluded_models ||= []; draftProfiles[pid].requirements = { ...defaultReq(), ...(draftProfiles[pid].requirements || {}) }; }
-	      await Promise.all([loadAudit(false), loadOptionalCompression()]); render();
+      await Promise.all([loadAudit(false), loadOptionalCompression()]); render();
 	      // Refresh the action toolbar now that state (incl. pro_installed) is loaded — it was first
 	      // built by setView() at bootstrap when state was null, so Pro-gated Fusion/Compression
 	      // buttons would otherwise never appear on a direct page load.
-	      setView(currentView);
+      setView(currentView);
+      startUpdateStatusPolling();
     }
     async function loadAudit(after = true) {
       const r = await fetch("/admin/audit?limit=12", { cache: "no-store" }); const p = await r.json();

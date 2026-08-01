@@ -87,7 +87,7 @@ def active_runtime_environment() -> Iterator[None]:
 
 
 with active_runtime_environment():
-    from ficelle import license_ops, router  # noqa: E402
+    from ficelle import license_ops, router, update as update_service  # noqa: E402
 
 
 def _run(cmd: list[str], *, check: bool = False, timeout: int = 60) -> subprocess.CompletedProcess[str]:
@@ -492,6 +492,64 @@ def cmd_install_pro() -> int:
             return 0
 
 
+def cmd_update(args: argparse.Namespace) -> int:
+    try:
+        if bool(getattr(args, "recover", False)):
+            update_service.recover_interrupted_update()
+            return 0
+        if bool(getattr(args, "apply", False)):
+            return update_service.apply_update()
+        if bool(getattr(args, "install", False)):
+            status = update_service.spawn_update()
+            if getattr(args, "json_output", False):
+                print(json.dumps(update_service.public_update_status(), ensure_ascii=False))
+            else:
+                print(
+                    "Ficelle update queued for "
+                    f"{status.get('latest_version') or 'the latest release'}."
+                )
+            return 0
+        status = update_service.check_for_updates(force=True)
+    except update_service.UpdateInProgress as exc:
+        if getattr(args, "json_output", False):
+            print(json.dumps(update_service.public_update_status(), ensure_ascii=False))
+        else:
+            print(str(exc), file=sys.stderr)
+        return 1
+    except (update_service.UpdateError, update_service.UpdateUnavailable) as exc:
+        if getattr(args, "json_output", False):
+            print(json.dumps(update_service.public_update_status(), ensure_ascii=False))
+        else:
+            print(str(exc), file=sys.stderr)
+        return 1
+    except OSError:
+        if getattr(args, "json_output", False):
+            print(json.dumps(update_service.public_update_status(), ensure_ascii=False))
+        else:
+            print("Ficelle could not access the local update state.", file=sys.stderr)
+        return 1
+    if getattr(args, "json_output", False):
+        print(json.dumps(update_service.public_update_status(), ensure_ascii=False))
+        return 0 if status.get("status") != "error" else 1
+    if status.get("update_available"):
+        print(
+            f"Ficelle {status.get('latest_version')} is available "
+            f"(current: {status.get('current_version')})."
+        )
+        if status.get("release_url"):
+            print(f"Release notes: {status['release_url']}")
+        if status.get("pro_update_required"):
+            print(str(status.get("message") or "A compatible Pro update is required."))
+        else:
+            print("Run `ficelle update --install` or use the Admin Control Center to install it.")
+    elif status.get("status") == "error":
+        print(str(status.get("message") or "Ficelle update check failed."), file=sys.stderr)
+        return 1
+    else:
+        print(f"Ficelle is up to date ({status.get('current_version')}).")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ficelle", description="Ficelle local OpenAI-compatible model router")
     sub = parser.add_subparsers(dest="command")
@@ -524,6 +582,13 @@ def main(argv: list[str] | None = None) -> int:
     license_parser.add_argument("key", nargs="?", help="License key (for activate)")
     license_parser.add_argument("--json", action="store_true", dest="json_output", help="Machine-readable status (JSON)")
     sub.add_parser("install-pro", help="Install/upgrade to Ficelle Pro from a license key (detached helper; key via FICELLE_LICENSE_KEY)")
+    update_parser = sub.add_parser("update", help="Check for or install a verified Ficelle update")
+    update_group = update_parser.add_mutually_exclusive_group()
+    update_group.add_argument("--check", action="store_true", help="Check the release service (default).")
+    update_group.add_argument("--install", action="store_true", help="Queue the verified update and restart the service.")
+    update_group.add_argument("--recover", action="store_true", help=argparse.SUPPRESS)
+    update_parser.add_argument("--json", action="store_true", dest="json_output", help="Print machine-readable status.")
+    update_parser.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.command == "serve":
         return router.main_args(["--serve"])
@@ -561,6 +626,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_license(args)
     if args.command == "install-pro":
         return cmd_install_pro()
+    if args.command == "update":
+        return cmd_update(args)
     parser.print_help()
     return 0
 
