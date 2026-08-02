@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ficelle.use_cases.capability_discovery import CapabilityDiscoveryJob
+from ficelle.use_cases.capability_discovery import (
+    ROUTE_REJECTION_VERDICT,
+    VERDICT_BASIS_KEY,
+    CapabilityDiscoveryJob,
+)
 
 
 class BenchmarkMediaError(RuntimeError):
@@ -111,6 +115,14 @@ def pick_vision_fixture(index: int | None = None, *, ports: BenchmarkMediaPorts)
     return number, url
 
 
+# How long a verdict reached by route rejection stays in force. The verified-capability TTL runs for
+# days because "the model answered and got it wrong" is a stable property; a 404 is not — it can be
+# an account-level setting or a provider hiccup, and the model would otherwise stay gated on that
+# profile long after the cause is fixed. One hour is under the default discovery interval, so a
+# recovered route is re-probed on the very next cycle.
+ROUTE_REJECTION_VERDICT_TTL_SECONDS = 3600
+
+
 def benchmark_result_is_aged(
     row: dict[str, Any],
     *,
@@ -119,6 +131,9 @@ def benchmark_result_is_aged(
     now_ts: float | None = None,
 ) -> bool:
     ttl = ports.active_ttl_seconds() if ttl_seconds is None else ttl_seconds
+    # Only ever shortens — `None` and `<= 0` keep their "never ages" meaning below.
+    if ttl is not None and isinstance(row, dict) and row.get(VERDICT_BASIS_KEY) == ROUTE_REJECTION_VERDICT:
+        ttl = min(ttl, ROUTE_REJECTION_VERDICT_TTL_SECONDS)
     if ttl is None or ttl <= 0:
         return False
     stamp = ports.parse_timestamp(ports.evidence_timestamp_value(row))

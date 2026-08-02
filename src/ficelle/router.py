@@ -150,6 +150,7 @@ from ficelle.use_cases.benchmark import (
     vision_benchmark_fixtures as vision_benchmark_fixtures_use_case,
 )
 from ficelle.use_cases.capability_discovery import (
+    VERDICT_BASIS_KEY,
     CapabilityDiscoveryJob,
     clear_background_job_error_in_state,
     discovery_eligible_models as discovery_eligible_models_use_case,
@@ -1690,7 +1691,12 @@ def persisted_profile_model_ids(config: dict[str, Any]) -> set[str]:
     return ids
 
 
-def validate_virtual_profiles_payload(payload: dict[str, Any], config: dict[str, Any], catalog: dict[str, Any]) -> dict[str, Any]:
+def validate_virtual_profiles_payload(
+    payload: dict[str, Any],
+    config: dict[str, Any],
+    catalog: dict[str, Any],
+    extra_stale_ids: Iterable[str] | None = None,
+) -> dict[str, Any]:
     raw_profiles = payload.get("virtual_profiles", payload.get("profiles"))
     if raw_profiles is None and all(is_virtual_profile_id(str(key)) for key in payload):
         raw_profiles = payload
@@ -1712,7 +1718,10 @@ def validate_virtual_profiles_payload(payload: dict[str, Any], config: dict[str,
     # dropping them, so an order survives a model that comes back; the dashboard shows
     # one as "Unknown model" with a control to remove it deliberately. Ids that were
     # never saved are still rejected, which is what catches a malformed client.
-    stale_model_ids = persisted_profile_model_ids(config) - known_model_ids
+    # `extra_stale_ids` carries the ids of a snapshot being restored: an Undo of a
+    # prune replays entries this config no longer holds, so persisted_profile_model_ids
+    # alone would reject exactly the rows the user is trying to get back.
+    stale_model_ids = (persisted_profile_model_ids(config) | set(extra_stale_ids or ())) - known_model_ids
 
     normalized: dict[str, Any] = {}
     for raw_key, raw_profile in raw_profiles.items():
@@ -1738,6 +1747,104 @@ def save_virtual_profiles(config: dict[str, Any], profiles: dict[str, Any]) -> d
     return profiles
 
 
+def model_id_source(model_id: str) -> str:
+    """Inverse of concrete_model_id: `ficelle/<source>/<upstream>` -> `<source>`.
+
+    maxsplit is deliberate — an upstream id carries its own slashes
+    (`nex-agi/nex-n2-pro:free`), so only the first two segments are structural.
+    """
+    parts = str(model_id or "").split("/", 2)
+    return parts[1] if len(parts) == 3 and parts[0] == "ficelle" else ""
+
+
+def prunable_catalog_sources(catalog: dict[str, Any], previous: dict[str, Any]) -> set[str]:
+    """Providers whose listing is trustworthy enough to conclude a model is gone.
+
+    A model id vanishing from the catalog has two very different causes, and only one
+    of them is safe to act on:
+
+    - the provider failed mid-refresh (`error` set, or it listed nothing) — the runner
+      does not preserve cached models on this path, so its whole section drops out.
+      We know nothing; conclude nothing.
+    - the provider answered in full and the id is simply not there any more — e.g.
+      OpenRouter retiring a `:free` variant while keeping the paid model. That id is
+      not coming back, and leaving it in a virtual model is permanent noise.
+
+    A provider can also answer `200` with a truncated listing. `raw_count` collapsing
+    against the previous refresh is the cheap tell, so a halved catalog is treated as
+    suspect rather than as mass deletion.
+    """
+    previous_providers = previous.get("providers") if isinstance(previous.get("providers"), dict) else {}
+    prunable: set[str] = set()
+    for source, summary in (catalog.get("providers") or {}).items():
+        if not isinstance(summary, dict) or summary.get("error"):
+            continue
+        raw_count = safe_int(summary.get("raw_count"), 0)
+        if raw_count <= 0:
+            continue
+        previous_summary = previous_providers.get(source)
+        previous_raw = (
+            safe_int(previous_summary.get("raw_count"), 0)
+            if isinstance(previous_summary, dict)
+            else 0
+        )
+        if previous_raw > 0 and raw_count * 2 < previous_raw:
+            continue
+        prunable.add(str(source))
+    return prunable
+
+
+def prune_stale_profile_models(
+    config: dict[str, Any],
+    catalog: dict[str, Any],
+    previous: dict[str, Any],
+) -> dict[str, list[str]]:
+    """Drop model ids their own provider no longer lists, and record it.
+
+    Runs only from the explicit refresh paths (see refresh_catalog), never from the
+    TTL reload on a routing request, so a chat call never rewrites the user's config.
+
+    The removal is audited as `admin.profiles.prune` rather than applied silently: an
+    order that changes on its own with no way to see why is worse than the stale entry
+    it fixes, and the audit entry carries the before-snapshot the Undo button needs.
+    """
+    prunable = prunable_catalog_sources(catalog, previous)
+    if not prunable:
+        return {}
+    known_ids = {
+        str(model.get("id"))
+        for model in catalog.get("models", [])
+        if isinstance(model, dict) and model.get("id")
+    }
+    before = normalized_virtual_profiles(config)
+    removed: dict[str, list[str]] = {}
+    pruned: dict[str, Any] = {}
+    for profile_id, profile in before.items():
+        updated = dict(profile)
+        gone: list[str] = []
+        for field in ("models", "excluded_models"):
+            kept = []
+            for model_id in profile.get(field) or []:
+                if model_id not in known_ids and model_id_source(model_id) in prunable:
+                    gone.append(str(model_id))
+                    continue
+                kept.append(model_id)
+            updated[field] = kept
+        if gone:
+            removed[profile_id] = gone
+        pruned[profile_id] = updated
+    if not removed:
+        return {}
+    saved = save_virtual_profiles(config, pruned)
+    write_admin_audit(
+        "admin.profiles.prune",
+        before={"virtual_profiles": before},
+        after={"virtual_profiles": saved},
+        metadata={"removed": removed, "sources": sorted(prunable)},
+    )
+    return removed
+
+
 def rollback_virtual_profiles_from_audit(audit_id: str, config: dict[str, Any]) -> dict[str, Any]:
     needle = str(audit_id or "").strip()
     if not needle:
@@ -1746,15 +1853,23 @@ def rollback_virtual_profiles_from_audit(audit_id: str, config: dict[str, Any]) 
     if row is None:
         raise ValueError(f"rollback audit entry not found: {needle}")
     assert row is not None
-    if row.get("action") != "admin.profiles.save":
-        raise ValueError("only admin.profiles.save entries can be rolled back")
+    # A prune writes the same before/after shape as a save, and it is the entry a user
+    # is most likely to want undone — it is the only one they did not ask for.
+    if row.get("action") not in {"admin.profiles.save", "admin.profiles.prune"}:
+        raise ValueError("only admin.profiles.save or admin.profiles.prune entries can be rolled back")
     before = row.get("before") if isinstance(row.get("before"), dict) else {}
     profiles = before.get("virtual_profiles") if isinstance(before.get("virtual_profiles"), dict) else None
     if profiles is None:
         raise ValueError("audit entry has no virtual model snapshot to restore")
     current = normalized_virtual_profiles(config)
     catalog = load_or_refresh_catalog(config)
-    restored = validate_virtual_profiles_payload({"virtual_profiles": profiles}, config, catalog)
+    # The snapshot's own ids are admissible by definition — they were persisted when
+    # the entry was written. Without this, undoing a prune fails on the very rows it
+    # is meant to restore.
+    snapshot_ids = persisted_profile_model_ids({"virtual_profiles": profiles})
+    restored = validate_virtual_profiles_payload(
+        {"virtual_profiles": profiles}, config, catalog, extra_stale_ids=snapshot_ids
+    )
     restored = save_virtual_profiles(config, restored)
     write_admin_audit(
         "admin.rollback",
@@ -3695,6 +3810,11 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
                 "message": safe_detail(raw_value.get("message")),
                 "text_preview": safe_detail(raw_value.get("text_preview")),
             }
+            # Carried so `redacted_benchmark_row` here ages the row on the same clock as the
+            # performance-history view, which redacts the raw row. Otherwise the two admin surfaces
+            # disagree for a route-rejection verdict between its own TTL and the capability TTL.
+            if raw_value.get(VERDICT_BASIS_KEY):
+                row[VERDICT_BASIS_KEY] = raw_value[VERDICT_BASIS_KEY]
             safe_profiles[safe_state_key(profile_id)] = redacted_benchmark_row(str(profile_id), row)
 
     verified_capabilities: dict[str, Any] = {}
@@ -4458,7 +4578,16 @@ def _refresh_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, A
 
 
 def refresh_catalog(config: dict[str, Any]) -> dict[str, Any]:
-    return _refresh_catalog_for_effective_config(effective_runtime_config(config))
+    # Read the cache before publishing over it: prunable_catalog_sources compares each
+    # provider's raw_count against the previous refresh to spot a truncated listing.
+    # Every caller of this function is an explicit action (the Refresh button, a
+    # credential change, `ficelle --refresh`) — the TTL reload on a routing request
+    # goes through _load_or_refresh_catalog_for_effective_config instead, so a chat
+    # call never triggers the prune below.
+    previous = load_runtime_json(CATALOG_PATH, {})
+    catalog = _refresh_catalog_for_effective_config(effective_runtime_config(config))
+    prune_stale_profile_models(config, catalog, previous if isinstance(previous, dict) else {})
+    return catalog
 
 
 def _load_or_refresh_catalog_for_effective_config(config: dict[str, Any], force: bool = False) -> dict[str, Any]:
@@ -6599,6 +6728,10 @@ def record_verified_capability(profile_id: str, model: dict[str, Any], result: d
             "upstream_id": model.get("upstream_id"),
             "message": safe_detail(result.get("message")),
         }
+        # This row — not the benchmark result — is what the routing gate and the re-probe scheduler
+        # read, so the verdict's basis has to travel with it or its short TTL never applies.
+        if result.get(VERDICT_BASIS_KEY):
+            row[VERDICT_BASIS_KEY] = result[VERDICT_BASIS_KEY]
         if status == "pass":
             row["verified_at"] = result.get("ran_at") or now_iso()
         else:

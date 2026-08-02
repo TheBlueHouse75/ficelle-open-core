@@ -386,7 +386,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (s) {
         push("Success rate", Math.round(pct(s.successes, s.requests)) + "% &middot; " + Number(s.successes || 0) + "/" + Number(s.requests || 0) + " calls");
         if (s.latency_ewma != null) push("Avg latency", Number(s.latency_ewma).toFixed(2) + "s");
-        if (s.consecutive_failures) push("Recent failures", '<span style="color:var(--danger)">' + Number(s.consecutive_failures) + " in a row" + (s.last_failure_reason ? " &middot; " + esc(reasonLabel(s.last_failure_reason)) : "") + "</span>");
+        // Kept apart: a caller-caused failure (a too-small max_tokens) updates the last reason
+        // without extending the streak, so pairing them would blame the streak on the wrong event.
+        // Splitting them also surfaces those failures, which carry no streak at all.
+        if (s.consecutive_failures) push("Recent failures", '<span style="color:var(--danger)">' + Number(s.consecutive_failures) + " in a row</span>");
+        if (s.last_failure_reason) push("Last failure", esc(reasonLabel(s.last_failure_reason)));
         if (s.last_success_at) push("Last success", timeChip(s.last_success_at));
       }
       const b = modelBenchmark(m);
@@ -1468,7 +1472,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       return ICONS.auditDefault;
 	    }
 	    function auditTitle(action) {
-	      return ({ "admin.profiles.save": "Saved virtual models", "admin.fusion.save": "Saved fusion settings", "admin.settings.save": "Saved routing settings", "admin.compression.clear": "Cleared compression store", "admin.canary": "Ran a canary health check", "admin.benchmark": "Ran a benchmark", "admin.quarantine.add": "Disabled a model", "admin.quarantine.remove": "Re-enabled a model", "admin.cooldowns.clear_model": "Resumed a model", "admin.cooldowns.clear_provider": "Resumed a provider", "admin.providers.probe": "Probed provider free quota", "admin.refresh": "Refreshed the model catalog" })[action] || action || "Admin action";
+	      return ({ "admin.profiles.save": "Saved virtual models", "admin.profiles.prune": "Removed models their provider dropped","admin.fusion.save": "Saved fusion settings", "admin.settings.save": "Saved routing settings", "admin.compression.clear": "Cleared compression store", "admin.canary": "Ran a canary health check", "admin.benchmark": "Ran a benchmark", "admin.quarantine.add": "Disabled a model", "admin.quarantine.remove": "Re-enabled a model", "admin.cooldowns.clear_model": "Resumed a model", "admin.cooldowns.clear_provider": "Resumed a provider", "admin.providers.probe": "Probed provider free quota", "admin.refresh": "Refreshed the model catalog" })[action] || action || "Admin action";
 	    }
 	    function auditMeta(e) {
 	      const m = e.metadata || {}, parts = [];
@@ -1481,7 +1485,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      if (m.scope) parts.push("scope " + m.scope);
 	      if (m.resource) parts.push(m.resource);
 	      if (m.compression_mode) parts.push("compression " + m.compression_mode);
-	      if (m.removed !== undefined) parts.push(m.removed + " removed");
+	      // A prune reports {virtualModelId: [modelIds]}; every other action reports a count.
+	      if (m.removed && typeof m.removed === "object") {
+	        const dropped = new Set(Object.values(m.removed).flat());
+	        const lanes = Object.keys(m.removed).map((x) => profileLabels[x]?.[0] || x);
+	        parts.push(esc(dropped.size + " model" + (dropped.size > 1 ? "s" : "") + " dropped from " + lanes.join(", ")));
+	      } else if (m.removed !== undefined) parts.push(m.removed + " removed");
 	      if ((m.profiles || []).length) parts.push((m.profiles || []).map((x) => (profileLabels[x]?.[0] || x)).join(", "));
 	      return parts.join(" &middot; ") || e.id;
 	    }
@@ -1489,7 +1498,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const list = $("auditList");
 	      if (!auditEntries.length) { list.innerHTML = '<div class="empty">No admin actions recorded yet.</div>'; return; }
 	      list.innerHTML = auditEntries.map((e) => {
-	        const profileRoll = e.action === "admin.profiles.save" && e.before?.virtual_profiles;
+	        // A prune is the one virtual-model change the user did not ask for, so Undo
+	        // matters there at least as much as on a manual save.
+	        const profileRoll = (e.action === "admin.profiles.save" || e.action === "admin.profiles.prune") && e.before?.virtual_profiles;
 	        const fusionRoll = e.action === "admin.fusion.save" && e.before?.fusion;
 		        const settingsRoll = e.action === "admin.settings.save" && e.before?.settings;
 	        const t = timeAgo(e.logged_at);

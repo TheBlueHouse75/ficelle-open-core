@@ -130,6 +130,15 @@ REQUEST_REJECTION_STATUSES = frozenset({400, 422})
 # strips URLs before matching the false-free markers.
 ROUTE_REJECTION_STATUSES = frozenset({404, 410})
 
+# Stamped on a verdict the probe reached by route rejection rather than by reading an answer. Both
+# are `failed`, but they age differently: "this model answered and got the capability wrong" is a
+# property of the model, while "the route said no" can just as well be an account-level condition
+# (OpenRouter's "No endpoints found matching your data policy") or a provider hiccup. The reader is
+# `benchmark_result_is_aged`, which caps these at a short TTL so a fixed setting recovers in one
+# discovery cycle instead of staying gated for the full verified-capability TTL.
+VERDICT_BASIS_KEY = "verdict_basis"
+ROUTE_REJECTION_VERDICT = "route_rejection"
+
 
 @dataclass(frozen=True)
 class CapabilityDiscoveryJob:
@@ -215,6 +224,9 @@ class CapabilityDiscoveryJob:
         rejected_route = response.status_code in ROUTE_REJECTION_STATUSES and not blocking
         if rejected_request or rejected_route:
             result.update({"status": "fail", "message": f"HTTP {response.status_code}: {reason}"})
+            if rejected_route:
+                # The probe never reached the model, so this verdict ages fast (see the constant).
+                result[VERDICT_BASIS_KEY] = ROUTE_REJECTION_VERDICT
             self.record_benchmark_result(profile_id, model, result)
             self.record_verified_capability(profile_id, model, result)
             return "failed"

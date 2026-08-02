@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from ficelle.use_cases.benchmark import (
+    ROUTE_REJECTION_VERDICT_TTL_SECONDS,
     BenchmarkEvidencePorts,
     BenchmarkMediaError,
     BenchmarkMediaPorts,
@@ -43,6 +44,8 @@ from ficelle.use_cases.benchmark import (
     vision_benchmark_fixtures,
 )
 from ficelle.use_cases.capability_discovery import (
+    ROUTE_REJECTION_VERDICT,
+    VERDICT_BASIS_KEY,
     CapabilityDiscoveryJob,
     clear_background_job_error_in_state,
     discovery_eligible_models,
@@ -324,6 +327,29 @@ def test_benchmark_evidence_helpers_match_test_type_and_ttl():
     assert benchmark_result_matches_current_test("ficelle/auto-tools", stale, ports=ports) is False
     assert stale_score_decay_factor("ficelle/auto-tools", stale, ports=ports) == 0.5
     assert stale_score_decay_factor("ficelle/auto-tools", {"test_type": "wrong", "ran_at": "50"}, ports=ports) == 0.0
+
+
+def test_route_rejection_verdicts_age_out_faster_than_capability_verdicts():
+    """"The route said no" is not the same evidence as "the model answered and got it wrong".
+
+    Both are `failed`, but only the second is a property of the model. A 404 can be an account-level
+    condition — OpenRouter's "No endpoints found matching your data policy" matches no marker — so
+    capping it keeps a profile from staying gated for the full multi-day TTL after the cause is fixed.
+    """
+    long_ttl = ROUTE_REJECTION_VERDICT_TTL_SECONDS * 24
+    just_past_the_short_ttl = ROUTE_REJECTION_VERDICT_TTL_SECONDS + 60
+    ports = evidence_ports(now_seconds=just_past_the_short_ttl, ttl_seconds=long_ttl)
+
+    answered = {"status": "fail", "test_type": "tool_call", "ran_at": "0"}
+    route = {**answered, VERDICT_BASIS_KEY: ROUTE_REJECTION_VERDICT}
+
+    assert benchmark_result_is_aged(answered, ports=ports) is False  # still trusted under the long TTL
+    assert benchmark_result_is_aged(route, ports=ports) is True  # capped, so it is re-probed
+
+    # The cap only ever shortens: a TTL configured below it still wins.
+    short_ports = evidence_ports(now_seconds=100.0, ttl_seconds=10)
+    assert benchmark_result_is_aged(route, ports=short_ports) is True
+    assert benchmark_result_is_aged({**route, "ran_at": "99"}, ports=short_ports) is False
 
 
 def test_mark_and_redact_stale_benchmark_rows_preserve_contract():

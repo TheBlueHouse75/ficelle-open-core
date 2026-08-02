@@ -101,6 +101,14 @@ class FailureMarkers:
 
 
 DEFAULT_FAILURE_MARKERS = FailureMarkers()
+
+# Failures the CALLER caused, not the model. They are still counted and shown — a model that only
+# ever truncates must stay visible rather than keep a clean record — but they do not feed the
+# consecutive-failure streak, whose penalty is cumulative (12 points each, `model_scoring`). Without
+# this, a client looping on a too-small max_tokens would progressively demote every candidate it
+# touches, reordering a whole profile's pool over a limit that says nothing about the models.
+CALLER_CAUSED_FAILURE_REASONS = frozenset({"truncated_before_content"})
+
 PROVIDER_SCOPED_COOLDOWN_REASONS = {"rate_limited", "auth_or_credit"}
 PROVIDER_ERROR_REASONS = PROVIDER_SCOPED_COOLDOWN_REASONS | {"quota_exhausted", "no_free_quota"}
 BENCHMARK_ROUTE_BLOCKING_REASONS = {

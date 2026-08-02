@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ficelle.failures import CooldownPolicy
+from ficelle.failures import CALLER_CAUSED_FAILURE_REASONS, CooldownPolicy
 
 
 StateMutator = Callable[[dict[str, Any]], dict[str, Any] | None]
@@ -262,7 +262,10 @@ def set_model_not_found_quarantine_in_state(
 def _record_failure(record: dict[str, Any], reason: str, *, ports: CooldownStatsPorts) -> None:
     record["requests"] = ports.safe_int(record.get("requests"), 0) + 1
     record["failures"] = ports.safe_int(record.get("failures"), 0) + 1
-    record["consecutive_failures"] = ports.safe_int(record.get("consecutive_failures"), 0) + 1
+    # The streak drives a cumulative score penalty and the selection tie-break, so it stays reserved
+    # for failures the model is answerable for. See CALLER_CAUSED_FAILURE_REASONS.
+    if reason not in CALLER_CAUSED_FAILURE_REASONS:
+        record["consecutive_failures"] = ports.safe_int(record.get("consecutive_failures"), 0) + 1
     record["last_failure_at"] = ports.now_iso()
     record["last_failure_reason"] = reason
     reasons = record.setdefault("failure_reasons", {})

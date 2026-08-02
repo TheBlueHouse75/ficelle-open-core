@@ -4,6 +4,7 @@ import json
 
 from ficelle.failures import (
     BENCHMARK_ROUTE_BLOCKING_REASONS,
+    CALLER_CAUSED_FAILURE_REASONS,
     FailureMarkers,
     PROVIDER_ERROR_REASONS,
     PROVIDER_SCOPED_COOLDOWN_REASONS,
@@ -142,6 +143,18 @@ def test_truncated_before_content_policy_records_the_failure_without_cooling():
     assert policy.quota_cooldown is False
     assert policy.quarantine is None
     assert policy.record_provider_error is False  # the caller's budget is not the provider's fault
+
+
+def test_caller_caused_failures_are_the_only_ones_exempt_from_the_streak():
+    """The consecutive-failure streak is reserved for what the model is answerable for.
+
+    Its penalty is cumulative (12 points each), so counting a caller's too-small max_tokens would let
+    one looping client progressively demote every candidate it touches. The failure is still counted
+    in `requests`/`failures` and still shown — only the streak is left alone.
+    """
+    assert CALLER_CAUSED_FAILURE_REASONS == {"truncated_before_content"}
+    for upstream_fault in ("unavailable", "server_error", "timeout", "empty_assistant_message"):
+        assert upstream_fault not in CALLER_CAUSED_FAILURE_REASONS
 
 
 def test_provider_scoped_policy_keeps_model_and_provider_cooldowns():
