@@ -1619,11 +1619,11 @@ def normalize_virtual_profile(
     known_model_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     if not is_virtual_profile_id(profile_id):
-        raise ValueError(f"profile key must start with ficelle/: {safe_detail(profile_id) or '[redacted]'}")
+        raise ValueError(f"virtual model id must start with ficelle/: {safe_detail(profile_id) or '[redacted]'}")
     if profile_id == FUSION_MODEL_ID:
-        raise ValueError(f"profile key is reserved for Fusion runtime: {FUSION_MODEL_ID}")
+        raise ValueError(f"virtual model id is reserved for Fusion runtime: {FUSION_MODEL_ID}")
     if not is_safe_virtual_profile_id(profile_id):
-        raise ValueError(f"profile key contains unsupported characters: {safe_detail(profile_id) or '[redacted]'}")
+        raise ValueError(f"virtual model id contains unsupported characters: {safe_detail(profile_id) or '[redacted]'}")
     profile = raw_profile if isinstance(raw_profile, dict) else {}
     mode = str(profile.get("mode") or "auto")
     if mode not in {"auto", "manual_order"}:
@@ -1709,7 +1709,7 @@ def rollback_virtual_profiles_from_audit(audit_id: str, config: dict[str, Any]) 
     before = row.get("before") if isinstance(row.get("before"), dict) else {}
     profiles = before.get("virtual_profiles") if isinstance(before.get("virtual_profiles"), dict) else None
     if profiles is None:
-        raise ValueError("audit entry has no profile snapshot to restore")
+        raise ValueError("audit entry has no virtual model snapshot to restore")
     current = normalized_virtual_profiles(config)
     catalog = load_or_refresh_catalog(config)
     restored = validate_virtual_profiles_payload({"virtual_profiles": profiles}, config, catalog)

@@ -21,6 +21,9 @@
       </header>
 
       <section class="update-banner" id="updateBanner" hidden aria-live="polite"></section>
+      <!-- Shown only if the first state load is slow or fails; aria-live so the wait is
+           announced, not just drawn. -->
+      <div class="empty boot-notice" id="bootNotice" hidden aria-live="polite"></div>
 
       <!-- ============ Routing view ============ -->
       <section class="view active" data-view="routing" id="view-routing">
@@ -42,7 +45,7 @@
             <div class="card">
               <div class="card-head">
                 <div>
-                  <h2 id="activeProfileName">Profile</h2>
+                  <h2 id="activeProfileName">Virtual model</h2>
                   <div class="ch-sub" id="activeProfileId"></div>
                 </div>
                 <span class="badge accent" id="eligibleBadge">0 usable</span>
@@ -82,7 +85,7 @@
           <section class="ws-col">
             <div class="card">
               <div class="card-head">
-                <div><h2>Available models</h2><div class="ch-sub">Drag into your order, add, exclude, or restore per profile.</div></div>
+                <div><h2>Available models</h2><div class="ch-sub">Drag into your order, add, exclude, or restore per virtual model.</div></div>
                 <span class="badge" id="modelCountBadge">0 models</span>
               </div>
               <div class="card-body">
@@ -123,7 +126,7 @@
       <section class="view" data-view="settings" id="view-settings">
         <div class="card">
           <div class="card-head">
-            <div><h2>Routing settings</h2><div class="ch-sub">Global resilience controls. They apply to every virtual model, not one profile.</div></div>
+            <div><h2>Routing settings</h2><div class="ch-sub">Global resilience controls. They apply to every virtual model, not to a single one.</div></div>
           </div>
           <div class="card-body" id="settingsControls"></div>
         </div>
@@ -192,7 +195,13 @@
             <div><h2>Generic client configuration</h2><div class="ch-sub">Use this with any OpenAI-compatible client. No secrets included.</div></div>
             <button class="btn sm" type="button" id="copyExportBtn">Copy JSON</button>
           </div>
-          <div class="card-body"><textarea class="codeblock" id="configExport" readonly placeholder="Press &quot;Build snippet&quot; to generate the export."></textarea></div>
+          <div class="card-body">
+            <div class="ep-inline" id="exportEndpoint" hidden>
+              <div><span class="ep-key">Base URL</span><span class="ep-val" id="exportEndpointUrl">&nbsp;</span></div>
+              <div><span class="ep-key">API key</span><span class="ep-val" id="exportEndpointKey">&nbsp;</span></div>
+            </div>
+            <textarea class="codeblock" id="configExport" readonly placeholder="Press &quot;Build snippet&quot; to generate the export."></textarea>
+          </div>
         </div>
       </section>
     </main>
@@ -205,6 +214,14 @@
         </div>
         <div><div class="brand-name">Ficelle</div><div class="brand-sub">Control Center</div></div>
       </div>
+
+      <!-- The address to point any OpenAI-compatible client at. Filled in from
+           location.origin so it stays right when the router runs on a custom port. -->
+      <button class="endpoint" id="endpointCopy" type="button" title="Copy the base URL">
+        <span class="ep-key">OpenAI-compatible endpoint</span>
+        <span class="ep-val" id="endpointUrl">&nbsp;</span>
+        <span class="ep-hint">Click to copy &middot; api key <code>ficelle-local</code></span>
+      </button>
 
       <nav class="nav" id="nav">
         <div class="nav-label">Workspace</div>

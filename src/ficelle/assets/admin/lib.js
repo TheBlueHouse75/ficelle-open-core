@@ -8,7 +8,7 @@ export const profileOrder = [
 export const fusionModelId = "ficelle/auto-fusion";
 export const profileLabels = {
   "ficelle/auto-orchestrator": ["Main orchestrator", "Your primary agent brain — the model most requests go to."],
-  "ficelle/auto-tools": ["Tool fallback", "Backup pool that takes over when the main model fails a tool call."],
+  "ficelle/auto-tools": ["Tool fallback", "A backup that takes over when the main model fails a tool call."],
   "ficelle/auto-json": ["Structured JSON", "Extraction and parsing jobs that need clean JSON back."],
   "ficelle/auto-compression": ["Compression", "Short, bounded summaries for chat compaction."],
   "ficelle/auto-long": ["Long context", "Very large prompts where the context window is the limit."],
@@ -57,6 +57,8 @@ export const CAP_STATE_META = {
 export const $ = (id) => document.getElementById(id);
 export const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 export const cloneJson = (v) => JSON.parse(JSON.stringify(v || {}));
+// Shared by every "wait for the daemon" loop in app.js, which each used to inline it.
+export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Provider display labels are overlaid from the backend (/admin/state provider_labels) so
 // the closed pack's providers — incl. the grey-market relays, which are NOT named in this
@@ -135,7 +137,7 @@ export const REASON_LABELS = {
   model_not_found: "Model not found upstream",
   benchmark_failed: "Benchmark failed",
   failed_capability_check: "Capability failed",
-  failed_benchmark: "Profile benchmark failed",
+  failed_benchmark: "Virtual model benchmark failed",
   upstream_failure: "Upstream failure",
   no_available_model: "No available model",
   mid_stream_failure: "Mid-stream failure",
@@ -174,4 +176,11 @@ export function showToast(msg) {
   $("toast").classList.add("show");
   clearTimeout(showToast.t);
   showToast.t = setTimeout(() => $("toast").classList.remove("show"), 2800);
+}
+
+// The clipboard rejects for reasons the user can act on (permission denied, document not
+// focused), so every caller needs the fallback message — not a raw DOMException in a toast.
+export async function copyToClipboard(text, okMessage, failMessage = "Copy failed.") {
+  try { await navigator.clipboard.writeText(text); showToast(okMessage); }
+  catch { showToast(failMessage); }
 }

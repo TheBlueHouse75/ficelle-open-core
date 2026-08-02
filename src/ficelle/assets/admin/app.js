@@ -1,7 +1,7 @@
-import { profileOrder, fusionModelId, profileLabels, profilePresets, CAP_PROFILE, CAP_STATE_META, $, esc, cloneJson,
+import { profileOrder, fusionModelId, profileLabels, profilePresets, CAP_PROFILE, CAP_STATE_META, $, esc, cloneJson, sleep,
   providerLabel, setProviderLabels, formatContext, formatTokenLimit, formatSeconds, formatDuration, pct, timeAgo, timeChip,
   hasIn, hasOut, hasParam, runtimeKey, freeAccess, freeModeLabel,
-  providerFreeModeLabel, reasonDescription, reasonLabel, reasonWithCode, showToast } from "./lib.js";
+  providerFreeModeLabel, reasonDescription, reasonLabel, reasonWithCode, showToast, copyToClipboard } from "./lib.js";
 import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeProfile, dragged, modelFilters, currentView, expandedModels,
   compressionPayload, setState, setAuditEntries, setDraftProfiles, setDraftFusion, setDraftSettings, setCompressionPayload, setActiveProfile, setDragged, setCurrentView,
   selectedProvider, setSelectedProvider,
@@ -322,7 +322,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const refCaps = m.capabilities_from_reference || [];
       if (refCaps.length) push("Reference prior", esc(refCaps.join(", ")) + (m.reference_confidence ? " &middot; " + esc(m.reference_confidence) + " confidence" : ""));
       const failed = modelFailedProfileEvidence(m);
-      if (failed) push("Profile guard", '<span style="color:var(--warn)">' + esc(reasonWithCode(failed.reason)) + "</span> &middot; " + esc(failed.message || reasonDescription(failed.reason)) + " &middot; Retest candidates to refresh.");
+      if (failed) push("Virtual model guard", '<span style="color:var(--warn)">' + esc(reasonWithCode(failed.reason)) + "</span> &middot; " + esc(failed.message || reasonDescription(failed.reason)) + " &middot; Retest candidates to refresh.");
       const cd = modelCooldown(m);
       if (cd) push("Cooling down", esc(formatSeconds(cd.seconds_remaining)) + " left &middot; " + esc(reasonWithCode(cd.reason)));
       const qc = modelQuotaCooldown(m);
@@ -612,7 +612,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 
     /* ---------- available-models filter + sort bar ---------- */
     const CAP_OPTIONS = [["json", "JSON"], ["reasoning", "Reasoning"], ["image", "Vision / image"], ["audio", "Audio"], ["video", "Video"]];
-    const SORT_OPTIONS = [["score", "Score (profile)"], ["latency", "Latency"], ["success", "Success rate"], ["context", "Context"], ["name", "Name"]];
+    const SORT_OPTIONS = [["score", "Score (this virtual model)"], ["latency", "Latency"], ["success", "Success rate"], ["context", "Context"], ["name", "Name"]];
     const CHEV = '<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>';
     const DIR_DESC = '<path d="M12 5v14M6 13l6 6 6-6"/>';
     const DIR_ASC = '<path d="M12 19V5M6 11l6-6 6 6"/>';
@@ -629,7 +629,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (id === "prov") return "Providers" + (f.providers.size ? '<span class="flt-count">' + f.providers.size + "</span>" : "");
       if (id === "cap") return "Capabilities" + (f.caps.size ? '<span class="flt-count">' + f.caps.size + "</span>" : "");
       if (id === "ctx") { const t = contextTiers().find(([v]) => v === f.minContext); return f.minContext && t ? esc(t[1]) : "Context"; }
-      if (id === "sort") { const s = SORT_OPTIONS.find(([v]) => v === f.sortKey); return "Sort: " + esc((s ? s[1] : "Score").replace(" (profile)", "")); }
+      if (id === "sort") { const s = SORT_OPTIONS.find(([v]) => v === f.sortKey); return "Sort: " + esc((s ? s[1] : "Score").replace(" (this virtual model)", "")); }
       return "";
     }
     function fltTriggerOn(id) {
@@ -1109,7 +1109,6 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      setTimeout(function () { window.location.reload(); }, 900);
 	    }
 	    async function pollUntilProReady(timeoutMs) {
-	      const sleep = function (ms) { return new Promise(function (res) { setTimeout(res, ms); }); };
 	      const deadline = Date.now() + timeoutMs;
 	      while (Date.now() < deadline) {
 	        await sleep(2500);
@@ -1209,7 +1208,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        '<div class="settings-grid">' +
 	          fusionSetting("setVerifiedTtl", "Capability re-check interval (seconds)",
 	            settingsNumber("setVerifiedTtl", "verified_capability_ttl_seconds", s.verified_capability_ttl_seconds, 86400, 2592000),
-	            "How long a model's verified or failed capability verdict is trusted before Ficelle re-benchmarks it for a specialized profile (auto-tools, auto-json, auto-reasoning, vision/video/audio). Minimum 86400s (24h) so benchmarks don't run too often; default 604800s (7 days); maximum 2592000s (30 days).") +
+	            "How long a model's verified or failed capability verdict is trusted before Ficelle re-benchmarks it for a specialized virtual model (auto-tools, auto-json, auto-reasoning, vision/video/audio). Minimum 86400s (24h) so benchmarks don't run too often; default 604800s (7 days); maximum 2592000s (30 days).") +
 	        "</div>";
 	      const benchmarkBudgetControls =
 	        '<div class="settings-grid">' +
@@ -1224,13 +1223,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        '<div class="settings-grid">' +
 	          settingsToggle("setRouteOnRef", "route_on_capability_reference", "Route on capability reference (Phase B)",
 	            !!s.route_on_capability_reference,
-	            "When on, a model whose specialized capability is confirmed by the high-confidence curated capability reference can route to that profile (auto-tools, auto-json, auto-reasoning, vision/video/audio) before it has been benchmarked. A failed benchmark always overrides, and verdicts are still re-checked on the interval above. Off by default — turn it on only once the capability-discrepancy log shows the reference agreeing with your providers' benchmarks.") +
+	            "When on, a model whose specialized capability is confirmed by the high-confidence curated capability reference can route to that virtual model (auto-tools, auto-json, auto-reasoning, vision/video/audio) before it has been benchmarked. A failed benchmark always overrides, and verdicts are still re-checked on the interval above. Off by default — turn it on only once the capability-discrepancy log shows the reference agreeing with your providers' benchmarks.") +
 	        "</div>";
 	      const autoBenchmarkControls =
 	        '<div class="settings-grid">' +
 	          settingsToggle("setAutoBench", "auto_benchmark_enabled", "Discover capabilities automatically",
 	            s.auto_benchmark_enabled !== false,
-	            "When on, Ficelle probes new/unproven models in the background and maps each to every profile it actually supports — so you don't click Canary. Each cycle takes a few not-yet-fully-discovered models and tests them across all capabilities (tools, json, reasoning, vision...). Failing one capability only marks that one as failed; it never benches the model elsewhere. Verdicts re-test themselves after the re-check interval above.") +
+	            "When on, Ficelle probes new/unproven models in the background and maps each to every virtual model it actually supports — so you don't click Canary. Each cycle takes a few not-yet-fully-discovered models and tests them across all capabilities (tools, json, reasoning, vision...). Failing one capability only marks that one as failed; it never benches the model elsewhere. Verdicts re-test themselves after the re-check interval above.") +
 	          fusionSetting("setAutoBenchInterval", "Discovery cycle interval (seconds)",
 	            settingsNumber("setAutoBenchInterval", "auto_benchmark_interval_seconds", s.auto_benchmark_interval_seconds, 3600, 604800),
 	            "How often the background loop runs a discovery cycle. Minimum 3600s (1h); default 10800s (3h); maximum 604800s (7 days).") +
@@ -1243,10 +1242,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	          fusionSettingsGroup("Retry budget", "How hard Ficelle tries within a virtual model's pool before returning an error to the client.", retryControls) +
 	          fusionSettingsGroup("Cooldown durations", "When an upstream fails, Ficelle benches it so the next request skips it. Each row is the bench time (in seconds) for one kind of failure. Higher means more cautious; lower retries a flaky model sooner.", cooldownControls) +
 	          fusionSettingsGroup("Timeouts and quota probes", "Network time limits and how often Ficelle re-checks a provider whose free quota ran out.", timeoutControls) +
-	          fusionSettingsGroup("Capability re-verification", "How long a benchmark verdict (verified or failed) is trusted before a model is re-tested for a specialized profile. Longer means fewer benchmarks but slower recovery when a provider changes a model.", verificationControls) +
+	          fusionSettingsGroup("Capability re-verification", "How long a benchmark verdict (verified or failed) is trusted before a model is re-tested for a specialized virtual model. Longer means fewer benchmarks but slower recovery when a provider changes a model.", verificationControls) +
 	          fusionSettingsGroup("Benchmark probe budgets", "Input size of the heavy capability probes. Bigger long-context/compression probes test deeper but cost more free-quota tokens per benchmarked model. Lower them if quotas are tight.", benchmarkBudgetControls) +
 	          fusionSettingsGroup("Capability reference routing", "Opt-in (Phase B): trust the curated capability prior for routing before a model is benchmarked. Safe defaults keep this off; a failed benchmark always overrides it.", referenceRoutingControls) +
-	          fusionSettingsGroup("Automatic capability discovery", "Ficelle probes new models in the background and maps each to every profile it supports, so you don't click Canary. On by default; bounded per cycle and quota-aware.", autoBenchmarkControls) +
+	          fusionSettingsGroup("Automatic capability discovery", "Ficelle probes new models in the background and maps each to every virtual model it supports, so you don't click Canary. On by default; bounded per cycle and quota-aware.", autoBenchmarkControls) +
 	        "</div>";
 	      $("settingsControls").querySelectorAll("[data-settings-field]").forEach((el) => el.addEventListener("change", readSettingsDraft));
 	    }
@@ -1544,7 +1543,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const f = requestFilters;
       const sources = (requestsSummary?.by_source || []).map((r) => r.source).filter(Boolean);
       if (f.source && !sources.includes(f.source)) sources.push(f.source);
-      const profileOpts = '<option value="">All profiles</option>' + [...profileOrder, fusionModelId].map((p) => reqOption(p, (profileLabels[p]?.[0] || p), f.profile)).join("");
+      const profileOpts = '<option value="">All virtual models</option>' + [...profileOrder, fusionModelId].map((p) => reqOption(p, (profileLabels[p]?.[0] || p), f.profile)).join("");
       const sourceOpts = '<option value="">All providers</option>' + sources.map((s) => reqOption(s, providerLabel(s), f.source)).join("");
       const reasons = (requestsSummary?.by_reason || []).map((r) => r.reason).filter(Boolean);
       if (f.reason && !reasons.includes(f.reason)) reasons.push(f.reason);
@@ -1555,7 +1554,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const hasFilter = f.profile || f.source || f.reason || f.status || f.q;
       el.innerHTML =
         '<label class="field req-search">' + ic(ICONS.search) + '<input id="reqSearch" type="search" placeholder="Search id, model, upstream" value="' + esc(f.q || "") + '"></label>' +
-        '<select id="reqProfile" class="req-select" aria-label="Profile">' + profileOpts + "</select>" +
+        '<select id="reqProfile" class="req-select" aria-label="Virtual model">' + profileOpts + "</select>" +
         '<select id="reqSource" class="req-select" aria-label="Provider">' + sourceOpts + "</select>" +
         '<select id="reqReason" class="req-select" aria-label="Outcome">' + reasonOpts + "</select>" +
         '<select id="reqStatus" class="req-select" aria-label="HTTP status">' + statusOpts + "</select>" +
@@ -1745,7 +1744,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     async function pollUntilUpdateReady(timeoutMs) {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 2500));
+        await sleep(2500);
         try {
           const r = await fetch("/admin/update", { cache: "no-store" });
           if (r.ok) {
@@ -1784,7 +1783,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       license: { eyebrow: "Configure", title: "License", desc: "Activate, refresh, or release this machine’s Ficelle Pro license, and check its current status." },
 	      health: { eyebrow: "Observe", title: "Health", desc: "Canary status and the guardrails currently holding models or providers out of rotation." },
 	      performance: { eyebrow: "Observe", title: "Performance", desc: "What actually happened: winning models, fallbacks, success rates, and latency per virtual model." },
-	      requests: { eyebrow: "Observe", title: "Requests", desc: "Every routed request, newest first: profile, provider, upstream model, outcome, error type, and latency — with health aggregates over a window." },
+	      requests: { eyebrow: "Observe", title: "Requests", desc: "Every routed request, newest first: virtual model, provider, upstream model, outcome, error type, and latency — with health aggregates over a window." },
 	      audit: { eyebrow: "Observe", title: "Audit", desc: "Every local change, newest first. Virtual model saves can be undone." },
       export: { eyebrow: "Ship it", title: "Export", desc: "Generate a generic OpenAI-compatible client configuration. No provider secrets included." }
     };
@@ -1841,7 +1840,18 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 
     /* ---------- data + actions ---------- */
 	    async function loadState() {
-	      const r = await fetch("/admin/state", { cache: "no-store" }); if (!r.ok) throw new Error("state failed: " + r.status);
+	      // Only this fetch can say "the daemon is not up yet"; everything below runs after it
+	      // answered. bootstrapState reads `bootRetryable` rather than sniffing the error type,
+	      // because a TypeError thrown by loadAudit or render() would otherwise be mistaken for
+	      // an unreachable service and replay the whole pipeline for 20s.
+	      let r;
+	      try { r = await fetch("/admin/state", { cache: "no-store" }); }
+	      catch (e) { e.bootRetryable = true; throw e; }
+	      if (!r.ok) {
+	        const err = new Error("state failed: " + r.status);
+	        err.status = r.status; err.bootRetryable = r.status >= 500;
+	        throw err;
+	      }
 	      setState(await r.json());
 	      setDraftProfiles(cloneJson(state.virtual_profiles || {}));
 	      setDraftFusion(cloneJson(state.fusion?.config || {}));
@@ -1873,13 +1883,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     async function saveProfiles(successMessage) {
       const toastMessage = typeof successMessage === "string" ? successMessage : "Virtual models saved.";
-      const btn = $("saveBtn"); if (btn) btn.disabled = true;
+      const btn = $("saveBtn"); setButtonLoading(btn, true);
       try {
         const r = await fetch("/admin/profiles", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ virtual_profiles: draftProfiles }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "save failed");
         state.virtual_profiles = p.virtual_profiles; setDraftProfiles(cloneJson(p.virtual_profiles));
         showToast(toastMessage); await loadAudit(false); render();
-      } catch (e) { showToast(e.message || String(e)); } finally { if (btn) btn.disabled = false; }
+      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(btn, false); }
     }
 	    async function rollbackProfiles(id) {
 	      if (!id || !window.confirm("Undo to this saved snapshot?")) return;
@@ -1901,7 +1911,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      } catch (e) { showToast(e.message || String(e)); }
 	    }
 	    async function saveRouterSettings(buttonId, successMessage, failureMessage, options = {}) {
-	      const btn = $(buttonId); if (btn) btn.disabled = true;
+	      const btn = $(buttonId); setButtonLoading(btn, true);
 	      try {
 	        const settings = readSettingsDraft();
 	        const r = await fetch("/admin/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings }) });
@@ -1911,7 +1921,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 		        if (options.refreshCompression) await Promise.all([loadAudit(false), loadOptionalCompression()]);
 	        else await loadAudit(false);
 	        render();
-	      } catch (e) { showToast(e.message || String(e)); } finally { if (btn) btn.disabled = false; }
+	      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(btn, false); }
 	    }
 	    async function saveSettings() {
 	      await saveRouterSettings("saveSettingsBtn", "Routing settings saved.", "settings save failed");
@@ -1929,10 +1939,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	    // core-only install. Retrieve/clear are wired entirely inside the Pro retrieval UI (pro-views.js).
 	    async function saveCompression() { return proViews.saveCompression ? proViews.saveCompression(proApi) : undefined; }
 		    async function refreshCatalog() {
-      const b = $("refreshBtn"); if (b) b.disabled = true;
+      const b = $("refreshBtn"); setButtonLoading(b, true);
       try { const r = await fetch("/admin/refresh", { method: "POST" }); const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "refresh failed");
         showToast("Catalog refreshed: " + (p.summary?.model_count || 0) + " models."); await loadState();
-      } catch (e) { showToast(e.message || String(e)); } finally { if (b) b.disabled = false; }
+      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(b, false); }
     }
     async function runBenchmark() {
       if (benchmarkRunInFlight) return;
@@ -1966,11 +1976,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       }
     }
     async function runCanary() {
-      const b = $("canaryBtn"); if (b) b.disabled = true;
+      const b = $("canaryBtn"); setButtonLoading(b, true);
       try { const r = await fetch("/admin/canary", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "canary failed");
         showToast("Canary " + p.canary_status + ": " + (p.summary?.passed || 0) + "/" + (p.summary?.total || 0) + " passed."); await loadState();
-      } catch (e) { showToast(e.message || String(e)); } finally { if (b) b.disabled = false; }
+      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(b, false); }
     }
     async function clearModelCooldown(id) {
       try { const r = await fetch("/admin/cooldowns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "clear", scope: "model", model_id: id }) });
@@ -2025,8 +2035,24 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     async function exportConfig() {
       const r = await fetch("/admin/export/generic"); const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "export failed");
       $("configExport").value = JSON.stringify(p.config || {}, null, 2); showToast("Configuration ready.");
+      // Spell out the same two values the JSON below carries, from the same payload: the
+      // server derives base_url from config.host/port, so deriving it here from
+      // location.origin instead would print two different URLs in one card.
+      $("exportEndpointUrl").textContent = p.config?.base_url || "";
+      $("exportEndpointKey").textContent = p.config?.api_key || "";
+      $("exportEndpoint").hidden = false;
     }
-    async function copyExport() { const t = $("configExport").value; if (!t) { showToast("Build the snippet first."); return; } await navigator.clipboard.writeText(t); showToast("JSON copied."); }
+    async function copyExport() { const t = $("configExport").value; if (!t) { showToast("Build the snippet first."); return; } await copyToClipboard(t, "JSON copied."); }
+
+    /* ---------- endpoint card ---------- */
+    function initEndpointCard() {
+      // location.origin, not the config: this card paints before any fetch, and the address
+      // the dashboard was reached on is by definition one that resolves. The Export view
+      // shows the server's own base_url instead — see exportConfig.
+      const url = location.origin + "/v1";
+      $("endpointUrl").textContent = url;
+      $("endpointCopy").addEventListener("click", () => copyToClipboard(url, "Endpoint copied: " + url, "Copy failed. The endpoint is " + url));
+    }
 
     /* ---------- theme ---------- */
     const THEME_KEY = "ficelle.theme";
@@ -2056,6 +2082,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("clearProfileBtn").addEventListener("click", () => setProfile({ mode: "auto", models: [], excluded_models: [] }));
       $("searchInput").addEventListener("input", renderAvailable);
       $("copyExportBtn").addEventListener("click", () => copyExport().catch((e) => showToast(e.message)));
+      initEndpointCard();
       // Close any open filter popover when clicking outside the bar. Capture phase so it
       // still fires even though model-card buttons stopPropagation on bubble.
       document.addEventListener("click", (e) => { if (!e.target.closest("#filterBar .flt")) closeFilterPops(); }, true);
@@ -2090,4 +2117,46 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     initTheme(); initNav(); initStaticControls();
     // A deep-linked key means the user just bought Pro — land on the License view to unlock.
     setView(deepLinkedKey ? "license" : (location.hash || "#/routing").replace("#/", ""));
-    loadState().catch((e) => showToast(e.message || String(e)));
+
+    /* First load is a race against the daemon: `bootstrap-ficelle.py` starts the service
+       and prints the dashboard URL in the same breath, and launchd may still be restarting
+       it. A single failed load used to leave the page on an ambiguous "0 usable / 0 models"
+       with nothing but a toast that faded away, and no retry — the user had to guess to
+       reload. The notice is armed on a timer rather than shown upfront: the first
+       /admin/state can also simply be *slow* (it builds the catalog), and a pending fetch
+       never reaches a catch — so an error-only notice would never paint in that case,
+       while showing it upfront would flash on every healthy load. */
+    const BOOT_DEADLINE_MS = 20000; // matches wait_for_admin_status() in cli.py
+    const BOOT_NOTICE_DELAY_MS = 600;
+    function bootNotice(text) {
+      const el = $("bootNotice");
+      el.textContent = text;
+      el.hidden = false;
+    }
+    async function bootstrapState() {
+      const slow = setTimeout(() => bootNotice("Waiting for the Ficelle service to come up…"), BOOT_NOTICE_DELAY_MS);
+      const deadline = Date.now() + BOOT_DEADLINE_MS;
+      let lastError = null;
+      let attempt = 0;
+      try {
+        while (Date.now() < deadline) {
+          try {
+            await loadState();
+            $("bootNotice").hidden = true;
+            return;
+          } catch (e) {
+            lastError = e;
+            // Only "nobody answered yet" is worth retrying — loadState tags that case
+            // itself. A 4xx, or any failure after /admin/state already returned 200, would
+            // replay the whole state+audit+render pipeline a dozen times for one outcome.
+            if (!e?.bootRetryable) break;
+            await sleep(Math.min(2000, 300 * ++attempt));
+          }
+        }
+      } finally {
+        clearTimeout(slow);
+      }
+      bootNotice("Can't reach the Ficelle service. Check it with `ficelle status`, then reload this page.");
+      showToast(lastError ? (lastError.message || String(lastError)) : "Loading the router state failed.");
+    }
+    bootstrapState();

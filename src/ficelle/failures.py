@@ -226,7 +226,7 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
     if reason_counts.get("auth_or_credit"):
         actions.append("Check provider credentials/credits, then clear the provider cooldown after fixing it.")
     if reason_counts.get("rate_limited"):
-        actions.append("Wait for the provider cooldown or switch this profile to another healthy provider.")
+        actions.append("Wait for the provider cooldown or switch this virtual model to another healthy provider.")
     if reason_counts.get("billing_or_paid"):
         actions.append("Inspect the anti false-free guard result; refresh the catalog before re-enabling the model.")
     if reason_counts.get("no_free_quota"):
@@ -236,7 +236,7 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
     if reason_counts.get("server_error"):
         actions.append("Retry after the short model cooldown or quarantine the unstable upstream.")
     if reason_counts.get("timeout"):
-        actions.append("Ficelle timed out a slow upstream and tried the next candidate; reduce this profile's timeout or quarantine repeat offenders.")
+        actions.append("Ficelle timed out a slow upstream and tried the next candidate; reduce this virtual model's timeout or quarantine repeat offenders.")
     if reason_counts.get("empty_assistant_message") or reason_counts.get("invalid_success_json"):
         actions.append("Inspect route logs and verified capabilities; this upstream returned HTTP 200 without a usable assistant message.")
     if not actions:

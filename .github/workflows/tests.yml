@@ -1,6 +1,9 @@
 name: tests
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -22,3 +25,7 @@ jobs:
         run: python -m pip install -e '.[dev]'
       - name: Run tests
         run: python -m pytest -q
+      # The dashboard ships as static ES modules with no build step, so a syntax error in
+      # them reaches users as a blank page. node is preinstalled on ubuntu-latest.
+      - name: Syntax-check the dashboard assets
+        run: for f in src/ficelle/assets/admin/*.js; do node --check "$f"; done

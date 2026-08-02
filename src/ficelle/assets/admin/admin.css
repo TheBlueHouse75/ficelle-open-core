@@ -165,6 +165,25 @@
     .brand-name { font-family: var(--font-display); font-weight: 800; font-size: 19px; letter-spacing: -0.02em; line-height: 1; }
     .brand-sub { font-size: 11px; color: var(--text-muted); margin-top: 3px; letter-spacing: 0.04em; }
 
+    /* Endpoint card: the one thing a new user needs before anything else here is
+       useful — where to point their client. Lives in the rail so every view shows it. */
+    .endpoint {
+      display: grid; gap: 3px; width: 100%; text-align: left;
+      padding: 10px 11px; margin-bottom: 6px;
+      border-radius: var(--radius-sm); border: 1px solid var(--border);
+      background: var(--surface-1); cursor: pointer;
+      transition: background 0.16s var(--ease), border-color 0.16s var(--ease);
+    }
+    .endpoint:hover { background: var(--surface-2); border-color: var(--border-strong); }
+    .endpoint .ep-hint { font-size: 10.5px; color: var(--text-muted); }
+    .endpoint .ep-hint code { font-family: var(--font-mono); }
+    /* One label/value pair for both places the endpoint is shown (rail card, Export view);
+       the rail is tighter, expressed as a delta rather than a parallel set of names. */
+    .ep-key { font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--text-muted); }
+    .ep-val { font-family: var(--font-mono); font-size: 12.5px; color: var(--brand); overflow-wrap: anywhere; }
+    .endpoint .ep-key { font-size: 10px; letter-spacing: 0.08em; }
+    .endpoint .ep-val { font-size: 11.5px; }
+
     .nav { display: flex; flex-direction: column; gap: 3px; }
     .nav-label { font-size: 10.5px; font-weight: 700; letter-spacing: 0.13em; text-transform: uppercase; color: var(--text-muted); padding: 8px 10px 4px; }
     .nav-item {
@@ -182,12 +201,10 @@
       background: var(--surface-2); border: 1px solid var(--border);
     }
     .nav-item:hover { background: var(--surface-2); color: var(--text); }
-    /* Active = the website's "live route" treatment: brand wash, brand hairline,
-       and a solid left edge (same inset rule as the routing card on ficelle.ai). */
+    /* Active = the website's "live route" treatment: brand wash + brand hairline. */
     .nav-item.active {
       background: var(--brand-wash);
       border-color: var(--brand-line);
-      box-shadow: inset 3px 0 0 var(--brand);
       color: var(--text);
     }
     .nav-item.active svg { opacity: 1; color: var(--brand); }
@@ -358,7 +375,7 @@
       transition: border-color 0.16s var(--ease), background 0.16s var(--ease);
     }
     .profile-tab:hover { background: var(--surface-2); }
-    .profile-tab.active { border-color: var(--brand-line); background: var(--brand-wash); box-shadow: inset 3px 0 0 var(--brand); }
+    .profile-tab.active { border-color: var(--brand-line); background: var(--brand-wash); }
     .profile-tab .pt-name { font-weight: 620; font-size: 13.5px; }
     .profile-tab .pt-id { grid-column: 1 / -1; font-family: var(--font-mono); font-size: 10.5px; color: var(--brand); }
     .profile-tab .pt-meta { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-muted); }
@@ -437,6 +454,8 @@
     .scroll::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
 
     .empty { border: 1px dashed var(--border-strong); border-radius: var(--radius-sm); color: var(--text-muted); padding: 28px 18px; text-align: center; font-size: 13px; background: color-mix(in srgb, var(--surface-2) 50%, transparent); }
+    /* Boot notice: an .empty block promoted to page level, under the sticky header. */
+    .boot-notice { margin-bottom: 18px; }
 
     /* ============ Model card (expandable) ============ */
     .mcard {
@@ -559,7 +578,7 @@
       cursor: pointer; transition: background 0.16s var(--ease), border-color 0.16s var(--ease), color 0.16s var(--ease);
     }
     .prov-list-item:hover { background: var(--surface-2); color: var(--text); }
-    .prov-list-item.active { background: var(--brand-wash); border-color: var(--brand-line); box-shadow: inset 3px 0 0 var(--brand); color: var(--text); }
+    .prov-list-item.active { background: var(--brand-wash); border-color: var(--brand-line); color: var(--text); }
     .prov-list-item .provider-logo { width: 30px; height: 30px; border-radius: 9px; }
     .prov-list-item .provider-logo .mark { width: 16px; height: 16px; }
     .prov-list-item .provider-logo .letter { font-size: 14px; }
@@ -613,6 +632,14 @@
     .audit-time { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
 
     /* ============ Export ============ */
+    /* Export view: the same connection details as the rail card, spelled out before the JSON. */
+    .ep-inline { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-bottom: 14px; }
+    /* An author-level `display` beats the UA's [hidden] rule, so opt back in explicitly —
+       same pairing as .update-banner above. Without it the labels paint with empty values
+       before the snippet is built. */
+    .ep-inline[hidden] { display: none; }
+    .ep-inline > div { display: flex; align-items: baseline; gap: 8px; }
+
     .codeblock { width: 100%; min-height: 320px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--bg-1); color: var(--text-soft); padding: 14px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; resize: vertical; }
 
     /* ============ Fusion ============ */
@@ -766,6 +793,9 @@
       }
       .brand { padding: 0; }
       .brand-sub { display: none; }
+      /* Rail turns into a top bar: the endpoint collapses to its URL only, still copyable. */
+      .endpoint { width: auto; margin-bottom: 0; padding: 7px 10px; flex: none; }
+      .endpoint .ep-key, .endpoint .ep-hint { display: none; }
       .nav { flex-direction: row; gap: 4px; }
       .nav-label, .nav-item .nav-text, .nav-item .nav-count { display: none; }
       .nav-item { padding: 9px; }
