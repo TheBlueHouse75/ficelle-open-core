@@ -480,6 +480,13 @@
     .mcard-name { font-weight: 620; font-size: 13.5px; line-height: 1.25; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .mcard-sub { color: var(--text-muted); font-size: 12px; margin-top: 2px; display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }
     .mcard-sub .sep { opacity: 0.4; }
+    /* Status badge stacks above the action row rather than beside it: the third Routing
+       column is narrow, and a wrapped "Provider paused" would push the buttons around. */
+    .mcard-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+    /* Only pin to the top when there is a badge to pin: on a card without one the action
+       row should stay vertically centred, as it was before. */
+    .mcard-right:has(.mcard-status) { align-self: start; }
+    .mcard-status { white-space: nowrap; }
     .mcard-actions { display: flex; gap: 5px; align-items: center; }
     .iconbtn {
       width: 30px; height: 30px; border-radius: var(--radius-pill); display: inline-grid; place-items: center;

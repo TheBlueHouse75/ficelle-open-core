@@ -81,6 +81,69 @@ def test_quota_exhausted_policy_sets_recoverable_quota_cooldown_only():
     assert policy.model_cooldown is False
 
 
+def test_tokens_per_minute_rejection_is_model_scoped_not_a_paid_signal():
+    """HTTP 413 is a transient per-model throughput limit, not a payment demand or a provider fault.
+
+    `docs/components/router.md` described this classification long before any code implemented it,
+    and the admin Settings page shipped a cooldown field bound to a key that existed nowhere in
+    Python — so the field silently discarded whatever an operator typed, and a real TPM rejection
+    fell through to `unavailable` and its 600s bench instead of the documented 120s.
+    """
+    tpm = "Request too large for model llama-3.3-70b on tokens per minute (TPM): Limit 8000, Requested 95722"
+    assert classify_failure(413, tpm) == "request_too_large"
+    # Mapping it to rate_limited would cool every model of the provider; billing_or_paid would
+    # quarantine it for 24h. Neither is right for a limit that recharges on its own.
+    assert "request_too_large" not in PROVIDER_SCOPED_COOLDOWN_REASONS
+    policy = cooldown_policy_for_reason("request_too_large", source="groq")
+    assert policy.model_cooldown is True
+    assert policy.provider_cooldown is False and policy.quarantine is None
+
+    # The upgrade link these messages carry must not turn the rejection into a paid signal.
+    assert classify_failure(413, f"{tpm}, see https://console.groq.com/settings/billing") == "request_too_large"
+
+
+def test_false_free_markers_ignore_urls():
+    """A link to a settings page is not a payment demand — but prose asking for credits still is.
+
+    Provider errors routinely append "see https://…/settings/credits", and the markers are bare
+    substrings, so without stripping URLs an unrelated 404 would classify as `billing_or_paid` and
+    quarantine a healthy model with no TTL. Strict-zero still has to hold: a real payment demand
+    states it outside a URL, and those must keep quarantining.
+    """
+    assert classify_failure(404, "No audio endpoint. See https://openrouter.ai/settings/credits") == "unavailable"
+    assert classify_failure(400, "invalid image credit line format") == "billing_or_paid"  # prose wins
+    assert classify_failure(402, "see https://example.test/help") == "billing_or_paid"  # status wins
+    for demand in ("add credits to continue", "payment required", "insufficient balance", "billing account needed"):
+        assert classify_failure(404, f"{demand} — https://example.test/settings") == "billing_or_paid", demand
+
+    # `text` is the raw response body and providers emit compact JSON, so the match must stop at the
+    # closing quote. A whitespace-bounded one would eat every field after the link — including the
+    # marker — and silently drop the payment signal.
+    compact = '{"error":{"message":"see https://p.test/e","type":"billing_error"}}'
+    assert classify_failure(404, compact) == "billing_or_paid"
+    nested = '{"error":{"message":"No route. See https://k.test/d","metadata":{"buyCreditsUrl":"https://k.test/credits"}}}'
+    assert classify_failure(404, nested) == "billing_or_paid"
+    # …while a link inside markdown or angle brackets is still fully stripped.
+    assert classify_failure(404, "no endpoint ([docs](https://x.test/credits))") == "unavailable"
+    assert classify_failure(404, "no endpoint <https://x.test/billing>") == "unavailable"
+
+
+def test_truncated_before_content_policy_records_the_failure_without_cooling():
+    """A caller's too-small max_tokens must not take the model out of the pool.
+
+    Recording still happens — `set_cooldown` runs `update_failure_stats` and
+    `record_model_error_in_state` before consulting the policy — so a model that truncates on every
+    request stays scored and visible instead of silently keeping a perfect record.
+    """
+    policy = cooldown_policy_for_reason("truncated_before_content", source="openrouter")
+
+    assert policy.model_cooldown is False
+    assert policy.provider_cooldown is False
+    assert policy.quota_cooldown is False
+    assert policy.quarantine is None
+    assert policy.record_provider_error is False  # the caller's budget is not the provider's fault
+
+
 def test_provider_scoped_policy_keeps_model_and_provider_cooldowns():
     policy = cooldown_policy_for_reason("rate_limited", source="openrouter")
 

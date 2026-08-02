@@ -117,6 +117,20 @@ def models_needing_discovery(
     ]
 
 
+# The provider rejected the REQUEST we sent, not the account. A 400/422 is by definition about this
+# body, so it stays a per-profile verdict unconditionally — matching the behaviour before route
+# rejections were added below.
+REQUEST_REJECTION_STATUSES = frozenset({400, 422})
+
+# The provider has no route for this request shape. Discovery deliberately bypasses the
+# per-capability shape filter, so it probes audio against text-only models and gets 404 back — a
+# capability verdict, not an outage. These defer to a provider-wide block, because a 404 can also
+# carry a genuine payment demand or mean the model id itself is gone (`model_not_found`); a bare
+# "credit"/"billing" substring inside a URL no longer triggers that, since `classify_failure`
+# strips URLs before matching the false-free markers.
+ROUTE_REJECTION_STATUSES = frozenset({404, 410})
+
+
 @dataclass(frozen=True)
 class CapabilityDiscoveryJob:
     benchmark_body: Callable[[str, dict[str, Any] | None], tuple[dict[str, Any], str, str]]
@@ -193,7 +207,13 @@ class CapabilityDiscoveryJob:
         result: dict[str, Any],
     ) -> str:
         reason = self.classify_failure(response.status_code, response.text[:1000], model)
-        if response.status_code in (400, 422):
+        blocking = reason in self.route_blocking_reasons
+        # A rejected probe is a verdict on the capability, not on the model, so it must NOT bench the
+        # model globally. Route rejections still defer to a provider-wide block: strict-zero means a
+        # genuine payment demand has to quarantine even when it arrives on a probe.
+        rejected_request = response.status_code in REQUEST_REJECTION_STATUSES
+        rejected_route = response.status_code in ROUTE_REJECTION_STATUSES and not blocking
+        if rejected_request or rejected_route:
             result.update({"status": "fail", "message": f"HTTP {response.status_code}: {reason}"})
             self.record_benchmark_result(profile_id, model, result)
             self.record_verified_capability(profile_id, model, result)
@@ -205,7 +225,7 @@ class CapabilityDiscoveryJob:
             detail=f"discovery HTTP {response.status_code}: {reason}",
             profile_id=profile_id,
         )
-        return "blocked" if reason in self.route_blocking_reasons else "skip"
+        return "blocked" if blocking else "skip"
 
     def run_auto_benchmark_cycle(
         self,
@@ -236,24 +256,28 @@ class CapabilityDiscoveryJob:
         if not models:
             return {"status": "idle", "models": 0}
         probe_one = probe_model_capability or self.probe_model_capability
-        verified = failed = 0
+        # Every verdict is counted, including the ones that cool a model ("skipped"/"blocked").
+        # Reporting only verified/failed made a cycle that benched several models look clean.
+        counts = {"verified": 0, "failed": 0, "skipped": 0, "blocked": 0}
         for model in models:
             for profile_id in model_due_capabilities(model, profile_ids, state):
                 verdict = probe_one(model, profile_id, config)
                 if verdict == "verified":
-                    verified += 1
+                    counts["verified"] += 1
                 elif verdict == "failed":
-                    failed += 1
+                    counts["failed"] += 1
                 elif verdict == "blocked":
+                    counts["blocked"] += 1
                     break
+                else:
+                    counts["skipped"] += 1
         state = load_state()
         if not isinstance(state, dict):
             state = {}
         state["auto_benchmark"] = {
             "last_run_at": self.now_iso(),
             "models": len(models),
-            "verified": verified,
-            "failed": failed,
+            **counts,
         }
         write_runtime_state(state)
-        return {"status": "ran", "models": len(models), "verified": verified, "failed": failed}
+        return {"status": "ran", "models": len(models), **counts}

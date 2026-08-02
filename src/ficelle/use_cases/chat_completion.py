@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - exercised only in core-only installs
     plan_chat_compression = None
     put_original = None
 from ficelle.redaction import redact_sensitive_json, sanitize_error_detail
+from ficelle.use_cases.benchmark import finish_reason_is_truncation
 
 
 DEFAULT_CHAT_COMPLETION_MODEL = "ficelle/auto-tools"
@@ -518,13 +519,30 @@ def evaluate_non_streaming_success_response(
         )
 
     if not has_deliverable(payload):
+        # A reasoning model can burn the whole completion budget on reasoning tokens and stop before
+        # emitting any assistant content. That is the caller's max_tokens being too small, not a
+        # broken upstream, so `truncated_before_content` carries a no-cooldown policy: the failure is
+        # still recorded and scored, but the model keeps its slot in the pool.
+        reason, cooldown_reason, cooldown_detail = (
+            (
+                "truncated_before_content",
+                "truncated_before_content",
+                "response hit the completion token budget before emitting assistant content",
+            )
+            if finish_reason_is_truncation(payload)
+            else (
+                "empty_assistant_message",
+                "unavailable",
+                "success response had no assistant content or tool calls",
+            )
+        )
         return _non_streaming_failure(
             model,
             status=status_code,
-            reason="empty_assistant_message",
+            reason=reason,
             latency_seconds=latency,
-            cooldown_reason="unavailable",
-            cooldown_detail="success response had no assistant content or tool calls",
+            cooldown_reason=cooldown_reason,
+            cooldown_detail=cooldown_detail,
             retry=requested_model_is_virtual,
         )
 
@@ -614,7 +632,14 @@ def evaluate_upstream_failure_response(
     classify: FailureClassifier,
 ) -> UpstreamFailureDecision:
     status_code = int(response.status_code)
-    text = str(response.text)[:1000]
+    # On a streaming request the body is not buffered, so reading `.text` pulls the rest of the
+    # connection and raises if the upstream drops it mid-transfer. That exception used to escape
+    # `run_attempts` — whose only try/except wraps `invoke_model` — turning a failover into a 500.
+    # An unreadable body is simply an unclassifiable one: keep the status, let `classify` judge it.
+    try:
+        text = str(response.text)[:1000]
+    except Exception as exc:
+        text = f"<unreadable response body: {type(exc).__name__}>"
     reason = classify(status_code, text, model)
     return UpstreamFailureDecision(
         outcome="retryable_failure" if requested_model_is_virtual else "terminal_failure",

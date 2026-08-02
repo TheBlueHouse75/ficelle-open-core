@@ -120,6 +120,7 @@ export function providerFreeModeLabel(row) {
 
 export const REASON_LABELS = {
   empty_assistant_message: "Empty model response",
+  truncated_before_content: "Token budget too small",
   invalid_success_json: "Invalid provider response",
   invalid_json: "Invalid JSON",
   invalid_schema: "Invalid JSON schema",
@@ -144,6 +145,7 @@ export const REASON_LABELS = {
 };
 export const REASON_DESCRIPTIONS = {
   empty_assistant_message: "The provider returned success, but no usable assistant text was found.",
+  truncated_before_content: "The request's max_tokens ran out before the model emitted any content, typically because a reasoning model spent the budget on reasoning tokens. Request-side limit: the model is not cooled.",
   invalid_success_json: "The provider returned success, but the JSON response could not be parsed.",
   invalid_json: "The judge response could not be parsed as JSON.",
   invalid_schema: "The judge returned JSON, but not in the schema Fusion expects.",

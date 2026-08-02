@@ -22,6 +22,7 @@ uv.lock
 # Local/editor
 .DS_Store
 *.log
+.claude/
 
 # MCP tool scratch output
 .playwright-mcp/

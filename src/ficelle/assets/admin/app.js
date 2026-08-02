@@ -263,6 +263,35 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (m.invokable) return '<span class="sdot ok" title="Ready"></span>';
       return '<span class="sdot warn" title="No API key &middot; ' + esc(m.auth_reason || "missing credentials") + '"></span>';
     }
+    /* The dot carries the reason a model is held back only in a hover title —
+       unreachable on touch, invisible at a glance — and the tinted card background
+       says "will not route" without distinguishing the five causes behind it. Name
+       the state in the card header instead.
+
+       Reports the model's runtime state in every column, in the same order statusDot()
+       resolves it, so the dot and the badge can never disagree. It is deliberately not
+       tied to the card tint: `blocked` only counts cooldowns in the available list, so
+       a paused model sitting in Your order keeps a plain card — it stays in the ranking
+       and is skipped for now — but still says "Paused" rather than showing a bare amber
+       dot. Ready models get nothing: a badge on every row would be noise, and the green
+       dot already says it. Per-virtual-model exclusion is not here — capChips() already
+       emits "Excluded here" for that, and it is a per-lane choice, not model state. */
+    function statusLabel(m) {
+      const q = modelQuarantine(m);
+      if (q) return { cls: "danger", text: "Disabled", title: "Disabled &middot; " + esc(q.note || q.reason) };
+      const cd = modelCooldown(m);
+      if (cd) return { cls: "warn", text: "Paused", title: "Paused " + esc(formatSeconds(cd.seconds_remaining)) + " &middot; " + esc(reasonDescription(cd.reason)) };
+      if (providerCooldown(m.source)) return { cls: "warn", text: "Provider paused", title: "Every model from this provider is paused" };
+      const qc = modelQuotaCooldown(m);
+      if (qc) return { cls: "warn", text: "Quota paused", title: "Free quota paused &middot; next probe " + esc(timeAgo(qc.next_probe_at_iso || qc.next_probe_at).label) };
+      if (!m.invokable) return { cls: "warn", text: "No API key", title: "No API key &middot; " + esc(m.auth_reason || "missing credentials") };
+      return null;
+    }
+    function statusLabelHtml(m) {
+      const label = statusLabel(m);
+      if (!label) return "";
+      return '<span class="badge ' + label.cls + ' mcard-status" title="' + label.title + '">' + esc(label.text) + "</span>";
+    }
     function scoreDetails(m, profileId = activeProfile) {
       return m?.auto_score_details?.[profileId] || null;
     }
@@ -457,7 +486,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
                 '<svg class="chev" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--text-muted)"><path d="m6 9 6 6 6-6"/></svg></div>' +
               '<div class="mcard-sub">' + subParts.map((p, i) => (i ? '<span class="sep">&middot;</span>' : "") + "<span>" + esc(p) + "</span>").join("") + "</div>" +
             "</button>" +
-            '<div class="mcard-actions">' + actions + "</div>" +
+            '<div class="mcard-right">' + statusLabelHtml(m) + '<div class="mcard-actions">' + actions + "</div></div>" +
           "</div>" +
           '<div class="mcard-chips">' + metricChip(m, ctx) + capChips(m) + "</div>" +
           '<div class="mcard-details"><div class="detail-grid">' + detailRows(m) + "</div></div>" +
@@ -566,7 +595,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       else {
         list.innerHTML = selectedIds.map((id, i) => {
           const m = models.get(id);
-          if (!m) return '<article class="mcard no-grip is-blocked" data-model="' + esc(id) + '" data-ctx="selected"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">Unknown model <span class="badge danger">missing</span></div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-actions"><button class="iconbtn danger" data-act="remove" data-id="' + esc(id) + '" title="Remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></button></div></div></article>';
+          if (!m) return '<article class="mcard no-grip is-blocked" data-model="' + esc(id) + '" data-ctx="selected"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">Unknown model</div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-right"><span class="badge danger mcard-status" title="This id is no longer in the catalog. Ficelle keeps it in case the model comes back; remove it to drop it for good.">Missing</span><div class="mcard-actions"><button class="iconbtn danger" data-act="remove" data-id="' + esc(id) + '" title="Remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></button></div></div></div></article>';
           return modelCard(m, "selected", i);
         }).join("");
       }
@@ -588,7 +617,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       }
       list.innerHTML = excluded.map((id, i) => {
         const m = models.get(id);
-        if (!m) return '<article class="mcard no-grip is-excluded" data-model="' + esc(id) + '" data-ctx="excluded"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">Unknown model <span class="badge warn">excluded</span></div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-actions">' + iconBtn("restore", id, "Restore to this virtual model", ICONS.restore) + "</div></div></article>";
+        if (!m) return '<article class="mcard no-grip is-excluded" data-model="' + esc(id) + '" data-ctx="excluded"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">Unknown model</div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-right"><span class="badge warn mcard-status" title="Excluded from this virtual model, and no longer in the catalog either.">Excluded</span><div class="mcard-actions">' + iconBtn("restore", id, "Restore to this virtual model", ICONS.restore) + "</div></div></div></article>";
         return modelCard(m, "excluded", i);
       }).join("");
       bindModelCard(list);
@@ -1363,7 +1392,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         { k: "Canary check", ic: ICONS.canary, v: (canary.status === "pass" ? "Passing" : (canary.status || "Not run")), note: (sum.passed ?? 0) + " of " + (sum.total ?? 0) + " virtual models ok &middot; last run " + timeAgo(canary.last_run_at).label, cls: canary.status === "pass" ? "ok" : "warn" },
         { k: "Paused", ic: ICONS.paused, v: (cdM + cdP + cdQ), note: cdM + " models &middot; " + cdP + " providers &middot; " + cdQ + " free quotas", cls: (cdM + cdP + cdQ) ? "warn" : "ok" },
         { k: "Disabled", ic: ICONS.disable, v: q, note: q ? "manually held out of routing" : "nothing quarantined", cls: q ? "warn" : "ok" },
-        { k: "Capability discovery", ic: ICONS.benchmark, v: (ab.last_run_at ? "Last run " + timeAgo(ab.last_run_at).label : "Not run yet"), note: ab.last_run_at ? ((ab.models ?? 0) + " models &middot; " + (ab.verified ?? 0) + " verified &middot; " + (ab.failed ?? 0) + " failed") : "background discovery &middot; configure in Settings", cls: "ok" },
+        // skipped/blocked are the verdicts that cool a model, so they are shown and drive the
+        // status colour: a cycle reporting only "0 verified, 0 failed" used to look green while it
+        // had just taken several models out of routing.
+        { k: "Capability discovery", ic: ICONS.benchmark, v: (ab.last_run_at ? "Last run " + timeAgo(ab.last_run_at).label : "Not run yet"), note: ab.last_run_at ? ((ab.models ?? 0) + " models &middot; " + (ab.verified ?? 0) + " verified &middot; " + (ab.failed ?? 0) + " failed &middot; " + (ab.skipped ?? 0) + " paused &middot; " + (ab.blocked ?? 0) + " blocked") : "background discovery &middot; configure in Settings", cls: ((ab.skipped ?? 0) + (ab.blocked ?? 0)) ? "warn" : "ok" },
         { k: "Context compression", ic: ICONS.compression, v: compressionStatus, note: "mode " + compressionMode + " &middot; ~" + compressionSaved + " tokens saved &middot; " + compressionEntries + " CCR entries <button class=\"btn ghost sm\" data-open-compression>Dashboard</button>", cls: compression.health_digest === "compression_errors_repeated" ? "warn" : "ok" },
         { k: "Watcher", ic: ICONS.watcher, v: "Silent", note: "alerts only when status is not ok &middot; catalog refresh hourly, background auto-benchmark (see Settings)", cls: "ok" }
       ];

@@ -130,6 +130,7 @@ from ficelle.use_cases.benchmark import (
     configured_benchmark_media_path as configured_benchmark_media_path_use_case,
     expected_probe_test_type,
     extract_message_text as benchmark_extract_message_text,
+    finish_reason_is_truncation,
     extract_reasoning_text as benchmark_extract_reasoning_text,
     extract_tool_calls as benchmark_extract_tool_calls,
     has_deliverable_message as benchmark_has_deliverable_message,
@@ -1086,6 +1087,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "catalog_timeout_seconds": 30,
     "cooldown_seconds": {
         "rate_limited": 900,
+        # Short by design: a TPM limit recharges continuously, so the model recovers on its own.
+        "request_too_large": 120,
         "quota_exhausted": 3600,
         "auth_or_credit": 3600,
         "billing_or_paid": 86400,
@@ -5926,6 +5929,7 @@ def build_fusion_runner() -> FusionRunner:
         invoke_model=invoke_model,
         classify_failure=classify_failure,
         extract_message_text=extract_message_text,
+        finish_reason_is_truncation=finish_reason_is_truncation,
         success_error_payload_failure=success_error_payload_failure,
         fusion_internal_body=fusion_internal_body,
         fusion_timeout_config=fusion_timeout_config,
@@ -6774,11 +6778,19 @@ def probe_model_capability(model: dict[str, Any], profile_id: str, config: dict[
     """Probe ONE model for ONE capability and record a per-(model, profile) verdict.
 
     Discovery-specific failure policy — deliberately different from ``benchmark_profile`` — because we
-    are testing capabilities the model may not have, so a capability probe must NEVER bench the model
-    globally: a clear client rejection (HTTP 400/422) or a 2xx response that fails validation is a
-    per-profile ``failed`` verdict; a transient error (429/5xx/timeout/exception) records nothing and is
-    retried next cycle; only a provider-wide block (billing/quota/auth) cools the model. Returns one of
-    ``verified`` / ``failed`` / ``skip`` / ``blocked``.
+    are testing capabilities the model may not have, so a capability probe must NEVER drop the model
+    from the routing pool for merely lacking the capability under test. A 2xx response that fails
+    validation, or a rejection of the probe itself, is a per-profile ``failed`` verdict that leaves
+    the model routable — an audio probe 404ing on a text-only model says nothing about its ability to
+    serve text. The two rejection families are deliberately not symmetric: ``REQUEST_REJECTION_STATUSES``
+    (400/422) are about the body we sent and stay per-profile unconditionally, while
+    ``ROUTE_REJECTION_STATUSES`` (404/410) still defer to a provider-wide block, because strict-zero
+    means a genuine payment demand must quarantine even on a probe. A bare "credit"/"billing"
+    substring inside a link no longer trips that, since ``classify_failure`` strips URLs before
+    matching the false-free markers. A transient error (5xx, 429, timeout, unparseable 2xx) records no
+    capability verdict but still applies a short availability backoff, so discovery stops re-probing a
+    model that is actually down instead of starving the others. Returns one of ``verified`` /
+    ``failed`` / ``skip`` / ``blocked``.
     """
     return build_capability_discovery_job().probe_model_capability(model, profile_id, config)
 

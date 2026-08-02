@@ -23,6 +23,7 @@ from ficelle.use_cases.benchmark import (
     configured_benchmark_media_path,
     expected_probe_test_type,
     extract_message_text,
+    finish_reason_is_truncation,
     extract_reasoning_text,
     extract_tool_calls,
     has_deliverable_message,
@@ -710,3 +711,22 @@ def test_probe_registry_support_helpers_match_legacy_shapes():
     assert has_deliverable_message({"choices": [{"message": {"content": None, "reasoning": "thinking"}}]}) is False
     assert has_deliverable_message({"choices": [{"message": {"content": "hello"}}]}) is True
     assert has_deliverable_message({"choices": [{"message": {"tool_calls": [{"function": {"name": "x"}}]}}]}) is True
+
+
+def test_finish_reason_is_truncation_accepts_every_provider_spelling():
+    """One concept, several spellings: matching only OpenAI's `length` would half-fix the bug.
+
+    Mistral is a configured provider and its enum is stop|length|model_length|error|tool_calls, so
+    an exact `== "length"` would still cool a Mistral model that merely ran out of budget.
+    """
+
+    def payload(finish_reason: Any) -> dict[str, Any]:
+        return {"choices": [{"message": {"content": ""}, "finish_reason": finish_reason}]}
+
+    for spelling in ("length", "model_length", "max_tokens", "MAX_TOKENS", " Length ", "max_output_tokens"):
+        assert finish_reason_is_truncation(payload(spelling)) is True, spelling
+    for spelling in ("stop", "tool_calls", "error", "content_filter", "", None):
+        assert finish_reason_is_truncation(payload(spelling)) is False, spelling
+    # Malformed upstream shapes must read as "not truncated", never raise.
+    for broken in ({}, {"choices": None}, {"choices": []}, {"choices": [None]}, {"choices": ["x"]}, [], None, "x"):
+        assert finish_reason_is_truncation(broken) is False, broken

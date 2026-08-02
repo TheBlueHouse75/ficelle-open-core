@@ -1225,6 +1225,22 @@ def has_deliverable_message(payload: Any) -> bool:
     return bool(extract_message_text(payload) or extract_tool_calls(payload))
 
 
+# One concept, spelled differently per provider: OpenAI/OpenRouter `length`, Mistral `model_length`,
+# Anthropic `max_tokens`, Gemini's native API `MAX_TOKENS`. Matched case- and space-insensitively
+# because gateway providers pass their upstream's spelling through unmapped.
+TRUNCATION_FINISH_REASONS = frozenset({"length", "model_length", "max_tokens", "max_output_tokens", "max_completion_tokens"})
+
+
+def finish_reason_is_truncation(payload: Any) -> bool:
+    """True when the first choice stopped because the completion token budget ran out."""
+    if not isinstance(payload, dict):
+        return False
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+    return str(choices[0].get("finish_reason") or "").strip().lower() in TRUNCATION_FINISH_REASONS
+
+
 def tool_call_arguments(call: dict[str, Any]) -> dict[str, Any]:
     function = call.get("function") if isinstance(call.get("function"), dict) else {}
     raw_arguments = function.get("arguments")

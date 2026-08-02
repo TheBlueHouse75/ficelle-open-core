@@ -1,9 +1,22 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from ficelle.redaction import sanitize_error_detail
+
+
+# Provider error messages routinely end with a link to an upgrade or settings page, and the
+# false-free markers below are bare substrings — so "see https://…/settings/credits" appended to an
+# unrelated rejection would read as a payment demand and quarantine a healthy model. URLs are
+# stripped before those markers are matched; a real payment demand states it in prose.
+#
+# The class stops at JSON/markdown delimiters rather than at whitespace: `text` is the raw response
+# body, and providers emit compact JSON, so a whitespace-bounded match would run past the closing
+# quote and swallow every field after the link — including the very marker we need to see, as in
+# `{"message":"see https://p.test/e","type":"billing_error"}`.
+_URL_PATTERN = re.compile(r"""https?://[^\s"'<>)\]},;]+""")
 
 
 FailureReason = Literal[
@@ -13,6 +26,7 @@ FailureReason = Literal[
     "no_free_quota",
     "quota_exhausted",
     "rate_limited",
+    "request_too_large",
     "server_error",
     "unavailable",
 ]
@@ -138,6 +152,11 @@ def cooldown_policy_for_reason(reason: str, *, source: str = "") -> CooldownPoli
             ),
             model_cooldown=False,
         )
+    if reason == "truncated_before_content":
+        # The caller's own token budget ran out before the model emitted anything. Record the
+        # failure so the model stays scored and visible in the admin, but never cool it: one client
+        # sending max_tokens=20 would otherwise empty a whole profile's pool for the cooldown window.
+        return CooldownPolicy(record_provider_error=False, model_cooldown=False)
     if reason == "quota_exhausted":
         return CooldownPolicy(
             record_provider_error=True,
@@ -172,6 +191,7 @@ def classify_failure(
     """Classify a provider failure using already-normalized free-access metadata."""
     marker_set = markers or DEFAULT_FAILURE_MARKERS
     lower = text.lower()
+    lower_without_urls = _URL_PATTERN.sub(" ", lower)
     has_quota_marker = any(marker in lower for marker in marker_set.quota_exhausted)
     access = normalized_free_access if isinstance(normalized_free_access, dict) else {}
     if has_quota_marker and access.get("eligible") is True and access.get("mode") == "quota_free":
@@ -186,7 +206,14 @@ def classify_failure(
         return "unavailable"
     if status_code == 429:
         return "rate_limited"
-    if status_code == 402 or any(marker in lower for marker in marker_set.false_free):
+    # A tokens-per-minute rejection is a transient, MODEL-scoped throughput limit that recharges on
+    # its own — deliberately neither `rate_limited` (provider-scoped, would cool every model of the
+    # provider) nor `billing_or_paid` (a 24h quarantine). Evaluated before the false-free markers
+    # because these messages often point at an upgrade page; URL stripping already covers the link
+    # itself, but the surrounding prose can name the plan too.
+    if status_code == 413:
+        return "request_too_large"
+    if status_code == 402 or any(marker in lower_without_urls for marker in marker_set.false_free):
         return "billing_or_paid"
     if status_code in {401, 403}:
         return "auth_or_credit"
@@ -237,6 +264,8 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
         actions.append("Retry after the short model cooldown or quarantine the unstable upstream.")
     if reason_counts.get("timeout"):
         actions.append("Ficelle timed out a slow upstream and tried the next candidate; reduce this virtual model's timeout or quarantine repeat offenders.")
+    if reason_counts.get("truncated_before_content"):
+        actions.append("The completion token budget ran out before the model emitted any content; reasoning models spend it on reasoning tokens first. Raise max_tokens on the request. No model was cooled: this is a request-side limit, not an upstream failure.")
     if reason_counts.get("empty_assistant_message") or reason_counts.get("invalid_success_json"):
         actions.append("Inspect route logs and verified capabilities; this upstream returned HTTP 200 without a usable assistant message.")
     if not actions:
