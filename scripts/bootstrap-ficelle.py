@@ -3,7 +3,7 @@
 
 This script is intentionally stdlib-only so it can be served as:
 
-    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.4/scripts/bootstrap-ficelle.py | python3
+    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.5/scripts/bootstrap-ficelle.py | python3
 
 Without a license key it installs the versioned open Core from the public GitHub
 release. With ``--license-key`` it also downloads the licensed Pro wheel, installs it
@@ -29,13 +29,13 @@ from email.parser import Parser
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
-CORE_VERSION = "0.1.4"
+CORE_VERSION = "0.1.5"
 DEFAULT_CORE_WHEEL_URL = (
     "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
     f"v{CORE_VERSION}/ficelle_router-{CORE_VERSION}-py3-none-any.whl"
 )
 DEFAULT_CORE_SHA256 = (
-    "4eb054fe4102180be06596c4975636843ddea5936d92c79ad7c19fb57c8475b8"
+    "335a5edd6e662dee386a46a12575a4b7fc75dac7cf85a62e4287498d6102d7ed"
 )
 DEFAULT_WHEEL_URL = "https://install.ficelle.ai/api/releases/latest/wheel"
 PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
