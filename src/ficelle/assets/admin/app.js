@@ -164,6 +164,51 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       draftProfiles[activeProfile] = { ...cur, ...next, models, excluded_models: excluded, requirements: req };
       render();
     }
+
+    /* ---------- unsaved-draft tracking ----------
+       Mode, auto-fill, order, add/remove and Reset only touch draftProfiles; a reload
+       used to drop them without a word, and Save looked identical either way. Compare
+       the draft to what the server last returned so the button can say so.
+
+       Both sides go through the same canonical form first: setProfile() normalizes
+       requirements on every edit, so a raw compare would call a profile dirty after a
+       round trip that changed nothing (Manual order then back to Automatic). */
+    function canonicalProfile(profile) {
+      const req = { ...defaultReq(), ...(profile?.requirements || {}) };
+      req.free = true; req.tools = true;
+      req.min_context = Math.max(Number(state?.config?.min_context_length || 131072), Number(req.min_context || 131072));
+      return JSON.stringify({
+        // Anything that is not manual_order routes as auto — treat it as auto here too.
+        mode: profile?.mode === "manual_order" ? "manual_order" : "auto",
+        models: uniqueStrings(profile?.models || []),
+        excluded_models: uniqueStrings(profile?.excluded_models || []),
+        // Absent means on, matching the auto_tail === false test in candidate ranking.
+        auto_tail: profile?.auto_tail !== false,
+        requirements: Object.keys(req).sort().reduce((out, key) => { out[key] = req[key]; return out; }, {}),
+      });
+    }
+    function unsavedProfileIds() {
+      const saved = state?.virtual_profiles || {};
+      const drafts = draftProfiles || {};
+      const ids = new Set([...Object.keys(saved), ...Object.keys(drafts)]);
+      return [...ids].filter((id) => canonicalProfile(drafts[id]) !== canonicalProfile(saved[id]));
+    }
+    // Save posts every virtual model at once, so the count is what makes edits parked on
+    // another card visible from the one you are looking at.
+    function syncSaveButton() {
+      const btn = $("saveBtn");
+      if (!btn) return;
+      // A save in flight owns the button; setButtonLoading re-enables it when it resolves.
+      if (btn.classList.contains("is-loading")) return;
+      const count = unsavedProfileIds().length;
+      btn.disabled = count === 0;
+      btn.title = count === 0
+        ? "No unsaved changes."
+        : "Save " + count + " edited virtual model" + (count > 1 ? "s" : "") + ". Exclude/restore already saved themselves.";
+      const badge = $("saveCount");
+      // No leading space: .btn's flex gap already separates the badge from the label.
+      if (badge) badge.textContent = count ? "· " + count : "";
+    }
     function addModel(id) {
       const p = currentProfile();
       const models = p.models || [];
@@ -1652,6 +1697,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      renderProfileList(); renderActiveProfile(); renderFilterBar(); renderSelected(); renderExcluded(); renderAvailable();
 	      renderProviders(); renderFusion(); renderSettings(); renderCompression(); renderLicense(); renderHealth(); renderPerformance(); renderAudit(); renderNavCounts();
       syncLongRunningActions();
+      syncSaveButton();
 	    }
 
     let updateInstallInFlight = false;
@@ -1805,7 +1851,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     function viewActions(name) {
 	      const btn = (id, label, primary, icon, title) => '<button class="btn ' + (primary ? "primary" : "") + '" id="' + id + '"' + (title ? ' title="' + esc(title) + '"' : "") + ">" + (icon || "") + label + "</button>";
-	      if (name === "routing") return btn("refreshBtn", "Refresh catalog", false, ic(ICONS.refresh), "Re-fetch each provider's model list and rebuild the free-only catalog. Metadata only — no test requests, no tokens spent.") + btn("benchmarkBtn", "Retest candidates", false, ic(ICONS.retest), "Send a real test request to every usable model in this pool, one by one, to refresh pass/fail evidence. Uses a little quota per model and can take a few minutes on a large pool.") + btn("saveBtn", "Save", true, ic(ICONS.save));
+	      if (name === "routing") return btn("refreshBtn", "Refresh catalog", false, ic(ICONS.refresh), "Re-fetch each provider's model list and rebuild the free-only catalog. Metadata only — no test requests, no tokens spent.") + btn("benchmarkBtn", "Retest candidates", false, ic(ICONS.retest), "Send a real test request to every usable model in this pool, one by one, to refresh pass/fail evidence. Uses a little quota per model and can take a few minutes on a large pool.") + btn("saveBtn", 'Save<span id="saveCount" class="save-count"></span>', true, ic(ICONS.save));
 	      if (name === "fusion") return state?.pro_installed ? btn("saveFusionBtn", "Save settings", true, ic(ICONS.save)) : "";
 	      if (name === "settings") return btn("saveSettingsBtn", "Save settings", true, ic(ICONS.save));
 	      if (name === "compression") return state?.pro_installed ? btn("reloadCompressionBtn", "Reload", false, ic(ICONS.refresh)) + btn("saveCompressionBtn", "Save settings", true, ic(ICONS.save)) : "";
@@ -1821,6 +1867,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        $("refreshBtn").addEventListener("click", refreshCatalog);
 	        $("benchmarkBtn").addEventListener("click", runBenchmark);
 	        $("saveBtn").addEventListener("click", saveProfiles);
+	        // The header is rebuilt on every view switch, so the fresh button needs the count.
+	        syncSaveButton();
 	      } else if (name === "fusion") { if (state?.pro_installed) $("saveFusionBtn").addEventListener("click", saveFusion); }
 		      else if (name === "settings") $("saveSettingsBtn").addEventListener("click", saveSettings);
 	      else if (name === "compression") {
@@ -1889,7 +1937,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "save failed");
         state.virtual_profiles = p.virtual_profiles; setDraftProfiles(cloneJson(p.virtual_profiles));
         showToast(toastMessage); await loadAudit(false); render();
-      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(btn, false); }
+        // render() ran while the button still carried is-loading, which syncSaveButton
+        // refuses to touch — so re-sync once the spinner is off, or the count would
+        // survive its own save.
+      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(btn, false); syncSaveButton(); }
     }
 	    async function rollbackProfiles(id) {
 	      if (!id || !window.confirm("Undo to this saved snapshot?")) return;
@@ -2083,6 +2134,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("searchInput").addEventListener("input", renderAvailable);
       $("copyExportBtn").addEventListener("click", () => copyExport().catch((e) => showToast(e.message)));
       initEndpointCard();
+      // Closing or reloading with a draft in memory silently discards it. The browser
+      // shows its own generic wording here; the text is ignored by every modern engine.
+      window.addEventListener("beforeunload", (e) => {
+        if (!unsavedProfileIds().length) return;
+        e.preventDefault();
+        e.returnValue = "";
+      });
       // Close any open filter popover when clicking outside the bar. Capture phase so it
       // still fires even though model-card buttons stopPropagation on bubble.
       document.addEventListener("click", (e) => { if (!e.target.closest("#filterBar .flt")) closeFilterPops(); }, true);

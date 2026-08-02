@@ -301,6 +301,10 @@
     .btn.primary:disabled { box-shadow: 0 3px 0 var(--brand-soft); }
     .btn.ghost { background: transparent; }
     .btn.sm { padding: 6px 12px; font-size: 12px; }
+    /* Unsaved-virtual-model count on Save. `:empty` matters: .btn is a flex container with
+       a gap, so an empty span would still push the label over by one gap. */
+    .save-count { font-variant-numeric: tabular-nums; }
+    .save-count:empty { display: none; }
 
     /* ============ Cards ============ */
     .card {

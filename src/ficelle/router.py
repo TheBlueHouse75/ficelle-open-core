@@ -1593,6 +1593,7 @@ def normalize_profile_model_id_list(
     raw_model_ids: Any,
     known_model_ids: set[str] | None,
     field_name: str,
+    stale_model_ids: set[str] | None = None,
 ) -> list[str]:
     if raw_model_ids is None:
         raw_model_ids = []
@@ -1606,7 +1607,11 @@ def normalize_profile_model_id_list(
         if not model_id or model_id in seen:
             continue
         if known_model_ids is not None and model_id not in known_model_ids:
-            raise ValueError(f"unknown catalog model id for {profile_id}: {model_id}")
+            # `stale_model_ids` are ids the saved config already carries: the catalog
+            # moved under them, the caller did not invent them. See
+            # validate_virtual_profiles_payload for why they are not an error.
+            if not stale_model_ids or model_id not in stale_model_ids:
+                raise ValueError(f"unknown catalog model id for {profile_id}: {model_id}")
         seen.add(model_id)
         model_ids.append(model_id)
     return model_ids
@@ -1617,6 +1622,7 @@ def normalize_virtual_profile(
     raw_profile: Any,
     config: dict[str, Any],
     known_model_ids: set[str] | None = None,
+    stale_model_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     if not is_virtual_profile_id(profile_id):
         raise ValueError(f"virtual model id must start with ficelle/: {safe_detail(profile_id) or '[redacted]'}")
@@ -1634,12 +1640,14 @@ def normalize_virtual_profile(
         profile.get("models", profile.get("model_ids", profile.get("order", []))),
         known_model_ids,
         "models",
+        stale_model_ids,
     )
     excluded_model_ids = normalize_profile_model_id_list(
         profile_id,
         profile.get("excluded_models", []),
         known_model_ids,
         "excluded_models",
+        stale_model_ids,
     )
 
     requirements = safe_profile_requirements(profile.get("requirements"), config)
@@ -1661,6 +1669,24 @@ def normalized_virtual_profiles(config: dict[str, Any]) -> dict[str, Any]:
     return profiles
 
 
+def persisted_profile_model_ids(config: dict[str, Any]) -> set[str]:
+    """Every model id the saved virtual profiles already reference, across all fields."""
+    saved = config.get("virtual_profiles")
+    if not isinstance(saved, dict):
+        return set()
+    ids: set[str] = set()
+    for profile in saved.values():
+        if not isinstance(profile, dict):
+            continue
+        # Same key aliases normalize_virtual_profile accepts, plus exclusions.
+        for field in ("models", "model_ids", "order", "excluded_models"):
+            raw = profile.get(field)
+            if not isinstance(raw, list):
+                continue
+            ids.update(candidate for candidate in (str(item).strip() for item in raw) if candidate)
+    return ids
+
+
 def validate_virtual_profiles_payload(payload: dict[str, Any], config: dict[str, Any], catalog: dict[str, Any]) -> dict[str, Any]:
     raw_profiles = payload.get("virtual_profiles", payload.get("profiles"))
     if raw_profiles is None and all(is_virtual_profile_id(str(key)) for key in payload):
@@ -1674,10 +1700,23 @@ def validate_virtual_profiles_payload(payload: dict[str, Any], config: dict[str,
         if isinstance(model, dict) and model.get("id")
     }
 
+    # A saved id that is no longer in the catalog is the catalog moving, not a bad
+    # request: free models come and go, and a provider that fails during a refresh
+    # shrinks the catalog for as long as it is down. Rejecting the payload over one of
+    # those blocked every other virtual model too, since a single POST carries them
+    # all — and it contradicted startup, where normalized_virtual_profiles() loads the
+    # very same ids with no catalog to check against. Carry them through instead of
+    # dropping them, so an order survives a model that comes back; the dashboard shows
+    # one as "Unknown model" with a control to remove it deliberately. Ids that were
+    # never saved are still rejected, which is what catches a malformed client.
+    stale_model_ids = persisted_profile_model_ids(config) - known_model_ids
+
     normalized: dict[str, Any] = {}
     for raw_key, raw_profile in raw_profiles.items():
         profile_id = str(raw_key).strip()
-        normalized[profile_id] = normalize_virtual_profile(profile_id, raw_profile, config, known_model_ids)
+        normalized[profile_id] = normalize_virtual_profile(
+            profile_id, raw_profile, config, known_model_ids, stale_model_ids
+        )
 
     for profile_id in sorted(VIRTUAL_MODELS):
         normalized.setdefault(profile_id, normalize_virtual_profile(profile_id, {}, config))
