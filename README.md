@@ -1,8 +1,17 @@
 # Ficelle
 
+<!--
+  Site links point at the Netlify deployment while the ficelle.ai domain is being
+  registered. Once it resolves, swap the three occurrences of
+  https://ficelle-website.netlify.app back to https://ficelle.ai (badge, benchmark
+  link, pricing link) and restore the "ficelle.ai" badge label. The release_url in
+  the update-manifest example further down is an illustration, not a live link, and
+  already uses the final domain.
+-->
+
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-f26a1b)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
-[![ficelle.ai](https://img.shields.io/badge/site-ficelle.ai-1c1410)](https://ficelle.ai)
+[![Website](https://img.shields.io/badge/website-live-1c1410)](https://ficelle-website.netlify.app)
 
 **A local, OpenAI-compatible router that keeps your AI agents running, and never lets
 them overspend.** Point any OpenAI-compatible client at `http://127.0.0.1:8646/v1`
@@ -40,7 +49,7 @@ routing was *quality-safe* (tied or better) on:
 | Polished long-form writing | 50% | keep your paid model |
 
 Route the first three through Ficelle and keep the budget for the writing. Method and
-raw numbers: [ficelle.ai/blog/free-vs-paid-llm-benchmark](https://ficelle.ai/blog/free-vs-paid-llm-benchmark/).
+raw numbers: [the benchmark write-up](https://ficelle-website.netlify.app/blog/free-vs-paid-llm-benchmark/).
 
 ## Quick start
 
@@ -164,7 +173,8 @@ the strict-zero safety model, the provider-adapter framework, and reference prov
 
 The paywall never sits on the core loop: routing, strict-zero, and free-provider access
 stay free and open. The Pro pack is not part of this repository; the core runs fully
-without it. Pricing and purchase live at [ficelle.ai](https://ficelle.ai/#pricing).
+without it. [Pricing and purchase](https://ficelle-website.netlify.app/#pricing) live on
+the website.
 
 ## Optional Hermes integration
 
