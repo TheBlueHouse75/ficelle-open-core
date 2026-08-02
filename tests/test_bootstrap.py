@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import re
 import sys
 import zipfile
 from email.message import Message
@@ -318,11 +319,23 @@ def test_default_wheel_endpoint_uses_valid_fallback_filename():
 
 
 def test_default_core_wheel_is_versioned_and_pinned():
-    assert "/releases/download/v0.1.3/" in bootstrap.DEFAULT_CORE_WHEEL_URL
+    # Derived from CORE_VERSION so a release bump does not have to edit this test. What is
+    # asserted is the shape: a semantic version pointing at a *tagged* release asset (never
+    # `main` or `latest`), with a full-length hash pinned next to it.
+    assert re.fullmatch(r"\d+\.\d+\.\d+", bootstrap.CORE_VERSION)
+    assert (
+        f"/releases/download/v{bootstrap.CORE_VERSION}/"
+        in bootstrap.DEFAULT_CORE_WHEEL_URL
+    )
     assert bootstrap.DEFAULT_CORE_WHEEL_URL.endswith(
-        "/ficelle_router-0.1.3-py3-none-any.whl"
+        f"/ficelle_router-{bootstrap.CORE_VERSION}-py3-none-any.whl"
     )
     assert len(bootstrap.DEFAULT_CORE_SHA256) == 64
+    # The docstring's curl line is what users copy; a bump that forgets it would serve an
+    # older installer than the wheel it pins.
+    assert f"/v{bootstrap.CORE_VERSION}/scripts/bootstrap-ficelle.py" in (
+        bootstrap.__doc__ or ""
+    )
 
 
 def test_wheel_filename_rejects_non_version_placeholder():

@@ -8,7 +8,15 @@ from pathlib import Path
 
 import pytest
 
+import ficelle
 from ficelle import license_ops, update
+
+
+# The manifests below must describe a release *newer* than the installed one, or the
+# checker legitimately reports up_to_date. Derive it so a version bump does not turn
+# these tests red.
+_MAJOR, _MINOR, _PATCH = ficelle.__version__.split(".")
+NEXT_VERSION = f"{_MAJOR}.{_MINOR}.{int(_PATCH) + 1}"
 
 
 class _Response:
@@ -34,7 +42,7 @@ def isolate_update_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(update, "update_status_path", lambda: tmp_path / "update-status.json")
 
 
-def compact_manifest(version: str = "0.1.4") -> dict[str, object]:
+def compact_manifest(version: str = NEXT_VERSION) -> dict[str, object]:
     return {
         "version": version,
         "channel": "stable",
@@ -53,21 +61,21 @@ def test_parse_compact_manifest_validates_artifact_and_version() -> None:
         source_url="https://install.ficelle.ai/api/releases/latest/core",
     )
 
-    assert manifest.version == "0.1.4"
+    assert manifest.version == NEXT_VERSION
     assert manifest.core.distribution == "ficelle-router"
-    assert manifest.core.filename == "ficelle_router-0.1.4-py3-none-any.whl"
+    assert manifest.core.filename == f"ficelle_router-{NEXT_VERSION}-py3-none-any.whl"
     assert manifest.core.sha256 == "a" * 64
 
 
 def test_parse_github_release_uses_asset_digest() -> None:
     payload = {
-        "tag_name": "v0.1.4",
-        "html_url": "https://github.com/TheBlueHouse75/ficelle-open-core/releases/tag/v0.1.4",
+        "tag_name": f"v{NEXT_VERSION}",
+        "html_url": f"https://github.com/TheBlueHouse75/ficelle-open-core/releases/tag/v{NEXT_VERSION}",
         "body": "Release notes",
         "assets": [
             {
-                "name": "ficelle_router-0.1.4-py3-none-any.whl",
-                "browser_download_url": "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/v0.1.4/ficelle_router-0.1.4-py3-none-any.whl",
+                "name": f"ficelle_router-{NEXT_VERSION}-py3-none-any.whl",
+                "browser_download_url": f"https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/v{NEXT_VERSION}/ficelle_router-{NEXT_VERSION}-py3-none-any.whl",
                 "digest": "sha256:" + "b" * 64,
             }
         ],
@@ -78,7 +86,7 @@ def test_parse_github_release_uses_asset_digest() -> None:
         source_url=update.DEFAULT_UPDATE_MANIFEST_URL,
     )
 
-    assert manifest.version == "0.1.4"
+    assert manifest.version == NEXT_VERSION
     assert manifest.core.sha256 == "b" * 64
 
 
@@ -104,7 +112,7 @@ def test_check_for_updates_persists_available_status_without_exposing_artifact_u
 
     assert status["status"] == "available"
     assert status["update_available"] is True
-    assert status["latest_version"] == "0.1.4"
+    assert status["latest_version"] == NEXT_VERSION
     assert update.public_update_status()["release_notes"] == "Bug fixes"
     assert "core_wheel_url" not in update.public_update_status()
     assert update.public_update_status()["pro_artifact_available"] is False
@@ -116,7 +124,7 @@ def test_check_for_updates_accepts_entitlement_authorized_pro_artifact(
 ) -> None:
     payload = compact_manifest()
     payload["pro"] = {
-        "wheel_url": "https://install.ficelle.ai/ficelle_pro-0.1.4-py3-none-any.whl",
+        "wheel_url": f"https://install.ficelle.ai/ficelle_pro-{NEXT_VERSION}-py3-none-any.whl",
         "sha256": "d" * 64,
         "authorization": "entitlement",
     }
@@ -139,7 +147,7 @@ def test_check_for_updates_blocks_pro_artifact_from_another_origin(
 ) -> None:
     payload = compact_manifest()
     payload["pro"] = {
-        "wheel_url": "https://downloads.ficelle.ai/ficelle_pro-0.1.4-py3-none-any.whl",
+        "wheel_url": f"https://downloads.ficelle.ai/ficelle_pro-{NEXT_VERSION}-py3-none-any.whl",
         "sha256": "d" * 64,
         "authorization": "entitlement",
     }

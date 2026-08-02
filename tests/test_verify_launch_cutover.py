@@ -49,8 +49,8 @@ def test_private_phase_requires_anonymous_repo_and_release_404() -> None:
     values = {
         "https://api.github.com/repos/TheBlueHouse75/ficelle-open-core":
             canary.Snapshot(404, b""),
-        "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
-        "v0.1.3/ficelle_router-0.1.3-py3-none-any.whl":
+        f"https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
+        f"v{canary.VERSION}/ficelle_router-{canary.VERSION}-py3-none-any.whl":
             canary.Snapshot(404, b""),
         "https://site.example/": canary.Snapshot(200, b"ready"),
         "https://license.example/healthz": _health(),
@@ -73,24 +73,25 @@ def test_public_phase_checks_release_hash_files_bootstrap_and_site(
     repository = "TheBlueHouse75/ficelle-open-core"
     release_url = (
         f"https://github.com/{repository}/releases/download/"
-        "v0.1.3/ficelle_router-0.1.3-py3-none-any.whl"
+        f"v{canary.VERSION}/ficelle_router-{canary.VERSION}-py3-none-any.whl"
     )
     values = {
         f"https://api.github.com/repos/{repository}":
             canary.Snapshot(200, b'{"private": false}'),
         release_url: canary.Snapshot(200, wheel),
-        f"https://raw.githubusercontent.com/{repository}/v0.1.3/"
+        f"https://raw.githubusercontent.com/{repository}/v{canary.VERSION}/"
         "scripts/bootstrap-ficelle.py":
             canary.Snapshot(
                 200,
                 (
-                    'CORE_VERSION = "0.1.3"\n'
+                    f'CORE_VERSION = "{canary.VERSION}"\n'
                     f'CORE_SHA = "{canary.CORE_SHA256}"'
                 ).encode(),
             ),
         "https://site.example/": canary.Snapshot(
             200,
-            b"/TheBlueHouse75/ficelle-open-core/v0.1.3/scripts/bootstrap-ficelle.py",
+            f"/TheBlueHouse75/ficelle-open-core/v{canary.VERSION}"
+            "/scripts/bootstrap-ficelle.py".encode(),
         ),
         "https://license.example/healthz": _health(),
     }

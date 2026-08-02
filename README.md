@@ -56,7 +56,7 @@ raw numbers: [the benchmark write-up](https://ficelle-website.netlify.app/blog/f
 Install the versioned open Core from its GitHub Release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.3/scripts/bootstrap-ficelle.py | python3 -
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.4/scripts/bootstrap-ficelle.py | python3 -
 ~/.local/bin/ficelle models
 ```
 
@@ -68,7 +68,7 @@ key in shell history, enter it silently before running the same command:
 (
   read -s FICELLE_LICENSE_KEY
   export FICELLE_LICENSE_KEY
-  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.3/scripts/bootstrap-ficelle.py | python3 -
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.4/scripts/bootstrap-ficelle.py | python3 -
 )
 ```
 
