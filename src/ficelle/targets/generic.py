@@ -33,6 +33,11 @@ class GenericClientTargetAdapter:
     def export_config(self, context: TargetExportContext) -> TargetExport:
         config = dict(context.config)
         base_url = target_base_url(config)
+        # Both forms, because clients disagree on what an "endpoint" field means: some append
+        # the route to a base, others send the configured value verbatim. Exporting only the
+        # base leaves the second kind with nothing to paste, so the user hand-builds a URL and
+        # lands on `POST /v1` — a 404 that reads as a router failure.
+        chat_completions_url = f"{base_url}/chat/completions"
         models = self._model_ids(config)
         primary = "ficelle/auto-fast" if "ficelle/auto-fast" in models else models[0]
         return TargetExport(
@@ -41,6 +46,7 @@ class GenericClientTargetAdapter:
             models=models,
             config={
                 "base_url": base_url,
+                "chat_completions_url": chat_completions_url,
                 "api_key": "ficelle-local",
                 "models": list(models),
             },
@@ -48,12 +54,14 @@ class GenericClientTargetAdapter:
                 {
                     "name": "Generic chat client",
                     "base_url": base_url,
+                    "chat_completions_url": chat_completions_url,
                     "model": primary,
                     "api_key": "ficelle-local",
                 },
             ),
             warnings=(
                 "Use the placeholder api_key only for clients that require a non-empty key for local loopback calls.",
+                "Paste base_url into clients that append the route themselves, chat_completions_url into clients whose endpoint field wants the full chat URL.",
             ),
             verification_commands=(
                 ("ficelle", "health"),

@@ -56,7 +56,7 @@ raw numbers: [the benchmark write-up](https://ficelle-website.netlify.app/blog/f
 Install the versioned open Core from its GitHub Release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.5/scripts/bootstrap-ficelle.py | python3 -
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.6/scripts/bootstrap-ficelle.py | python3 -
 ~/.local/bin/ficelle models
 ```
 
@@ -68,7 +68,7 @@ key in shell history, enter it silently before running the same command:
 (
   read -s FICELLE_LICENSE_KEY
   export FICELLE_LICENSE_KEY
-  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.5/scripts/bootstrap-ficelle.py | python3 -
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.6/scripts/bootstrap-ficelle.py | python3 -
 )
 ```
 
@@ -121,14 +121,14 @@ its own HTTPS manifest with `FICELLE_UPDATE_MANIFEST_URL`. The compact manifest 
 
 ```json
 {
-  "version": "0.1.5",
-  "release_url": "https://ficelle.ai/releases/0.1.5",
+  "version": "0.1.6",
+  "release_url": "https://ficelle.ai/releases/0.1.6",
   "core": {
-    "wheel_url": "https://downloads.example/ficelle_router-0.1.5-py3-none-any.whl",
+    "wheel_url": "https://downloads.example/ficelle_router-0.1.6-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>"
   },
   "pro": {
-    "wheel_url": "https://downloads.example/ficelle_pro-0.1.5-py3-none-any.whl",
+    "wheel_url": "https://downloads.example/ficelle_pro-0.1.6-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>",
     "authorization": "bearer"
   }

@@ -198,6 +198,7 @@
           <div class="card-body">
             <div class="ep-inline" id="exportEndpoint" hidden>
               <div><span class="ep-key">Base URL</span><span class="ep-val" id="exportEndpointUrl">&nbsp;</span></div>
+              <div><span class="ep-key">Full chat URL</span><span class="ep-val" id="exportEndpointChatUrl">&nbsp;</span></div>
               <div><span class="ep-key">API key</span><span class="ep-val" id="exportEndpointKey">&nbsp;</span></div>
             </div>
             <textarea class="codeblock" id="configExport" readonly placeholder="Press &quot;Build snippet&quot; to generate the export."></textarea>
@@ -216,11 +217,19 @@
       </div>
 
       <!-- The address to point any OpenAI-compatible client at. Filled in from
-           location.origin so it stays right when the router runs on a custom port. -->
+           location.origin so it stays right when the router runs on a custom port.
+           Both forms are offered because clients disagree on what an "endpoint" field
+           means: paste the base into clients that append the route themselves, the full
+           chat URL into clients that send the configured value verbatim. -->
       <button class="endpoint" id="endpointCopy" type="button" title="Copy the base URL">
         <span class="ep-key">OpenAI-compatible endpoint</span>
         <span class="ep-val" id="endpointUrl">&nbsp;</span>
         <span class="ep-hint">Click to copy &middot; api key <code>ficelle-local</code></span>
+      </button>
+      <button class="endpoint endpoint-alt" id="endpointChatCopy" type="button" title="Copy the full chat completions URL">
+        <span class="ep-key">Full chat URL</span>
+        <span class="ep-val" id="endpointChatUrl">&nbsp;</span>
+        <span class="ep-hint">For clients whose endpoint field wants the whole path</span>
       </button>
 
       <nav class="nav" id="nav">

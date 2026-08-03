@@ -21,11 +21,13 @@ _URL_PATTERN = re.compile(r"""https?://[^\s"'<>)\]},;]+""")
 
 FailureReason = Literal[
     "auth_or_credit",
+    "bad_upstream_request",
     "billing_or_paid",
     "model_not_found",
     "no_free_quota",
     "quota_exhausted",
     "rate_limited",
+    "rate_limited_upstream",
     "request_too_large",
     "server_error",
     "unavailable",
@@ -64,6 +66,24 @@ FREE_TIER_ZERO_ALLOCATION_MARKERS = (
     "limit:0",
 )
 
+# Structural "the pool behind THIS model id is saturated" markers. An aggregator serves one model id
+# from a shared upstream pool, so its 429 says nothing about the account: every sibling model of the
+# same provider is still answering. Mapping it to `rate_limited` benches the whole provider for one
+# saturated model.
+UPSTREAM_RATE_LIMIT_TEXT_MARKERS = (
+    "rate-limited upstream",
+    "rate limited upstream",
+)
+
+# Stronger account-scope signals win over the upstream-pool wording. Some first-party providers name
+# both the model and the organization/API key whose RPM budget was consumed; the model id alone must
+# not weaken that provider-wide protection.
+ACCOUNT_RATE_LIMIT_TEXT_MARKERS = (
+    "account",
+    "organization",
+    "api key",
+)
+
 # Structural "this upstream model id is not serveable" markers. A positive
 # match quarantines a model instead of cooling it for repeated re-probes.
 MODEL_NOT_FOUND_TEXT_MARKERS = (
@@ -83,6 +103,7 @@ class FailureMarkers:
     quota_exhausted: tuple[str, ...] = QUOTA_EXHAUSTED_TEXT_MARKERS
     free_tier_zero_allocation: tuple[str, ...] = FREE_TIER_ZERO_ALLOCATION_MARKERS
     model_not_found: tuple[str, ...] = MODEL_NOT_FOUND_TEXT_MARKERS
+    upstream_rate_limit: tuple[str, ...] = UPSTREAM_RATE_LIMIT_TEXT_MARKERS
 
     def with_extra(
         self,
@@ -91,23 +112,50 @@ class FailureMarkers:
         quota_exhausted: tuple[str, ...] = (),
         free_tier_zero_allocation: tuple[str, ...] = (),
         model_not_found: tuple[str, ...] = (),
+        upstream_rate_limit: tuple[str, ...] = (),
     ) -> "FailureMarkers":
         return FailureMarkers(
             false_free=self.false_free + false_free,
             quota_exhausted=self.quota_exhausted + quota_exhausted,
             free_tier_zero_allocation=self.free_tier_zero_allocation + free_tier_zero_allocation,
             model_not_found=self.model_not_found + model_not_found,
+            upstream_rate_limit=self.upstream_rate_limit + upstream_rate_limit,
         )
 
 
 DEFAULT_FAILURE_MARKERS = FailureMarkers()
 
-# Failures the CALLER caused, not the model. They are still counted and shown — a model that only
-# ever truncates must stay visible rather than keep a clean record — but they do not feed the
-# consecutive-failure streak, whose penalty is cumulative (12 points each, `model_scoring`). Without
-# this, a client looping on a too-small max_tokens would progressively demote every candidate it
-# touches, reordering a whole profile's pool over a limit that says nothing about the models.
-CALLER_CAUSED_FAILURE_REASONS = frozenset({"truncated_before_content"})
+# The provider rejected the REQUEST we sent, not the account: a 400/422 is by definition about this
+# body. Shared with `capability_discovery`, which reads the same statuses as a per-profile capability
+# verdict — one name, one meaning, and the two paths' differing consequences stay deliberate.
+REQUEST_REJECTION_STATUSES = frozenset({400, 422})
+
+# Failures the CALLER caused, not the model. Two consequences, both flowing from that single fact:
+# `cooldown_policy_for_reason` withholds the cooldown, and the consecutive-failure streak skips them.
+# The streak's penalty is cumulative (12 points each, `model_scoring`), so without the exemption a
+# client looping on a too-small max_tokens would progressively demote every candidate it touches,
+# reordering a whole profile's pool over a limit that says nothing about the models. They are still
+# counted and shown — a model that only ever truncates must stay visible rather than keep a clean
+# record.
+CALLER_CAUSED_FAILURE_REASONS = frozenset(
+    {
+        "truncated_before_content",
+        # The upstream refused the request body itself. A malformed tool_call or an unsupported
+        # field says nothing about the model's health, and every candidate would reject the same
+        # payload — so no retry (see NON_RETRYABLE_FAILURE_REASONS), no cooldown, and the caller
+        # gets the upstream's own 400.
+        "bad_upstream_request",
+        # Writing to the caller's socket failed: the client hung up mid-stream. The upstream was
+        # answering fine; cooling it would punish a healthy model for a client-side abort.
+        "client_disconnected",
+    }
+)
+
+# Failures no other candidate can do better on, because the candidate was never the problem. Trying
+# the next one replays the same rejection and burns a healthy model's turn. Distinct from
+# CALLER_CAUSED_FAILURE_REASONS, which is about *state writes*: a truncated response is the caller's
+# fault too, yet a model with a larger budget may well answer, so it keeps its failover.
+NON_RETRYABLE_FAILURE_REASONS = frozenset({"bad_upstream_request"})
 
 PROVIDER_SCOPED_COOLDOWN_REASONS = {"rate_limited", "auth_or_credit"}
 PROVIDER_ERROR_REASONS = PROVIDER_SCOPED_COOLDOWN_REASONS | {"quota_exhausted", "no_free_quota"}
@@ -160,10 +208,12 @@ def cooldown_policy_for_reason(reason: str, *, source: str = "") -> CooldownPoli
             ),
             model_cooldown=False,
         )
-    if reason == "truncated_before_content":
-        # The caller's own token budget ran out before the model emitted anything. Record the
-        # failure so the model stays scored and visible in the admin, but never cool it: one client
-        # sending max_tokens=20 would otherwise empty a whole profile's pool for the cooldown window.
+    if reason in CALLER_CAUSED_FAILURE_REASONS:
+        # The caller, not the model, produced the failure: a token budget that ran out before any
+        # content, a request body the upstream refuses, a client that hung up mid-stream. Record it
+        # so the model stays scored and visible in the admin, but never cool it — one client sending
+        # max_tokens=20 or a malformed tool_call would otherwise empty a whole profile's pool for
+        # the cooldown window, which is exactly how a bad client takes the router down.
         return CooldownPolicy(record_provider_error=False, model_cooldown=False)
     if reason == "quota_exhausted":
         return CooldownPolicy(
@@ -195,6 +245,7 @@ def classify_failure(
     *,
     normalized_free_access: dict[str, Any] | None = None,
     markers: FailureMarkers | None = None,
+    upstream_model_id: str | None = None,
 ) -> FailureReason:
     """Classify a provider failure using already-normalized free-access metadata."""
     marker_set = markers or DEFAULT_FAILURE_MARKERS
@@ -211,8 +262,25 @@ def classify_failure(
             return "auth_or_credit"
         if status_code >= 500:
             return "server_error"
+        # Deliberately not `bad_upstream_request`: the message names an exhausted quota, so the
+        # request body is not what this 400 is about, and the model does belong on cooldown.
         return "unavailable"
     if status_code == 429:
+        # A 429 that names the shared pool behind one model id is MODEL-scoped: the account is fine
+        # and every sibling model keeps answering, so it must not cool the provider. Matched on the
+        # URL-stripped text like the false-free markers, since these messages link to a settings page.
+        # The marker alone is not enough: an account/provider-level message may also mention an
+        # upstream limit. Fail closed to the provider-scoped policy unless the body names the exact
+        # model Ficelle called.
+        normalized_model_id = str(upstream_model_id or "").strip().lower()
+        names_model = len(normalized_model_id) >= 4 and normalized_model_id in lower_without_urls
+        names_account_scope = any(marker in lower_without_urls for marker in ACCOUNT_RATE_LIMIT_TEXT_MARKERS)
+        if (
+            names_model
+            and not names_account_scope
+            and any(marker in lower_without_urls for marker in marker_set.upstream_rate_limit)
+        ):
+            return "rate_limited_upstream"
         return "rate_limited"
     # A tokens-per-minute rejection is a transient, MODEL-scoped throughput limit that recharges on
     # its own — deliberately neither `rate_limited` (provider-scoped, would cool every model of the
@@ -229,6 +297,11 @@ def classify_failure(
         return "model_not_found"
     if status_code >= 500:
         return "server_error"
+    # Last, so a 400 that actually states a billing/quota/auth problem keeps its stronger reading
+    # above: what is left is the upstream rejecting the request body. Retrying it on another
+    # candidate replays the same rejection, and cooling the model blames it for the caller's payload.
+    if status_code in REQUEST_REJECTION_STATUSES:
+        return "bad_upstream_request"
     return "unavailable"
 
 
@@ -262,6 +335,8 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
         actions.append("Check provider credentials/credits, then clear the provider cooldown after fixing it.")
     if reason_counts.get("rate_limited"):
         actions.append("Wait for the provider cooldown or switch this virtual model to another healthy provider.")
+    if reason_counts.get("rate_limited_upstream"):
+        actions.append("The shared upstream pool behind this model id is saturated, not your account: the model is cooled briefly and its provider keeps serving. Nothing to fix; add your own upstream key if you need dedicated limits.")
     if reason_counts.get("billing_or_paid"):
         actions.append("Inspect the anti false-free guard result; refresh the catalog before re-enabling the model.")
     if reason_counts.get("no_free_quota"):
@@ -272,6 +347,10 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
         actions.append("Retry after the short model cooldown or quarantine the unstable upstream.")
     if reason_counts.get("timeout"):
         actions.append("Ficelle timed out a slow upstream and tried the next candidate; reduce this virtual model's timeout or quarantine repeat offenders.")
+    if reason_counts.get("bad_upstream_request"):
+        actions.append("The upstream rejected the request body itself (HTTP 400/422) — inspect the payload the client sent, typically a malformed tool_call or an unsupported field. No model was cooled and no other candidate was tried: every one of them would reject the same body.")
+    if reason_counts.get("client_disconnected"):
+        actions.append("The client closed the connection while the answer was streaming; the upstream was healthy and was not cooled. Look at the client's timeout or cancel behaviour, not at the model.")
     if reason_counts.get("truncated_before_content"):
         actions.append("The completion token budget ran out before the model emitted any content; reasoning models spend it on reasoning tokens first. Raise max_tokens on the request. No model was cooled: this is a request-side limit, not an upstream failure.")
     if reason_counts.get("empty_assistant_message") or reason_counts.get("invalid_success_json"):
@@ -279,6 +358,24 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
     if not actions:
         actions.append("Inspect ~/.ficelle/logs/routes.jsonl with the request_id, then clear cooldowns only after the upstream issue is understood.")
     return actions
+
+
+def caller_rejected_request(errors: list[dict[str, Any]]) -> bool:
+    """True when every attempt failed because the upstream refused the request body itself.
+
+    The payload is the problem, so no candidate could have done better: the caller gets the
+    upstream's own 400 instead of a 502 that reads as "Ficelle is broken".
+    """
+    return bool(errors) and all(row.get("reason") == "bad_upstream_request" for row in errors)
+
+
+def upstream_failure_status(errors: list[dict[str, Any]]) -> int:
+    """HTTP status for a run where no candidate delivered.
+
+    Paired with `build_upstream_failure_error`, which reads the same verdict off the same list:
+    every caller of one must use the other, or the status and the payload's `type` disagree.
+    """
+    return 400 if caller_rejected_request(errors) else 502
 
 
 def build_upstream_failure_error(
@@ -313,10 +410,17 @@ def build_upstream_failure_error(
         safe_details.append({key: value for key, value in safe_row.items() if value is not None})
     reason_summary = ", ".join(f"{reason}={count}" for reason, count in sorted(reason_counts.items())) or "unknown"
     safe_requested_model = sanitize_error_detail(requested_model, 250) or "[redacted]"
+    if list(reason_counts) == ["bad_upstream_request"]:  # `caller_rejected_request`, already counted
+        upstream_detail = safe_details[-1].get("detail") if safe_details else ""
+        message = "upstream rejected this request as invalid" + (f": {upstream_detail}" if upstream_detail else "")
+        error_type = "invalid_request_error"
+    else:
+        message = f"all Ficelle candidates failed for {safe_requested_model} ({len(attempts)}/{candidate_count} attempted; {reason_summary})"
+        error_type = "upstream_failure"
     return {
         "error": {
-            "message": f"all Ficelle candidates failed for {safe_requested_model} ({len(attempts)}/{candidate_count} attempted; {reason_summary})",
-            "type": "upstream_failure",
+            "message": message,
+            "type": error_type,
             "request_id": request_id,
             "requested_model": safe_requested_model,
             "candidate_count": candidate_count,

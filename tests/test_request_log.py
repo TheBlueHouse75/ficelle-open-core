@@ -201,6 +201,81 @@ def test_summary_success_is_reason_ok_not_http_status(paths):
     assert {200, 502} <= statuses
 
 
+def test_summary_timeline_covers_every_slot_including_idle_ones(paths):
+    log, db = paths
+    now = time.time()
+    # Two requests half an hour apart, so the middle of the window is genuinely idle.
+    _write(log, [
+        _line("early", now=now, offset=1800),
+        _line("late", now=now),
+    ])
+    s = rl.summary(store_path=db, source_path=log, window_seconds=3600, now=now)
+    bucket = s["bucket_seconds"]
+    starts = [row["bucket"] for row in s["timeline"]]
+    # A windowed series is defined by its window: contiguous slots, no holes.
+    assert starts == list(range(starts[0], starts[-1] + bucket, bucket))
+    assert starts[-1] == int(now // bucket) * bucket
+    assert starts[0] == int((now - 3600) // bucket) * bucket
+    # The timeline and the window totals share one cutoff, so they must never drift.
+    assert sum(row["total"] for row in s["timeline"]) == s["total"] == 2
+    assert any(row["total"] == 0 for row in s["timeline"]), "idle slots must be reported as zeros"
+
+
+def test_summary_timeline_is_all_zeros_when_nothing_was_logged(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [])
+    s = rl.summary(store_path=db, source_path=log, window_seconds=3600, now=now)
+    assert s["total"] == 0
+    # The admin view keys its "no requests yet" empty state off the counts, not the
+    # length — so assert the slots are actually there before asserting they are zero.
+    assert len(s["timeline"]) == 3600 // s["bucket_seconds"] + 1
+    assert all(row["total"] == 0 for row in s["timeline"])
+
+
+def test_summary_timeline_uses_floor_buckets_before_unix_epoch(paths):
+    log, db = paths
+    reference = -1.0
+    cutoff = reference - 60
+    # Insert directly because catch-up retention correctly removes 1969 log rows.
+    rl.summary(store_path=db, source_path=log, window_seconds=60, now=reference)
+    with sqlite3.connect(db) as conn:
+        conn.executemany(
+            "INSERT INTO requests (request_id, ts, reason) VALUES (?, ?, 'ok')",
+            [("at-cutoff", cutoff), ("at-reference", reference)],
+        )
+
+    s = rl.summary(store_path=db, source_path=log, window_seconds=60, now=reference)
+    assert s["timeline"] == [{"bucket": -300, "total": 2, "ok": 2}]
+    assert sum(row["total"] for row in s["timeline"]) == s["total"] == 2
+
+
+def test_summary_excludes_rows_after_the_reference_time(paths):
+    log, db = paths
+    reference = 1_000.0
+    cutoff = reference - 300
+    rl.summary(store_path=db, source_path=log, window_seconds=300, now=reference)
+    with sqlite3.connect(db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO requests (request_id, ts, reason, source, latency_seconds)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("at-cutoff", cutoff, "ok", "inside", 1.0),
+                ("at-reference", reference, "failed", "inside", 2.0),
+                ("future", reference + 500, "ok", "future", 100.0),
+            ],
+        )
+
+    s = rl.summary(store_path=db, source_path=log, window_seconds=300, now=reference)
+    assert sum(row["total"] for row in s["timeline"]) == s["total"] == 2
+    assert s["ok"] == 1
+    assert s["by_source"] == [{"source": "inside", "total": 2, "ok": 1}]
+    assert s["latency_p50"] == 1.0
+    assert s["latency_p95"] == 2.0
+
+
 def test_summary_window_excludes_old_rows(paths):
     log, db = paths
     now = time.time()
@@ -264,6 +339,96 @@ def test_missing_source_file_is_safe(paths):
     assert rows == []
     summary = rl.summary(store_path=db, source_path=log, window_seconds=3600)
     assert summary["total"] == 0
+
+
+def test_tail_primes_without_replaying_history(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [_line("a", now=now, offset=2), _line("b", now=now, offset=1)])
+
+    primed = rl.tail(store_path=db, source_path=log)
+
+    # Opening the page must not push rows the list already showed.
+    assert primed == {"cursor": 2, "entries": [], "resync": False}
+
+
+def test_tail_returns_only_rows_ingested_after_the_cursor(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [_line("a", now=now, offset=2)])
+    primed = rl.tail(store_path=db, source_path=log)
+    _write(log, [_line("b", now=now, offset=1), _line("c", now=now)])
+
+    batch = rl.tail(cursor=primed["cursor"], store_path=db, source_path=log)
+
+    assert [row["request_id"] for row in batch["entries"]] == ["b", "c"]  # oldest first
+    assert batch["cursor"] == 3
+    assert rl.tail(cursor=batch["cursor"], store_path=db, source_path=log)["entries"] == []
+
+
+def test_tail_cursor_advances_past_rows_the_filter_dropped(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [_line("a", now=now, offset=3)])
+    primed = rl.tail(store_path=db, source_path=log, source="openrouter")
+    _write(log, [
+        _line("other", now=now, offset=2, selected_source="nous"),
+        _line("match", now=now, offset=1),
+    ])
+
+    batch = rl.tail(cursor=primed["cursor"], store_path=db, source_path=log, source="openrouter")
+
+    # Without the skip the non-matching row would be re-scanned on every poll, forever.
+    assert [row["request_id"] for row in batch["entries"]] == ["match"]
+    assert batch["cursor"] == 3
+
+
+def test_tail_caps_one_batch_and_resumes_from_the_last_row(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [_line("a", now=now, offset=3)])
+    primed = rl.tail(store_path=db, source_path=log)
+    _write(log, [_line("b", now=now, offset=2), _line("c", now=now, offset=1), _line("d", now=now)])
+
+    first = rl.tail(cursor=primed["cursor"], store_path=db, source_path=log, limit=2)
+    assert [row["request_id"] for row in first["entries"]] == ["b", "c"]
+    assert first["cursor"] == 3
+
+    second = rl.tail(cursor=first["cursor"], store_path=db, source_path=log, limit=2)
+    assert [row["request_id"] for row in second["entries"]] == ["d"]
+
+
+def test_tail_asks_for_a_resync_when_the_subscriber_fell_too_far_behind(paths):
+    log, db = paths
+    now = time.time()
+    total = rl.MAX_TAIL_REPLAY + 5
+    _write(log, [_line(f"r{i}", now=now, offset=total - i) for i in range(total)])
+
+    batch = rl.tail(cursor=0, store_path=db, source_path=log)
+
+    assert batch == {"cursor": total, "entries": [], "resync": True}
+
+
+def test_tail_asks_for_a_resync_when_the_index_was_rebuilt_below_the_cursor(paths):
+    log, db = paths
+    _write(log, [_line("a", now=time.time())])
+
+    batch = rl.tail(cursor=999, store_path=db, source_path=log)
+
+    assert batch == {"cursor": 1, "entries": [], "resync": True}
+
+
+def test_source_signature_moves_only_when_the_log_grows(paths):
+    log, _db = paths
+    assert rl.source_signature(log) is None
+
+    _write(log, [_line("a", now=time.time())])
+    first = rl.source_signature(log)
+    assert first is not None
+    assert rl.source_signature(log) == first
+
+    _write(log, [_line("b", now=time.time())])
+    assert rl.source_signature(log) != first
 
 
 def test_window_seconds_from_label():

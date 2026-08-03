@@ -13,6 +13,8 @@ from ficelle.use_cases.capability_discovery import (
     ROUTE_REJECTION_VERDICT,
     VERDICT_BASIS_KEY,
     CapabilityDiscoveryJob,
+    ProviderProbePacer,
+    provider_probe_interval_seconds,
 )
 
 
@@ -964,6 +966,7 @@ class BenchmarkRunner:
     redact_sensitive_json: Callable[[dict[str, Any]], dict[str, Any]]
     now_iso: Callable[[], str]
     route_blocking_reasons: frozenset[str]
+    pacer: ProviderProbePacer
     media_error_types: tuple[type[BaseException], ...] = ()
     registry: ProbeRegistry = ProbeRegistry()
 
@@ -1086,6 +1089,11 @@ class BenchmarkRunner:
         expected: str,
         config: dict[str, Any],
     ) -> dict[str, Any]:
+        # Same pacer instance as capability discovery: a canary walking every candidate of a profile
+        # is a LARGER burst than the discovery cycle that first tripped OpenRouter's per-minute
+        # limit, and the admin "Test candidates" button can fire it while a cycle is already running.
+        source = str(model.get("source") or "")
+        self.pacer.wait_turn(source, provider_probe_interval_seconds(config, source))
         started = time.time()
         result: dict[str, Any] = {
             "profile_id": profile_id,

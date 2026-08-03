@@ -47,6 +47,7 @@ from ficelle.use_cases.capability_discovery import (
     ROUTE_REJECTION_VERDICT,
     VERDICT_BASIS_KEY,
     CapabilityDiscoveryJob,
+    ProviderProbePacer,
     clear_background_job_error_in_state,
     discovery_eligible_models,
     model_due_capabilities,
@@ -549,6 +550,7 @@ def test_benchmark_runner_falls_back_to_next_candidate_after_semantic_failure():
         safe_detail=safe_detail,
         redact_sensitive_json=dict,
         now_iso=lambda: "2026-06-21T00:00:00Z",
+        pacer=ProviderProbePacer(pause=lambda _seconds: None),
         route_blocking_reasons=frozenset({"billing", "quota", "auth"}),
     )
 
@@ -580,6 +582,7 @@ def test_benchmark_runner_aggregates_run_summary_and_default_profiles():
         safe_detail=lambda value, limit=None: str(value)[:limit] if limit is not None else str(value),
         redact_sensitive_json=dict,
         now_iso=lambda: "2026-06-21T00:00:00Z",
+        pacer=ProviderProbePacer(pause=lambda _seconds: None),
         route_blocking_reasons=frozenset(),
     )
 
@@ -623,6 +626,7 @@ def test_capability_discovery_records_shape_rejection_without_cooldown():
         safe_detail=lambda value, *_args: str(value),
         now_iso=lambda: "2026-06-21T00:00:00Z",
         route_blocking_reasons=frozenset({"billing", "quota", "auth"}),
+        pacer=ProviderProbePacer(pause=lambda _seconds: None),
         registry=ProbeRegistry(),
     )
 

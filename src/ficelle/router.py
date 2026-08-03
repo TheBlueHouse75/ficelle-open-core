@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -76,6 +77,7 @@ from ficelle.failures import (
     cooldown_policy_for_reason,
     safe_error_body as safe_error_body_result,
     upstream_failure_actions as upstream_failure_actions_result,
+    upstream_failure_status,
 )
 from ficelle.provider_credentials import (
     PROVIDER_ENV_ALIASES,
@@ -152,6 +154,7 @@ from ficelle.use_cases.benchmark import (
 from ficelle.use_cases.capability_discovery import (
     VERDICT_BASIS_KEY,
     CapabilityDiscoveryJob,
+    ProviderProbePacer,
     clear_background_job_error_in_state,
     discovery_eligible_models as discovery_eligible_models_use_case,
     model_due_capabilities as model_due_capabilities_use_case,
@@ -362,6 +365,7 @@ except ImportError:  # pragma: no cover - exercised only in core-only installs
     valid_fusion_judge_json_use_case = None
 from ficelle.use_cases.hermes_export import HermesExportBuilder
 from ficelle.targets import TargetAdapter, TargetExport, TargetExportContext, target_export
+from ficelle.targets.base import target_base_url
 from ficelle.targets.generic import GenericClientTargetAdapter
 from ficelle.targets.hermes import HermesTargetAdapter, build_hermes_runtime_resolver
 from ficelle.targets.openclaw import OpenClawTargetAdapter
@@ -500,6 +504,13 @@ _STATE_STORE = StateStore(
     fallback_backup_dir=RUNTIME_PATHS.runtime_read_dir / STATE_BACKUP_DIR.name,
 )
 _REQUEST_LOG_LOCK = threading.Lock()
+# Live request tail (SSE, admin Requests page). Each subscriber holds one handler thread,
+# so the tail is bounded on both axes: how many may be open, and how long one may stay.
+# The browser's EventSource reconnects by itself when the lifetime cap closes a stream.
+REQUEST_STREAM_POLL_SECONDS = 1.0
+REQUEST_STREAM_PING_SECONDS = 15.0
+REQUEST_STREAM_MAX_SECONDS = 900.0
+_REQUEST_STREAM_SLOTS = threading.BoundedSemaphore(4)
 _CATALOG_PUBLISH_THREAD_LOCK = threading.RLock()
 # Held from background transition-thread creation until that worker exits; it only
 # deduplicates license-transition refreshes and does not serialize general catalog writes.
@@ -1061,6 +1072,11 @@ CORE_PROVIDERS: dict[str, dict] = {
         "base_url": "https://openrouter.ai/api/v1",
         "api_key_env": "OPENROUTER_API_KEY",
         "source_type": "zero_price_catalog",
+        # Published `:free` limit (`FREE_MODEL_RATE_LIMIT_RPM = 20`). Paces PROBES only, at a
+        # fraction of it — live routing is never queued. Verified 03/08/2026: OpenRouter exposes no
+        # rate-limit header on a 2xx, and the `rate_limit` field of `GET /api/v1/key` is documented
+        # as deprecated, so a declared value is the only signal available before a 429 arrives.
+        "rate_limit_rpm": 20,
     },
     "nous": {
         "enabled": True,
@@ -1088,6 +1104,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "catalog_timeout_seconds": 30,
     "cooldown_seconds": {
         "rate_limited": 900,
+        # Short by design: the saturated pool is behind ONE model id, and the provider says "retry
+        # shortly". Cooling it for the provider-wide 900s would strand a model that recovers faster.
+        "rate_limited_upstream": 300,
         # Short by design: a TPM limit recharges continuously, so the model recovers on its own.
         "request_too_large": 120,
         "quota_exhausted": 3600,
@@ -1338,6 +1357,33 @@ def safe_error_body(exc: Exception, *, request_id: str | None = None) -> dict[st
 
 def bad_request_body(exc: Exception, *, request_id: str | None = None) -> dict[str, Any]:
     return bad_request_body_result(exc, request_id=request_id)
+
+
+CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+
+
+def not_found_body(method: str, path: str, base_url: str) -> dict[str, Any]:
+    """404 body naming the endpoint a client that missed the OpenAI surface probably wanted.
+
+    Clients whose settings ask for a full chat URL POST the configured value verbatim, so a
+    `/v1` base arrives as `POST /v1`; they then surface our `error.message` as-is, and a terse
+    "not found" reads as a router failure rather than a client-config mistake. `base_url` is
+    the one the export endpoints advertise, so the hint agrees with `/admin/export/generic`.
+    Misses outside the OpenAI surface (`/favicon.ico`, admin typos) keep the terse body.
+    """
+    if path != "/" and not path.startswith("/v1"):
+        return {"error": {"message": "not found", "type": "not_found"}}
+    if method == "POST":
+        message = (
+            f"not found — Ficelle serves chat at POST {CHAT_COMPLETIONS_PATH}. Point your client's "
+            f"chat endpoint at the full URL {base_url}/chat/completions, not the {base_url} base."
+        )
+    else:
+        message = (
+            "not found — Ficelle serves GET /v1/models, /health, /status. "
+            f"The chat endpoint is POST {CHAT_COMPLETIONS_PATH}."
+        )
+    return {"error": {"message": message, "type": "not_found"}}
 
 
 def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
@@ -4299,29 +4345,51 @@ def admin_query_limit(path: str, default: int = 50) -> int:
     return safe_int(values[0], default) if values else default
 
 
-def request_log_query_payload(path: str) -> dict[str, Any]:
-    """Filtered list of recent routed requests from the derived index."""
+def request_log_filters(path: str) -> dict[str, str | None]:
+    """Parse the request-log filter query string, shared by the list and the live tail."""
     params = parse_qs(urlparse(path).query, keep_blank_values=True)
 
     def first(key: str) -> str | None:
         values = params.get(key)
         return values[0] if values and values[0] != "" else None
 
+    return {key: first(key) for key in ("profile", "source", "reason", "status", "q")}
+
+
+def request_log_query_payload(path: str) -> dict[str, Any]:
+    """Filtered list of recent routed requests from the derived index."""
     try:
         with _REQUEST_LOG_LOCK:
             rows = request_log.query(
                 store_path=REQUEST_LOG_STORE_PATH,
                 source_path=runtime_read_path(ROUTE_LOG_PATH),
                 limit=admin_query_limit(path, default=request_log.DEFAULT_QUERY_LIMIT),
-                profile=first("profile"),
-                source=first("source"),
-                reason=first("reason"),
-                status=first("status"),
-                q=first("q"),
+                **request_log_filters(path),
             )
-        return {"generated_at": now_iso(), "entries": rows}
+            # The cursor pins this snapshot for a live tail opened right after: it resumes
+            # from here instead of from wherever the head has drifted to by then.
+            cursor = request_log.head_cursor(store_path=REQUEST_LOG_STORE_PATH)
+        return {"generated_at": now_iso(), "entries": rows, "cursor": cursor}
     except Exception as exc:
         return {"generated_at": now_iso(), "entries": [], "error_type": type(exc).__name__}
+
+
+def request_log_tail_payload(cursor: int | None, filters: dict[str, str | None]) -> dict[str, Any]:
+    """One live-tail batch: rows ingested after ``cursor``, plus the next cursor."""
+    try:
+        with _REQUEST_LOG_LOCK:
+            payload = request_log.tail(
+                cursor=cursor,
+                store_path=REQUEST_LOG_STORE_PATH,
+                source_path=runtime_read_path(ROUTE_LOG_PATH),
+                **filters,
+            )
+        payload["generated_at"] = now_iso()
+        return payload
+    except Exception as exc:
+        # Degraded-safe like the other two reads: keep the cursor so the next tick retries
+        # from the same point instead of skipping the rows this one could not read.
+        return {"generated_at": now_iso(), "cursor": cursor, "entries": [], "resync": False, "error_type": type(exc).__name__}
 
 
 def request_log_summary_payload(path: str) -> dict[str, Any]:
@@ -5809,8 +5877,15 @@ def provider_credentials(source: str, config: dict[str, Any]) -> tuple[str | Non
 def classify_failure(status_code: int, text: str, model: dict[str, Any] | None = None) -> str:
     access = normalized_free_access(model) if isinstance(model, dict) else None
     source = str(model.get("source") or "") if isinstance(model, dict) else ""
+    upstream_model_id = str(model.get("upstream_id") or "") if isinstance(model, dict) else ""
     markers = provider_catalog_adapter(source).failure_markers() if source else None
-    return classify_failure_result(status_code, text, normalized_free_access=access, markers=markers)
+    return classify_failure_result(
+        status_code,
+        text,
+        normalized_free_access=access,
+        markers=markers,
+        upstream_model_id=upstream_model_id,
+    )
 
 
 def success_error_payload_failure(payload: Any, model: dict[str, Any] | None = None) -> tuple[str, str, int | None] | None:
@@ -6391,8 +6466,9 @@ def run_fusion_chat_completion(
         )
         persist_fusion_run(metadata)
         record_last_route(FUSION_MODEL_ID, "fail", "upstream_failure", request_id, len(panel_candidates), len(panel_results), time.time() - request_started, attempts=panel_attempts)
-        write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": 502, "final_reason": "insufficient_panel_success", "candidate_count": len(panel_candidates), "attempt_count": len(panel_results), "attempts": panel_attempts, "stream": False})
-        return 502, build_upstream_failure_error(FUSION_MODEL_ID, request_id, len(panel_candidates), panel_attempts, errors), fusion_response_headers(request_id, None, len(panel_results), metadata)
+        panel_failure_status = upstream_failure_status(errors)
+        write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": panel_failure_status, "final_reason": "insufficient_panel_success", "candidate_count": len(panel_candidates), "attempt_count": len(panel_results), "attempts": panel_attempts, "stream": False})
+        return panel_failure_status, build_upstream_failure_error(FUSION_MODEL_ID, request_id, len(panel_candidates), panel_attempts, errors), fusion_response_headers(request_id, None, len(panel_results), metadata)
 
     peer_ranking_config = fusion.get("peer_ranking") if isinstance(fusion.get("peer_ranking"), dict) else {}
     peer_ranking_enabled = bool(peer_ranking_config.get("enabled")) and bool(successes)
@@ -6531,11 +6607,12 @@ def run_fusion_chat_completion(
     attempts.extend(draft_attempts)
     attempts.extend(synth_attempts)
     if not final_text:
-        record_last_route(FUSION_MODEL_ID, "fail", reason_code, request_id, len(panel_candidates), len(attempts), time.time() - request_started, attempts=attempts)
-        write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": 502, "final_reason": reason_code, "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
         synth_failure_errors = synth_errors or [{"reason": "synthesizer_unavailable"}]
         synth_failure_candidate_count = max(synth_candidate_count, len(synth_failure_errors))
-        return 502, build_upstream_failure_error(FUSION_MODEL_ID, request_id, synth_failure_candidate_count, synth_failure_errors, synth_failure_errors), fusion_response_headers(request_id, None, len(attempts), metadata)
+        synth_failure_status = upstream_failure_status(synth_failure_errors)
+        record_last_route(FUSION_MODEL_ID, "fail", reason_code, request_id, len(panel_candidates), len(attempts), time.time() - request_started, attempts=attempts)
+        write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": synth_failure_status, "final_reason": reason_code, "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
+        return synth_failure_status, build_upstream_failure_error(FUSION_MODEL_ID, request_id, synth_failure_candidate_count, synth_failure_errors, synth_failure_errors), fusion_response_headers(request_id, None, len(attempts), metadata)
     record_last_route(FUSION_MODEL_ID, "ok", "ok", request_id, len(panel_candidates), len(attempts), time.time() - request_started, selected_synth, attempts)
     write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "selected_model": selected_synth.get("id") if selected_synth else None, "final_status": 200, "final_reason": "ok", "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
     return 200, fusion_openai_response(request_id, final_text), fusion_response_headers(request_id, selected_synth, len(attempts), metadata)
@@ -6617,6 +6694,13 @@ def sse_error_event(code: str, detail: str | None = None) -> bytes:
 
 def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: Any) -> dict[str, Any]:
     response_committed = False
+    # True only while a call into `write_chunk`/`flush` is in flight — the delivery side. An
+    # exception raised under this flag never came from the upstream, which is what matters here: a
+    # client-side abort must not cool a model that was answering correctly. It is deliberately the
+    # *whole* callback and not just the socket write, because the callback also builds and emits the
+    # response headers on its first call (`write_stream_chunk`); a failure there is not the model's
+    # fault either, so the same no-cooldown verdict is the right one.
+    writing_to_client = False
     chunk_count = 0
     bytes_sent = 0
     stream_tail = b""
@@ -6629,13 +6713,20 @@ def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: An
             # fallback on an already-started HTTP 200; update byte/tail metrics only after the
             # chunk itself was accepted.
             response_committed = True
+            writing_to_client = True
             write_chunk(chunk)
             chunk_count += 1
             bytes_sent += len(chunk)
             stream_tail = (stream_tail + chunk)[-2:]
             flush()
+            writing_to_client = False
     except Exception as exc:
-        reason = "mid_stream_failure" if response_committed else "pre_stream_failure"
+        if writing_to_client:
+            reason = "client_disconnected"
+        elif response_committed:
+            reason = "mid_stream_failure"
+        else:
+            reason = "pre_stream_failure"
         detail = safe_detail(exc)
         if response_committed:
             # The HTTP response may already be committed (headers sent, no retry possible):
@@ -6763,6 +6854,21 @@ def validate_benchmark_response(test_type: str, expected: str, text: str, payloa
     )
 
 
+def probe_pause(seconds: float) -> None:
+    """The wait a prober serves to stay under a provider's per-minute budget.
+
+    A named seam rather than a bare ``time.sleep`` so tests neutralize pacing without patching the
+    shared ``time`` module. Looked up through the module at call time, so the patch takes effect.
+    """
+    time.sleep(seconds)
+
+
+# ONE pacer for every prober in the process — capability discovery and the benchmark/canary path
+# share a provider's per-minute budget, so pacing them separately would let their sum exceed what
+# either respects alone. Rebuilt on module reload, so tests start from a clean slate.
+_PROBE_PACER = ProviderProbePacer(pause=lambda seconds: probe_pause(seconds))
+
+
 def build_benchmark_runner() -> BenchmarkRunner:
     return BenchmarkRunner(
         load_or_refresh_catalog=load_or_refresh_catalog,
@@ -6782,6 +6888,7 @@ def build_benchmark_runner() -> BenchmarkRunner:
         redact_sensitive_json=redact_sensitive_json,
         now_iso=now_iso,
         route_blocking_reasons=BENCHMARK_ROUTE_BLOCKING_REASONS,
+        pacer=_PROBE_PACER,
         media_error_types=(BenchmarkMediaError,),
         registry=ProbeRegistry(compression_max_words=COMPRESSION_BENCHMARK_MAX_WORDS),
     )
@@ -6800,6 +6907,7 @@ def build_capability_discovery_job() -> CapabilityDiscoveryJob:
         safe_detail=safe_detail,
         now_iso=now_iso,
         route_blocking_reasons=BENCHMARK_ROUTE_BLOCKING_REASONS,
+        pacer=_PROBE_PACER,
         registry=ProbeRegistry(compression_max_words=COMPRESSION_BENCHMARK_MAX_WORDS),
     )
 
@@ -6923,7 +7031,8 @@ def probe_model_capability(model: dict[str, Any], profile_id: str, config: dict[
     matching the false-free markers. A transient error (5xx, 429, timeout, unparseable 2xx) records no
     capability verdict but still applies a short availability backoff, so discovery stops re-probing a
     model that is actually down instead of starving the others. Returns one of ``verified`` /
-    ``failed`` / ``skip`` / ``blocked``.
+    ``failed`` / ``blocked`` / ``skip`` — where ``skip`` alone means nothing was sent and nothing
+    cooled, so the caller may keep probing this model.
     """
     return build_capability_discovery_job().probe_model_capability(model, profile_id, config)
 
@@ -6933,10 +7042,13 @@ def run_auto_benchmark_cycle(config: dict[str, Any]) -> dict[str, Any]:
 
     Takes up to ``auto_benchmark_models_per_cycle`` not-yet-fully-discovered models and probes each on
     ALL its still-unverdicted probeable capabilities (no stop-at-first-pass), so over time every model
-    is mapped to every profile it supports. A capability probe never benches a model globally (see
-    ``probe_model_capability``); a provider-wide block stops that model for the cycle. Converges then
-    idles; the verified-capability TTL re-opens verdicts for re-discovery. Records a privacy-safe
-    marker in state. Never raises out (the loop also guards).
+    is mapped to every profile it supports. A negative capability verdict never benches a model
+    globally (see ``probe_model_capability``); a transient probe that cools the model stops it for the
+    cycle, and eligibility is re-checked against fresh state before each model, so one that cooled a whole
+    provider (or a quota scope) also drops the models queued behind it. Probes of the same provider
+    are spaced so a cycle cannot trip a free-tier per-minute limit on its own. Converges then idles;
+    the verified-capability TTL re-opens verdicts for re-discovery. Records a privacy-safe marker in
+    state. Never raises out (the loop also guards).
     """
     result = build_capability_discovery_job().run_auto_benchmark_cycle(
         config,
@@ -7178,6 +7290,96 @@ class RouterHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _stream_request_log(self) -> None:
+        """Server-sent live tail of the derived request index (admin Requests page).
+
+        The loop polls the route log's ``stat()`` signature and only opens SQLite when the
+        log actually grew, so an idle router costs one ``stat()`` per second per subscriber
+        and the routing hot path stays untouched — the same "no hook in the writer" contract
+        the lazy catch-up ingest already follows.
+
+        Each event carries the cursor as its SSE ``id``, so a reconnecting browser resumes
+        exactly where it stopped via ``Last-Event-ID`` instead of replaying or skipping rows.
+        """
+        # A cross-site page cannot read this stream (EventSource is CORS-gated), but it could
+        # still open one and park a handler thread. The admin origin check closes that door;
+        # an Origin-less client (curl) is allowed, as everywhere else on the admin surface.
+        if not self._admin_origin_ok():
+            self._send_json(403, {"error": {"message": "cross-origin request stream rejected", "type": "forbidden"}})
+            return
+        if not _REQUEST_STREAM_SLOTS.acquire(blocking=False):
+            self._send_json(503, {"error": {"message": "too many live request streams", "type": "busy"}})
+            return
+        try:
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            # `cursor` pins the stream to the list snapshot the page already rendered, so no
+            # request slips through the gap between the two reads. On a reconnect the browser's
+            # own Last-Event-ID is newer and wins. An unparseable value lands on 0, which `tail`
+            # answers with a resync rather than a replay — the safe reading of "no idea where
+            # this client is".
+            start = self.headers.get("Last-Event-ID") or (parse_qs(urlparse(self.path).query).get("cursor") or [""])[0]
+            cursor: int | None = max(0, safe_int(start, 0)) if start else None
+            # The query string cannot change for the life of the connection, so parse it once
+            # rather than on every tick.
+            filters = request_log_filters(self.path)
+            # Sentinel: never equal to a real signature, so the first tick always primes.
+            signature: Any = object()
+            deadline = time.monotonic() + REQUEST_STREAM_MAX_SECONDS
+            last_write = time.monotonic()
+            while time.monotonic() < deadline:
+                current = request_log.source_signature(runtime_read_path(ROUTE_LOG_PATH))
+                if current != signature:
+                    signature = current
+                    batch = request_log_tail_payload(cursor, filters)
+                    next_cursor = batch.get("cursor")
+                    if isinstance(next_cursor, int):
+                        cursor = next_cursor
+                    if batch["entries"] or batch.get("resync") or batch.get("error_type"):
+                        self._write_sse_event("requests", batch, event_id=cursor)
+                        last_write = time.monotonic()
+                if time.monotonic() - last_write >= REQUEST_STREAM_PING_SECONDS:
+                    # Comment frame: keeps the connection warm and lets the browser notice a
+                    # dead peer, without pushing a payload the page would have to parse.
+                    self._write_sse_raw(": ping\n\n")
+                    last_write = time.monotonic()
+                if self._wait_or_peer_gone(REQUEST_STREAM_POLL_SECONDS):
+                    return
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # subscriber went away mid-stream; nothing to report
+        finally:
+            _REQUEST_STREAM_SLOTS.release()
+
+    def _wait_or_peer_gone(self, timeout: float) -> bool:
+        """Wait one tick, returning True as soon as the subscriber closed the connection.
+
+        Nothing else can arrive on a body-less, close-delimited GET, so a readable socket means
+        the peer is gone. Without this an abandoned stream would hold its slot until the next
+        ping write failed, up to ``REQUEST_STREAM_PING_SECONDS`` later.
+        """
+        try:
+            return bool(select.select([self.connection], [], [], timeout)[0])
+        except (ValueError, OSError):
+            # select cannot watch this descriptor (closed, or past FD_SETSIZE). Fall back to a
+            # plain wait and let the next write surface the disconnect.
+            time.sleep(timeout)
+            return False
+
+    def _write_sse_raw(self, frame: str) -> None:
+        self.wfile.write(frame.encode("utf-8"))
+        self.wfile.flush()
+
+    def _write_sse_event(self, event: str, payload: Any, event_id: int | None = None) -> None:
+        # json.dumps escapes newlines, so the payload can never break out of its data line.
+        data = json.dumps(payload, ensure_ascii=False)
+        prefix = f"id: {event_id}\n" if event_id is not None else ""
+        self._write_sse_raw(f"{prefix}event: {event}\ndata: {data}\n\n")
+
     def _read_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b"{}"
@@ -7280,6 +7482,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             if path == "/admin/requests":
                 self._send_json(200, request_log_query_payload(self.path))
                 return
+            if path == "/admin/requests/stream":
+                self._stream_request_log()
+                return
             if path == "/admin/requests/summary":
                 self._send_json(200, request_log_summary_payload(self.path))
                 return
@@ -7348,7 +7553,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 redacted = dict(catalog)
                 self._send_json(200, redacted)
                 return
-            self._send_json(404, {"error": {"message": "not found", "type": "not_found"}})
+            self._send_json(404, not_found_body("GET", path, target_base_url(self.config)))
         except Exception as exc:
             self._send_json(500, safe_error_body(exc))
 
@@ -7838,8 +8043,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(500, safe_error_body(exc))
             return
 
-        if path != "/v1/chat/completions":
-            self._send_json(404, {"error": {"message": "not found", "type": "not_found"}})
+        if path != CHAT_COMPLETIONS_PATH:
+            self._send_json(404, not_found_body("POST", path, target_base_url(self.config)))
             return
         request_id = uuid.uuid4().hex
         requested_model = DEFAULT_CHAT_COMPLETION_MODEL

@@ -29,6 +29,12 @@ except ImportError:  # pragma: no cover - exercised only in core-only installs
     compress_block = None
     plan_chat_compression = None
     put_original = None
+from ficelle.failures import (
+    CALLER_CAUSED_FAILURE_REASONS,
+    NON_RETRYABLE_FAILURE_REASONS,
+    caller_rejected_request,
+    upstream_failure_status,
+)
 from ficelle.redaction import redact_sensitive_json, sanitize_error_detail
 from ficelle.use_cases.benchmark import finish_reason_is_truncation
 
@@ -195,6 +201,10 @@ class FailureRouteLogInput:
     attempts: list[dict[str, Any]]
     duration_seconds: float
     stream: bool
+    # The errors the run collected, so the log records the status and reason the caller actually
+    # received. Hardcoding 502/`upstream_failure` made the Requests page contradict the response
+    # whenever every attempt died on the request body.
+    errors: list[dict[str, Any]]
     compression: dict[str, Any] | None = None
 
 
@@ -208,6 +218,11 @@ class MidStreamFailureRouteLogInput:
     attempt_count: int
     attempts: list[dict[str, Any]]
     duration_seconds: float
+    # `client_disconnected` when the caller hung up, `mid_stream_failure` when the upstream broke.
+    # Both end the request the same way, but only one of them is the model's fault — so this is
+    # required rather than defaulted: a caller that forgets it would silently log a client abort
+    # as the model's failure, which is the exact bug this field exists to prevent.
+    reason: str
     compression: dict[str, Any] | None = None
 
 
@@ -515,7 +530,7 @@ def evaluate_non_streaming_success_response(
             latency_seconds=latency,
             cooldown_reason=reason,
             cooldown_detail=detail,
-            retry=requested_model_is_virtual,
+            retry=_should_retry(reason, requested_model_is_virtual),
         )
 
     if not has_deliverable(payload):
@@ -550,6 +565,17 @@ def evaluate_non_streaming_success_response(
         outcome="success",
         attempt_update={"status": status_code, "reason": "ok", "latency_seconds": latency},
     )
+
+
+def _should_retry(reason: str, requested_model_is_virtual: bool) -> bool:
+    """Whether the next candidate is worth trying after this failure.
+
+    A rejected request body is terminal even on a virtual profile: the next candidate receives the
+    very same body and answers the very same 400, so failing over only burns healthy candidates and
+    delays an error the caller has to fix anyway. It reaches here by two routes — an HTTP 400, and a
+    200 whose payload carries `error.code: 400` — and both have to stop.
+    """
+    return requested_model_is_virtual and reason not in NON_RETRYABLE_FAILURE_REASONS
 
 
 def _non_streaming_failure(
@@ -617,7 +643,9 @@ def evaluate_streaming_result(
         outcome=outcome,
         attempt_update=attempt_update,
         error=error,
-        cooldown_reason="unavailable",
+        # `client_disconnected` carries its own no-cooldown policy: the write to the caller's socket
+        # is what failed, so the model keeps its slot. Every other stream failure is on the upstream.
+        cooldown_reason=reason if reason in CALLER_CAUSED_FAILURE_REASONS else "unavailable",
         cooldown_detail=f"{reason}: {stream_result.get('error_type') or ''} {stream_result.get('message') or ''}".strip(),
         cooldown_status="stream_error",
     )
@@ -642,7 +670,7 @@ def evaluate_upstream_failure_response(
         text = f"<unreadable response body: {type(exc).__name__}>"
     reason = classify(status_code, text, model)
     return UpstreamFailureDecision(
-        outcome="retryable_failure" if requested_model_is_virtual else "terminal_failure",
+        outcome="retryable_failure" if _should_retry(reason, requested_model_is_virtual) else "terminal_failure",
         attempt_update={"status": status_code, "reason": reason, "latency_seconds": round(latency_seconds, 4)},
         error={
             "model": model.get("id"),
@@ -731,12 +759,16 @@ def build_success_route_telemetry(row: SuccessRouteLogInput) -> ChatCompletionRo
     )
 
 
+def failure_route_reason(errors: list[dict[str, Any]]) -> str:
+    return "bad_upstream_request" if caller_rejected_request(errors) else "upstream_failure"
+
+
 def build_failure_route_log(row: FailureRouteLogInput) -> dict[str, Any]:
     return {
         "request_id": row.request_id,
         "requested_model": row.safe_requested_model,
-        "final_status": 502,
-        "final_reason": "upstream_failure",
+        "final_status": upstream_failure_status(row.errors),
+        "final_reason": failure_route_reason(row.errors),
         "candidate_count": row.candidate_count,
         "attempt_count": row.attempt_count,
         "attempts": row.attempts,
@@ -751,7 +783,7 @@ def build_failure_route_telemetry(row: FailureRouteLogInput) -> ChatCompletionRo
         last_route=ChatCompletionLastRouteRecord(
             safe_requested_model=row.safe_requested_model,
             status="fail",
-            reason="upstream_failure",
+            reason=failure_route_reason(row.errors),
             request_id=row.request_id,
             candidate_count=row.candidate_count,
             attempt_count=row.attempt_count,
@@ -771,7 +803,7 @@ def build_mid_stream_failure_route_log(row: MidStreamFailureRouteLogInput) -> di
         "selected_upstream": row.selected_model.get("upstream_id"),
         "selected_source": row.selected_model.get("source"),
         "final_status": row.final_status,
-        "final_reason": "mid_stream_failure",
+        "final_reason": row.reason,
         "candidate_count": row.candidate_count,
         "attempt_count": row.attempt_count,
         "attempts": row.attempts,
@@ -787,7 +819,7 @@ def build_mid_stream_failure_route_telemetry(row: MidStreamFailureRouteLogInput)
         last_route=ChatCompletionLastRouteRecord(
             safe_requested_model=row.safe_requested_model,
             status="fail",
-            reason="mid_stream_failure",
+            reason=row.reason,
             request_id=row.request_id,
             candidate_count=row.candidate_count,
             attempt_count=row.attempt_count,
@@ -807,7 +839,7 @@ def build_upstream_failure_response(
     build_headers: FailureResponseHeadersBuilder,
 ) -> ChatCompletionResponse:
     return ChatCompletionResponse(
-        status=502,
+        status=upstream_failure_status(row.errors),
         payload=build_error(row.requested_model, row.request_id, row.candidate_count, row.attempts, row.errors),
         headers=build_headers(row.request_id, row.safe_requested_model, len(row.attempts), row.compression),
     )
@@ -1162,6 +1194,7 @@ class ChatCompletionRouter:
                                 attempts=attempts,
                                 duration_seconds=self.now() - request_started,
                                 compression=plan.compression_metadata,
+                                reason=stream_decision.attempt_update["reason"],
                             )
                         )
                     )
@@ -1200,6 +1233,7 @@ class ChatCompletionRouter:
                     attempts=attempts,
                     duration_seconds=self.now() - request_started,
                     stream=bool(body.get("stream")),
+                    errors=errors,
                     compression=plan.compression_metadata,
                 )
             )

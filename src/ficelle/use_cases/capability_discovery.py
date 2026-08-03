@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, Protocol
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol
+
+from ficelle.failures import REQUEST_REJECTION_STATUSES as FAILURE_REQUEST_REJECTION_STATUSES
 
 
 class ProbeResponseValidator(Protocol):
@@ -119,8 +122,9 @@ def models_needing_discovery(
 
 # The provider rejected the REQUEST we sent, not the account. A 400/422 is by definition about this
 # body, so it stays a per-profile verdict unconditionally — matching the behaviour before route
-# rejections were added below.
-REQUEST_REJECTION_STATUSES = frozenset({400, 422})
+# rejections were added below. Defined in `failures.py`, where the chat path reads the same statuses
+# as `bad_upstream_request`; the consequences differ by path on purpose, the statuses do not.
+REQUEST_REJECTION_STATUSES = FAILURE_REQUEST_REJECTION_STATUSES
 
 # The provider has no route for this request shape. Discovery deliberately bypasses the
 # per-capability shape filter, so it probes audio against text-only models and gets 404 back — a
@@ -129,6 +133,86 @@ REQUEST_REJECTION_STATUSES = frozenset({400, 422})
 # "credit"/"billing" substring inside a URL no longer triggers that, since `classify_failure`
 # strips URLs before matching the false-free markers.
 ROUTE_REJECTION_STATUSES = frozenset({404, 410})
+
+# `skip` sent nothing and cooled nothing; `verified`/`failed` are real capability verdicts and let
+# the cycle continue to the next profile. `blocked` is the only sent/cooldown path and stops the
+# remaining probes for that model.
+ProbeVerdict = Literal["verified", "failed", "blocked", "skip"]
+
+# Spacing between two probes of the SAME provider when it declares no `rate_limit_rpm` — a safety
+# floor, not a preference: an operator raising `auto_benchmark_models_per_cycle` would otherwise
+# multiply the burst without noticing. The clock starts when a probe is SENT, so a slow probe costs
+# no extra wait and only a burst of fast ones is paced.
+PROBE_MIN_SECONDS_BETWEEN_CALLS = 4.0
+
+# Probing never spends a provider's whole published budget: live routing and any other client share
+# it, and providers measure over sliding windows that punish pacing right at the edge. 0.75 of the
+# published rate is the working margin — at OpenRouter's 20 RPM it yields exactly the 4s floor above.
+PROBE_RATE_LIMIT_HEADROOM = 0.75
+
+# A misdeclared `rate_limit_rpm` must not be able to stall discovery for good, nor to disable pacing.
+PROBE_INTERVAL_BOUNDS_SECONDS = (0.5, 60.0)
+
+
+def provider_probe_interval_seconds(
+    config: dict[str, Any],
+    source: str,
+    *,
+    default_seconds: float = PROBE_MIN_SECONDS_BETWEEN_CALLS,
+) -> float:
+    """Seconds to leave between two probes of ``source``, from its declared requests-per-minute.
+
+    Read per call rather than captured once, so an admin editing the setting takes effect on the
+    next probe. A provider that declares nothing keeps the conservative default: the floor is sized
+    for the tightest free tier, which is the wrong price for a local runtime but the safe one.
+    """
+    providers = config.get("providers") if isinstance(config, dict) else None
+    provider_cfg = (providers or {}).get(str(source or "")) if isinstance(providers, dict) else None
+    raw_rpm = provider_cfg.get("rate_limit_rpm") if isinstance(provider_cfg, dict) else None
+    try:
+        rpm = float(raw_rpm)
+    except (TypeError, ValueError):
+        return default_seconds
+    if rpm <= 0:
+        return default_seconds
+    low, high = PROBE_INTERVAL_BOUNDS_SECONDS
+    return min(max(60.0 / (rpm * PROBE_RATE_LIMIT_HEADROOM), low), high)
+
+
+@dataclass
+class ProviderProbePacer:
+    """Spaces PROBE traffic per provider, across every prober in the process.
+
+    One pacer is shared by capability discovery and the benchmark path because they hit the same
+    upstream budget: pacing them separately would let their sum exceed what either respects on its
+    own — a background discovery cycle and an admin "Test candidates" click can overlap. Live
+    routing is deliberately NOT paced; it would add latency to a user's request for no safety gain.
+    The sharing ends at the process boundary: `ficelle canary` runs in its own process and gets its
+    own budget, which would take cross-process coordination to close.
+
+    Slots are reserved rather than merely timestamped, so two threads probing one provider queue
+    behind each other instead of both waking at the same instant. Reserving happens under the lock;
+    the wait itself does not, so probes of other providers are never blocked.
+    """
+
+    pause: Callable[[float], None]
+    min_seconds_between_calls: float = PROBE_MIN_SECONDS_BETWEEN_CALLS
+    monotonic: Callable[[], float] = time.monotonic
+    _next_slot_at: dict[str, float] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def wait_turn(self, source: str, min_seconds: float | None = None) -> None:
+        key = str(source or "")
+        interval = self.min_seconds_between_calls if min_seconds is None else max(0.0, min_seconds)
+        with self._lock:
+            now = self.monotonic()
+            # `max(now, ...)` is what makes a slow probe free: once its own slot is in the past, the
+            # next call proceeds immediately instead of paying a wait it already served in latency.
+            slot = max(now, self._next_slot_at.get(key, now))
+            self._next_slot_at[key] = slot + interval
+        wait = slot - self.monotonic()
+        if wait > 0:
+            self.pause(wait)
 
 # Stamped on a verdict the probe reached by route rejection rather than by reading an answer. Both
 # are `failed`, but they age differently: "this model answered and got the capability wrong" is a
@@ -153,25 +237,44 @@ class CapabilityDiscoveryJob:
     safe_detail: Callable[..., str]
     now_iso: Callable[[], str]
     route_blocking_reasons: frozenset[str]
+    pacer: ProviderProbePacer
     registry: ProbeResponseValidator
 
-    def probe_model_capability(self, model: dict[str, Any], profile_id: str, config: dict[str, Any]) -> str:
+    def _cool_and_stop(
+        self,
+        model: dict[str, Any],
+        reason: str,
+        config: dict[str, Any],
+        *,
+        detail: str,
+        profile_id: str,
+    ) -> ProbeVerdict:
+        """Bench the model and stop probing it — one call so the two cannot drift apart.
+
+        A benched model cannot answer the capabilities queued behind the one that just failed, so
+        every probe fired at it is a wasted call into a limit already recorded.
+        """
+        self.set_cooldown(model, reason, config, detail=detail, profile_id=profile_id)
+        return "blocked"
+
+    def probe_model_capability(self, model: dict[str, Any], profile_id: str, config: dict[str, Any]) -> ProbeVerdict:
         try:
             body, test_type, expected = self.benchmark_body(profile_id, config)
         except Exception:
             return "skip"
+        source = str(model.get("source") or "")
+        self.pacer.wait_turn(source, provider_probe_interval_seconds(config, source))
         started = time.time()
         try:
             response = self.invoke_model(model, body, config)
         except Exception as exc:
-            self.set_cooldown(
+            return self._cool_and_stop(
                 model,
                 "unavailable",
                 config,
                 detail=f"discovery {type(exc).__name__}",
                 profile_id=profile_id,
             )
-            return "skip"
         result: dict[str, Any] = {
             "profile_id": profile_id,
             "model_id": model.get("id"),
@@ -187,14 +290,13 @@ class CapabilityDiscoveryJob:
             text = self.extract_message_text(payload)
             passed, message = self.registry.validate_response(test_type, expected, text, payload)
         except Exception as exc:
-            self.set_cooldown(
+            return self._cool_and_stop(
                 model,
                 "unavailable",
                 config,
                 detail=f"discovery parse {type(exc).__name__}",
                 profile_id=profile_id,
             )
-            return "skip"
         result.update({
             "status": "pass" if passed else "fail",
             "message": self.safe_detail(message),
@@ -214,7 +316,7 @@ class CapabilityDiscoveryJob:
         config: dict[str, Any],
         response: Any,
         result: dict[str, Any],
-    ) -> str:
+    ) -> ProbeVerdict:
         reason = self.classify_failure(response.status_code, response.text[:1000], model)
         blocking = reason in self.route_blocking_reasons
         # A rejected probe is a verdict on the capability, not on the model, so it must NOT bench the
@@ -230,14 +332,13 @@ class CapabilityDiscoveryJob:
             self.record_benchmark_result(profile_id, model, result)
             self.record_verified_capability(profile_id, model, result)
             return "failed"
-        self.set_cooldown(
+        return self._cool_and_stop(
             model,
             reason,
             config,
             detail=f"discovery HTTP {response.status_code}: {reason}",
             profile_id=profile_id,
         )
-        return "blocked" if blocking else "skip"
 
     def run_auto_benchmark_cycle(
         self,
@@ -268,11 +369,27 @@ class CapabilityDiscoveryJob:
         if not models:
             return {"status": "idle", "models": 0}
         probe_one = probe_model_capability or self.probe_model_capability
-        # Every verdict is counted, including the ones that cool a model ("skipped"/"blocked").
-        # Reporting only verified/failed made a cycle that benched several models look clean.
+        # Counted even when the probe produced no capability answer: `blocked` stopped a model,
+        # `skipped` never ran. Reporting only verified/failed made a cycle that benched several
+        # models look clean.
         counts = {"verified": 0, "failed": 0, "skipped": 0, "blocked": 0}
         for model in models:
-            for profile_id in model_due_capabilities(model, profile_ids, state):
+            state = load_state()
+            if not isinstance(state, dict):
+                state = {}
+            due = model_due_capabilities(model, profile_ids, state)
+            # Re-asked against fresh state, not the snapshot this cycle opened with: a probe of an
+            # earlier model may have cooled this one's whole provider — or its quota scope — and
+            # probing it would only deepen a limit already recorded. `models_needing_discovery` is
+            # the same eligibility predicate that picked these models, so there is one authority on
+            # what is probeable rather than a second, narrower copy of it here.
+            still_probeable = models_needing_discovery(catalog, state, profile_ids)
+            if not any(other.get("id") == model.get("id") for other in still_probeable):
+                counts["skipped"] += len(due)
+                continue
+            for profile_id in due:
+                # Spacing lives in `probe_model_capability`, next to the call it protects, so a probe
+                # reached any other way is paced too.
                 verdict = probe_one(model, profile_id, config)
                 if verdict == "verified":
                     counts["verified"] += 1

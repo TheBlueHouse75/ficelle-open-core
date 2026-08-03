@@ -22,7 +22,8 @@ export const modelFilters = { providers: new Set(), caps: new Set(), minContext:
 // Requests view — derived request-log payloads + session-only filters (not persisted).
 export let requestsPayload = { entries: [] };
 export let requestsSummary = {};
-export let requestsAutoRefresh = false;
+// Live tail of the Requests list: SSE when the browser can hold an event stream, a 5s poll otherwise.
+export let requestsLive = false;
 export const expandedRequests = new Set();
 export const requestFilters = { profile: "", source: "", reason: "", status: "", q: "", window: "24h" };
 
@@ -38,4 +39,4 @@ export function setCurrentView(v) { currentView = v; }
 export function setSelectedProvider(v) { selectedProvider = v; }
 export function setRequestsPayload(v) { requestsPayload = v; }
 export function setRequestsSummary(v) { requestsSummary = v; }
-export function setRequestsAutoRefresh(v) { requestsAutoRefresh = v; }
+export function setRequestsLive(v) { requestsLive = v; }

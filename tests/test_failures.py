@@ -10,6 +10,7 @@ from ficelle.failures import (
     PROVIDER_SCOPED_COOLDOWN_REASONS,
     bad_request_body,
     build_upstream_failure_error,
+    caller_rejected_request,
     classify_failure,
     cooldown_policy_for_reason,
     safe_error_body,
@@ -51,7 +52,10 @@ def test_provider_markers_can_extend_failure_classification():
 
 
 def test_transient_failures_return_transient_reasons():
-    rate_limit = classify_failure(429, "model is temporarily rate-limited upstream", normalized_free_access=quota_free_access())
+    # Says nothing about WHICH resource is limited, so it keeps the provider-wide meaning. A body
+    # that names the model's shared pool instead is `rate_limited_upstream` — see
+    # `test_saturated_model_pool_is_model_scoped_not_a_provider_outage`.
+    rate_limit = classify_failure(429, "too many requests, slow down", normalized_free_access=quota_free_access())
     auth = classify_failure(403, "invalid api key", normalized_free_access=catalog_free_access())
     unavailable = classify_failure(404, "upstream temporarily overloaded", normalized_free_access=quota_free_access())
 
@@ -70,6 +74,60 @@ def test_failure_reason_sets_match_routing_contracts():
         "auth_or_credit",
         "model_not_found",
     }
+
+
+def test_saturated_model_pool_is_model_scoped_not_a_provider_outage():
+    """An aggregator's 429 about ONE model id must not bench the provider's other models.
+
+    Observed live: OpenRouter answered `google/gemma-4-31b-it:free is temporarily rate-limited
+    upstream` — Google's shared free pool was full, the account was fine. Classified as
+    `rate_limited`, that single model cooled all 14 usable OpenRouter models for 15 minutes, and the
+    discovery cycle re-probed it every pass, so 54 of the provider's 55 rate-limit failures came from
+    that one id. Same reasoning as `request_too_large`: a limit scoped to one model gets a model
+    cooldown, and the branch is deliberately evaluated on the URL-stripped text.
+    """
+    saturated = (
+        '{"error":{"message":"Provider returned error","code":429,"metadata":{"raw":'
+        '"google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, '
+        'or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations"}}}'
+    )
+    model_id = "google/gemma-4-31b-it:free"
+    assert classify_failure(429, saturated, upstream_model_id=model_id) == "rate_limited_upstream"
+    # Safety default: the phrase alone cannot remove the provider-wide guard. The caller must prove
+    # that the body names the exact model it invoked.
+    assert classify_failure(429, saturated) == "rate_limited"
+    assert (
+        classify_failure(
+            429,
+            f"{model_id} is temporarily rate-limited upstream for your account",
+            upstream_model_id=model_id,
+        )
+        == "rate_limited"
+    )
+    # The account-level 429 keeps its provider-wide meaning.
+    assert classify_failure(429, "Rate limit exceeded for your account") == "rate_limited"
+
+    # Quota-free exhaustion remains the higher-priority structural signal even if the provider also
+    # names the model and calls its serving pool upstream.
+    quota_text = f"{model_id} is rate-limited upstream: free tier quota exhausted"
+    assert (
+        classify_failure(
+            429,
+            quota_text,
+            normalized_free_access=quota_free_access(),
+            upstream_model_id=model_id,
+        )
+        == "quota_exhausted"
+    )
+
+    assert "rate_limited_upstream" not in PROVIDER_SCOPED_COOLDOWN_REASONS
+    assert "rate_limited_upstream" not in PROVIDER_ERROR_REASONS
+    policy = cooldown_policy_for_reason("rate_limited_upstream", source="openrouter")
+    assert policy.model_cooldown is True
+    assert policy.provider_cooldown is False and policy.quarantine is None
+    # No provider error either: the provider card must not read "last error: rate limited" for an
+    # account that is answering fine on every other model.
+    assert policy.record_provider_error is False
 
 
 def test_quota_exhausted_policy_sets_recoverable_quota_cooldown_only():
@@ -129,30 +187,89 @@ def test_false_free_markers_ignore_urls():
     assert classify_failure(404, "no endpoint <https://x.test/billing>") == "unavailable"
 
 
-def test_truncated_before_content_policy_records_the_failure_without_cooling():
-    """A caller's too-small max_tokens must not take the model out of the pool.
+def test_a_rejected_request_body_is_not_an_unavailable_model():
+    """HTTP 400/422 means "your request is wrong", not "this model is down".
+
+    Reading it as `unavailable` cooled a healthy model for 600s and sent the same doomed body to
+    the next candidate — one client with a malformed tool_call could empty a whole profile. It is
+    the last branch, so a 400 whose prose names a stronger reading still gets it.
+    """
+    assert classify_failure(400, "This request is not valid. Additional info: Provider returned error") == "bad_upstream_request"
+    assert classify_failure(422, "messages.1: tool_call_id not found") == "bad_upstream_request"
+
+    assert classify_failure(400, "add credits to continue") == "billing_or_paid"  # prose wins
+    # …and a body Ficelle could not even read stays the generic unavailable.
+    assert classify_failure(418, "<unreadable response body: RuntimeError>") == "unavailable"
+
+
+def test_caller_caused_policies_record_the_failure_without_cooling():
+    """No caller-caused failure may take a healthy model out of the pool.
 
     Recording still happens — `set_cooldown` runs `update_failure_stats` and
     `record_model_error_in_state` before consulting the policy — so a model that truncates on every
-    request stays scored and visible instead of silently keeping a perfect record.
+    request stays scored and visible instead of silently keeping a perfect record. Driven off the
+    set itself, so a fourth member added later cannot quietly skip the contract.
     """
-    policy = cooldown_policy_for_reason("truncated_before_content", source="openrouter")
+    for reason in sorted(CALLER_CAUSED_FAILURE_REASONS):
+        policy = cooldown_policy_for_reason(reason, source="nous")
 
-    assert policy.model_cooldown is False
-    assert policy.provider_cooldown is False
-    assert policy.quota_cooldown is False
-    assert policy.quarantine is None
-    assert policy.record_provider_error is False  # the caller's budget is not the provider's fault
+        assert policy.model_cooldown is False, reason
+        assert policy.provider_cooldown is False, reason
+        assert policy.quota_cooldown is False, reason
+        assert policy.quarantine is None, reason
+        assert policy.record_provider_error is False, reason  # not the provider's fault either
+
+
+def test_a_wholly_rejected_request_answers_with_the_upstream_message():
+    """When every attempt died on the body, the caller needs the upstream's own words.
+
+    "all Ficelle candidates failed" reads as a router outage and invites a retry; the actual
+    provider message is what points at the malformed field.
+    """
+    errors = [
+        {
+            "model": "ficelle/nous/stepfun/step-3.7-flash:free",
+            "reason": "bad_upstream_request",
+            "status": 400,
+            "detail": '{"status":400,"message":"This request is not valid."}',
+        }
+    ]
+
+    error = build_upstream_failure_error("ficelle/auto-fast", "req-1", 2, [{"model": "x"}], errors)["error"]
+
+    assert error["type"] == "invalid_request_error"
+    assert error["message"].startswith("upstream rejected this request as invalid: ")
+    assert "This request is not valid." in error["message"]
+    assert any("no other candidate was tried" in action for action in error["actions"])
+
+    # One genuine upstream failure in the mix and it is a gateway problem again.
+    mixed = [*errors, {"model": "ficelle/nous/tencent/hy3:free", "reason": "server_error", "status": 503}]
+    mixed_error = build_upstream_failure_error("ficelle/auto-fast", "req-2", 2, [{"model": "x"}], mixed)["error"]
+    assert mixed_error["type"] == "upstream_failure"
+    assert mixed_error["message"].startswith("all Ficelle candidates failed")
+
+
+def test_caller_rejected_request_needs_every_attempt_to_agree():
+    assert caller_rejected_request([{"reason": "bad_upstream_request"}]) is True
+    assert caller_rejected_request([{"reason": "bad_upstream_request"}, {"reason": "rate_limited"}]) is False
+    assert caller_rejected_request([{"reason": "server_error"}]) is False
+    # No attempt reached an upstream at all: nothing says the body is what failed.
+    assert caller_rejected_request([]) is False
 
 
 def test_caller_caused_failures_are_the_only_ones_exempt_from_the_streak():
     """The consecutive-failure streak is reserved for what the model is answerable for.
 
-    Its penalty is cumulative (12 points each), so counting a caller's too-small max_tokens would let
-    one looping client progressively demote every candidate it touches. The failure is still counted
-    in `requests`/`failures` and still shown — only the streak is left alone.
+    Its penalty is cumulative (12 points each), so counting a caller's too-small max_tokens, its
+    malformed request body, or its own mid-stream hangup would let one misbehaving client
+    progressively demote every candidate it touches. The failure is still counted in
+    `requests`/`failures` and still shown — only the streak is left alone.
     """
-    assert CALLER_CAUSED_FAILURE_REASONS == {"truncated_before_content"}
+    assert CALLER_CAUSED_FAILURE_REASONS == {
+        "truncated_before_content",
+        "bad_upstream_request",
+        "client_disconnected",
+    }
     for upstream_fault in ("unavailable", "server_error", "timeout", "empty_assistant_message"):
         assert upstream_fault not in CALLER_CAUSED_FAILURE_REASONS
 

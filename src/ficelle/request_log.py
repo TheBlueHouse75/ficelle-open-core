@@ -43,6 +43,12 @@ INGEST_BATCH = 1000
 DEFAULT_QUERY_LIMIT = 50
 MAX_QUERY_LIMIT = 200
 
+# Live-tail bounds. MAX_TAIL_REPLAY caps how far behind a resuming subscriber may be
+# before ``tail`` gives up on replaying and asks it to reload from scratch — a browser
+# tab that reconnects after hours must not stream a day of history one batch at a time.
+DEFAULT_TAIL_LIMIT = 100
+MAX_TAIL_REPLAY = 200
+
 # Summary windows exposed to the dashboard (label -> seconds).
 WINDOW_SECONDS: dict[str, int] = {
     "1h": 3_600,
@@ -120,30 +126,123 @@ def query(
     bounded = max(1, min(_safe_int(limit, DEFAULT_QUERY_LIMIT) or DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT))
     with closing(_connect(store_path)) as conn:
         _catch_up(conn, source_path)
-        where: list[str] = []
-        params: list[Any] = []
-        if profile:
-            where.append("profile = ?")
-            params.append(profile)
-        if source:
-            where.append("source = ?")
-            params.append(source)
-        if reason:
-            where.append("reason = ?")
-            params.append(reason)
-        if status is not None and status != "":
-            where.append("status = ?")
-            params.append(_safe_int(status, -1))
-        if q:
-            where.append("(request_id LIKE ? OR model_id LIKE ? OR upstream_id LIKE ?)")
-            like = f"%{q}%"
-            params.extend([like, like, like])
+        where, params = _filter_conditions(profile, source, reason, status, q)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         rows = conn.execute(
             f"SELECT * FROM requests{clause} ORDER BY ts DESC, rowid DESC LIMIT ?",
             (*params, bounded),
         ).fetchall()
         return [_public_row(row) for row in rows]
+
+
+def tail(
+    *,
+    cursor: Any = None,
+    store_path: Path | None = None,
+    source_path: Path | None = None,
+    limit: int = DEFAULT_TAIL_LIMIT,
+    profile: str | None = None,
+    source: str | None = None,
+    reason: str | None = None,
+    status: Any = None,
+    q: str | None = None,
+) -> dict[str, Any]:
+    """Return rows ingested after ``cursor`` (oldest first) and the cursor to poll next.
+
+    The cursor is the SQLite ``rowid``, which follows the append-only ingest order, so a
+    subscriber never re-reads a row it already has. ``cursor=None`` primes a live tail:
+    it catches up and hands back the current high-water mark with no rows, so opening the
+    page does not replay history.
+
+    ``resync`` asks the caller to reload the list instead of applying a delta — either the
+    subscriber fell further behind than ``MAX_TAIL_REPLAY``, or the index was rebuilt under
+    it and the rowids restarted below its cursor.
+    """
+    bounded = max(1, min(_safe_int(limit, DEFAULT_TAIL_LIMIT) or DEFAULT_TAIL_LIMIT, MAX_QUERY_LIMIT))
+    with closing(_connect(store_path)) as conn:
+        _catch_up(conn, source_path)
+        head = _head(conn)
+        start = _safe_int(cursor, None)
+        if start is None:
+            return {"cursor": head, "entries": [], "resync": False}
+        if start > head or head - start > MAX_TAIL_REPLAY:
+            return {"cursor": head, "entries": [], "resync": True}
+        where, params = _filter_conditions(profile, source, reason, status, q)
+        clause = " AND ".join(["rowid > ?", *where])
+        rows = conn.execute(
+            f"SELECT rowid AS row_id, * FROM requests WHERE {clause} ORDER BY rowid LIMIT ?",
+            (start, *params, bounded),
+        ).fetchall()
+        # Fewer rows than the cap means the scan reached the head, so the cursor may skip
+        # the rows the filter dropped. A full batch means more may remain behind it.
+        next_cursor = int(rows[-1]["row_id"]) if len(rows) >= bounded else head
+        return {"cursor": next_cursor, "entries": [_public_row(row) for row in rows], "resync": False}
+
+
+def head_cursor(*, store_path: Path | None = None) -> int:
+    """Current high-water rowid, without ingesting.
+
+    Pairs a list snapshot with the cursor a live tail must start from: without it the
+    subscriber primes at whatever the head is when its stream opens, and any request
+    logged between the two silently never reaches the page.
+    """
+    with closing(_connect(store_path)) as conn:
+        return _head(conn)
+
+
+def _head(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT COALESCE(MAX(rowid), 0) AS head FROM requests").fetchone()["head"])
+
+
+def source_signature(source_path: Path | None = None) -> tuple[int, int] | None:
+    """Cheap change detector for the route log: ``(size, mtime_ns)``, or ``None`` if absent.
+
+    A live tail polls this instead of opening the index, so an idle router costs one
+    ``stat()`` per tick per subscriber and touches SQLite only when the log actually grew.
+    """
+    path = (
+        source_path
+        if source_path is not None
+        else _RUNTIME_PATHS.read_path(DEFAULT_ROUTE_LOG_PATH)
+    )
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime_ns)
+
+
+def _filter_conditions(
+    profile: str | None,
+    source: str | None,
+    reason: str | None,
+    status: Any,
+    q: str | None,
+) -> tuple[list[str], list[Any]]:
+    """Build the shared WHERE conditions for the list and the live tail, and their params.
+
+    Returns the conditions unjoined: the tail prepends its own cursor condition, and each
+    caller owns where the ``WHERE`` keyword goes.
+    """
+    where: list[str] = []
+    params: list[Any] = []
+    if profile:
+        where.append("profile = ?")
+        params.append(profile)
+    if source:
+        where.append("source = ?")
+        params.append(source)
+    if reason:
+        where.append("reason = ?")
+        params.append(reason)
+    if status is not None and status != "":
+        where.append("status = ?")
+        params.append(_safe_int(status, -1))
+    if q:
+        where.append("(request_id LIKE ? OR model_id LIKE ? OR upstream_id LIKE ?)")
+        like = f"%{q}%"
+        params.extend([like, like, like])
+    return where, params
 
 
 def summary(
@@ -158,6 +257,8 @@ def summary(
     reference = float(now) if now is not None else time.time()
     cutoff = reference - window
     bucket = _bucket_seconds(window)
+    first_bucket = int(cutoff // bucket) * bucket
+    last_bucket = int(reference // bucket) * bucket
     with closing(_connect(store_path)) as conn:
         _catch_up(conn, source_path)
         totals = conn.execute(
@@ -167,32 +268,40 @@ def summary(
               SUM(CASE WHEN reason = 'ok' THEN 1 ELSE 0 END) AS ok,
               SUM(CASE WHEN fallback = 1 THEN 1 ELSE 0 END) AS fallback,
               SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END) AS stream
-            FROM requests WHERE ts >= ?
+            FROM requests WHERE ts >= ? AND ts <= ?
             """,
-            (cutoff,),
+            (cutoff, reference),
         ).fetchone()
         total = int(totals["total"] or 0)
         ok = int(totals["ok"] or 0)
         errors = total - ok
-        by_source = _grouped(conn, "source", cutoff)
-        by_reason = _grouped(conn, "reason", cutoff)
-        by_status = _grouped(conn, "status", cutoff)
-        timeline = [
-            {"bucket": int(row["b"]), "total": int(row["t"]), "ok": int(row["ok"] or 0)}
+        by_source = _grouped(conn, "source", cutoff, reference)
+        by_reason = _grouped(conn, "reason", cutoff, reference)
+        by_status = _grouped(conn, "status", cutoff, reference)
+        counted = {
+            int(row["b"]): (int(row["t"]), int(row["ok"] or 0))
             for row in conn.execute(
                 """
-                SELECT CAST(ts / ? AS INT) * ? AS b,
+                SELECT CAST((ts - ?) / ? AS INT) * ? + ? AS b,
                        COUNT(*) AS t,
                        SUM(CASE WHEN reason = 'ok' THEN 1 ELSE 0 END) AS ok
-                FROM requests WHERE ts >= ? AND ts IS NOT NULL
+                FROM requests WHERE ts >= ? AND ts <= ? AND ts IS NOT NULL
                 GROUP BY b ORDER BY b
                 """,
-                (bucket, bucket, cutoff),
+                (first_bucket, bucket, bucket, first_bucket, cutoff, reference),
             ).fetchall()
-        ]
+        }
+        # Emit every slot in the window, idle ones included: a windowed series is defined
+        # by its window, so an idle bucket is a zero, not an absence. A bare GROUP BY
+        # drops those rows, leaving callers unable to tell quiet apart from missing.
+        timeline = []
+        for start in range(first_bucket, last_bucket + bucket, bucket):
+            slot_total, slot_ok = counted.get(start, (0, 0))
+            timeline.append({"bucket": start, "total": slot_total, "ok": slot_ok})
         latency_count = int(conn.execute(
-            "SELECT COUNT(*) AS c FROM requests WHERE ts >= ? AND latency_seconds IS NOT NULL",
-            (cutoff,),
+            "SELECT COUNT(*) AS c FROM requests "
+            "WHERE ts >= ? AND ts <= ? AND latency_seconds IS NOT NULL",
+            (cutoff, reference),
         ).fetchone()["c"] or 0)
         return {
             "generated_at": _now_iso(),
@@ -204,8 +313,8 @@ def summary(
             "success_rate": round(ok / total, 4) if total else None,
             "fallback_count": int(totals["fallback"] or 0),
             "stream_count": int(totals["stream"] or 0),
-            "latency_p50": _percentile(conn, cutoff, latency_count, 50),
-            "latency_p95": _percentile(conn, cutoff, latency_count, 95),
+            "latency_p50": _percentile(conn, cutoff, reference, latency_count, 50),
+            "latency_p95": _percentile(conn, cutoff, reference, latency_count, 95),
             "by_source": by_source,
             "by_reason": by_reason,
             "by_status": by_status,
@@ -391,16 +500,21 @@ def _trim(conn: sqlite3.Connection, now: float | None = None) -> None:
 # --------------------------------------------------------------------------- #
 # Aggregation helpers
 # --------------------------------------------------------------------------- #
-def _grouped(conn: sqlite3.Connection, column: str, cutoff: float) -> list[dict[str, Any]]:
+def _grouped(
+    conn: sqlite3.Connection,
+    column: str,
+    cutoff: float,
+    reference: float,
+) -> list[dict[str, Any]]:
     rows = conn.execute(
         f"""
         SELECT {column} AS key,
                COUNT(*) AS total,
                SUM(CASE WHEN reason = 'ok' THEN 1 ELSE 0 END) AS ok
-        FROM requests WHERE ts >= ? AND {column} IS NOT NULL
+        FROM requests WHERE ts >= ? AND ts <= ? AND {column} IS NOT NULL
         GROUP BY {column} ORDER BY total DESC
         """,
-        (cutoff,),
+        (cutoff, reference),
     ).fetchall()
     return [
         {column: row["key"], "total": int(row["total"]), "ok": int(row["ok"] or 0)}
@@ -408,16 +522,23 @@ def _grouped(conn: sqlite3.Connection, column: str, cutoff: float) -> list[dict[
     ]
 
 
-def _percentile(conn: sqlite3.Connection, cutoff: float, count: int, pct: int) -> float | None:
+def _percentile(
+    conn: sqlite3.Connection,
+    cutoff: float,
+    reference: float,
+    count: int,
+    pct: int,
+) -> float | None:
     if count == 0:
         return None
     # Nearest-rank: 1-based ceil(pct/100 * count) converted to a 0-based offset.
     # Avoids the upper bias of floor() (e.g. p50 of two samples returning the max).
     offset = max(0, min((count * pct + 99) // 100 - 1, count - 1))
     row = conn.execute(
-        "SELECT latency_seconds FROM requests WHERE ts >= ? AND latency_seconds IS NOT NULL "
+        "SELECT latency_seconds FROM requests "
+        "WHERE ts >= ? AND ts <= ? AND latency_seconds IS NOT NULL "
         "ORDER BY latency_seconds LIMIT 1 OFFSET ?",
-        (cutoff, offset),
+        (cutoff, reference, offset),
     ).fetchone()
     return float(row["latency_seconds"]) if row else None
 

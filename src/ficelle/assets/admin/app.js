@@ -5,8 +5,8 @@ import { profileOrder, fusionModelId, profileLabels, profilePresets, CAP_PROFILE
 import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeProfile, dragged, modelFilters, currentView, expandedModels,
   compressionPayload, setState, setAuditEntries, setDraftProfiles, setDraftFusion, setDraftSettings, setCompressionPayload, setActiveProfile, setDragged, setCurrentView,
   selectedProvider, setSelectedProvider,
-  requestsPayload, requestsSummary, requestsAutoRefresh, expandedRequests, requestFilters,
-  setRequestsPayload, setRequestsSummary, setRequestsAutoRefresh } from "./store.js";
+  requestsPayload, requestsSummary, requestsLive, expandedRequests, requestFilters,
+  setRequestsPayload, setRequestsSummary, setRequestsLive } from "./store.js";
 
 /* ===================== Ficelle admin app ===================== */
 
@@ -570,22 +570,24 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("activeProfileName").textContent = lab[0];
       $("activeProfileId").textContent = activeProfile;
       $("eligibleBadge").textContent = eligibleCount(activeProfile) + " usable";
+      const manual = p.mode === "manual_order";
       const full = candidatePreview(activeProfile);
       const preview = full.slice(0, 4);
       const more = full.length - preview.length;
       const previewHtml = preview.length
         ? preview.map((m, i) => { const sc = m.auto_scores?.[activeProfile]; const v = modelVerified(m); return '<div class="hp"><span class="n">' + (i + 1) + ".</span><span>" + esc(m.name || m.upstream_id) + " &middot; " + esc(candidateOrigin(p, m)) + (sc ? ' &middot; <span title="' + scoreTitle(scoreDetails(m)) + '">score ' + Number(sc).toFixed(0) + "</span>" : "") + (v ? " &middot; " + esc(v.status) : "") + "</span></div>"; }).join("")
-          + (more > 0 ? '<div class="hp" style="color:var(--text-muted)"><span class="n">+</span><span>' + more + " more usable model" + (more > 1 ? "s" : "") + ", ranked by score</span></div>" : "")
+          + (more > 0 ? '<div class="hp" style="color:var(--text-muted)"><span class="n">+</span><span>' + more + " more usable model" + (more > 1 ? "s" : "") + (manual ? ", further down this list" : ", ranked by score") + "</span></div>" : "")
         : '<div class="hp"><span>No usable models match this virtual model yet.</span></div>';
-      const heading = full.length
-        ? "Ficelle ranks all " + full.length + " usable models by score and tries them best-first until one responds:"
-        : "Routing preview:";
+      const heading = !full.length
+        ? "Routing preview:"
+        : manual
+          ? "Your order decides, not the score — Ficelle tries these " + full.length + " usable models top-first until one responds (paused models are already skipped):"
+          : "Ficelle ranks all " + full.length + " usable models by score and tries them best-first until one responds:";
       $("profileHint").innerHTML = "<b>" + esc(lab[0]) + ".</b> " + esc(profilePresets[activeProfile] || "") +
         '<div class="hint-preview"><span style="color:var(--text-soft);font-weight:600">' + esc(heading) + "</span>" + previewHtml + "</div>";
       $("autoModeBtn").classList.toggle("active", p.mode !== "manual_order");
       $("manualModeBtn").classList.toggle("active", p.mode === "manual_order");
       $("autoTailToggle").checked = Boolean(p.auto_tail);
-      const manual = p.mode === "manual_order";
       $("orderBlock").style.display = manual ? "flex" : "none";
       $("autoNote").style.display = manual ? "none" : "flex";
       $("autoTailWrap").style.display = manual ? "" : "none";
@@ -1234,7 +1236,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	    // Single source of truth for the cooldown rows: [inputId, reason, label, help].
 	    // Drives both the rendered fields and readSettingsDraft so the list is edited in one place.
 	    const SETTINGS_COOLDOWN_FIELDS = [
-	      ["setCdRateLimited", "rate_limited", "Rate limited (HTTP 429)", "Bench time after the upstream returns a rate-limit. Default 900s (15 min)."],
+	      ["setCdRateLimited", "rate_limited", "Rate limited (HTTP 429)", "Bench time after the upstream returns an account-wide rate-limit. Default 900s (15 min). Provider-scoped: every model of that provider waits."],
+	      ["setCdRateLimitedUpstream", "rate_limited_upstream", "Model pool saturated (HTTP 429 upstream)", "Bench time after a 429 that names the model's shared upstream pool rather than your account. Short by design (default 300s) and model-scoped — the provider's other models keep routing."],
 	      ["setCdReqTooLarge", "request_too_large", "Request too large (HTTP 413 TPM)", "Bench time after the upstream rejects a request as too large for its tokens-per-minute budget. Short by design (default 120s) — a transient, model-scoped throughput limit that recharges on its own; not a billing block."],
 	      ["setCdQuota", "quota_exhausted", "Free quota exhausted", "Bench time after a provider reports its free quota is used up. Default 3600s (1 hour)."],
 	      ["setCdAuth", "auth_or_credit", "Auth or credit error", "Bench time after an authentication or credit failure. Default 3600s (1 hour). Usually a key needs fixing."],
@@ -1396,9 +1399,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         { k: "Canary check", ic: ICONS.canary, v: (canary.status === "pass" ? "Passing" : (canary.status || "Not run")), note: (sum.passed ?? 0) + " of " + (sum.total ?? 0) + " virtual models ok &middot; last run " + timeAgo(canary.last_run_at).label, cls: canary.status === "pass" ? "ok" : "warn" },
         { k: "Paused", ic: ICONS.paused, v: (cdM + cdP + cdQ), note: cdM + " models &middot; " + cdP + " providers &middot; " + cdQ + " free quotas", cls: (cdM + cdP + cdQ) ? "warn" : "ok" },
         { k: "Disabled", ic: ICONS.disable, v: q, note: q ? "manually held out of routing" : "nothing quarantined", cls: q ? "warn" : "ok" },
-        // skipped/blocked are the verdicts that cool a model, so they are shown and drive the
-        // status colour: a cycle reporting only "0 verified, 0 failed" used to look green while it
-        // had just taken several models out of routing.
+        // blocked means a probe cooled/stopped its model; skipped also counts still-due probes held
+        // behind a freshly observed provider/quota cooldown. Both drive the warning colour: a cycle
+        // reporting only "0 verified, 0 failed" used to look green while routing was paused.
         { k: "Capability discovery", ic: ICONS.benchmark, v: (ab.last_run_at ? "Last run " + timeAgo(ab.last_run_at).label : "Not run yet"), note: ab.last_run_at ? ((ab.models ?? 0) + " models &middot; " + (ab.verified ?? 0) + " verified &middot; " + (ab.failed ?? 0) + " failed &middot; " + (ab.skipped ?? 0) + " paused &middot; " + (ab.blocked ?? 0) + " blocked") : "background discovery &middot; configure in Settings", cls: ((ab.skipped ?? 0) + (ab.blocked ?? 0)) ? "warn" : "ok" },
         { k: "Context compression", ic: ICONS.compression, v: compressionStatus, note: "mode " + compressionMode + " &middot; ~" + compressionSaved + " tokens saved &middot; " + compressionEntries + " CCR entries <button class=\"btn ghost sm\" data-open-compression>Dashboard</button>", cls: compression.health_digest === "compression_errors_repeated" ? "warn" : "ok" },
         { k: "Watcher", ic: ICONS.watcher, v: "Silent", note: "alerts only when status is not ok &middot; catalog refresh hourly, background auto-benchmark (see Settings)", cls: "ok" }
@@ -1515,32 +1518,40 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	    }
 
     /* ---------- requests (derived route-log index) ---------- */
-    let requestsTimer = null;
+    let requestsTimer = null;          // polling fallback ticker
+    let requestsStream = null;         // EventSource live tail
+    let requestsFlushTimer = null;
+    let requestsPending = [];          // streamed rows waiting for the next paint
+    let requestsSummaryAt = 0;
+    let requestsCursor = null;         // index position the rendered list was read at
     let requestsDegraded = false;
     const REQ_WINDOWS = ["1h", "24h", "7d", "30d"];
-    const autoRefreshLabel = () => ic(ICONS.watcher) + "Auto-refresh: " + (requestsAutoRefresh ? "on" : "off");
+    const REQ_LIST_CAP = 200;          // rows kept in the payload and in the DOM
+    const REQ_FLUSH_MS = 400;          // coalesce a burst of streamed rows into one paint
+    const REQ_SUMMARY_MS = 15000;      // the aggregates are the heavy read; refresh them sparingly
+    const liveLabel = () => ic(ICONS.watcher) + "Live: " + (requestsLive ? "on" : "off");
 
-    async function loadRequests(after = true) {
+    function requestQuery() {
       const f = requestFilters;
-      const params = new URLSearchParams({ limit: "200" });
+      const params = new URLSearchParams({ limit: String(REQ_LIST_CAP) });
       if (f.profile) params.set("profile", f.profile);
       if (f.source) params.set("source", f.source);
       if (f.reason) params.set("reason", f.reason);
       if (f.status) params.set("status", f.status);
       if (f.q) params.set("q", f.q);
-      const [lr, sr] = await Promise.all([
-        fetch("/admin/requests?" + params.toString(), { cache: "no-store" }),
-        fetch("/admin/requests/summary?window=" + encodeURIComponent(f.window || "24h"), { cache: "no-store" }),
-      ]);
-      const lp = await lr.json();
-      const sp = await sr.json();
-      if (!lr.ok || !sr.ok) throw new Error(lp?.error?.message || sp?.error?.message || "requests failed");
-      setRequestsPayload(lp || { entries: [] });
-      setRequestsSummary(sp || {});
-      // Toast only on the transition into a degraded state, so auto-refresh doesn't spam it every tick.
-      const degraded = lp?.error_type || sp?.error_type;
-      if (degraded && !requestsDegraded) showToast("Request index unavailable: " + degraded);
-      requestsDegraded = Boolean(degraded);
+      return params.toString();
+    }
+    const summaryUrl = () => "/admin/requests/summary?window=" + encodeURIComponent(requestFilters.window || "24h");
+    // Toast only on the transition into a degraded state, so a live tail doesn't spam it every tick.
+    function noteRequestsDegraded(errorType) {
+      if (errorType && !requestsDegraded) showToast("Request index unavailable: " + errorType);
+      requestsDegraded = Boolean(errorType);
+    }
+    async function loadRequests(after = true) {
+      const [lp, sp] = await Promise.all([loadRequestsList(false), fetchRequestsSummary()]);
+      setRequestsSummary(sp);
+      requestsSummaryAt = Date.now();
+      noteRequestsDegraded(lp?.error_type || sp?.error_type);
       if (after) {
         renderRequests();
         // Refresh the filter controls (newly seen providers/outcomes) unless the user is
@@ -1549,28 +1560,124 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         if (!$("requestsFilters").contains(document.activeElement)) renderRequestsFilters();
       }
     }
+    // List only. A resync takes this path rather than loadRequests(): the aggregates are the
+    // expensive read, and they have their own cadence.
+    async function loadRequestsList(after = true) {
+      const r = await fetch("/admin/requests?" + requestQuery(), { cache: "no-store" });
+      const p = await r.json();
+      if (!r.ok) throw new Error(p?.error?.message || "requests failed");
+      // A full list read supersedes anything the stream queued for the old list.
+      requestsPending = [];
+      requestsCursor = typeof p?.cursor === "number" ? p.cursor : null;
+      setRequestsPayload(p || { entries: [] });
+      if (after) { noteRequestsDegraded(p?.error_type); renderRequestsList(); }
+      return p;
+    }
+    async function fetchRequestsSummary() {
+      const r = await fetch(summaryUrl(), { cache: "no-store" });
+      const p = await r.json();
+      if (!r.ok) throw new Error(p?.error?.message || "summary failed");
+      return p || {};
+    }
     function enterRequests() {
       renderRequestsFilters();
       renderRequests();
       loadRequests().catch((e) => showToast(e.message || String(e)));
-      if (requestsAutoRefresh) startRequestsAutoRefresh();
+      if (requestsLive) startRequestsLive();
     }
-    function stopRequestsAutoRefresh() { if (requestsTimer) { clearInterval(requestsTimer); requestsTimer = null; } }
-    function startRequestsAutoRefresh() {
-      stopRequestsAutoRefresh();
+
+    /* Live tail. The server pushes only the rows a subscriber has not seen yet, so the page
+     * stays current without re-fetching the whole list; the 5s poll is the fallback for a
+     * browser or proxy that cannot hold an event stream. Both stop when the view is left or
+     * the tab is hidden — a background tab must not keep a connection or a timer alive. */
+    function stopRequestsLive() { closeRequestsStream(); stopRequestsPolling(); }
+    function closeRequestsStream() {
+      if (requestsStream) { requestsStream.close(); requestsStream = null; }
+      if (requestsFlushTimer) { clearTimeout(requestsFlushTimer); requestsFlushTimer = null; }
+      requestsPending = [];
+    }
+    function stopRequestsPolling() { if (requestsTimer) { clearInterval(requestsTimer); requestsTimer = null; } }
+    function startRequestsLive() {
+      stopRequestsLive();
+      if (document.hidden) return;  // resumed by the visibilitychange handler
+      if (typeof EventSource !== "function") { startRequestsPolling(); return; }
+      // Resume from the snapshot the list was built on, so nothing routed between that read
+      // and this connection is lost. EventSource cannot set headers, hence the query param.
+      const at = requestsCursor === null ? "" : "&cursor=" + encodeURIComponent(requestsCursor);
+      const stream = new EventSource("/admin/requests/stream?" + requestQuery() + at);
+      requestsStream = stream;
+      stream.addEventListener("requests", (ev) => {
+        if (stream !== requestsStream) return;
+        let batch;
+        try { batch = JSON.parse(ev.data); } catch { return; }
+        if (typeof batch?.cursor === "number") requestsCursor = batch.cursor;
+        // The server asks for a resync when a resuming tail fell too far behind to replay.
+        // Reload the list, not the aggregates: the stream is still live and a resync happens
+        // exactly when the router is busiest, which is the worst moment to pay for them.
+        if (batch?.resync) { loadRequestsList().catch(() => {}); return; }
+        queueStreamedRequests(batch?.entries || []);
+      });
+      stream.addEventListener("error", () => {
+        if (stream !== requestsStream) return;
+        // EventSource retries on its own while it is CONNECTING (a server restart, or the
+        // stream's own lifetime cap). CLOSED means it gave up — that is the only failure
+        // worth downgrading the transport for.
+        if (stream.readyState !== EventSource.CLOSED) return;
+        closeRequestsStream();
+        startRequestsPolling();
+        showToast("Live stream unavailable; falling back to polling.");
+      });
+    }
+    function startRequestsPolling() {
+      stopRequestsPolling();
       requestsTimer = setInterval(() => {
-        if (currentView !== "requests") { stopRequestsAutoRefresh(); return; }
+        if (currentView !== "requests" || !requestsLive) { stopRequestsPolling(); return; }
+        if (document.hidden) return;
         loadRequests().catch(() => {});
       }, 5000);
     }
-    function toggleRequestsAutoRefresh() {
-      setRequestsAutoRefresh(!requestsAutoRefresh);
-      const b = $("autoRefreshRequestsBtn");
-      if (b) { b.innerHTML = autoRefreshLabel(); b.classList.toggle("primary", requestsAutoRefresh); b.setAttribute("aria-pressed", requestsAutoRefresh ? "true" : "false"); }
-      if (requestsAutoRefresh) startRequestsAutoRefresh(); else stopRequestsAutoRefresh();
+    function toggleRequestsLive() {
+      setRequestsLive(!requestsLive);
+      const b = $("liveRequestsBtn");
+      if (b) { b.innerHTML = liveLabel(); b.classList.toggle("primary", requestsLive); b.setAttribute("aria-pressed", requestsLive ? "true" : "false"); }
+      if (requestsLive) startRequestsLive(); else stopRequestsLive();
+    }
+    function queueStreamedRequests(entries) {
+      if (!entries.length) return;
+      requestsPending.push(...entries);
+      if (!requestsFlushTimer) requestsFlushTimer = setTimeout(flushStreamedRequests, REQ_FLUSH_MS);
+    }
+    function flushStreamedRequests() {
+      requestsFlushTimer = null;
+      const pending = requestsPending;
+      requestsPending = [];
+      const el = $("requestsList");
+      if (!pending.length || !el || currentView !== "requests") return;
+      const known = new Set((requestsPayload.entries || []).map((e) => e.request_id));
+      const fresh = [];
+      for (const e of pending) {
+        if (!e?.request_id || known.has(e.request_id)) continue;
+        known.add(e.request_id);
+        fresh.push(e);
+      }
+      if (!fresh.length) return;
+      fresh.reverse();  // the tail arrives oldest first; the list reads newest first
+      setRequestsPayload({ ...requestsPayload, entries: fresh.concat(requestsPayload.entries || []).slice(0, REQ_LIST_CAP) });
+      if (el.querySelector(".empty")) {
+        renderRequestsList();  // the list was empty: swap the placeholder out
+      } else {
+        // Prepend just the new rows instead of rebuilding: the rows already on screen keep
+        // their expanded state, and a long list costs nothing to leave alone.
+        el.insertAdjacentHTML("afterbegin", fresh.map((e) => reqRowHTML(e, true)).join(""));
+        while (el.children.length > REQ_LIST_CAP) el.lastElementChild.remove();
+      }
+      if (Date.now() - requestsSummaryAt >= REQ_SUMMARY_MS) {
+        requestsSummaryAt = Date.now();  // claim the slot before awaiting so a burst cannot stack fetches
+        fetchRequestsSummary().then((sp) => { setRequestsSummary(sp); renderRequestsSummary(); renderRequestsTimeline(); }).catch(() => {});
+      }
     }
 
-    function renderRequests() { renderRequestsSummary(); renderRequestsTimeline(); renderRequestsList(); }
+    function renderRequests() { renderRequestsSummary(); renderRequestsWindow(); renderRequestsTimeline(); renderRequestsList(); }
 
     function renderRequestsSummary() {
       const el = $("requestsSummary"); if (!el) return;
@@ -1594,33 +1701,191 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       el.innerHTML = cards.map(hcardHTML).join("");
     }
 
+    function renderRequestsWindow() {
+      const wEl = $("requestsWindow"); if (!wEl) return;
+      wEl.innerHTML = '<div class="segmented" role="group" aria-label="Summary window">' +
+        REQ_WINDOWS.map((w) => '<button type="button" data-req-window="' + w + '"' + (requestFilters.window === w ? ' class="active"' : "") + ">" + w + "</button>").join("") + "</div>";
+      wEl.querySelectorAll("[data-req-window]").forEach((b) => b.addEventListener("click", () => { requestFilters.window = b.dataset.reqWindow; loadRequests().catch((e) => showToast(e.message)); }));
+    }
+
     function renderRequestsTimeline() {
-      const wEl = $("requestsWindow");
-      if (wEl) {
-        wEl.innerHTML = '<div class="segmented" role="group" aria-label="Summary window">' +
-          REQ_WINDOWS.map((w) => '<button type="button" data-req-window="' + w + '"' + (requestFilters.window === w ? ' class="active"' : "") + ">" + w + "</button>").join("") + "</div>";
-        wEl.querySelectorAll("[data-req-window]").forEach((b) => b.addEventListener("click", () => { requestFilters.window = b.dataset.reqWindow; loadRequests().catch((e) => showToast(e.message)); }));
-      }
       const el = $("requestsTimeline"); if (!el) return;
       const buckets = (requestsSummary?.timeline) || [];
-      if (!buckets.length) { el.innerHTML = '<div class="empty">No requests in this window yet.</div>'; return; }
-      const maxTotal = Math.max(1, ...buckets.map((b) => Number(b.total || 0)));
-      const bw = 10, gap = 4, H = 100, W = Math.max(1, buckets.length * (bw + gap) - gap);
+      // Leave the chart alone while the pointer is on it: the 5s poll would otherwise
+      // rebuild the DOM under the cursor and drop the tooltip mid-read. This also comes
+      // before the empty state so an expiring last bucket waits for pointer leave.
+      if ($("reqChart")?.matches(":hover")) return;
+      if (!buckets.some((b) => Number(b.total || 0) > 0)) {
+        stopChartResizeWatch();
+        el.innerHTML = '<div class="empty">No requests in this window yet.</div>';
+        return;
+      }
+      // Built once and then kept: the host has to outlive the poll for its hover
+      // listeners and its resize observer to be bound once rather than every 5s.
+      if (!$("reqChart")) {
+        el.innerHTML = '<div class="req-chart" id="reqChart"></div>' +
+          '<div class="req-spark-legend"><span><i class="dot ok"></i>success</span><span><i class="dot danger"></i>error</span>' +
+          '<span class="req-spark-span" id="reqChartSpan"></span></div>';
+        startChartResizeWatch();
+      }
+      $("reqChartSpan").textContent = new Date(Number(buckets[0].bucket) * 1000).toLocaleString() + " → now";
+      drawRequestsChart();
+    }
+
+    /* ---------- request volume chart ----------
+       Drawn in real pixels measured off the card rather than in a stretched viewBox:
+       the plot is ~12x wider than tall, so a non-uniform scale would flatten the bars
+       into slabs and turn every corner radius into an ellipse. Redrawn on resize. */
+    const CHART_PAD = { top: 12, right: 12, bottom: 24, left: 38 };
+    const CHART_PLOT_H = 132;
+    let chartResizeObserver = null;
+
+    // One reading of a bucket, so the bars and the tooltip can never disagree about it.
+    // `Number(x) || 0` rather than `Number(x || 0)`: the latter keeps NaN for a
+    // non-numeric field and paints it as "NaN" instead of an empty bucket.
+    function bucketCounts(b) {
+      const total = Number(b?.total) || 0;
+      const ok = Math.max(0, Math.min(total, Number(b?.ok) || 0));
+      return { total, ok, err: total - ok };
+    }
+
+    // A y-axis top that lands on a whole number, aiming for about three intervals.
+    function niceAxis(maxValue) {
+      const rough = Math.max(1, maxValue) / 3;
+      const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+      const unit = rough / mag;
+      const step = Math.max(1, Math.round((unit <= 1 ? 1 : unit <= 2 ? 2 : unit <= 5 ? 5 : 10) * mag));
+      return { step, max: Math.ceil(Math.max(1, maxValue) / step) * step };
+    }
+
+    // Shared by the axis ticks and the hover tooltip so both always read the same way.
+    const chartClock = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const chartDay = (d) => d.toLocaleDateString([], { day: "2-digit", month: "2-digit" });
+
+    // Bucket width decides how much of the date a tick label needs to stay unambiguous.
+    function chartTickFormat(bucketSeconds) {
+      if (bucketSeconds >= 86400) return chartDay;
+      if (bucketSeconds >= 21600) return (d) => chartDay(d) + " " + chartClock(d);
+      return chartClock;
+    }
+
+    function drawRequestsChart() {
+      const host = $("reqChart"); if (!host) return;
+      const buckets = (requestsSummary?.timeline) || [];
+      const width = Math.round(host.clientWidth || 0);
+      if (!buckets.length || width < 80) return;
+      // Same width, same numbers, same picture: skip the poll's redundant repaint, and
+      // make the resize observer a no-op unless the width actually moved. Parked on the
+      // host so the cache dies with the drawing it describes.
+      const key = width + "|" + JSON.stringify(buckets);
+      if (host.dataset.key === key) return;
+      host.dataset.key = key;
+
+      const P = CHART_PAD, H = CHART_PLOT_H;
+      const plotW = width - P.left - P.right;
+      const height = H + P.top + P.bottom;
+      const n = buckets.length;
+      const axis = niceAxis(Math.max(...buckets.map((b) => bucketCounts(b).total)));
+      const yOf = (v) => P.top + H - (v / axis.max) * H;
+      const slot = plotW / n;
+      const bw = Math.max(2, Math.min(slot - 3, 26));
+      const bucketSeconds = Number(requestsSummary?.bucket_seconds || 300);
+      const fmt = chartTickFormat(bucketSeconds);
+
+      let grid = "";
+      for (let v = 0; v <= axis.max; v += axis.step) {
+        const y = Math.round(yOf(v)) + 0.5; // half-pixel offset keeps the rule at 1 crisp px
+        grid += '<line class="rc-grid' + (v === 0 ? " rc-base" : "") + '" x1="' + P.left + '" x2="' + (width - P.right) + '" y1="' + y + '" y2="' + y + '"/>' +
+          '<text class="rc-ylab" x="' + (P.left - 8) + '" y="' + (y + 4) + '">' + v + "</text>";
+      }
+
       const bars = buckets.map((b, i) => {
-        const total = Number(b.total || 0), okc = Number(b.ok || 0);
-        const x = i * (bw + gap);
-        const totalH = (total / maxTotal) * H;
-        const okH = total ? (okc / total) * totalH : 0;
-        const errH = totalH - okH;
-        const tip = new Date(Number(b.bucket) * 1000).toLocaleString() + " — " + okc + "/" + total + " ok";
-        return "<g><title>" + esc(tip) + "</title>" +
-          (errH > 0 ? '<rect x="' + x + '" y="' + (H - totalH) + '" width="' + bw + '" height="' + errH + '" rx="1.5" fill="var(--danger)"/>' : "") +
-          (okH > 0 ? '<rect x="' + x + '" y="' + (H - okH) + '" width="' + bw + '" height="' + okH + '" rx="1.5" fill="var(--ok)"/>' : "") +
+        const { total, ok: okc, err: errc } = bucketCounts(b);
+        if (!total) return "";
+        // Floor the drawn height so a lone request in a tall window stays visible, then
+        // clamp the error segment so neither side of a mixed bucket vanishes.
+        const hTotal = Math.max(okc && errc ? 3 : 1.5, (total / axis.max) * H);
+        const hErr = !errc ? 0 : !okc ? hTotal
+          : Math.min(Math.max(hTotal - (okc / total) * hTotal, 1.5), hTotal - 1.5);
+        const hOk = hTotal - hErr;
+        const x = P.left + i * slot + (slot - bw) / 2;
+        const top = P.top + H - hTotal;
+        return '<g class="rc-bar" data-i="' + i + '">' +
+          (hErr ? '<rect class="rc-err" x="' + x.toFixed(1) + '" y="' + top.toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + hErr.toFixed(1) + '" rx="2"/>' : "") +
+          // Only the top segment gets rounded corners, so the stack reads as one bar.
+          (hOk ? '<rect class="rc-ok" x="' + x.toFixed(1) + '" y="' + (P.top + H - hOk).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + hOk.toFixed(1) + '" rx="' + (hErr ? 0 : 2) + '"/>' : "") +
           "</g>";
       }).join("");
-      el.innerHTML = '<svg class="req-spark" viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" role="img" aria-label="Request volume over time">' + bars + "</svg>" +
-        '<div class="req-spark-legend"><span><i class="dot ok"></i>success</span><span><i class="dot danger"></i>error</span><span class="req-spark-span">' +
-        esc(new Date(Number(buckets[0].bucket) * 1000).toLocaleString()) + " → now</span></div>";
+
+      const every = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(plotW / 110))));
+      let ticks = "";
+      for (let i = 0; i < n; i += every) {
+        const cx = Math.min(width - P.right - 18, Math.max(P.left + 18, P.left + i * slot + slot / 2));
+        ticks += '<text class="rc-xlab" x="' + cx.toFixed(1) + '" y="' + (P.top + H + 16) + '">' + esc(fmt(new Date(Number(buckets[i].bucket) * 1000))) + "</text>";
+      }
+
+      const hits = buckets.map((_, i) =>
+        '<rect class="rc-hit" data-i="' + i + '" x="' + (P.left + i * slot).toFixed(1) + '" y="' + P.top + '" width="' + slot.toFixed(1) + '" height="' + H + '"/>'
+      ).join("");
+
+      host.innerHTML = '<svg class="rc-svg" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + " " + height + '" role="img" aria-label="Request volume over time, success and error stacked per time bucket">' +
+        grid +
+        '<rect class="rc-band" id="rcBand" y="' + P.top + '" height="' + H + '" width="' + slot.toFixed(1) + '" rx="3" visibility="hidden"/>' +
+        bars + ticks + hits + "</svg>" +
+        '<div class="req-tip" id="reqTip" hidden></div>';
+      bindChartHover(host, buckets, { width, bucketSeconds });
+    }
+
+    function bindChartHover(host, buckets, geo) {
+      const band = $("rcBand"), tip = $("reqTip");
+      host.querySelectorAll(".rc-hit").forEach((hit) => {
+        hit.addEventListener("mouseenter", () => {
+          const i = Number(hit.dataset.i);
+          const b = buckets[i]; if (!b || !band || !tip) return;
+          const { total, ok: okc, err: errc } = bucketCounts(b);
+          const start = new Date(Number(b.bucket) * 1000);
+          const end = new Date((Number(b.bucket) + geo.bucketSeconds) * 1000);
+          // Take the slot geometry off the hit rect itself rather than recomputing it,
+          // so the band and the tooltip cannot drift from the bars they point at.
+          const slotX = Number(hit.getAttribute("x")), slotW = Number(hit.getAttribute("width"));
+          band.setAttribute("x", slotX.toFixed(1));
+          band.setAttribute("visibility", "visible");
+          // The hit rects sit above the bars and swallow the pointer, so :hover never
+          // reaches the bar itself — carry the highlight explicitly.
+          host.querySelector(".rc-bar.is-active")?.classList.remove("is-active");
+          host.querySelector('.rc-bar[data-i="' + i + '"]')?.classList.add("is-active");
+          tip.innerHTML = '<div class="rt-when">' + esc(chartDay(start)) + " " + esc(chartClock(start)) + " – " + esc(chartClock(end)) + "</div>" +
+            (total
+              ? '<div class="rt-counts"><span><i class="dot ok"></i>' + okc + " ok</span><span><i class=\"dot danger\"></i>" + errc + " error" + (errc === 1 ? "" : "s") + "</span></div>" +
+                '<div class="rt-total">' + total + " request" + (total === 1 ? "" : "s") + "</div>"
+              : '<div class="rt-total">no traffic</div>');
+          tip.hidden = false;
+          // Sit beside the slot, on whichever side has room — never on top of the bar
+          // being read — then clamp so the card stays inside the plot.
+          const w = tip.offsetWidth;
+          const beside = slotX < geo.width / 2 ? slotX + slotW + 8 : slotX - w - 8;
+          tip.style.left = Math.max(4, Math.min(geo.width - w - 4, beside)) + "px";
+        });
+      });
+      // The host outlives the poll, so this binds once for its whole lifetime.
+      if (host.dataset.hoverBound) return;
+      host.dataset.hoverBound = "1";
+      host.addEventListener("mouseleave", () => {
+        $("rcBand")?.setAttribute("visibility", "hidden");
+        const t = $("reqTip"); if (t) t.hidden = true;
+        host.querySelector(".rc-bar.is-active")?.classList.remove("is-active");
+        renderRequestsTimeline(); // catch up on any poll skipped while hovering
+      });
+    }
+
+    function startChartResizeWatch() {
+      const host = $("reqChart"); if (!host || typeof ResizeObserver === "undefined") return;
+      stopChartResizeWatch();
+      chartResizeObserver = new ResizeObserver(() => drawRequestsChart());
+      chartResizeObserver.observe(host);
+    }
+    function stopChartResizeWatch() {
+      if (chartResizeObserver) { chartResizeObserver.disconnect(); chartResizeObserver = null; }
     }
 
     function reqOption(value, label, current) {
@@ -1647,7 +1912,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         '<select id="reqReason" class="req-select" aria-label="Outcome">' + reasonOpts + "</select>" +
         '<select id="reqStatus" class="req-select" aria-label="HTTP status">' + statusOpts + "</select>" +
         (hasFilter ? '<button class="btn ghost sm" type="button" id="reqReset">Reset</button>' : "");
-      const apply = () => loadRequests().catch((e) => showToast(e.message));
+      // A live tail is filtered server-side, so a filter change has to reopen it.
+      const apply = () => loadRequests().then(() => { if (requestsLive) startRequestsLive(); }).catch((e) => showToast(e.message));
       $("reqProfile").addEventListener("change", (e) => { f.profile = e.target.value; apply(); });
       $("reqSource").addEventListener("change", (e) => { f.source = e.target.value; apply(); });
       $("reqReason").addEventListener("change", (e) => { f.reason = e.target.value; apply(); });
@@ -1662,14 +1928,20 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const el = $("requestsList"); if (!el) return;
       const rows = requestsPayload?.entries || [];
       if (!rows.length) { el.innerHTML = '<div class="empty">No matching requests yet. Route a request — or relax the filters — to see traffic here.</div>'; return; }
-      el.innerHTML = rows.map(reqRowHTML).join("");
-      el.querySelectorAll("[data-req-id]").forEach((row) => row.addEventListener("click", () => {
-        const id = row.dataset.reqId;
-        if (expandedRequests.has(id)) expandedRequests.delete(id); else expandedRequests.add(id);
-        renderRequestsList();
-      }));
+      el.innerHTML = rows.map((e) => reqRowHTML(e)).join("");
+      // Delegated, and assigned rather than added: the live tail prepends rows into this same
+      // container, and a per-row listener would have to be re-attached on every batch.
+      el.onclick = onRequestRowActivate;
+      el.onkeydown = (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onRequestRowActivate(ev); } };
     }
-    function reqRowHTML(e) {
+    function onRequestRowActivate(ev) {
+      const row = ev.target.closest("[data-req-id]");
+      if (!row) return;
+      const id = row.dataset.reqId;
+      if (expandedRequests.has(id)) expandedRequests.delete(id); else expandedRequests.add(id);
+      renderRequestsList();
+    }
+    function reqRowHTML(e, isNew = false) {
       const ok = e.reason === "ok";
       const open = expandedRequests.has(e.request_id);
       const statusBadge = '<span class="badge ' + (ok ? "ok" : "danger") + '">' + esc(String(e.status ?? "—")) + "</span>";
@@ -1689,7 +1961,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         '<span class="req-lat">' + esc(lat) + "</span>" +
         '<span class="req-flags">' + fallback + stream + "</span>" +
         "</div>";
-      return '<div class="req-item">' + head + (open ? reqDetailHTML(e) : "") + "</div>";
+      return '<div class="req-item' + (isNew ? " is-new" : "") + '">' + head + (open ? reqDetailHTML(e) : "") + "</div>";
     }
     function reqDetailHTML(e) {
       const attempts = e.attempts || [];
@@ -1888,19 +2160,19 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("viewActions").innerHTML = viewActions(name);
       bindViewActions(name);
       syncLongRunningActions();
-      if (name === "requests") enterRequests(); else stopRequestsAutoRefresh();
+      if (name === "requests") enterRequests(); else stopRequestsLive();
       if (location.hash !== "#/" + name) history.replaceState(null, "", "#/" + name);
       window.scrollTo({ top: 0, behavior: "instant" in document.documentElement.style ? "instant" : "auto" });
     }
     function viewActions(name) {
 	      const btn = (id, label, primary, icon, title) => '<button class="btn ' + (primary ? "primary" : "") + '" id="' + id + '"' + (title ? ' title="' + esc(title) + '"' : "") + ">" + (icon || "") + label + "</button>";
-	      if (name === "routing") return btn("refreshBtn", "Refresh catalog", false, ic(ICONS.refresh), "Re-fetch each provider's model list and rebuild the free-only catalog. Metadata only — no test requests, no tokens spent.") + btn("benchmarkBtn", "Retest candidates", false, ic(ICONS.retest), "Send a real test request to every usable model in this pool, one by one, to refresh pass/fail evidence. Uses a little quota per model and can take a few minutes on a large pool.") + btn("saveBtn", 'Save<span id="saveCount" class="save-count"></span>', true, ic(ICONS.save));
+	      if (name === "routing") return btn("refreshBtn", "Refresh catalog", false, ic(ICONS.refresh), "Re-fetch each provider's model list and rebuild the free-only catalog. Metadata only — no test requests, no tokens spent.") + btn("benchmarkBtn", "Retest candidates", false, ic(ICONS.retest), "Send a real test request to every usable model in this pool, one by one, to refresh pass/fail evidence. Uses a little quota per model. Tests of one provider are spaced ~4s apart so this cannot trip its rate limit, so a large pool takes several minutes.") + btn("saveBtn", 'Save<span id="saveCount" class="save-count"></span>', true, ic(ICONS.save));
 	      if (name === "fusion") return state?.pro_installed ? btn("saveFusionBtn", "Save settings", true, ic(ICONS.save)) : "";
 	      if (name === "settings") return btn("saveSettingsBtn", "Save settings", true, ic(ICONS.save));
 	      if (name === "compression") return state?.pro_installed ? btn("reloadCompressionBtn", "Reload", false, ic(ICONS.refresh)) + btn("saveCompressionBtn", "Save settings", true, ic(ICONS.save)) : "";
 	      if (name === "health") return btn("canaryBtn", "Run canary", true, ic(ICONS.canary));
       if (name === "audit") return btn("reloadAuditBtn", "Reload", false, ic(ICONS.refresh));
-      if (name === "requests") return btn("reloadRequestsBtn", "Reload", false, ic(ICONS.refresh)) + '<button class="btn' + (requestsAutoRefresh ? " primary" : "") + '" id="autoRefreshRequestsBtn" type="button" aria-pressed="' + (requestsAutoRefresh ? "true" : "false") + '">' + autoRefreshLabel() + "</button>";
+      if (name === "requests") return btn("reloadRequestsBtn", "Reload", false, ic(ICONS.refresh)) + '<button class="btn' + (requestsLive ? " primary" : "") + '" id="liveRequestsBtn" type="button" title="Stream new requests as they are routed, without reloading the page." aria-pressed="' + (requestsLive ? "true" : "false") + '">' + liveLabel() + "</button>";
       if (name === "export") return btn("buildExportBtn", "Build snippet", true, ic(ICONS.export));
       return "";
     }
@@ -1924,7 +2196,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       else if (name === "audit") $("reloadAuditBtn").addEventListener("click", () => loadAudit().then(() => showToast("Audit reloaded.")).catch((e) => showToast(e.message)));
       else if (name === "requests") {
         $("reloadRequestsBtn").addEventListener("click", () => loadRequests().then(() => showToast("Requests reloaded.")).catch((e) => showToast(e.message)));
-        $("autoRefreshRequestsBtn").addEventListener("click", toggleRequestsAutoRefresh);
+        $("liveRequestsBtn").addEventListener("click", toggleRequestsLive);
       }
       else if (name === "export") $("buildExportBtn").addEventListener("click", () => exportConfig().catch((e) => showToast(e.message)));
     }
@@ -2129,10 +2401,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     async function exportConfig() {
       const r = await fetch("/admin/export/generic"); const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "export failed");
       $("configExport").value = JSON.stringify(p.config || {}, null, 2); showToast("Configuration ready.");
-      // Spell out the same two values the JSON below carries, from the same payload: the
-      // server derives base_url from config.host/port, so deriving it here from
-      // location.origin instead would print two different URLs in one card.
+      // Spell out the same values the JSON below carries, from the same payload: the
+      // server derives base_url from config.host/port, so deriving them here from
+      // location.origin instead would print different URLs in one card.
       $("exportEndpointUrl").textContent = p.config?.base_url || "";
+      $("exportEndpointChatUrl").textContent = p.config?.chat_completions_url || "";
       $("exportEndpointKey").textContent = p.config?.api_key || "";
       $("exportEndpoint").hidden = false;
     }
@@ -2143,9 +2416,15 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       // location.origin, not the config: this card paints before any fetch, and the address
       // the dashboard was reached on is by definition one that resolves. The Export view
       // shows the server's own base_url instead — see exportConfig.
-      const url = location.origin + "/v1";
-      $("endpointUrl").textContent = url;
-      $("endpointCopy").addEventListener("click", () => copyToClipboard(url, "Endpoint copied: " + url, "Copy failed. The endpoint is " + url));
+      const base = location.origin + "/v1";
+      // Both forms, because clients disagree on what an "endpoint" field means. Offering only
+      // the base leaves the verbatim kind to assemble a URL by hand and land on POST /v1.
+      bindEndpointCopy("endpointCopy", "endpointUrl", base);
+      bindEndpointCopy("endpointChatCopy", "endpointChatUrl", base + "/chat/completions");
+    }
+    function bindEndpointCopy(buttonId, valueId, url) {
+      $(valueId).textContent = url;
+      $(buttonId).addEventListener("click", () => copyToClipboard(url, "Endpoint copied: " + url, "Copy failed. The endpoint is " + url));
     }
 
     /* ---------- theme ---------- */
@@ -2187,6 +2466,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       // Close any open filter popover when clicking outside the bar. Capture phase so it
       // still fires even though model-card buttons stopPropagation on bubble.
       document.addEventListener("click", (e) => { if (!e.target.closest("#filterBar .flt")) closeFilterPops(); }, true);
+      // A hidden tab holds no live tail: drop it on the way out, and resync on the way back
+      // rather than replaying whatever piled up while nobody was looking.
+      document.addEventListener("visibilitychange", () => {
+        if (currentView !== "requests" || !requestsLive) return;
+        if (document.hidden) { stopRequestsLive(); return; }
+        loadRequests().then(() => startRequestsLive()).catch(() => startRequestsLive());
+      });
     }
     // Bridge for the optional closed-pack views (pro-views.js). The moved Fusion/Compression render
     // and save/load functions read every helper, state accessor, and core callback they need from this
