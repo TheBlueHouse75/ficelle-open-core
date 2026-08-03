@@ -13,7 +13,7 @@ from typing import Callable
 REPOSITORY = "TheBlueHouse75/ficelle-open-core"
 VERSION = "0.1.6"
 CORE_WHEEL = f"ficelle_router-{VERSION}-py3-none-any.whl"
-CORE_SHA256 = "335a5edd6e662dee386a46a12575a4b7fc75dac7cf85a62e4287498d6102d7ed"
+CORE_SHA256 = "535830d5f58468d40fbd01e674a66f008ce22a81abda3d4663b748f0913b3f87"
 BOOTSTRAP_PATH = f"/{REPOSITORY}/v{VERSION}/scripts/bootstrap-ficelle.py"
 
 

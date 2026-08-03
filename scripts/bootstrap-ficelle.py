@@ -35,7 +35,7 @@ DEFAULT_CORE_WHEEL_URL = (
     f"v{CORE_VERSION}/ficelle_router-{CORE_VERSION}-py3-none-any.whl"
 )
 DEFAULT_CORE_SHA256 = (
-    "335a5edd6e662dee386a46a12575a4b7fc75dac7cf85a62e4287498d6102d7ed"
+    "535830d5f58468d40fbd01e674a66f008ce22a81abda3d4663b748f0913b3f87"
 )
 DEFAULT_WHEEL_URL = "https://install.ficelle.ai/api/releases/latest/wheel"
 PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
