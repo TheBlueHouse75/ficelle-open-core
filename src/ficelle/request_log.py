@@ -32,7 +32,7 @@ from typing import Any
 
 from ficelle.runtime_paths import RuntimePaths
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Retention bounds for the derived index (the JSONL source keeps everything).
 MAX_ROWS = 100_000
@@ -437,11 +437,41 @@ def _row_from_log_line(raw: Any) -> dict[str, Any] | None:
         if isinstance(raw_attempts, list)
         else []
     )
+    last_attempt = attempts[-1] if attempts else None
     error_type: str | None = None
-    if attempts:
-        candidate = attempts[-1].get("error_type")
+    if last_attempt is not None:
+        candidate = last_attempt.get("error_type")
         if isinstance(candidate, str) and candidate:
             error_type = candidate
+
+    # `selected_*` is written only once an attempt delivered, so a run where no candidate
+    # succeeded carries none of it — and these three fields are the list's provider column,
+    # the provider filter and the `q` search. Left NULL, a failure names nobody in the very
+    # views built to spot a misbehaving provider. Fall back to the last attempt that FAILED,
+    # not the last attempt: a Fusion panel runs in parallel and its rows carry the successful
+    # panelists too (`reason: "ok"`), in completion order — a fast rejection lands first and a
+    # real generation last, so plain `attempts[-1]` would routinely charge a failed run to the
+    # one provider that answered correctly. An attempt has to state a failure to be picked: one
+    # whose `reason` is absent or not a string says nothing about its outcome (the whitelist can
+    # also reduce an unrecognized attempt to `{}`), and a row must not name a provider on a
+    # guess. A row with no stated failure at all names nobody, which is the honest answer. Only
+    # the last failure is attributed: earlier ones stay in `attempts`, since one row has one
+    # provider column. All three fields move together or none do, so a row never mixes one
+    # attempt's provider with another's model.
+    selected_source = _str_or_none(raw.get("selected_source"))
+    selected_upstream = _str_or_none(raw.get("selected_upstream"))
+    selected_model = _str_or_none(raw.get("selected_model"))
+    if selected_source is None and selected_upstream is None and selected_model is None:
+        failed_attempt = None
+        for attempt in reversed(attempts):
+            attempt_reason = attempt.get("reason")
+            if isinstance(attempt_reason, str) and attempt_reason and attempt_reason != "ok":
+                failed_attempt = attempt
+                break
+        if failed_attempt is not None:
+            selected_source = _str_or_none(failed_attempt.get("source"))
+            selected_upstream = _str_or_none(failed_attempt.get("upstream"))
+            selected_model = _str_or_none(failed_attempt.get("model"))
 
     compression = raw.get("compression")
     compression_status = compression.get("status") if isinstance(compression, dict) else None
@@ -454,9 +484,9 @@ def _row_from_log_line(raw: Any) -> dict[str, Any] | None:
         "ts": _parse_ts(logged_at),
         "logged_at": logged_at,
         "profile": _str_or_none(raw.get("requested_model")),
-        "source": _str_or_none(raw.get("selected_source")),
-        "upstream_id": _str_or_none(raw.get("selected_upstream")),
-        "model_id": _str_or_none(raw.get("selected_model")),
+        "source": selected_source,
+        "upstream_id": selected_upstream,
+        "model_id": selected_model,
         "status": _safe_int(raw.get("final_status"), None),
         "reason": _str_or_none(raw.get("final_reason")),
         "error_type": error_type,

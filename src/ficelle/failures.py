@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
 
 from ficelle.redaction import sanitize_error_detail
 
 
-# Provider error messages routinely end with a link to an upgrade or settings page, and the
-# false-free markers below are bare substrings — so "see https://…/settings/credits" appended to an
-# unrelated rejection would read as a payment demand and quarantine a healthy model. URLs are
-# stripped before those markers are matched; a real payment demand states it in prose.
+# Provider error messages routinely end with a link to an upgrade or settings page, and a URL can
+# put `credits` somewhere the identifier rule below still accepts it (`?plan=credits`, `#credits`) —
+# so a link appended to an unrelated rejection would read as a payment demand and quarantine a
+# healthy model. URLs are stripped first; a real payment demand states it in prose.
 #
 # The class stops at JSON/markdown delimiters rather than at whitespace: `text` is the raw response
 # body, and providers emit compact JSON, so a whitespace-bounded match would run past the closing
@@ -33,6 +35,17 @@ FailureReason = Literal[
     "unavailable",
 ]
 
+# Provider error-code spellings, kept as text markers for the bodies `error_object_codes` cannot
+# read: a non-JSON body, an unusual shape, an upstream payload nested inside a string. Restricted to
+# identifiers a caller would not plausibly name a tool — `payment_required` is deliberately absent,
+# since the structural read covers it and a tool could carry that name.
+FALSE_FREE_ERROR_CODE_MARKERS = (
+    "billing_error",
+    "billing_hard_limit_reached",
+    "buycreditsurl",
+    "insufficient_credits",
+)
+
 FALSE_FREE_TEXT_MARKERS = (
     "payment required",
     "requires payment",
@@ -43,7 +56,70 @@ FALSE_FREE_TEXT_MARKERS = (
     "quota exceeded",
     "not enough balance",
     "free promotion has ended",
+) + FALSE_FREE_ERROR_CODE_MARKERS
+
+# Every marker that is a single token rather than prose. `false_free_pattern` already keeps these
+# from matching inside an identifier, but a token can also be echoed with real boundaries around it —
+# a tool named plainly `credits` comes back as `Invalid schema for function 'credits'`, and quotes
+# *are* boundaries. HTTP 400/422 is where that is the norm, since the message is about the body we
+# just sent, so those two statuses drop the single tokens entirely and keep only explicit prose,
+# pairing status and markers the way the 404/410 branch already does for `model_not_found`. A
+# provider that really demands payment on a 400 states it in prose, and 402 stands on its own.
+SINGLE_TOKEN_FALSE_FREE_MARKERS = ("billing", "credit", "credits") + FALSE_FREE_ERROR_CODE_MARKERS
+
+# Derived, not re-typed: a marker added to FALSE_FREE_TEXT_MARKERS must keep applying on 400/422, or
+# the narrowing would silently start dropping real payment demands. The extras below are the
+# phrasings the single tokens used to cover on their own.
+FALSE_FREE_PAYMENT_DEMAND_MARKERS = tuple(
+    marker for marker in FALSE_FREE_TEXT_MARKERS if marker not in SINGLE_TOKEN_FALSE_FREE_MARKERS
+) + (
+    "insufficient credit",
+    "requires more credits",
+    "add credits",
+    "buy credits",
+    "purchase credits",
+    "out of credits",
+    "credits have run out",
+    "credits remaining",
+    "credit balance",
+    "credit limit",
+    "billing account",
+    "billing issue",
+    "billing required",
+    "enable billing",
 )
+
+# Characters an identifier is built from. `\b` would only cover `_`, leaving `credits-lookup`,
+# `tools/credits` and `credit.balance` matching — and kebab-case tool names are at least as common as
+# snake_case. The trade-off is that a single token followed by a period ("out of credit.") stops
+# counting on its own; explicit prose and HTTP 402 still carry those.
+_IDENTIFIER_CHARS = r"[\w./-]"
+
+
+@lru_cache(maxsize=None)
+def false_free_pattern(markers: tuple[str, ...]) -> re.Pattern[str]:
+    """Compile a false-free marker set so single tokens cannot match inside an identifier.
+
+    A provider message routinely quotes an identifier the caller sent — `call_credits_lookup`,
+    `billing_report`, `credits-lookup` — and a plain substring match reads those as a payment demand,
+    which quarantines a healthy model for 24h. Requiring that no identifier character sits on either
+    side ends that class on *every* status, where the narrowed marker set only covers the request
+    rejections.
+
+    Phrases stay plain substrings: a space cannot occur inside an identifier, so they are not exposed
+    to the echo, and substring matching is what makes them deliberately cover their own inflections
+    ("insufficient credit" catching "insufficient credits").
+    """
+    parts = [
+        re.escape(marker)
+        if " " in marker
+        else rf"(?<!{_IDENTIFIER_CHARS}){re.escape(marker)}(?!{_IDENTIFIER_CHARS})"
+        for marker in markers
+    ]
+    # An adapter that cleared its markers must disable them: `re.compile("")` matches *everything*
+    # and would turn every failure into a payment demand.
+    return re.compile("|".join(parts) or r"(?!)")
+
 
 QUOTA_EXHAUSTED_TEXT_MARKERS = (
     "quota exceeded",
@@ -96,10 +172,110 @@ MODEL_NOT_FOUND_TEXT_MARKERS = (
     "gone",
 )
 
+# A provider that wraps its rejection in an HTTP 200 payload puts the status in `error.code` or
+# `error.type` — sometimes as a number, sometimes as OpenAI's/Anthropic's name for it. A name is not
+# "no status": dropping it classifies a dead API key as a plain model failure and a spent quota as a
+# healthy model, where the same message carried by its real HTTP status classifies as
+# `auth_or_credit` / `rate_limited`. Translating the canonical names keeps both doors in agreement;
+# anything else (`"tool_use_failed"`, `"invalid_value"`) really is unknown and stays `None`.
+ERROR_CODE_STATUSES = {
+    "api_error": 500,
+    "authentication_error": 401,
+    "insufficient_quota": 429,
+    "invalid_api_key": 401,
+    "invalid_request_error": 400,
+    "model_not_found": 404,
+    "not_found_error": 404,
+    "overloaded_error": 503,
+    "permission_error": 403,
+    "rate_limit_error": 429,
+}
+
+
+# Words that make a provider's own error code a payment condition, whatever it spelled it — matched
+# against the code's WORDS, not as substrings of it. `error.code`/`error.type` is the PROVIDER's
+# vocabulary rather than the caller's, which is why the message-prose identifier rule does not apply
+# here; but that only rules out an echo, so `discredit` and `prepayment_ok` would still have read as
+# payment demands. Splitting first is what covers the spellings no list anticipates —
+# `insufficient_credit` (singular), `credit_limit_exceeded`, `creditBalance` — without them.
+PAYMENT_CODE_WORDS = frozenset({"billing", "credit", "credits", "payment", "balance", "funds"})
+
+# `_`, `-`, `.` and a camelCase hump all separate words in a provider's code. Split on the ORIGINAL
+# casing — lowercasing first would weld `creditBalance` into one word.
+_CODE_WORD_BOUNDARY = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+
+
+def error_code_words(code: str) -> set[str]:
+    """Split a provider error code into its words, so a match cannot land inside a longer one."""
+    return {word.lower() for word in _CODE_WORD_BOUNDARY.split(code) if word}
+
+
+# The prose markers read the head of the body only — a gateway that echoes its upstream's payload or
+# a stack trace can answer with far more than anyone states a payment demand in. The structural read
+# below parses further, because `error.code` can sit behind a long `message`, but still refuses a
+# body no error payload would plausibly reach.
+PROSE_SCAN_LIMIT = 1000
+ERROR_BODY_PARSE_LIMIT = 64_000
+
+
+def error_object_codes(error: dict[str, Any]) -> tuple[str, ...]:
+    """The names a provider chose for an error: its `code` and `type`.
+
+    This is the structural discriminator the prose markers cannot have. These two fields are the
+    PROVIDER's verdict — the caller's vocabulary lands in `message` and `param` — so a payment word
+    inside them counts, where the same word in the prose first has to clear the identifier rule
+    (`false_free_pattern`). It is what lets `{"type":"billing_error"}` classify while
+    `Invalid schema for function 'billing_report'` does not, with no list of spellings to maintain.
+
+    `metadata` is deliberately NOT read: it is a free-form bag, and a key as ordinary as
+    `credits_used` on a timeout would quarantine a healthy model for 24h.
+    """
+    return tuple(error[key] for key in ("code", "type") if isinstance(error.get(key), str))
+
+
+def provider_error_codes(text: str) -> tuple[str, ...]:
+    """`error_object_codes` for a raw response body, so every path reads the same fields.
+
+    Returns `()` for a body that is not JSON, is shaped differently, or is too large to be an error
+    payload — all of which fall back to matching the prose.
+    """
+    if len(text) > ERROR_BODY_PARSE_LIMIT:
+        return ()
+    try:
+        payload = json.loads(text)
+    except (ValueError, RecursionError):
+        # RecursionError is not a ValueError: `json.loads` raises it on a deeply nested body, which
+        # fits well under the size limit. Letting it out turns a failover into a 500, since the chat
+        # path calls `classify_failure` outside the try/except that wraps `invoke_model`.
+        return ()
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return error_object_codes(error) if isinstance(error, dict) else ()
+
+
+def status_for_error_codes(*values: Any) -> int | None:
+    """Map a provider's textual error code/type to the HTTP status it stands for.
+
+    A canonical name wins over the payment-word fallback across ALL the fields, not field by field: a
+    provider answering `type: invalid_request_error` alongside `code: billing_report` is telling us
+    the message is about the request we sent, and a `code` that merely *contains* a payment word must
+    not outrank that — `billing_report` is the caller's tool.
+    """
+    codes = [value.strip() for value in values if isinstance(value, str)]
+    for code in codes:
+        mapped = ERROR_CODE_STATUSES.get(code.lower())
+        if mapped is not None:
+            return mapped
+    # A code naming a payment condition is that provider's spelling of 402, which stands on its own.
+    for code in codes:
+        if error_code_words(code) & PAYMENT_CODE_WORDS:
+            return 402
+    return None
+
 
 @dataclass(frozen=True)
 class FailureMarkers:
     false_free: tuple[str, ...] = FALSE_FREE_TEXT_MARKERS
+    false_free_payment_demand: tuple[str, ...] = FALSE_FREE_PAYMENT_DEMAND_MARKERS
     quota_exhausted: tuple[str, ...] = QUOTA_EXHAUSTED_TEXT_MARKERS
     free_tier_zero_allocation: tuple[str, ...] = FREE_TIER_ZERO_ALLOCATION_MARKERS
     model_not_found: tuple[str, ...] = MODEL_NOT_FOUND_TEXT_MARKERS
@@ -116,6 +292,10 @@ class FailureMarkers:
     ) -> "FailureMarkers":
         return FailureMarkers(
             false_free=self.false_free + false_free,
+            # A provider adapter's extra markers are deliberate, provider-specific phrasings rather
+            # than the generic substrings the 400/422 narrowing protects against, so they stay
+            # trusted on every status.
+            false_free_payment_demand=self.false_free_payment_demand + false_free,
             quota_exhausted=self.quota_exhausted + quota_exhausted,
             free_tier_zero_allocation=self.free_tier_zero_allocation + free_tier_zero_allocation,
             model_not_found=self.model_not_found + model_not_found,
@@ -240,16 +420,32 @@ def cooldown_policy_for_reason(reason: str, *, source: str = "") -> CooldownPoli
 
 
 def classify_failure(
-    status_code: int,
+    status_code: int | None,
     text: str,
     *,
+    error_codes: tuple[str, ...] = (),
     normalized_free_access: dict[str, Any] | None = None,
     markers: FailureMarkers | None = None,
     upstream_model_id: str | None = None,
 ) -> FailureReason:
-    """Classify a provider failure using already-normalized free-access metadata."""
+    """Classify a provider failure using already-normalized free-access metadata.
+
+    ``status_code`` is ``None`` when there is no status to read at all — a provider that wrapped its
+    rejection in an HTTP 200 payload whose error code is not a status (`"invalid_request_error"`).
+
+    Pass ``text`` UNTRUNCATED: the prose scan bounds itself (`PROSE_SCAN_LIMIT`), while the structural
+    read needs the whole object to parse. Slicing it first is what silently disables the latter, since
+    a body cut mid-JSON no longer loads. ``error_codes`` short-circuits that read for a caller that
+    already parsed the payload.
+    """
     marker_set = markers or DEFAULT_FAILURE_MARKERS
-    lower = text.lower()
+    # An unknown status corroborates nothing, so it narrows the false-free markers exactly like a
+    # request rejection does: a message that carries no status is just as likely to be echoing the
+    # caller's own request. Every other branch below sees the neutral 200 this used to be called with.
+    unknown_status = status_code is None
+    if status_code is None:
+        status_code = 200
+    lower = text[:PROSE_SCAN_LIMIT].lower()
     lower_without_urls = _URL_PATTERN.sub(" ", lower)
     has_quota_marker = any(marker in lower for marker in marker_set.quota_exhausted)
     access = normalized_free_access if isinstance(normalized_free_access, dict) else {}
@@ -289,7 +485,18 @@ def classify_failure(
     # itself, but the surrounding prose can name the plan too.
     if status_code == 413:
         return "request_too_large"
-    if status_code == 402 or any(marker in lower_without_urls for marker in marker_set.false_free):
+    # The provider's own code fields skip both marker rules: they carry its verdict, not the caller's
+    # vocabulary, so `status_for_error_codes` reads them directly — and its own precedence keeps a
+    # canonical name (`type: invalid_request_error`) ahead of a payment word in a sibling field.
+    named_status = status_for_error_codes(*(error_codes or provider_error_codes(text)))
+    # A provider that NAMES the error a request rejection is saying the message is about the body we
+    # sent, whatever status it wrapped that in — a gateway relaying an upstream 400 under its own 502
+    # is the common case. That is the same evidence as the status itself, so it narrows the markers
+    # too; without it, `{"code": "invalid_request_error"}` on a 502 still read a tool named `credits`
+    # as a payment demand. See FALSE_FREE_PAYMENT_DEMAND_MARKERS.
+    quotes_caller_request = unknown_status or status_code in {400, 422} or named_status in {400, 422}
+    false_free = marker_set.false_free_payment_demand if quotes_caller_request else marker_set.false_free
+    if status_code == 402 or named_status == 402 or false_free_pattern(false_free).search(lower_without_urls):
         return "billing_or_paid"
     if status_code in {401, 403}:
         return "auth_or_credit"

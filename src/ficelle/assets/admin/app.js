@@ -1013,9 +1013,28 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const { accepted } = providerCounts(p);
       // Chip families: Class (static classification), Runtime (usage metrics), Health (incidents).
       const callsOk = st ? pct(st.successes, st.requests) : null;
+      const budget = st?.budget;
+      const budgetSpent = Number(budget?.spent);
+      const budgetLimit = Number(budget?.limit);
+      const safeBudgetSpent = Number.isFinite(budgetSpent) && budgetSpent >= 0 ? budgetSpent : 0;
+      const hasBudgetLimit = Number.isFinite(budgetLimit) && budgetLimit > 0;
+      const budgetAmount = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
+      // This window's spend against the pool's allowance. Only shown when the provider could tell
+      // us the allowance and the meter records its unit (most cannot) — "412" without a comparable
+      // ceiling answers nothing, and background probing stops at 40% of it, so this is where a
+      // stalled discovery is explained.
+      const budgetBadge = hasBudgetLimit && budget.spent != null
+        ? '<span class="badge' + (safeBudgetSpent >= budgetLimit * 0.9 ? " warn" : "")
+          + '" title="' + esc("Spend Ficelle sent against this account's allowance"
+            + (budget.shared ? ", drawn from a pool shared with the account's other providers" : "")) + '">'
+          + budgetAmount(safeBudgetSpent) + " / " + budgetAmount(budgetLimit)
+          + (budget.unit && budget.unit !== "requests" ? " " + esc(budget.unit) : "")
+          + (budget.period === "month" ? " this month" : " today") + "</span>"
+        : "";
       const runtimePills = st
         ? '<span class="badge ' + (callsOk >= 95 ? "ok" : callsOk >= 80 ? "warn" : "danger") + '">' + callsOk + "% calls ok</span>"
           + (st.latency_ewma != null ? '<span class="badge" title="Average latency (EWMA)">' + Number(st.latency_ewma).toFixed(2) + "s latency</span>" : "")
+          + budgetBadge
         : "";
       const nextProbeBadge = qc ? '<span class="badge warn">next quota probe ' + esc(timeAgo(qc.next_probe_at_iso || qc.next_probe_at).label) + "</span>" : "";
       const healthPills = [quotaBadge, errBadge, nextProbeBadge, probeBadge].filter(Boolean).join("");
@@ -1399,10 +1418,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         { k: "Canary check", ic: ICONS.canary, v: (canary.status === "pass" ? "Passing" : (canary.status || "Not run")), note: (sum.passed ?? 0) + " of " + (sum.total ?? 0) + " virtual models ok &middot; last run " + timeAgo(canary.last_run_at).label, cls: canary.status === "pass" ? "ok" : "warn" },
         { k: "Paused", ic: ICONS.paused, v: (cdM + cdP + cdQ), note: cdM + " models &middot; " + cdP + " providers &middot; " + cdQ + " free quotas", cls: (cdM + cdP + cdQ) ? "warn" : "ok" },
         { k: "Disabled", ic: ICONS.disable, v: q, note: q ? "manually held out of routing" : "nothing quarantined", cls: q ? "warn" : "ok" },
-        // blocked means a probe cooled/stopped its model; skipped also counts still-due probes held
-        // behind a freshly observed provider/quota cooldown. Both drive the warning colour: a cycle
-        // reporting only "0 verified, 0 failed" used to look green while routing was paused.
-        { k: "Capability discovery", ic: ICONS.benchmark, v: (ab.last_run_at ? "Last run " + timeAgo(ab.last_run_at).label : "Not run yet"), note: ab.last_run_at ? ((ab.models ?? 0) + " models &middot; " + (ab.verified ?? 0) + " verified &middot; " + (ab.failed ?? 0) + " failed &middot; " + (ab.skipped ?? 0) + " paused &middot; " + (ab.blocked ?? 0) + " blocked") : "background discovery &middot; configure in Settings", cls: ((ab.skipped ?? 0) + (ab.blocked ?? 0)) ? "warn" : "ok" },
+        // blocked means a probe cooled/stopped its model; skipped counts still-due probes held
+        // behind a cooldown; budget_capped means the pool's probing share of the budget was spent.
+        { k: "Capability discovery", ic: ICONS.benchmark, v: (ab.last_run_at ? "Last run " + timeAgo(ab.last_run_at).label : "Not run yet"), note: ab.last_run_at ? ((ab.models ?? 0) + " models &middot; " + (ab.verified ?? 0) + " verified &middot; " + (ab.failed ?? 0) + " failed &middot; " + (ab.skipped ?? 0) + " paused &middot; " + (ab.blocked ?? 0) + " blocked &middot; " + (ab.budget_capped ?? 0) + " budget-capped") : "background discovery &middot; configure in Settings", cls: ((ab.skipped ?? 0) + (ab.blocked ?? 0) + (ab.budget_capped ?? 0)) ? "warn" : "ok" },
         { k: "Context compression", ic: ICONS.compression, v: compressionStatus, note: "mode " + compressionMode + " &middot; ~" + compressionSaved + " tokens saved &middot; " + compressionEntries + " CCR entries <button class=\"btn ghost sm\" data-open-compression>Dashboard</button>", cls: compression.health_digest === "compression_errors_repeated" ? "warn" : "ok" },
         { k: "Watcher", ic: ICONS.watcher, v: "Silent", note: "alerts only when status is not ok &middot; catalog refresh hourly, background auto-benchmark (see Settings)", cls: "ok" }
       ];

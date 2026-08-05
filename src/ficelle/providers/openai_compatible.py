@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ficelle.config_store import deep_merge
+from ficelle.domain_models import ProviderBudget
 from ficelle.failures import DEFAULT_FAILURE_MARKERS, FailureMarkers
 from ficelle.providers.base import (
     CatalogFetchContext,
@@ -49,6 +50,39 @@ class OpenAICompatibleCatalogAdapter:
 
     def failure_markers(self) -> FailureMarkers:
         return DEFAULT_FAILURE_MARKERS
+
+    def resolve_budget(self, context: CatalogFetchContext, provider_cfg: dict[str, Any]) -> ProviderBudget | None:
+        """This ACCOUNT's budget, read from the provider, or None if it cannot say.
+
+        A tier that differs between two users of the same build cannot be shipped as a constant, and
+        guessing it wrong is worse than not knowing: too low throttles a paying account, too high
+        defeats the meter. Providers that expose nothing return None and are counted but never
+        capped. Never raises — a router does not fail to start because an account endpoint is down.
+        """
+        if self.source != "openrouter":
+            return None
+        try:
+            # Resolved inside the guard: on macOS this shells out to the keychain, which is one more
+            # thing that can fail for reasons that have nothing to do with the account's tier.
+            key, _reason = context.resolve_credentials(self.source, provider_cfg)
+            base_url = self._base_url(provider_cfg)
+            if not key or not base_url:
+                return None
+            timeout = context.timeout_seconds
+            response = context.http_get(
+                f"{base_url}/credits",
+                headers={"Accept": "application/json", "Authorization": f"Bearer {key}", **self.request_headers()},
+                timeout=(min(5.0, timeout), timeout),
+            )
+            if not (200 <= int(response.status_code) < 300):
+                return None
+            purchased = float(((response.json() or {}).get("data") or {}).get("total_credits"))
+        except Exception:
+            return None
+        # OpenRouter's published thresholds for `:free` models, keyed on LIFETIME PURCHASED credits —
+        # `total_credits`, not the per-key spend cap `/api/v1/key` reports as `limit`, which an
+        # operator sets and which says nothing about the tier.
+        return ProviderBudget(1000.0 if purchased >= 10 else 50.0)
 
     def safe_diagnostics(self, provider_cfg: dict[str, Any]) -> dict[str, Any]:
         return {

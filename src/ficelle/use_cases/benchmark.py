@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from ficelle.use_cases.capability_discovery import (
+    MAX_VERDICT_STREAK,
     ROUTE_REJECTION_VERDICT,
     VERDICT_BASIS_KEY,
     CapabilityDiscoveryJob,
     ProviderProbePacer,
+    VERDICT_STREAK_KEY,
     provider_probe_interval_seconds,
 )
 
@@ -125,6 +127,28 @@ def pick_vision_fixture(index: int | None = None, *, ports: BenchmarkMediaPorts)
 ROUTE_REJECTION_VERDICT_TTL_SECONDS = 3600
 
 
+def route_rejection_deserves_a_retry_soon(row: Any) -> bool:
+    """True while a route rejection is still worth re-asking within the hour — the first one only.
+
+    The short TTL exists for a 404 an operator can fix in a minute (a data-policy setting, an
+    endpoint switched on). Applied to every attempt it never ended: discovery deliberately asks
+    text-only models for audio, the verdict expired before the next cycle, and the same refusal was
+    re-bought ~120 times a day against a daily free-model allowance. A route that says no, gets asked
+    again an hour later, and says no again is structural — it ages on the normal capability TTL and
+    comes back when a catalog might actually have changed.
+    """
+    if not isinstance(row, dict) or row.get(VERDICT_BASIS_KEY) != ROUTE_REJECTION_VERDICT:
+        return False
+    streak = row.get(VERDICT_STREAK_KEY)
+    if streak is None:
+        # Absent on rows written before the streak existed: treat those as a first refusal, so the
+        # upgrade costs one extra probe rather than freezing a verdict nobody has re-confirmed.
+        return True
+    # Invalid state also gets one recovery probe. The writer then normalizes a matching repeat to 2,
+    # so a corrupt string/float/negative/oversized value cannot crash or recreate the hourly loop.
+    return type(streak) is not int or not 1 <= streak <= MAX_VERDICT_STREAK or streak == 1
+
+
 def benchmark_result_is_aged(
     row: dict[str, Any],
     *,
@@ -134,7 +158,7 @@ def benchmark_result_is_aged(
 ) -> bool:
     ttl = ports.active_ttl_seconds() if ttl_seconds is None else ttl_seconds
     # Only ever shortens — `None` and `<= 0` keep their "never ages" meaning below.
-    if ttl is not None and isinstance(row, dict) and row.get(VERDICT_BASIS_KEY) == ROUTE_REJECTION_VERDICT:
+    if ttl is not None and route_rejection_deserves_a_retry_soon(row):
         ttl = min(ttl, ROUTE_REJECTION_VERDICT_TTL_SECONDS)
     if ttl is None or ttl <= 0:
         return False
@@ -1148,7 +1172,7 @@ class BenchmarkRunner:
         config: dict[str, Any],
         result: dict[str, Any],
     ) -> dict[str, Any]:
-        reason = self.classify_failure(response.status_code, response.text[:1000], model)
+        reason = self.classify_failure(response.status_code, response.text, model)
         detail = f"benchmark HTTP {response.status_code}: {response.text[:250]}"
         if reason in self.route_blocking_reasons:
             self.set_cooldown(model, reason, config, detail=detail, profile_id=profile_id)

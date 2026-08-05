@@ -342,6 +342,45 @@ def normalize_chat_completion_request(body: Any) -> ChatCompletionRequest:
     )
 
 
+def malformed_tool_call_detail(body: Any) -> str | None:
+    """Locate the first replayed tool call with no function name, or return None.
+
+    The one request-body defect worth catching before the network. OpenAI requires
+    ``tool_calls[].function.name``; a client that replays an empty one gets the upstream's own
+    400 ("historical tool function name is invalid") — and since `bad_upstream_request` is
+    non-retryable, that costs a full round trip to learn something knowable locally. On Fusion
+    it costs one per panelist. Ficelle stays a passthrough: the body is never rewritten, only
+    refused with a message naming the offending index.
+
+    Deliberately narrow, because the provider remains the authority on everything else in the
+    body: only a ``function`` object that IS present with a blank or non-string ``name`` is
+    rejected. A ``type: "custom"`` tool call carries no ``function`` at all and must still reach
+    the provider, and anything that is not shaped like a tool call is left alone rather than
+    guessed at.
+    """
+    if not isinstance(body, dict):
+        return None
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for call_index, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return f"messages[{message_index}].tool_calls[{call_index}].function.name is empty"
+    return None
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -665,7 +704,7 @@ def evaluate_upstream_failure_response(
     # `run_attempts` — whose only try/except wraps `invoke_model` — turning a failover into a 500.
     # An unreadable body is simply an unclassifiable one: keep the status, let `classify` judge it.
     try:
-        text = str(response.text)[:1000]
+        text = str(response.text)
     except Exception as exc:
         text = f"<unreadable response body: {type(exc).__name__}>"
     reason = classify(status_code, text, model)
@@ -951,6 +990,22 @@ class ChatCompletionRouter:
         if not isinstance(body, dict):
             raise ValueError("JSON body must be an object")
         request = request or normalize_chat_completion_request(body)
+        # Before the catalog, and before Fusion is even considered: a body no provider can accept
+        # is invalid whatever the routing would have been, and refusing it here is what turns a
+        # billed round trip (N of them on a Fusion panel) into a local 400. `catalog` is left
+        # empty on that path — the only reader, the Fusion branch in `router.py`, is unreachable
+        # once `response` is set.
+        malformed_tool_call = malformed_tool_call_detail(body)
+        if malformed_tool_call is not None:
+            return ChatCompletionStart(
+                request=request,
+                catalog={},
+                candidates=[],
+                is_fusion_request=False,
+                response=self._malformed_tool_call_response(
+                    body, request, request_id, request_started, malformed_tool_call
+                ),
+            )
         catalog = self.load_catalog(self.config)
         is_fusion_request = self.is_fusion_profile(request.requested_model)
         candidates = []
@@ -1255,29 +1310,32 @@ class ChatCompletionRouter:
             ),
         )
 
-    def _no_available_model_response(
+    def _refusal_response(
         self,
         body: dict[str, Any],
         request: ChatCompletionRequest,
         request_id: str,
         request_started: float,
+        *,
+        status: int,
+        reason: str,
+        error_type: str,
+        message: str,
     ) -> ChatCompletionResponse:
+        """A refusal Ficelle owns, logged like any other route so the Requests page shows it.
+
+        `candidate_count` and `attempts` are 0/empty and mean it literally: no model was picked,
+        none was called, none was cooled. One shape for every such refusal, so the route-log row
+        the index reads cannot drift between them.
+        """
         duration = self.now() - request_started
-        self.record_last_route(
-            request.safe_requested_model,
-            "fail",
-            "no_available_model",
-            request_id,
-            0,
-            0,
-            duration,
-        )
+        self.record_last_route(request.safe_requested_model, "fail", reason, request_id, 0, 0, duration)
         self.write_route_log(
             {
                 "request_id": request_id,
                 "requested_model": request.safe_requested_model,
-                "final_status": 503,
-                "final_reason": "no_available_model",
+                "final_status": status,
+                "final_reason": reason,
                 "candidate_count": 0,
                 "attempts": [],
                 "duration_seconds": round(duration, 4),
@@ -1285,13 +1343,51 @@ class ChatCompletionRouter:
             }
         )
         return ChatCompletionResponse(
-            status=503,
-            payload={
-                "error": {
-                    "message": f"no invokable free tool-capable model for {request.safe_requested_model}",
-                    "type": "no_available_model",
-                    "request_id": request_id,
-                }
-            },
+            status=status,
+            payload={"error": {"message": message, "type": error_type, "request_id": request_id}},
             headers=self.response_headers(request_id, request.safe_requested_model),
+        )
+
+    def _malformed_tool_call_response(
+        self,
+        body: dict[str, Any],
+        request: ChatCompletionRequest,
+        request_id: str,
+        request_started: float,
+        detail: str,
+    ) -> ChatCompletionResponse:
+        """Its own reason class rather than `bad_upstream_request`: that one records a provider's
+        verdict on a body Ficelle did forward, this one records Ficelle declining to ask."""
+        return self._refusal_response(
+            body,
+            request,
+            request_id,
+            request_started,
+            status=400,
+            reason="malformed_tool_call",
+            error_type="invalid_request_error",
+            message=(
+                f"invalid request body: {detail}. Every tool call replayed in the conversation "
+                "history must name the function it called; fix the client that built this "
+                "history, or start a new conversation. No provider was called: they all reject "
+                "this body."
+            ),
+        )
+
+    def _no_available_model_response(
+        self,
+        body: dict[str, Any],
+        request: ChatCompletionRequest,
+        request_id: str,
+        request_started: float,
+    ) -> ChatCompletionResponse:
+        return self._refusal_response(
+            body,
+            request,
+            request_id,
+            request_started,
+            status=503,
+            reason="no_available_model",
+            error_type="no_available_model",
+            message=f"no invokable free tool-capable model for {request.safe_requested_model}",
         )

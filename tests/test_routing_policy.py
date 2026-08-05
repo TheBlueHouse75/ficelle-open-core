@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from ficelle.routing_policy import competence_gate_result, competence_label, model_matches_profile_requirements
+from ficelle.routing_policy import (
+    catalog_denies_structured_output,
+    competence_gate_result,
+    competence_label,
+    model_matches_profile_requirements,
+)
 
 
 def free_access_eligible(model):
@@ -71,6 +76,32 @@ def test_policy_requirements_reject_missing_capabilities_and_small_context():
     assert matches(model_row(supported_parameters=["tools"]), profile_requirements(supported_parameters=["response_format"])) is False
     assert matches(model_row(supported_parameters=["tools"]), profile_requirements(supported_parameters_any=["reasoning"])) is False
     assert matches(model_row(context_length=32_000), profile_requirements(min_context=128_000)) is False
+
+
+def test_catalog_denies_structured_output_mirrors_the_routing_filter():
+    no_structured = model_row(supports_structured_outputs=False, supported_parameters=["tools", "tool_choice"])
+
+    assert catalog_denies_structured_output(no_structured, {"structured": True}) is True
+    # The routing filter rejects the same row on the same field, which is what makes the skip
+    # lossless: a `verified` verdict won by probing anyway could never have been routed.
+    assert matches(no_structured, profile_requirements(structured=True)) is False
+
+    # Declared support keeps its probes: the catalog's claim is what gets verified.
+    assert catalog_denies_structured_output(model_row(), {"structured": True}) is False
+    # A profile that does not require structured outputs never denies.
+    assert catalog_denies_structured_output(no_structured, {}) is False
+    assert catalog_denies_structured_output(no_structured, {"structured": False}) is False
+    # A flag that may have been synthesized from provider defaults is not a catalog answer.
+    assert (
+        catalog_denies_structured_output(
+            no_structured, {"structured": True}, structured_support_may_come_from_defaults=True
+        )
+        is False
+    )
+    # An absent flag means "not declared", never a denial — even though routing rejects it too.
+    undeclared = model_row(supported_parameters=["tools", "tool_choice"])
+    undeclared.pop("supports_structured_outputs")
+    assert catalog_denies_structured_output(undeclared, {"structured": True}) is False
 
 
 def test_competence_gate_uses_anti_empty_fallback_for_specialized_profiles():

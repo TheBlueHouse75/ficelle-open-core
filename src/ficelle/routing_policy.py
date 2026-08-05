@@ -31,6 +31,63 @@ def model_has_all(model: dict[str, Any], field: str, values: Iterable[str]) -> b
     return all(str(value) in current for value in values)
 
 
+def catalog_denies_input_modality(
+    model: dict[str, Any],
+    requirements: dict[str, Any],
+    *,
+    modalities_may_come_from_defaults: bool = False,
+) -> bool:
+    """True when the model declares its input modalities and the one a profile needs is missing.
+
+    Why probing it anyway is pointless, structurally rather than by measurement:
+    `model_matches_profile_requirements` filters this same field HARD when routing, and no verdict
+    overrides it — so a `verified` won here could never be routed. An empty list, or a value that
+    may have been synthesized from provider defaults, means "not declared", so an unknown model is
+    never denied. Read from the live catalog row on every cycle, never persisted, so a model that
+    gains a modality is due again on the next one.
+
+    See `docs/components/router.md` § Automatic capability discovery for why discovery honours this
+    for modalities only.
+    """
+    required_all = safe_string_list(requirements.get("input_modalities"))
+    # Only `auto-multimodal` requires "any of", and it has no probe body today, so that branch is
+    # unreachable from discovery. Kept so the two filters cannot drift apart.
+    required_any = safe_string_list(requirements.get("input_modalities_any"))
+    # Asked first: most profiles need no modality at all, and then the model never has to be read.
+    if not (required_all or required_any):
+        return False
+    if modalities_may_come_from_defaults or not safe_string_list(model.get("input_modalities")):
+        return False
+    if required_all and not model_has_all(model, "input_modalities", required_all):
+        return True
+    return bool(required_any) and not model_has_any(model, "input_modalities", required_any)
+
+
+def catalog_denies_structured_output(
+    model: dict[str, Any],
+    requirements: dict[str, Any],
+    *,
+    structured_support_may_come_from_defaults: bool = False,
+) -> bool:
+    """True when the model declares no structured-output support and the profile requires it.
+
+    Same argument as `catalog_denies_input_modality`, same hard counterpart:
+    `model_matches_profile_requirements` rejects on this very field when `structured` is required,
+    and no verdict overrides it — so a `verified` won here could never be routed. Only an explicit
+    `False` denies: a missing field means "not declared", and whether the row itself answered —
+    the flag can be computed off defaults-inherited params (see the caller) — arrives through
+    `structured_support_may_come_from_defaults`. Only the `structured: True` direction is read —
+    the only one a probeable profile can carry, since built-in requirements overwrite user config
+    for the four profiles that set it; a user `structured: false` on another built-in profile would
+    need the opposite provenance guard (a defaults-inflated `True`) and buys nothing today.
+    """
+    if requirements.get("structured") is not True:
+        return False
+    if structured_support_may_come_from_defaults:
+        return False
+    return model.get("supports_structured_outputs") is False
+
+
 def profile_excluded_model_ids(profile: dict[str, Any]) -> set[str]:
     return {str(item) for item in profile.get("excluded_models") or []}
 

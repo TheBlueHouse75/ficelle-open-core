@@ -181,6 +181,22 @@ class RouterModel:
 
 
 @dataclass(frozen=True)
+class ProviderBudget:
+    """One account's allowance for one pool of upstream capacity, as the provider states it.
+
+    A budget is a stock with a refill schedule, not a bare number: providers disagree on the unit
+    (requests, tokens, dollars, Neurons) and on the window (daily for most, monthly for Cohere), so
+    both travel with the amount instead of being baked into field names and state keys. Only
+    ``requests`` budgets are enforced today — that is the unit Ficelle's own meter records — but a
+    budget in any unit can be stored and surfaced without a schema change.
+    """
+
+    amount: float
+    unit: str = "requests"
+    period: str = "day"
+
+
+@dataclass(frozen=True)
 class SelectionRequest:
     requested_model: str
     canonical_model: str

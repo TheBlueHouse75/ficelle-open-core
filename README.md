@@ -56,7 +56,7 @@ raw numbers: [the benchmark write-up](https://ficelle-website.netlify.app/blog/f
 Install the versioned open Core from its GitHub Release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.6/scripts/bootstrap-ficelle.py | python3 -
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.7/scripts/bootstrap-ficelle.py | python3 -
 ~/.local/bin/ficelle models
 ```
 
@@ -68,7 +68,7 @@ key in shell history, enter it silently before running the same command:
 (
   read -s FICELLE_LICENSE_KEY
   export FICELLE_LICENSE_KEY
-  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.6/scripts/bootstrap-ficelle.py | python3 -
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.7/scripts/bootstrap-ficelle.py | python3 -
 )
 ```
 
@@ -91,6 +91,29 @@ client = OpenAI(
     api_key="ficelle-local",
 )
 ```
+
+### See the failover, without waiting for an outage
+
+```bash
+ficelle demo
+```
+
+Sends one real completion with the model that was about to answer forced to fail,
+and shows what happens next:
+
+```text
+  1. openrouter/llama-3.3-70b:free (openrouter) — SIMULATED OUTAGE, HTTP 429 → rate_limited
+     (fabricated by the demo; no request was sent to this provider)
+  2. nous/hermes-4-70b (nous) — answered, HTTP 200 · 412 ms
+
+Answered by nous/hermes-4-70b in 0.4s.
+Cost of this request: $0.00
+```
+
+Only the outage is simulated. The candidate order, the failure classification and
+the answer all come from the same code path that serves your agents, and the run
+writes nothing: no cooldown, no route log. `ficelle demo --json` prints the same
+run as a payload.
 
 `ficelle-setup --target auto` selects Hermes only when it detects a reliable local
 Hermes signal; otherwise it selects the same standalone generic target. The explicit
@@ -121,14 +144,14 @@ its own HTTPS manifest with `FICELLE_UPDATE_MANIFEST_URL`. The compact manifest 
 
 ```json
 {
-  "version": "0.1.6",
-  "release_url": "https://ficelle.ai/releases/0.1.6",
+  "version": "0.1.7",
+  "release_url": "https://ficelle.ai/releases/0.1.7",
   "core": {
-    "wheel_url": "https://downloads.example/ficelle_router-0.1.6-py3-none-any.whl",
+    "wheel_url": "https://downloads.example/ficelle_router-0.1.7-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>"
   },
   "pro": {
-    "wheel_url": "https://downloads.example/ficelle_pro-0.1.6-py3-none-any.whl",
+    "wheel_url": "https://downloads.example/ficelle_pro-0.1.7-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>",
     "authorization": "bearer"
   }

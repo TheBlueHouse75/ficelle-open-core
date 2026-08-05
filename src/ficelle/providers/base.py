@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
+from ficelle.domain_models import ProviderBudget
 from ficelle.failures import FailureMarkers
 from ficelle.redaction import sanitize_error_detail
 
@@ -100,6 +101,9 @@ class ProviderCatalogAdapter(Protocol):
         ...
 
     def failure_markers(self) -> FailureMarkers:
+        ...
+
+    def resolve_budget(self, context: CatalogFetchContext, provider_cfg: dict[str, Any]) -> ProviderBudget | None:
         ...
 
     def safe_diagnostics(self, provider_cfg: dict[str, Any]) -> dict[str, Any]:

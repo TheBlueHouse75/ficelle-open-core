@@ -27,5 +27,15 @@ jobs:
         run: python -m pytest -q
       # The dashboard ships as static ES modules with no build step, so a syntax error in
       # them reaches users as a blank page. node is preinstalled on ubuntu-latest.
+      # The closed pack ships its own module, injected as a separate <script type="module">
+      # that registers onto window.__ficelleProViews; if it fails to parse, app.js keeps
+      # running and the Pro tabs silently fall back to the core's upsell placeholders — a
+      # paying user reads that as an expired license, not as a bug. Guarded by the directory
+      # test because this workflow is mirrored to the core-only public repo, where an
+      # unmatched glob would stay literal and fail the run.
       - name: Syntax-check the dashboard assets
-        run: for f in src/ficelle/assets/admin/*.js; do node --check "$f"; done
+        run: |
+          for f in src/ficelle/assets/admin/*.js; do node --check "$f"; done
+          if [ -d ficelle-pro/src/ficelle_pro/assets/admin ]; then
+            for f in ficelle-pro/src/ficelle_pro/assets/admin/*.js; do node --check "$f"; done
+          fi

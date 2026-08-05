@@ -74,9 +74,22 @@ def model_due_capabilities(
     state: dict[str, Any],
     *,
     verified_capability_row: Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]],
+    catalog_denies_capability: Callable[[str, dict[str, Any]], bool],
 ) -> list[str]:
-    """Return probeable capabilities without a fresh verified/failed verdict."""
-    return [profile_id for profile_id in profile_ids if not verified_capability_row(profile_id, model, state)]
+    """Return probeable capabilities without a fresh verified/failed verdict.
+
+    A capability the catalog has already ruled out is not due at all: probing it can only return the
+    404 the catalog predicted. Dropping it here rather than at the probe means the model converges
+    and leaves the discovery queue, instead of coming back every cycle for an answer it has — which
+    is why the port is required: a caller that forgot it would still queue the model with nothing
+    left to ask it.
+    """
+    return [
+        profile_id
+        for profile_id in profile_ids
+        if not catalog_denies_capability(profile_id, model)
+        and not verified_capability_row(profile_id, model, state)
+    ]
 
 
 def discovery_eligible_models(
@@ -106,6 +119,7 @@ def models_needing_discovery(
     model_on_cooldown: Callable[[dict[str, Any], dict[str, Any]], tuple[bool, str | None]],
     model_is_quarantined: Callable[[dict[str, Any], dict[str, Any]], bool],
     verified_capability_row: Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]],
+    catalog_denies_capability: Callable[[str, dict[str, Any]], bool],
 ) -> list[dict[str, Any]]:
     """Return eligible models with at least one due discovery capability."""
     return [
@@ -116,7 +130,13 @@ def models_needing_discovery(
             model_on_cooldown=model_on_cooldown,
             model_is_quarantined=model_is_quarantined,
         )
-        if model_due_capabilities(model, profile_ids, state, verified_capability_row=verified_capability_row)
+        if model_due_capabilities(
+            model,
+            profile_ids,
+            state,
+            verified_capability_row=verified_capability_row,
+            catalog_denies_capability=catalog_denies_capability,
+        )
     ]
 
 
@@ -223,6 +243,33 @@ class ProviderProbePacer:
 VERDICT_BASIS_KEY = "verdict_basis"
 ROUTE_REJECTION_VERDICT = "route_rejection"
 
+# How many probes in a row have reached the verdict the same way. The basis alone cannot answer
+# "have we already retried this?": each probe rewrites the row, so an attempt that declined to
+# re-stamp the marker would read as "never rejected" on the next pass and hand back the short TTL
+# forever — the very loop the streak exists to end.
+VERDICT_STREAK_KEY = "verdict_basis_streak"
+MAX_VERDICT_STREAK = 2**31 - 1
+
+
+def consecutive_verdict_count(previous_row: Any, row: dict[str, Any]) -> int:
+    """Continue the previous streak when the new verdict repeats it, otherwise start at 1.
+
+    A different basis, or the same basis reached on a different `test_type`, is a different claim:
+    re-probing a redesigned audio check is a fresh question, not a repeat of the old answer.
+    """
+    if not isinstance(previous_row, dict):
+        return 1
+    if previous_row.get(VERDICT_BASIS_KEY) != row.get(VERDICT_BASIS_KEY):
+        return 1
+    if previous_row.get("test_type") != row.get("test_type"):
+        return 1
+    previous_streak = previous_row.get(VERDICT_STREAK_KEY)
+    if type(previous_streak) is not int or not 1 <= previous_streak <= MAX_VERDICT_STREAK:
+        # Missing on pre-streak rows, or corrupt in hand-edited state. The matching basis and test
+        # still prove this is at least the second consecutive verdict, so converge immediately.
+        return 2
+    return min(previous_streak + 1, MAX_VERDICT_STREAK)
+
 
 @dataclass(frozen=True)
 class CapabilityDiscoveryJob:
@@ -317,7 +364,7 @@ class CapabilityDiscoveryJob:
         response: Any,
         result: dict[str, Any],
     ) -> ProbeVerdict:
-        reason = self.classify_failure(response.status_code, response.text[:1000], model)
+        reason = self.classify_failure(response.status_code, response.text, model)
         blocking = reason in self.route_blocking_reasons
         # A rejected probe is a verdict on the capability, not on the model, so it must NOT bench the
         # model globally. Route rejections still defer to a provider-wide block: strict-zero means a
@@ -328,6 +375,8 @@ class CapabilityDiscoveryJob:
             result.update({"status": "fail", "message": f"HTTP {response.status_code}: {reason}"})
             if rejected_route:
                 # The probe never reached the model, so this verdict ages fast (see the constant).
+                # Only the first one does: the writer counts repeats, the reader stops shortening
+                # once the route has said no twice.
                 result[VERDICT_BASIS_KEY] = ROUTE_REJECTION_VERDICT
             self.record_benchmark_result(profile_id, model, result)
             self.record_verified_capability(profile_id, model, result)
@@ -355,28 +404,29 @@ class CapabilityDiscoveryJob:
         ],
         model_due_capabilities: Callable[[dict[str, Any], list[str], dict[str, Any]], list[str]],
         auto_benchmark_models_per_cycle: Callable[[dict[str, Any]], int],
+        probing_is_within_budget: Callable[[dict[str, Any], dict[str, Any]], bool],
         probe_model_capability: Callable[[dict[str, Any], str, dict[str, Any]], str] | None = None,
     ) -> dict[str, Any]:
         if not auto_benchmark_enabled(config):
             return {"status": "disabled"}
+
+        def fresh_state() -> dict[str, Any]:
+            state = load_state()
+            return state if isinstance(state, dict) else {}
+
         catalog = load_or_refresh_catalog(config)
-        state = load_state()
-        if not isinstance(state, dict):
-            state = {}
         profile_ids = probeable_capability_profiles(config)
         model_limit = auto_benchmark_models_per_cycle(config)
-        models = models_needing_discovery(catalog, state, profile_ids)[:model_limit]
+        models = models_needing_discovery(catalog, fresh_state(), profile_ids)[:model_limit]
         if not models:
             return {"status": "idle", "models": 0}
         probe_one = probe_model_capability or self.probe_model_capability
         # Counted even when the probe produced no capability answer: `blocked` stopped a model,
         # `skipped` never ran. Reporting only verified/failed made a cycle that benched several
         # models look clean.
-        counts = {"verified": 0, "failed": 0, "skipped": 0, "blocked": 0}
+        counts = {"verified": 0, "failed": 0, "skipped": 0, "blocked": 0, "budget_capped": 0}
         for model in models:
-            state = load_state()
-            if not isinstance(state, dict):
-                state = {}
+            state = fresh_state()
             due = model_due_capabilities(model, profile_ids, state)
             # Re-asked against fresh state, not the snapshot this cycle opened with: a probe of an
             # earlier model may have cooled this one's whole provider — or its quota scope — and
@@ -387,7 +437,18 @@ class CapabilityDiscoveryJob:
             if not any(other.get("id") == model.get("id") for other in still_probeable):
                 counts["skipped"] += len(due)
                 continue
-            for profile_id in due:
+            for index, profile_id in enumerate(due):
+                # Discovery converges over days; a user's request fails now. When the share of the
+                # pool's budget reserved for probing is spent, the rest of the window belongs to
+                # routing. Checked per probe, on freshly loaded state, so the probes of one model
+                # cannot overrun the line — a model with N due capabilities used to send all N
+                # after a single test.
+                if not probing_is_within_budget(fresh_state(), model):
+                    # Counted apart from `skipped`: "discovery has nothing left to ask" and
+                    # "discovery ran out of allowance" look identical in a single counter, and they
+                    # call for opposite reactions.
+                    counts["budget_capped"] += len(due) - index
+                    break
                 # Spacing lives in `probe_model_capability`, next to the call it protects, so a probe
                 # reached any other way is paced too.
                 verdict = probe_one(model, profile_id, config)
@@ -400,9 +461,7 @@ class CapabilityDiscoveryJob:
                     break
                 else:
                     counts["skipped"] += 1
-        state = load_state()
-        if not isinstance(state, dict):
-            state = {}
+        state = fresh_state()
         state["auto_benchmark"] = {
             "last_run_at": self.now_iso(),
             "models": len(models),

@@ -177,6 +177,132 @@ def test_filters(paths):
     assert q(q="y") == ["r3"]  # upstream_id LIKE %y%
 
 
+def test_failed_run_is_attributed_to_its_last_attempt(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [
+        # No candidate delivered, so the router wrote no `selected_*`: the row must still name the
+        # provider and model that produced final_reason, or every failure is invisible in the
+        # provider column, the provider filter, the search box and the per-provider summary.
+        _line("fail", now=now, selected_source=None, selected_model=None, selected_upstream=None,
+              final_status=400, final_reason="bad_upstream_request", attempt_count=1,
+              attempts=[{"model": "ficelle/openrouter/gemma:free", "upstream": "google/gemma-4",
+                         "source": "openrouter", "status": 400, "reason": "bad_upstream_request"}]),
+        # Refused before any attempt: nothing to attribute it to, so the columns stay empty.
+        _line("early", now=now, selected_source=None, selected_model=None, selected_upstream=None,
+              final_status=400, final_reason="malformed_tool_call", attempt_count=0, attempts=[]),
+    ])
+    rows = {r["request_id"]: r for r in rl.query(store_path=db, source_path=log)}
+    assert rows["fail"]["source"] == "openrouter"
+    assert rows["fail"]["upstream_id"] == "google/gemma-4"
+    assert rows["fail"]["model_id"] == "ficelle/openrouter/gemma:free"
+    assert rows["early"]["source"] is None
+    assert rows["early"]["upstream_id"] is None
+    assert rows["early"]["model_id"] is None
+    assert [r["request_id"] for r in rl.query(store_path=db, source_path=log, source="openrouter")] == ["fail"]
+    by_source = {r["source"]: r["total"] for r in rl.summary(store_path=db, source_path=log, now=now)["by_source"]}
+    assert by_source["openrouter"] == 1
+
+
+def test_a_failed_run_is_never_attributed_to_an_attempt_that_succeeded(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [
+        # A Fusion panel: its attempts carry the successful panelists too, in completion order, so
+        # the LAST one is the slow model that answered correctly. Charging it with the run's
+        # failure would blame the only provider that worked.
+        _line("panel", now=now, requested_model="ficelle/auto-fusion", selected_source=None,
+              selected_model=None, selected_upstream=None, final_status=502,
+              final_reason="insufficient_panel_success", attempt_count=3,
+              attempts=[{"model": "a", "upstream": "groq/a", "source": "groq", "status": 429, "reason": "rate_limited"},
+                        {"model": "b", "upstream": "nvidia/b", "source": "nvidia", "status": 400, "reason": "bad_upstream_request"},
+                        {"model": "c", "upstream": "or/c", "source": "openrouter", "status": 200, "reason": "ok"}]),
+        # Every attempt succeeded yet the run failed (a synth stage with no candidate to run):
+        # no model is at fault, so the row names none.
+        _line("synth", now=now, requested_model="ficelle/auto-fusion", selected_source=None,
+              selected_model=None, selected_upstream=None, final_status=502,
+              final_reason="synthesizer_failed", attempt_count=1,
+              attempts=[{"model": "judge", "upstream": "x/judge", "source": "cerebras", "status": 200, "reason": "ok"}]),
+        # A stage that did fail is named even when the terminal verdict came from a later stage
+        # that never ran: the column answers "who failed on this request", and the row's own
+        # `reason` already says what ended it.
+        _line("synth-unavailable", now=now, requested_model="ficelle/auto-fusion",
+              selected_source=None, selected_model=None, selected_upstream=None,
+              final_status=502, final_reason="synthesizer_failed", attempt_count=2,
+              attempts=[{"model": "panel-bad", "upstream": "x/panel-bad", "source": "groq",
+                         "status": 503, "reason": "server_error"},
+                        {"model": "judge", "upstream": "x/judge", "source": "cerebras",
+                         "status": 200, "reason": "ok"}],
+              fusion={"degraded_flags": {"synthesizer_unavailable": True}}),
+        # If the synthesizer did run and fail, its attempt remains the correct attribution.
+        _line("synth-failed", now=now, requested_model="ficelle/auto-fusion",
+              selected_source=None, selected_model=None, selected_upstream=None,
+              final_status=502, final_reason="synthesizer_failed", attempt_count=2,
+              attempts=[{"model": "panel", "upstream": "x/panel", "source": "groq",
+                         "status": 200, "reason": "ok"},
+                        {"model": "synth", "upstream": "x/synth", "source": "nvidia",
+                         "status": 503, "reason": "server_error"}],
+              fusion={"degraded_flags": {}}),
+    ])
+    rows = {r["request_id"]: r for r in rl.query(store_path=db, source_path=log)}
+    assert rows["panel"]["source"] == "nvidia"
+    assert rows["panel"]["upstream_id"] == "nvidia/b"
+    assert rows["synth"]["source"] is None
+    assert rows["synth"]["upstream_id"] is None
+    assert rows["synth-unavailable"]["source"] == "groq"
+    assert rows["synth-unavailable"]["upstream_id"] == "x/panel-bad"
+    assert rows["synth-failed"]["source"] == "nvidia"
+    assert rows["synth-failed"]["upstream_id"] == "x/synth"
+    by_source = {r["source"]: r["total"] for r in rl.summary(store_path=db, source_path=log, now=now)["by_source"]}
+    assert "openrouter" not in by_source
+    assert "cerebras" not in by_source
+    assert by_source["nvidia"] == 2
+
+
+def test_attempt_without_an_explicit_failure_reason_is_not_used_for_attribution(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [
+        _line("prior-failure", now=now, selected_source=None, selected_model=None,
+              selected_upstream=None, final_status=502, final_reason="upstream_failure",
+              attempt_count=3,
+              attempts=[{"model": "failed", "upstream": "nous/failed", "source": "nous",
+                         "status": 503, "reason": "server_error"},
+                        {"model": "unknown", "upstream": "other/unknown", "source": "other",
+                         "status": 200},
+                        {"ignored_by_whitelist": True}]),
+        _line("unknown-only", now=now, selected_source=None, selected_model=None,
+              selected_upstream=None, final_status=502, final_reason="upstream_failure",
+              attempt_count=1,
+              attempts=[{"model": "unknown", "upstream": "other/unknown", "source": "other",
+                         "status": 200}]),
+    ])
+
+    rows = {r["request_id"]: r for r in rl.query(store_path=db, source_path=log)}
+    assert rows["prior-failure"]["source"] == "nous"
+    assert rows["prior-failure"]["upstream_id"] == "nous/failed"
+    assert rows["prior-failure"]["model_id"] == "failed"
+    assert rows["unknown-only"]["source"] is None
+    assert rows["unknown-only"]["upstream_id"] is None
+    assert rows["unknown-only"]["model_id"] is None
+
+
+def test_a_recorded_selection_always_wins_over_the_attempt_fallback(paths):
+    log, db = paths
+    now = time.time()
+    # A run that failed over and then succeeded: `selected_*` names the winner, and the failed
+    # attempt must not be what the row reports.
+    _write(log, [
+        _line("won", now=now, attempt_count=2,
+              attempts=[{"model": "other", "upstream": "other/model", "source": "nous", "status": 429, "reason": "rate_limited"},
+                        {"model": "ficelle/openrouter/gemma:free", "source": "openrouter", "status": 200, "reason": "ok"}]),
+    ])
+    row = rl.query(store_path=db, source_path=log)[0]
+    assert row["source"] == "openrouter"
+    assert row["upstream_id"] == "google/gemma"
+    assert row["model_id"] == "ficelle/openrouter/gemma:free"
+
+
 def test_summary_success_is_reason_ok_not_http_status(paths):
     log, db = paths
     now = time.time()

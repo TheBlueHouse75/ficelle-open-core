@@ -38,6 +38,7 @@ from ficelle.use_cases.benchmark import (
     record_benchmark_failure_in_state,
     record_benchmark_result_in_state,
     redacted_benchmark_row,
+    route_rejection_deserves_a_retry_soon,
     stale_score_decay_factor,
     tool_call_arguments,
     validate_probe_response,
@@ -46,9 +47,11 @@ from ficelle.use_cases.benchmark import (
 from ficelle.use_cases.capability_discovery import (
     ROUTE_REJECTION_VERDICT,
     VERDICT_BASIS_KEY,
+    VERDICT_STREAK_KEY,
     CapabilityDiscoveryJob,
     ProviderProbePacer,
     clear_background_job_error_in_state,
+    consecutive_verdict_count,
     discovery_eligible_models,
     model_due_capabilities,
     models_needing_discovery,
@@ -346,11 +349,38 @@ def test_route_rejection_verdicts_age_out_faster_than_capability_verdicts():
 
     assert benchmark_result_is_aged(answered, ports=ports) is False  # still trusted under the long TTL
     assert benchmark_result_is_aged(route, ports=ports) is True  # capped, so it is re-probed
+    assert benchmark_result_is_aged({**route, VERDICT_STREAK_KEY: 2}, ports=ports) is False
 
     # The cap only ever shortens: a TTL configured below it still wins.
     short_ports = evidence_ports(now_seconds=100.0, ttl_seconds=10)
     assert benchmark_result_is_aged(route, ports=short_ports) is True
     assert benchmark_result_is_aged({**route, "ran_at": "99"}, ports=short_ports) is False
+
+
+def test_route_rejection_streak_resets_and_repairs_invalid_state():
+    current = {VERDICT_BASIS_KEY: ROUTE_REJECTION_VERDICT, "test_type": "audio"}
+
+    assert consecutive_verdict_count(None, current) == 1
+    assert consecutive_verdict_count(dict(current), current) == 2  # pre-streak persisted row
+    assert consecutive_verdict_count({**current, VERDICT_STREAK_KEY: 1}, current) == 2
+    assert consecutive_verdict_count({**current, VERDICT_STREAK_KEY: 2}, current) == 3
+    assert consecutive_verdict_count(
+        {**current, VERDICT_STREAK_KEY: 7},
+        {**current, "test_type": "audio-v2"},
+    ) == 1
+    assert consecutive_verdict_count(
+        {**current, VERDICT_STREAK_KEY: 7},
+        {**current, VERDICT_BASIS_KEY: "model_answer"},
+    ) == 1
+
+    for corrupt in ("2", -1, 1.5, True, 10**100):
+        row = {**current, VERDICT_STREAK_KEY: corrupt}
+        assert route_rejection_deserves_a_retry_soon(row) is True
+        assert consecutive_verdict_count(row, current) == 2
+
+    assert route_rejection_deserves_a_retry_soon(current) is True  # backward-compatible row
+    assert route_rejection_deserves_a_retry_soon({**current, VERDICT_STREAK_KEY: 1}) is True
+    assert route_rejection_deserves_a_retry_soon({**current, VERDICT_STREAK_KEY: 2}) is False
 
 
 def test_mark_and_redact_stale_benchmark_rows_preserve_contract():
@@ -501,6 +531,7 @@ def test_models_needing_discovery_filters_cooldowns_quarantine_and_fresh_verdict
         profiles,
         state,
         verified_capability_row=verified_capability_row,
+        catalog_denies_capability=lambda _profile_id, _model: False,
     )
     needing = models_needing_discovery(
         {"models": [ready, cooled, quarantined, complete, not_invokable]},
@@ -509,6 +540,7 @@ def test_models_needing_discovery_filters_cooldowns_quarantine_and_fresh_verdict
         model_on_cooldown=model_on_cooldown,
         model_is_quarantined=model_is_quarantined,
         verified_capability_row=verified_capability_row,
+        catalog_denies_capability=lambda _profile_id, _model: False,
     )
 
     assert [model["id"] for model in eligible] == ["ready", "complete"]

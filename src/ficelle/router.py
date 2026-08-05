@@ -64,6 +64,7 @@ except ImportError:  # pragma: no cover - exercised only in core-only installs
     compression_store_stats = None
 from ficelle.domain_models import (
     CatalogModel,
+    ProviderBudget,
     SelectionPurpose,
     SelectionResult,
 )
@@ -75,7 +76,9 @@ from ficelle.failures import (
     build_upstream_failure_error as build_upstream_failure_error_result,
     classify_failure as classify_failure_result,
     cooldown_policy_for_reason,
+    error_object_codes,
     safe_error_body as safe_error_body_result,
+    status_for_error_codes,
     upstream_failure_actions as upstream_failure_actions_result,
     upstream_failure_status,
 )
@@ -100,6 +103,8 @@ from ficelle.selection import (
 )
 from ficelle.runtime_paths import RuntimePaths
 from ficelle.routing_policy import (
+    catalog_denies_input_modality,
+    catalog_denies_structured_output,
     competence_gate_result as policy_competence_gate_result,
     competence_label as policy_competence_label,
     model_has_any,
@@ -153,8 +158,10 @@ from ficelle.use_cases.benchmark import (
 )
 from ficelle.use_cases.capability_discovery import (
     VERDICT_BASIS_KEY,
+    VERDICT_STREAK_KEY,
     CapabilityDiscoveryJob,
     ProviderProbePacer,
+    consecutive_verdict_count,
     clear_background_job_error_in_state,
     discovery_eligible_models as discovery_eligible_models_use_case,
     model_due_capabilities as model_due_capabilities_use_case,
@@ -186,6 +193,13 @@ from ficelle.use_cases.chat_completion import (
     build_streaming_response_start,
     normalize_chat_completion_request,
     prepare_compression_route_body as prepare_chat_compression_route_body,
+)
+from ficelle.use_cases.failover_demo import (
+    FailoverDemoResult,
+    answer_text_from_payload,
+    demo_attempts_from_route,
+    forced_failure_invoker,
+    knocked_out_candidate_ids,
 )
 from ficelle.use_cases.admin_status import (
     AdminStateBuilder,
@@ -396,6 +410,16 @@ from ficelle.use_cases.provider_auth import (
     auth_status as auth_status_use_case,
     provider_auth_row as provider_auth_row_use_case,
 )
+from ficelle.use_cases.provider_budget import (
+    budget_pool_scope,
+    drop_provider_budget_in_state,
+    probing_is_within_budget as probing_is_within_budget_use_case,
+    provider_budget_rows,
+    record_provider_spend,
+    retired_budget_state_present,
+    store_provider_budgets,
+    stored_provider_budgets,
+)
 from ficelle.use_cases.provider_catalog import (
     ProviderCatalogPorts,
     fetch_provider_catalog as fetch_provider_catalog_use_case,
@@ -437,6 +461,7 @@ from ficelle.providers.base import (
     ProviderCatalogPolicy,
     free_access_payload,
     normalized_free_access_status,
+    CatalogFetchContext,
 )
 from ficelle.providers.openai_compatible import NOUS_DEFAULT_BASE_URL, OPENCODE_ZEN_USER_AGENT
 try:
@@ -1220,6 +1245,18 @@ def merge_runtime_state_for_write(current: Any, incoming: dict[str, Any]) -> dic
 def write_runtime_state(state: dict[str, Any]) -> None:
     """Persist runtime state while preserving accumulated benchmark/capability evidence."""
     _STATE_STORE.write(state)
+
+
+def write_auto_benchmark_state(state: dict[str, Any]) -> None:
+    """Persist only a discovery cycle's summary, without replacing concurrently updated state."""
+    row = state.get("auto_benchmark") if isinstance(state, dict) else None
+    if not isinstance(row, dict):
+        return
+
+    def mutate(current: dict[str, Any]) -> None:
+        current["auto_benchmark"] = copy.deepcopy(row)
+
+    _STATE_STORE.update(mutate, reason="write_auto_benchmark_state")
 
 
 def write_route_log(row: dict[str, Any], path: Path = ROUTE_LOG_PATH) -> None:
@@ -3587,7 +3624,7 @@ def store_provider_key(source: str, config: dict[str, Any], secret: str, *, stor
     macOS login Keychain). The server-side write path passes a non-interactive store
     so the launchd daemon never touches the login keychain (R9)."""
     store = store if store is not None else default_secret_store()
-    return store_provider_key_use_case(
+    target = store_provider_key_use_case(
         source,
         config,
         secret,
@@ -3595,6 +3632,8 @@ def store_provider_key(source: str, config: dict[str, Any], secret: str, *, stor
         credential_env_file=CREDENTIAL_ENV_FILE,
         env_file_set_key=env_file_set_key,
     )
+    invalidate_provider_budget(source)
+    return target
 
 
 def remove_provider_key(source: str, config: dict[str, Any], *, store: SecretStore | None = None) -> list[str]:
@@ -3605,13 +3644,16 @@ def remove_provider_key(source: str, config: dict[str, Any], *, store: SecretSto
     legacy sources separately.
     """
     store = store if store is not None else default_secret_store()
-    return remove_provider_key_use_case(
+    cleared = remove_provider_key_use_case(
         source,
         config,
         store=store,
         credential_env_file=CREDENTIAL_ENV_FILE,
         env_file_delete_key=env_file_delete_key,
     )
+    if cleared:
+        invalidate_provider_budget(source)
+    return cleared
 
 
 def _auth_row(invokable: bool, key: Any, reason: str, base_url: Any) -> dict[str, Any]:
@@ -3735,10 +3777,15 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
             "last_failure_reason": safe_detail(raw_value.get("last_failure_reason")),
         }
 
+    # Projected onto provider_stats rather than as their own keys: "spent 412 of 1000 today" only
+    # means something next to the lifetime counters, and this is the record the admin already reads.
+    budget_rows = provider_budget_rows(source, datetime.now(timezone.utc))
+    raw_provider_stats = source.get("provider_stats") if isinstance(source.get("provider_stats"), dict) else {}
+    provider_keys = {str(key) for key in (*raw_provider_stats, *budget_rows)}
     provider_stats: dict[str, Any] = {}
-    for key, raw_value in (source.get("provider_stats") or {}).items():
-        if not isinstance(raw_value, dict):
-            continue
+    for key in sorted(provider_keys):
+        raw_value = raw_provider_stats.get(key)
+        raw_value = raw_value if isinstance(raw_value, dict) else {}
         provider_stats[safe_state_key(key)] = {
             "requests": safe_int(raw_value.get("requests"), 0),
             "successes": safe_int(raw_value.get("successes"), 0),
@@ -3748,6 +3795,9 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
             "last_success_at": raw_value.get("last_success_at"),
             "last_failure_at": raw_value.get("last_failure_at"),
             "last_failure_reason": safe_detail(raw_value.get("last_failure_reason")),
+            # None where the provider never spent and could not tell us this account's budget —
+            # which is most of them. `spent` is this window's meter, `limit` the resolved allowance.
+            "budget": budget_rows.get(str(key)),
         }
 
     provider_errors: dict[str, Any] = {}
@@ -3861,6 +3911,8 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
             # disagree for a route-rejection verdict between its own TTL and the capability TTL.
             if raw_value.get(VERDICT_BASIS_KEY):
                 row[VERDICT_BASIS_KEY] = raw_value[VERDICT_BASIS_KEY]
+            if VERDICT_STREAK_KEY in raw_value:
+                row[VERDICT_STREAK_KEY] = raw_value[VERDICT_STREAK_KEY]
             safe_profiles[safe_state_key(profile_id)] = redacted_benchmark_row(str(profile_id), row)
 
     verified_capabilities: dict[str, Any] = {}
@@ -3882,6 +3934,10 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
                 "upstream_id": safe_detail(raw_value.get("upstream_id")),
                 "message": safe_detail(raw_value.get("message")),
             }
+            if raw_value.get(VERDICT_BASIS_KEY):
+                row[VERDICT_BASIS_KEY] = raw_value[VERDICT_BASIS_KEY]
+            if VERDICT_STREAK_KEY in raw_value:
+                row[VERDICT_STREAK_KEY] = raw_value[VERDICT_STREAK_KEY]
             safe_profiles[safe_state_key(profile_id)] = redacted_benchmark_row(str(profile_id), row)
 
     return {
@@ -4128,6 +4184,11 @@ def model_history_row(profile_id: str, model: dict[str, Any], state: dict[str, A
 
 
 def fallback_attempt_rows(last_route: dict[str, Any]) -> list[dict[str, Any]]:
+    # Every attempt that failed, for the Health card's fallback list. Deliberately a different
+    # question from the single-provider attribution in `compression_route_event` below, which
+    # needs a *stated* failure and ignores `status` — an attempt with no `reason` is listed here
+    # and passed over there. Neither is the other's helper: check both before changing what
+    # "failed" means.
     rows: list[dict[str, Any]] = []
     attempts = last_route.get("attempts") if isinstance(last_route.get("attempts"), list) else []
     for attempt in attempts:
@@ -4285,13 +4346,50 @@ def compression_route_event(raw: Any) -> dict[str, Any] | None:
         return None
     attempts = raw.get("attempts") if isinstance(raw.get("attempts"), list) else []
     selected = raw.get("selected_upstream") or raw.get("selected_model")
+    selected_source = raw.get("selected_source")
+    if not selected and not selected_source:
+        # `selected_*` is written only once a candidate delivered (`build_success_route_log` /
+        # `build_mid_stream_failure_route_log`), so a compressed run that reached no candidate
+        # carries none of it and the event card reads "no selected model" — exactly the rows an
+        # operator opens the Compression tab for, while the model that failed sits in `attempts`.
+        # The guard is all-or-nothing on purpose: a line carrying *some* `selected_*` had a
+        # candidate deliver, so filling the missing half from `attempts` would pair a delivered
+        # provider with a failed model. Leave those alone, however incomplete they read.
+        #
+        # Attribute to the last attempt that FAILED, not to `attempts[-1]`. The two agree today —
+        # an attempt that succeeded routes the run to a builder that writes `selected_*`, so
+        # nothing under this guard carries `reason: "ok"` — but that invariant lives in
+        # `use_cases/chat_completion.py`, and a stage that logs its successes next to its failures
+        # breaks the shortcut. `run_fusion_chat_completion` already logs a panel in completion
+        # order, where a fast rejection lands first and a real generation last, so `attempts[-1]`
+        # would charge the run to the one provider that answered correctly; it stays out of reach
+        # only because those log lines carry no `compression` key. Both fields move together, so
+        # an event never mixes one attempt's provider with another's model.
+        #
+        # This is `request_log._row_from_log_line`'s derivation, applied at the other reader of
+        # `routes.jsonl`, down to requiring a *stated* failure: an attempt whose `reason` is absent
+        # or not a string says nothing about its outcome, and neither view may name a provider on a
+        # guess. Kept as a second copy rather than shared — that module imports nothing from this
+        # one (see its docstring), and two call sites do not earn a third module to bridge them —
+        # so the two predicates must be changed together.
+        failed = next(
+            (
+                a
+                for a in reversed(attempts)
+                if isinstance(a, dict) and isinstance(a.get("reason"), str) and a["reason"] not in ("", "ok")
+            ),
+            None,
+        )
+        if failed is not None:
+            selected = failed.get("upstream") or failed.get("model")
+            selected_source = failed.get("source")
     final_status = raw.get("final_status")
     event = {
         "logged_at": safe_detail(raw.get("logged_at"), 80),
         "request_id": safe_detail(raw.get("request_id"), 80),
         "requested_model": safe_detail(raw.get("requested_model"), 120),
         "selected_upstream": safe_detail(selected, 160),
-        "selected_source": safe_detail(raw.get("selected_source"), 80),
+        "selected_source": safe_detail(selected_source, 80),
         "final_status": final_status if type(final_status) is int else safe_detail(final_status, 40),
         "final_reason": safe_detail(raw.get("final_reason"), 120),
         "candidate_count": safe_int(raw.get("candidate_count"), 0),
@@ -4653,9 +4751,59 @@ def refresh_catalog(config: dict[str, Any]) -> dict[str, Any]:
     # goes through _load_or_refresh_catalog_for_effective_config instead, so a chat
     # call never triggers the prune below.
     previous = load_runtime_json(CATALOG_PATH, {})
-    catalog = _refresh_catalog_for_effective_config(effective_runtime_config(config))
+    effective = effective_runtime_config(config)
+    catalog = _refresh_catalog_for_effective_config(effective)
     prune_stale_profile_models(config, catalog, previous if isinstance(previous, dict) else {})
+    refresh_provider_budgets(effective)
     return catalog
+
+
+# A metadata lookup, not the catalog: a provider that hangs on it must not hold an admin response
+# for the catalog timeout, which is 30s by default and configurable to 120.
+BUDGET_LOOKUP_TIMEOUT_SECONDS = 5.0
+
+
+def refresh_provider_budgets(effective_config: dict[str, Any]) -> dict[str, ProviderBudget]:
+    """Ask each provider what THIS account's budget is, and remember the answers.
+
+    Done on catalog refresh — already networked, already off the routing path — rather than on the
+    counting path, which must stay cheap. A provider that has never answered is simply absent from
+    the map, and `provider_budget_for_source` then reports no cap at all.
+    """
+    context = CatalogFetchContext(
+        timeout_seconds=BUDGET_LOOKUP_TIMEOUT_SECONDS,
+        http_get=requests.get,
+        resolve_credentials=resolve_generic_provider_credentials,
+    )
+    state = load_runtime_state()
+    known = stored_provider_budgets(state)
+    budgets: dict[str, ProviderBudget] = {}
+    for source, provider_cfg in (effective_config.get("providers") or {}).items():
+        # `enabled` defaults to true, as everywhere else that decides whether to reach a provider
+        # (use_cases/catalog_refresh._provider_disabled). Skipping a provider here that the catalog
+        # refresh does fetch would leave it counted and never capped.
+        if not isinstance(provider_cfg, dict) or not provider_cfg.get("enabled", True):
+            continue
+        budget = provider_catalog_adapter(source).resolve_budget(context, provider_cfg)
+        if not isinstance(budget, ProviderBudget) or not (budget.amount > 0):
+            # One failed lookup is usually the network, not a changed tier. Keeping the last known
+            # figure costs a stale cap for a while; dropping it silently un-caps probing until
+            # someone clicks Refresh. A provider that leaves the config loses its entry either way,
+            # since only enabled providers are carried over.
+            budget = known.get(str(source))
+        if budget is not None:
+            budgets[str(source)] = budget
+
+    # A tier changes when someone tops up an account — rarely. Writing only on a change keeps the
+    # hourly refresh from touching state for nothing, and leaves `last_update_reason` describing the
+    # refresh itself rather than this postscript. Pre-release budget keys still force one write, or
+    # a dogfood install whose lookups keep failing would carry them forever.
+    if known != budgets or retired_budget_state_present(state):
+        def mutate(state: dict[str, Any]) -> None:
+            store_provider_budgets(state, budgets)
+
+        _STATE_STORE.update(mutate, reason="refresh_provider_budgets")
+    return budgets
 
 
 def _load_or_refresh_catalog_for_effective_config(config: dict[str, Any], force: bool = False) -> dict[str, Any]:
@@ -4931,6 +5079,87 @@ def clear_quarantine(model: dict[str, Any]) -> bool:
 
     _STATE_STORE.update(mutate, reason="clear_quarantine")
     return existed
+
+
+def provider_budget_for_source(source: str, state: dict[str, Any] | None = None) -> ProviderBudget | None:
+    """This account's budget for ``source``, or None when nothing reliable is known.
+
+    Read from state, where the catalog refresh stored what the provider answered for THIS account —
+    OpenRouter's tier keys off the account's credit, so one build cannot ship a number that is right
+    for every user. Falling through to None is the common case and the safe one: probing is never
+    held back on a limit nobody established.
+    """
+    return stored_provider_budgets(state).get(str(source))
+
+
+def invalidate_provider_budget(source: str) -> bool:
+    """Forget an account-specific budget when Ficelle changes that provider's credentials."""
+    source = str(source or "").strip()
+    if not source or source not in stored_provider_budgets(load_runtime_state()):
+        return False
+
+    def mutate(current: dict[str, Any]) -> None:
+        drop_provider_budget_in_state(current, source)
+
+    _STATE_STORE.update(mutate, reason="invalidate_provider_budget")
+    return True
+
+
+def budget_meter_key(model: dict[str, Any]) -> str:
+    """The pool ``model``'s spend counts against.
+
+    `provider:{source}` for most — a budget is an account-level stock, whatever granularity the
+    provider tracks quota exhaustion at — and the shared-account pool where several configured
+    sources draw on one account, which keyed apart would each be allowed the full probe share of
+    the same allowance.
+    """
+    return quota_cooldown_key_for_scope(model, budget_pool_scope(quota_cooldown_scope(model)))
+
+
+def record_upstream_spend(model: dict[str, Any]) -> None:
+    """Count one request's cost against its pool's budget.
+
+    Called from `invoke_model`, the single place every upstream call leaves from — routing,
+    benchmarks, capability probes, quota probes. Counting at the state writers instead looked free,
+    because they were mutations the caller was already holding, but they only run on a success or on
+    a failure whose policy sets a cooldown: a timeout, a 5xx, a rejected probe all left without being
+    counted, and the probe traffic this budget exists to bound was the least counted of all.
+
+    Counted before the call rather than after it, so a request that leaves and never answers still
+    spends its allowance — a budget that undercounts is one that stops holding probing back. The
+    amount is the model's `burn_weight`: a tier that drains a shared pool five times faster is
+    metered five times heavier.
+    """
+    source = str(model.get("source") or "")
+    if not source:
+        return
+    meter_key = budget_meter_key(model)
+    weight = safe_float(model.get("burn_weight"), 1.0)
+    # A missing, zero or negative weight cannot make requests free — everything costs at least one.
+    amount = weight if weight > 0 else 1.0
+    now = datetime.now(timezone.utc)
+
+    def mutate(state: dict[str, Any]) -> None:
+        record_provider_spend(
+            state,
+            meter_key,
+            source,
+            amount,
+            now=now,
+            budget=provider_budget_for_source(source, state),
+        )
+
+    _STATE_STORE.update(mutate, reason="record_upstream_spend")
+
+
+def probing_is_within_budget_for_model(state: dict[str, Any], model: dict[str, Any]) -> bool:
+    """Whether background probing may still spend on ``model``'s pool, per the state in hand."""
+    return probing_is_within_budget_use_case(
+        state,
+        budget_meter_key(model),
+        provider_budget_for_source(str(model.get("source") or ""), state),
+        now=datetime.now(timezone.utc),
+    )
 
 
 def cooldown_stats_ports() -> CooldownStatsPorts:
@@ -5540,7 +5769,7 @@ def probe_quota_cooldown(key: str, model: dict[str, Any], config: dict[str, Any]
         _STATE_STORE.update(mutate, reason="probe_quota_cooldown:pass")
         return {"status": "pass", "reason": "ok", "key": key, "model_id": model.get("id")}
 
-    text = response.text[:1000]
+    text = response.text
     reason = classify_failure(response.status_code, text, model)
     detail = f"quota probe HTTP {response.status_code}: {text[:250]}"
     apply_failure_guard: Callable[[dict[str, Any]], None] | None = None
@@ -5874,7 +6103,13 @@ def provider_credentials(source: str, config: dict[str, Any]) -> tuple[str | Non
     )
 
 
-def classify_failure(status_code: int, text: str, model: dict[str, Any] | None = None) -> str:
+def classify_failure(
+    status_code: int | None,
+    text: str,
+    model: dict[str, Any] | None = None,
+    *,
+    error_codes: tuple[str, ...] = (),
+) -> str:
     access = normalized_free_access(model) if isinstance(model, dict) else None
     source = str(model.get("source") or "") if isinstance(model, dict) else ""
     upstream_model_id = str(model.get("upstream_id") or "") if isinstance(model, dict) else ""
@@ -5882,6 +6117,7 @@ def classify_failure(status_code: int, text: str, model: dict[str, Any] | None =
     return classify_failure_result(
         status_code,
         text,
+        error_codes=error_codes,
         normalized_free_access=access,
         markers=markers,
         upstream_model_id=upstream_model_id,
@@ -5902,7 +6138,17 @@ def success_error_payload_failure(payload: Any, model: dict[str, Any] | None = N
             status_code = int(raw_code)
         except ValueError:
             status_code = None
-    reason = classify_failure(status_code or 200, json.dumps(error, ensure_ascii=False)[:1000], model)
+    # The provider's own verdict fields, read once and handed to both consumers below. A numeric
+    # `error.code` must not hide them: `{"code": 500, "type": "credit_limit_exceeded"}` resolves its
+    # status numerically, and the type would then never be read on a body whose dumped form carries
+    # no `{"error": …}` envelope for `classify_failure` to parse back.
+    error_codes = error_object_codes(error)
+    if status_code is None:
+        # A name is still a status; only a genuinely opaque code (`"tool_use_failed"`) leaves none,
+        # and classify_failure narrows its markers accordingly rather than reading the neutral 200
+        # this used to pass.
+        status_code = status_for_error_codes(raw_code, *error_codes)
+    reason = classify_failure(status_code, json.dumps(error, ensure_ascii=False), model, error_codes=error_codes)
     return reason, message, status_code
 
 
@@ -6006,6 +6252,7 @@ def invoke_model(
         timeout = float(timeout_seconds) if timeout_seconds is not None else request_timeout_seconds_for_profile(requested_model, config)
     except Exception:
         timeout = request_timeout_seconds_for_profile(requested_model, config)
+    record_upstream_spend(model)
     return requests.post(
         f"{base_url.rstrip('/')}/chat/completions",
         headers=headers,
@@ -6802,6 +7049,7 @@ def verified_capability_row(profile_id: str, model: dict[str, Any], state: dict[
 def record_verified_capability(profile_id: str, model: dict[str, Any], result: dict[str, Any]) -> None:
     def mutate(state: dict[str, Any]) -> None:
         key = cooldown_key(model)
+        canonical_profile_id = canonical_virtual_model_id(profile_id)
         verified = state.setdefault("verified_capabilities", {})
         if not isinstance(verified, dict):
             verified = {}
@@ -6823,11 +7071,38 @@ def record_verified_capability(profile_id: str, model: dict[str, Any], result: d
         # read, so the verdict's basis has to travel with it or its short TTL never applies.
         if result.get(VERDICT_BASIS_KEY):
             row[VERDICT_BASIS_KEY] = result[VERDICT_BASIS_KEY]
+            # Counted here because this is the one place holding the previous row and the new one at
+            # once, under the state lock. Deriving it from the previous row's basis instead would be
+            # lossy — every probe rewrites the row, so "no marker" cannot distinguish "already
+            # retried" from "never rejected" — and racy, since two probers would read before either
+            # writes. The reader (`route_rejection_deserves_a_retry_soon`) owns what to do with it.
+            row[VERDICT_STREAK_KEY] = consecutive_verdict_count(
+                by_profile.get(canonical_profile_id), row
+            )
+
+            # Discovery persisted the corresponding benchmark result immediately before this call.
+            # Keep both evidence histories on the same TTL policy; otherwise the scheduler converges
+            # after the second refusal while scoring and admin history still age every refusal in an
+            # hour. Match the exact probe so a concurrent/manual result is never annotated by
+            # another writer's streak.
+            benchmark_results = state.get("benchmark_results")
+            benchmark_profiles = benchmark_results.get(key) if isinstance(benchmark_results, dict) else None
+            benchmark_row = benchmark_profiles.get(canonical_profile_id) if isinstance(benchmark_profiles, dict) else None
+            if (
+                isinstance(benchmark_row, dict)
+                and result.get("ran_at")
+                and benchmark_row.get("ran_at") == result.get("ran_at")
+                and benchmark_row.get("test_type") == row.get("test_type")
+                and benchmark_row.get(VERDICT_BASIS_KEY) == row.get(VERDICT_BASIS_KEY)
+            ):
+                updated_benchmark_row = dict(benchmark_row)
+                updated_benchmark_row[VERDICT_STREAK_KEY] = row[VERDICT_STREAK_KEY]
+                benchmark_profiles[canonical_profile_id] = redact_sensitive_json(updated_benchmark_row)
         if status == "pass":
             row["verified_at"] = result.get("ran_at") or now_iso()
         else:
             row["failed_at"] = result.get("ran_at") or now_iso()
-        by_profile[canonical_virtual_model_id(profile_id)] = redact_sensitive_json(row)
+        by_profile[canonical_profile_id] = redact_sensitive_json(row)
 
     _STATE_STORE.update(mutate, reason="record_verified_capability")
 
@@ -6979,13 +7254,72 @@ def probeable_capability_profiles(config: dict[str, Any]) -> list[str]:
     )
 
 
-def model_due_capabilities(model: dict[str, Any], profile_ids: list[str], state: dict[str, Any]) -> list[str]:
+def catalog_denies_capability(
+    profile_id: str,
+    model: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> bool:
+    """Whether the catalog already rules this model out for the profile's input modality or
+    structured-output requirement.
+
+    Use the normalized profile when the active config is available, so user-added requirements and
+    routing cannot diverge. Provider defaults are not catalog evidence: when the normalized model's
+    modalities — or its merged `supported_parameters`, which `supports_structured_outputs` is
+    computed from (the catalog merge unions the defaults in, so a silent row inherits exactly their
+    list) — equal configured defaults, the raw row may have been silent and discovery must keep
+    probing. This conservative equality check can retain an unnecessary probe when a row explicitly
+    repeats the defaults, but it cannot hide a capability from a sparse catalog.
+    """
+    canonical_profile_id = canonical_virtual_model_id(profile_id)
+    requirements = VIRTUAL_MODEL_REQUIREMENTS.get(canonical_profile_id) or {}
+    modalities_may_come_from_defaults = False
+    structured_support_may_come_from_defaults = False
+    if isinstance(config, dict):
+        raw_profiles = config.get("virtual_profiles") if isinstance(config.get("virtual_profiles"), dict) else {}
+        raw_profile = raw_profiles.get(profile_id, raw_profiles.get(canonical_profile_id, {}))
+        requirements = normalize_virtual_profile(canonical_profile_id, raw_profile, config)["requirements"]
+
+        providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+        provider = providers.get(str(model.get("source") or ""))
+        provider = provider if isinstance(provider, dict) else {}
+        defaults = provider.get("catalog_model_defaults")
+        defaults = defaults if isinstance(defaults, dict) else {}
+        architecture = defaults.get("architecture")
+        architecture = architecture if isinstance(architecture, dict) else {}
+        default_modalities = set(safe_string_list(architecture.get("input_modalities")))
+        model_modalities = set(safe_string_list(model.get("input_modalities")))
+        modalities_may_come_from_defaults = bool(default_modalities) and model_modalities == default_modalities
+        # Same defaults-equality signal as the modalities above — see the docstring.
+        default_params = set(safe_string_list(defaults.get("supported_parameters")))
+        model_params = set(safe_string_list(model.get("supported_parameters")))
+        structured_support_may_come_from_defaults = bool(default_params) and model_params == default_params
+
+    return catalog_denies_input_modality(
+        model,
+        requirements,
+        modalities_may_come_from_defaults=modalities_may_come_from_defaults,
+    ) or catalog_denies_structured_output(
+        model,
+        requirements,
+        structured_support_may_come_from_defaults=structured_support_may_come_from_defaults,
+    )
+
+
+def model_due_capabilities(
+    model: dict[str, Any],
+    profile_ids: list[str],
+    state: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> list[str]:
     """Probeable capabilities for which this model has no fresh verified/failed verdict yet (TTL-aware)."""
     return model_due_capabilities_use_case(
         model,
         profile_ids,
         state,
         verified_capability_row=verified_capability_row,
+        catalog_denies_capability=lambda profile_id, candidate: catalog_denies_capability(
+            profile_id, candidate, config
+        ),
     )
 
 
@@ -7004,7 +7338,12 @@ def discovery_eligible_models(catalog: dict[str, Any], state: dict[str, Any]) ->
     )
 
 
-def models_needing_discovery(catalog: dict[str, Any], state: dict[str, Any], profile_ids: list[str]) -> list[dict[str, Any]]:
+def models_needing_discovery(
+    catalog: dict[str, Any],
+    state: dict[str, Any],
+    profile_ids: list[str],
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     return models_needing_discovery_use_case(
         catalog,
         state,
@@ -7012,6 +7351,9 @@ def models_needing_discovery(catalog: dict[str, Any], state: dict[str, Any], pro
         model_on_cooldown=model_on_cooldown,
         model_is_quarantined=model_is_quarantined,
         verified_capability_row=verified_capability_row,
+        catalog_denies_capability=lambda profile_id, candidate: catalog_denies_capability(
+            profile_id, candidate, config
+        ),
     )
 
 
@@ -7055,11 +7397,18 @@ def run_auto_benchmark_cycle(config: dict[str, Any]) -> dict[str, Any]:
         auto_benchmark_enabled=auto_benchmark_enabled,
         load_or_refresh_catalog=load_or_refresh_catalog,
         load_state=load_runtime_state,
-        write_runtime_state=write_runtime_state,
+        # The cycle loaded a snapshot before probing. Persist only its summary so a request counted
+        # after that load cannot be replaced by the stale snapshot at the end of the cycle.
+        write_runtime_state=write_auto_benchmark_state,
         probeable_capability_profiles=probeable_capability_profiles,
-        models_needing_discovery=models_needing_discovery,
-        model_due_capabilities=model_due_capabilities,
+        models_needing_discovery=lambda catalog, state, profile_ids: models_needing_discovery(
+            catalog, state, profile_ids, config
+        ),
+        model_due_capabilities=lambda model, profile_ids, state: model_due_capabilities(
+            model, profile_ids, state, config
+        ),
         auto_benchmark_models_per_cycle=auto_benchmark_models_per_cycle,
+        probing_is_within_budget=probing_is_within_budget_for_model,
         probe_model_capability=probe_model_capability,
     )
     if result.get("status") in {"disabled", "idle", "ran"}:
@@ -7128,6 +7477,165 @@ def run_canary(profile_ids: list[str], config: dict[str, Any]) -> dict[str, Any]
     _STATE_STORE.update(mutate, reason="run_canary")
     result["canary_status"] = status
     return result
+
+
+DEFAULT_FAILOVER_DEMO_PROMPT = "In one sentence, what is a rate limit?"
+
+
+def simulated_outage_response(status: int, payload: dict[str, Any]) -> requests.Response:
+    """A real ``requests.Response`` carrying the demo's synthetic outage body.
+
+    Built as the genuine transport object rather than a stand-in so the attempt runs
+    through the same reading, classification and cooldown-decision code as a real
+    provider rejection. The only difference from a true outage is where the bytes
+    came from.
+    """
+    response = requests.Response()
+    response.status_code = int(status)
+    response._content = json.dumps(payload).encode("utf-8")
+    response.encoding = "utf-8"
+    response.reason = "Too Many Requests"
+    response.headers["Content-Type"] = "application/json"
+    return response
+
+
+def run_failover_demo(
+    config: dict[str, Any],
+    *,
+    profile: str | None = None,
+    prompt: str | None = None,
+    knock_out: int = 1,
+) -> FailoverDemoResult:
+    """Run one real completion with the leading candidate(s) forced to fail.
+
+    Drives the production ``ChatCompletionRouter`` with the production ports, and
+    replaces exactly two of them:
+
+    - ``invoke_model`` is wrapped so the knocked-out candidates answer a synthetic
+      429 (``use_cases/failover_demo.py``). Every other candidate is invoked for
+      real, which is what makes the answer at the end a real one.
+    - the state-writing ports are neutered. Applying the cooldown would bench a
+      healthy provider on the strength of an outage that never happened, and
+      recording the route would file a fabricated failure in the log the admin
+      dashboard reads back as provider history. A demonstration that degrades the
+      thing it demonstrates is a bug, so this one is read-only by construction.
+
+    Candidates are selected once and handed to the router, so the models knocked out
+    are exactly the models it goes on to try, in that order.
+    """
+    requested_model = str(profile or DEFAULT_CHAT_COMPLETION_MODEL)
+    demo_prompt = str(prompt or DEFAULT_FAILOVER_DEMO_PROMPT)
+    entitled = license_ops.is_entitled()
+    effective_config = effective_runtime_config(config, entitled=entitled)
+
+    # A concrete model id resolves to a single candidate and `_should_retry` refuses to
+    # fail over off it, by design: only a virtual profile promises a pool. Demanding one
+    # here turns "the demo silently showed nothing" into an explainable refusal.
+    if canonical_virtual_model_id(requested_model) not in configured_virtual_model_ids(effective_config):
+        raise ValueError(
+            f"{requested_model} is not a routing profile. The failover demo needs a "
+            f"profile with a pool behind it, for example {DEFAULT_CHAT_COMPLETION_MODEL}."
+        )
+
+    catalog = load_or_refresh_catalog(config, entitled=entitled)
+    candidates = select_models(requested_model, catalog, effective_config)
+    if not candidates:
+        raise RuntimeError(
+            f"No model is currently routable for {requested_model}. Run `ficelle doctor` "
+            "to see which providers are configured and reachable."
+        )
+    knocked_out = knocked_out_candidate_ids(candidates, knock_out)
+    if not knocked_out:
+        raise RuntimeError(
+            f"Only one model is currently routable for {requested_model}, so there is "
+            "nothing to fail over to. Add a provider key, or run `ficelle refresh`."
+        )
+
+    captured: dict[str, Any] = {"attempts": [], "duration_seconds": 0.0}
+
+    def capture_telemetry(telemetry: ChatCompletionRouteTelemetry) -> None:
+        captured["attempts"] = list(telemetry.last_route.attempts or [])
+        captured["duration_seconds"] = telemetry.last_route.duration_seconds
+
+    def refuse_stream(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("the failover demo never streams")
+
+    demo_router = ChatCompletionRouter(
+        config=effective_config,
+        load_catalog=lambda _config: catalog,
+        select_candidates=lambda *_args, **_kwargs: candidates,
+        is_fusion_profile=lambda model: canonical_virtual_model_id(model) == FUSION_MODEL_ID,
+        is_virtual_model=lambda model: model in configured_virtual_model_ids(effective_config),
+        response_headers=ficelle_response_headers,
+        record_last_route=lambda *_args, **_kwargs: None,
+        write_route_log=lambda *_args, **_kwargs: None,
+        max_attempts_for_request=max_attempts_for_request,
+        prepare_compression_route_body=lambda request_body, cfg: prepare_compression_route_body(
+            request_body,
+            cfg,
+            entitled=entitled,
+        ),
+        now=time.time,
+    )
+
+    def demo_ports(_attempt_plan: ChatCompletionAttemptPlan) -> ChatCompletionAttemptPorts:
+        return ChatCompletionAttemptPorts(
+            invoke_model=forced_failure_invoker(
+                invoke_model,
+                knocked_out=knocked_out,
+                build_response=simulated_outage_response,
+            ),
+            apply_cooldown=lambda _cooldown: None,
+            record_success=lambda _model, _latency: None,
+            resolve_competence=lambda profile_id, model: model_route_competence(profile_id, model, fresh_runtime_state()),
+            record_telemetry=capture_telemetry,
+            stream_response=refuse_stream,
+            detect_success_error=success_error_payload_failure,
+            has_deliverable=has_deliverable_message,
+            classify_failure=classify_failure,
+            is_timeout_exception=lambda exc: isinstance(exc, requests.exceptions.Timeout),
+            build_success_headers=chat_success_response_headers,
+            build_failure_error=build_upstream_failure_error,
+            build_failure_headers=chat_failure_response_headers,
+        )
+
+    body = {
+        "model": requested_model,
+        "messages": [{"role": "user", "content": demo_prompt}],
+        "stream": False,
+        "max_tokens": 160,
+    }
+    started = time.time()
+    result = demo_router.handle(
+        body,
+        request_id=uuid.uuid4().hex,
+        request_started=started,
+        ports_factory=demo_ports,
+    )
+
+    answer: str | None = None
+    raw_response = result.attempt_result.raw_response if result.attempt_result is not None else None
+    if raw_response is not None:
+        try:
+            answer = answer_text_from_payload(json.loads(raw_response.content.decode("utf-8", "replace")))
+        except (ValueError, AttributeError):
+            answer = None
+
+    attempts = demo_attempts_from_route(captured["attempts"], knocked_out)
+    attempted_ids = {attempt.model for attempt in attempts}
+    return FailoverDemoResult(
+        profile=requested_model,
+        prompt=demo_prompt,
+        candidate_count=len(candidates),
+        knocked_out=knocked_out,
+        attempts=attempts,
+        answer=answer,
+        duration_seconds=float(captured["duration_seconds"] or (time.time() - started)),
+        all_candidates_free=all(
+            model_is_strict_zero(model) for model in candidates if str(model.get("id") or "") in attempted_ids
+        ),
+        paid_fallback_allowed=bool(effective_config.get("allow_paid_fallback")),
+    )
 
 
 def profile_ids_from_admin_body(body: dict[str, Any]) -> list[str]:
@@ -8136,22 +8644,26 @@ class RouterHandler(BaseHTTPRequestHandler):
                 request=chat_request,
             )
             chat_route = chat_result.start
-            catalog = chat_route.catalog
+            # A response the route already produced wins over every other branch, Fusion included:
+            # `start` returns one when it refused the request outright (an invalid body, no
+            # candidate), and those refusals hold whatever the routing would have been. Testing
+            # Fusion first would make that refusal depend on `is_fusion_request` being set to a
+            # value the refusal path has no opinion about.
+            if chat_route.response is not None:
+                self._send_json(chat_route.response.status, chat_route.response.payload, headers=chat_route.response.headers)
+                return
             if chat_route.is_fusion_request:
                 recursion_depth = safe_int(self.headers.get("X-Ficelle-Fusion-Depth"), 0)
                 status, payload, headers = run_fusion_chat_completion(
                     body,
                     effective_config,
-                    catalog,
+                    chat_route.catalog,
                     request_id,
                     request_started,
                     recursion_depth,
                     entitled=entitled,
                 )
                 self._send_json(status, payload, headers=headers)
-                return
-            if chat_route.response is not None:
-                self._send_json(chat_route.response.status, chat_route.response.payload, headers=chat_route.response.headers)
                 return
             attempt_result = chat_result.attempt_result
             if attempt_result is None:
@@ -8224,6 +8736,7 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
     try:
         refresh_capability_oracle_if_stale(config)
         load_or_refresh_catalog(config)
+        refresh_provider_budgets(effective_runtime_config(config))
     except Exception as exc:  # never let the warm crash the serving process
         print(f"initial catalog warm failed: {exc}")
     while True:
@@ -8231,6 +8744,11 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
         try:
             refresh_capability_oracle_if_stale(config)
             load_or_refresh_catalog(config, force=True)
+            # Refreshed here and not inside `load_or_refresh_catalog`: this loop is the only
+            # periodic caller, and the TTL reload it shares with routing must not add a network
+            # round-trip to a user's request. `refresh_catalog` covers the explicit paths (the
+            # Refresh button, a credential change, `--refresh`), which this loop does not reach.
+            refresh_provider_budgets(effective_runtime_config(config))
         except Exception as exc:
             print(f"periodic catalog refresh failed: {exc}")
 

@@ -492,6 +492,40 @@ def cmd_install_pro() -> int:
             return 0
 
 
+def cmd_demo(args: argparse.Namespace) -> int:
+    """Show the failover on a real request, with the leading candidate forced to fail.
+
+    Runs in-process against the local configuration rather than through the served
+    endpoint: the fault injection lives in the demo, so the running router keeps no
+    way of being asked to fail a request.
+    """
+    from ficelle.use_cases.failover_demo import failover_demo_payload, render_failover_demo
+
+    try:
+        result = router.run_failover_demo(
+            router.load_config(),
+            profile=getattr(args, "profile", None),
+            prompt=getattr(args, "prompt", None),
+            knock_out=int(getattr(args, "knock_out", 1) or 1),
+        )
+    except (ValueError, RuntimeError) as exc:
+        # These carry the actionable message (`ficelle doctor`, add a key, pick a
+        # profile). Printing the class name on top of it would only bury it.
+        print(str(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - a demo must not hand a user a traceback
+        print(f"The failover demo could not run: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json_output", False):
+        print(json.dumps(failover_demo_payload(result), ensure_ascii=False, indent=2))
+    else:
+        print(render_failover_demo(result))
+    # A pool that answered nothing is a real finding, not a crash: report it as a
+    # non-zero exit so a scripted check can tell the two apart.
+    return 0 if result.answered_by is not None else 1
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     try:
         if bool(getattr(args, "recover", False)):
@@ -573,6 +607,20 @@ def main(argv: list[str] | None = None) -> int:
         default="generic",
         help="Client target (default: generic)",
     )
+    demo_parser = sub.add_parser(
+        "demo",
+        help="Show the failover: knock out the model that would have answered, on a real request",
+    )
+    demo_parser.add_argument("--profile", help=f"Routing profile to demonstrate (default: {router.DEFAULT_CHAT_COMPLETION_MODEL})")
+    demo_parser.add_argument("--prompt", help="Prompt to send (default: a one-sentence question)")
+    demo_parser.add_argument(
+        "--knock-out",
+        type=int,
+        default=1,
+        dest="knock_out",
+        help="How many leading candidates to fail (default: 1; one candidate is always left alive)",
+    )
+    demo_parser.add_argument("--json", action="store_true", dest="json_output", help="Print machine-readable JSON")
     set_key_parser = sub.add_parser("set-key", help="Store a provider API key (prompted, hidden input)")
     set_key_parser.add_argument("provider")
     remove_key_parser = sub.add_parser("remove-key", help="Remove a stored provider API key")
@@ -618,6 +666,8 @@ def main(argv: list[str] | None = None) -> int:
         return http_json("/health")
     if args.command == "export":
         return http_json(f"/admin/export/{args.target}")
+    if args.command == "demo":
+        return cmd_demo(args)
     if args.command == "set-key":
         return set_key(args.provider)
     if args.command == "remove-key":
