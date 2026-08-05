@@ -50,6 +50,10 @@ RuntimePayload: TypeAlias = Callable[[dict[str, Any], dict[str, Any]], dict[str,
 NowIso: TypeAlias = Callable[[], str]
 ApplyConfigRule: TypeAlias = Callable[[dict[str, Any]], None]
 LoadCatalog: TypeAlias = Callable[[dict[str, Any]], dict[str, Any]]
+StaleProfileModelRows: TypeAlias = Callable[
+    [dict[str, Any], dict[str, Any]],
+    list[dict[str, Any]],
+]
 RunQuotaProbes: TypeAlias = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 LoadRuntimeState: TypeAlias = Callable[[], dict[str, Any]]
 CatalogWithScores: TypeAlias = Callable[
@@ -152,6 +156,7 @@ class AdminStateBuildPorts:
     fusion_payload: FusionPayload
     router_settings_payload: RouterSettingsPayload
     redact_runtime_state: RuntimeStateTransform
+    stale_profile_model_rows: StaleProfileModelRows
     safe_int: SafeInt
     safe_string_list: SafeStringList
 
@@ -198,6 +203,11 @@ class AdminStateBuilder:
         return {
             "catalog": self.ports.catalog_with_auto_scores(catalog, config, state),
             "virtual_profiles": profiles,
+            # Ids a virtual model still points at that the catalog dropped. Sent even when
+            # empty: the dashboard renders those cards from `virtual_profiles`, and without
+            # this it can only say "Unknown model" — not whether the provider is down or the
+            # model is gone for good.
+            "stale_profile_models": self.ports.stale_profile_model_rows(config, catalog),
             "profiles": status_payload.get("profiles") or {},
             "performance_history": status_payload.get("performance_history") or {},
             "compression": status_payload.get("compression") or {},

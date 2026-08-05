@@ -86,6 +86,7 @@ from ficelle.provider_credentials import (
     PROVIDER_ENV_ALIASES,
     PROVIDER_KEY_VALIDATORS,
     PROVIDER_SERVICE_ALIASES,
+    ProviderCredentialsUnavailable,
     generic_provider_credential_aliases,
     generic_provider_credential_activation_fingerprint as generic_provider_credential_activation_fingerprint_use_case,
     is_usable_openrouter_key,
@@ -109,6 +110,7 @@ from ficelle.routing_policy import (
     competence_label as policy_competence_label,
     model_has_any,
     model_matches_profile_requirements as policy_model_matches_profile_requirements,
+    profile_capability_metadata,
 )
 from ficelle.state_store import (
     StateStore,
@@ -200,6 +202,7 @@ from ficelle.use_cases.failover_demo import (
     demo_attempts_from_route,
     forced_failure_invoker,
     knocked_out_candidate_ids,
+    unroutable_pool_message,
 )
 from ficelle.use_cases.admin_status import (
     AdminStateBuilder,
@@ -791,11 +794,14 @@ DEFAULT_VIRTUAL_PROFILES = {
     }
     for model_id in sorted(VIRTUAL_MODELS)
 }
+# Seeded starting orders. Every id here must still be listed by its provider: a retired one
+# makes a brand-new install prune on its first refresh and announce the removal of a model the
+# user never picked. `nex-agi/nex-n2-pro:free` was exactly that — OpenRouter dropped the free
+# variant while these seeds kept shipping it at position 1 of three lanes.
 DEFAULT_VIRTUAL_PROFILES["ficelle/auto-fast"].update(
     {
         "mode": "manual_order",
         "models": [
-            "ficelle/openrouter/nex-agi/nex-n2-pro:free",
             "ficelle/openrouter/google/gemma-4-31b-it:free",
             "ficelle/nous/stepfun/step-3.7-flash:free",
         ],
@@ -806,7 +812,6 @@ DEFAULT_VIRTUAL_PROFILES["ficelle/auto-compression"].update(
         "mode": "manual_order",
         "models": [
             "ficelle/openrouter/google/gemma-4-31b-it:free",
-            "ficelle/openrouter/nex-agi/nex-n2-pro:free",
             "ficelle/nous/stepfun/step-3.7-flash:free",
         ],
     }
@@ -815,7 +820,6 @@ DEFAULT_VIRTUAL_PROFILES["ficelle/auto-orchestrator"].update(
     {
         "mode": "manual_order",
         "models": [
-            "ficelle/openrouter/nex-agi/nex-n2-pro:free",
             "ficelle/openrouter/nvidia/nemotron-3-super-120b-a12b:free",
             "ficelle/openrouter/google/gemma-4-31b-it:free",
             "ficelle/nous/stepfun/step-3.7-flash:free",
@@ -1653,6 +1657,37 @@ def listed_virtual_model_ids(
     return sorted(dict.fromkeys(model_ids))
 
 
+def virtual_model_listing_metadata(
+    model_id: str,
+    profiles: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """The capability fields `/v1/models` publishes for one virtual model.
+
+    Virtual models used to list bare — id, object, created, owned_by — while the concrete
+    catalog rows next to them carried `supports_tools`, `context_length` and
+    `supports_structured_outputs`. Since the virtual ids are the ones clients actually
+    select, a client had no way to learn a slot's capabilities except by sending a request
+    and reading the failure. Clients that do not know these fields ignore them.
+
+    Fusion is the case that makes this worth publishing: its preflight answers HTTP 400 to
+    any tool-bearing or streaming request, so it is the one virtual model that must say
+    `false` rather than stay silent.
+    """
+    if model_id == FUSION_MODEL_ID:
+        return {
+            "context_length": safe_profile_requirements({}, config)["min_context"],
+            "supports_tools": False,
+            "supports_streaming": False,
+            "capabilities": ["completion"],
+        }
+    profile = profiles.get(model_id)
+    if not isinstance(profile, dict):
+        return {}
+    requirements = profile.get("requirements")
+    return profile_capability_metadata(requirements if isinstance(requirements, dict) else {})
+
+
 def safe_profile_requirements(raw: Any, config: dict[str, Any]) -> dict[str, Any]:
     requirements = raw if isinstance(raw, dict) else {}
     base_min_context = safe_int(config.get("min_context_length"), DEFAULT_PROFILE_REQUIREMENTS["min_context"])
@@ -1890,6 +1925,14 @@ def prune_stale_profile_models(
     The removal is audited as `admin.profiles.prune` rather than applied silently: an
     order that changes on its own with no way to see why is worse than the stale entry
     it fixes, and the audit entry carries the before-snapshot the Undo button needs.
+
+    What gets removed is decided INSIDE the config store's update, against the config it
+    has just read from disk — not from the caller's `config` and written back after. That
+    dict is the live server config the admin handlers mutate in place, and a write-back
+    replaces `virtual_profiles` wholesale: a `POST /admin/profiles` landing between the
+    read and the write would be overwritten by a snapshot taken before it, silently losing
+    the order the user had just saved. Narrow window, but this now runs unattended every
+    refresh cycle, and "never destroy a manual order on its own" is the whole point.
     """
     prunable = prunable_catalog_sources(catalog, previous)
     if not prunable:
@@ -1899,33 +1942,120 @@ def prune_stale_profile_models(
         for model in catalog.get("models", [])
         if isinstance(model, dict) and model.get("id")
     }
-    before = normalized_virtual_profiles(config)
-    removed: dict[str, list[str]] = {}
-    pruned: dict[str, Any] = {}
-    for profile_id, profile in before.items():
-        updated = dict(profile)
-        gone: list[str] = []
-        for field in ("models", "excluded_models"):
-            kept = []
-            for model_id in profile.get(field) or []:
-                if model_id not in known_ids and model_id_source(model_id) in prunable:
-                    gone.append(str(model_id))
-                    continue
-                kept.append(model_id)
-            updated[field] = kept
-        if gone:
-            removed[profile_id] = gone
-        pruned[profile_id] = updated
+    outcome: dict[str, Any] = {}
+
+    def apply_prune(disk_config: dict[str, Any]) -> None:
+        before = normalized_virtual_profiles(disk_config)
+        removed: dict[str, list[str]] = {}
+        pruned: dict[str, Any] = {}
+        for profile_id, profile in before.items():
+            updated = dict(profile)
+            gone: list[str] = []
+            for field in ("models", "excluded_models"):
+                kept = []
+                for model_id in profile.get(field) or []:
+                    if model_id not in known_ids and model_id_source(model_id) in prunable:
+                        gone.append(str(model_id))
+                        continue
+                    kept.append(model_id)
+                updated[field] = kept
+            if gone:
+                removed[profile_id] = gone
+            pruned[profile_id] = updated
+        outcome["before"] = before
+        outcome["removed"] = removed
+        if not removed:
+            return
+        disk_config["virtual_profiles"] = pruned
+        disk_config["allow_paid_fallback"] = False
+
+    saved_config = runtime_config_store().update(apply_prune)
+    removed = outcome.get("removed") or {}
     if not removed:
         return {}
-    saved = save_virtual_profiles(config, pruned)
-    write_admin_audit(
+    saved = saved_config.get("virtual_profiles") or {}
+    # Mirror the write onto the caller's config, the same way save_virtual_profiles does:
+    # the daemon loop and every request handler share this one dict.
+    config["virtual_profiles"] = saved
+    config["allow_paid_fallback"] = False
+    normalize_config_fusion(config, strict=False)
+    row = write_admin_audit(
         "admin.profiles.prune",
-        before={"virtual_profiles": before},
+        before={"virtual_profiles": outcome["before"]},
         after={"virtual_profiles": saved},
         metadata={"removed": removed, "sources": sorted(prunable)},
     )
+    record_last_profile_prune(row, removed)
     return removed
+
+
+def record_last_profile_prune(
+    audit_row: dict[str, Any],
+    removed: dict[str, list[str]],
+) -> None:
+    """Leave the prune where the dashboard can find it, so it can say what it did.
+
+    The audit log already holds the full before/after, but nothing reads it on load —
+    the Activity tab has to be opened. A prune is the one virtual-model change the user
+    did not ask for, so it needs to announce itself once, next to the Undo it enables.
+    Runtime state rather than a queue: there is nothing to deliver, only a last-known
+    fact the dashboard compares against what it has already shown.
+
+    `sources` is read back off the removed ids, not taken from the prunable set the audit
+    entry records: the banner names who dropped these models, and every provider that
+    merely answered in full this round is not that.
+    """
+    model_ids = sorted({model_id for ids in removed.values() for model_id in ids})
+    sources = {model_id_source(model_id) for model_id in model_ids}
+
+    def mutate(state: dict[str, Any]) -> None:
+        state["last_profile_prune"] = {
+            "at": audit_row.get("logged_at"),
+            "audit_id": audit_row.get("id"),
+            "models": model_ids,
+            "profiles": sorted(removed),
+            "sources": sorted(source for source in sources if source),
+        }
+
+    _STATE_STORE.update(mutate, reason="profiles_prune")
+
+
+def stale_profile_model_rows(config: dict[str, Any], catalog: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every id a virtual model still points at that the catalog no longer lists.
+
+    Two very different situations wear the same "Unknown model" card, and nothing told
+    them apart: a provider that is merely down (the id returns with it) and a model its
+    provider stopped offering for free (it never returns, and the next refresh prunes
+    it). `disposition` is that distinction, so the dashboard can stop guessing.
+
+    `prunable_catalog_sources` is reused with no previous catalog on purpose — its
+    halving guard compares two refreshes, which a read-only view does not have. The
+    worst case is calling a truncated listing `retired` one cycle early; the prune
+    itself still re-reads the previous catalog before removing anything.
+    """
+    prunable = prunable_catalog_sources(catalog, {})
+    known_ids = {
+        str(model.get("id"))
+        for model in catalog.get("models", [])
+        if isinstance(model, dict) and model.get("id")
+    }
+    rows: list[dict[str, Any]] = []
+    for profile_id, profile in normalized_virtual_profiles(config).items():
+        for field in ("models", "excluded_models"):
+            for model_id in profile.get(field) or []:
+                if str(model_id) in known_ids:
+                    continue
+                source = model_id_source(str(model_id))
+                rows.append(
+                    {
+                        "profile_id": profile_id,
+                        "model_id": str(model_id),
+                        "source": source,
+                        "field": field,
+                        "disposition": "retired" if source in prunable else "held",
+                    }
+                )
+    return rows
 
 
 def rollback_virtual_profiles_from_audit(audit_id: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -1954,6 +2084,7 @@ def rollback_virtual_profiles_from_audit(audit_id: str, config: dict[str, Any]) 
         {"virtual_profiles": profiles}, config, catalog, extra_stale_ids=snapshot_ids
     )
     restored = save_virtual_profiles(config, restored)
+    clear_last_profile_prune(needle)
     write_admin_audit(
         "admin.rollback",
         before={"virtual_profiles": current},
@@ -1961,6 +2092,26 @@ def rollback_virtual_profiles_from_audit(audit_id: str, config: dict[str, Any]) 
         metadata={"resource": "virtual_profiles", "source_audit_id": needle},
     )
     return restored
+
+
+def clear_last_profile_prune(rolled_back_audit_id: str) -> None:
+    """Retract the prune announcement once its own prune has been undone.
+
+    Matched on the audit id: rolling back some unrelated save must not silence a prune the
+    user has not seen yet. The audit entry itself stays — this only drops the "and here is
+    what just happened" marker the dashboard reads on load.
+
+    The match is re-checked inside the mutator, under the store's lock. Deciding outside it
+    would let a prune recorded between the check and the write be dropped instead: undoing
+    prune A would silently swallow the announcement of prune B.
+    """
+
+    def mutate(current: dict[str, Any]) -> None:
+        recorded = current.get("last_profile_prune")
+        if isinstance(recorded, dict) and recorded.get("audit_id") == rolled_back_audit_id:
+            current.pop("last_profile_prune", None)
+
+    _STATE_STORE.update(mutate, reason="profiles_prune_rolled_back")
 
 
 def validate_fusion_payload(payload: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3960,6 +4111,21 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
         "admin_jobs": active_admin_jobs(source),
         "canary": redact_sensitive_json(source.get("canary")) if isinstance(source.get("canary"), dict) else {},
         "auto_benchmark": redact_sensitive_json(source.get("auto_benchmark")) if isinstance(source.get("auto_benchmark"), dict) else {},
+        # The dashboard announces this one: a prune is the only change to a virtual model the
+        # user did not ask for. Model ids are catalog ids, never a credential.
+        "last_profile_prune": last_profile_prune_row(source.get("last_profile_prune")),
+    }
+
+
+def last_profile_prune_row(raw_value: Any) -> dict[str, Any]:
+    if not isinstance(raw_value, dict):
+        return {}
+    return {
+        "at": raw_value.get("at"),
+        "audit_id": safe_detail(raw_value.get("audit_id")),
+        "models": safe_string_list(raw_value.get("models")),
+        "profiles": safe_string_list(raw_value.get("profiles")),
+        "sources": safe_string_list(raw_value.get("sources")),
     }
 
 
@@ -4020,6 +4186,7 @@ def build_admin_state_builder() -> AdminStateBuilder:
             fusion_payload=fusion_admin_payload,
             router_settings_payload=router_settings_payload,
             redact_runtime_state=redact_runtime_state,
+            stale_profile_model_rows=stale_profile_model_rows,
             safe_int=safe_int,
             safe_string_list=safe_string_list,
         ),
@@ -6233,7 +6400,7 @@ def invoke_model(
     source = str(model.get("source"))
     key, base_url, reason = provider_credentials(source, config)
     if not base_url or (not key and reason != "keyless_local"):
-        raise RuntimeError(f"credentials unavailable: {reason}")
+        raise ProviderCredentialsUnavailable(f"credentials unavailable: {reason}")
     requested_model = normalize_chat_completion_request(body).requested_model
     payload = dict(body)
     payload.pop("_ficelle_timeout_seconds", None)
@@ -7540,10 +7707,12 @@ def run_failover_demo(
     catalog = load_or_refresh_catalog(config, entitled=entitled)
     candidates = select_models(requested_model, catalog, effective_config)
     if not candidates:
-        raise RuntimeError(
-            f"No model is currently routable for {requested_model}. Run `ficelle doctor` "
-            "to see which providers are configured and reachable."
-        )
+        # The commonest way to get here by far is an install with no key at all: the
+        # catalog loads unauthenticated, but its entries carry their provider's
+        # `invokable` flag and selection drops every one of them. Read the live
+        # credential state so the refusal can name that instead of describing an
+        # empty pool the user has no way to interpret.
+        raise RuntimeError(unroutable_pool_message(requested_model, auth_status(config), PROVIDER_KEY_URLS))
     knocked_out = knocked_out_candidate_ids(candidates, knock_out)
     if not knocked_out:
         raise RuntimeError(
@@ -8038,8 +8207,15 @@ class RouterHandler(BaseHTTPRequestHandler):
                 catalog = load_or_refresh_catalog(self.config, entitled=entitled)
                 data = []
                 now = int(time.time())
+                profiles = normalized_virtual_profiles(effective_config)
                 for mid in listed_virtual_model_ids(effective_config, entitled=entitled):
-                    data.append({"id": mid, "object": "model", "created": now, "owned_by": "ficelle"})
+                    data.append({
+                        "id": mid,
+                        "object": "model",
+                        "created": now,
+                        "owned_by": "ficelle",
+                        **virtual_model_listing_metadata(mid, profiles, effective_config),
+                    })
                 for model in catalog.get("models", []):
                     if not isinstance(model, dict):
                         continue
@@ -8743,12 +8919,17 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
         time.sleep(catalog_refresh_interval_seconds(config))
         try:
             refresh_capability_oracle_if_stale(config)
-            load_or_refresh_catalog(config, force=True)
-            # Refreshed here and not inside `load_or_refresh_catalog`: this loop is the only
-            # periodic caller, and the TTL reload it shares with routing must not add a network
-            # round-trip to a user's request. `refresh_catalog` covers the explicit paths (the
-            # Refresh button, a credential change, `--refresh`), which this loop does not reach.
-            refresh_provider_budgets(effective_runtime_config(config))
+            # `refresh_catalog` rather than a forced `load_or_refresh_catalog`: at force=True
+            # the two rebuild and publish the same catalog, but only this one prunes the model
+            # ids their provider stopped listing, and refreshes provider budgets. Wiring the
+            # prune to the explicit paths alone (the Refresh button, a credential change,
+            # `--refresh`) meant a retired model sat in a user's order until they happened to
+            # click something — on the dogfood machine, three of them for days. This loop is
+            # the periodic full refresh and carries the same evidence the button does.
+            #
+            # Still not the TTL reload shared with routing (_load_or_refresh_catalog_for_
+            # effective_config): a chat call must never rewrite the user's config.
+            refresh_catalog(config)
         except Exception as exc:
             print(f"periodic catalog refresh failed: {exc}")
 

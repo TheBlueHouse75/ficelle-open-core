@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -60,3 +61,50 @@ def test_manifest_version_reads_the_root_key_only(tmp_path):
     manifest.write_text("name: ficelle\n")
     with pytest.raises(AssertionError):
         _manifest_version(manifest)
+
+
+# The pin below is the one bump nothing else catches. `pyproject.toml`, `__init__.py` and the
+# manifests are all read by tests or by the runtime, but a stale `ficelle-router==` only fails
+# when pip actually resolves Core and Pro together — that is, in the buyer's terminal, as
+# `ResolutionImpossible`, after they have paid. 0.1.7 shipped with it stale and was caught by a
+# manual install, not by this suite.
+#
+# It reads the closed pack, and the rest of this file is core, so the mirror ships the file
+# without `ficelle-pro/` to read. Skip there rather than fail: the monorepo is the only place
+# the pin exists to be checked, and a red suite in the mirror is a red badge on the public repo.
+PRO_PYPROJECT = REPO_ROOT / "ficelle-pro/pyproject.toml"
+
+
+@pytest.mark.skipif(not PRO_PYPROJECT.exists(), reason="closed pack absent (core-only checkout)")
+def test_pro_pins_the_core_version_it_ships_with() -> None:
+    metadata = tomllib.loads(PRO_PYPROJECT.read_text(encoding="utf-8"))
+    pins = [
+        dep
+        for dep in metadata["project"]["dependencies"]
+        if dep.replace(" ", "").startswith("ficelle-router")
+    ]
+    assert len(pins) == 1, f"expected exactly one ficelle-router pin, found {pins}"
+    assert pins[0].replace(" ", "") == f"ficelle-router=={ficelle.__version__}", (
+        f"ficelle-pro pins {pins[0]!r} while Core is {ficelle.__version__} — "
+        "every Core+Pro install would fail pip resolution"
+    )
+
+
+# The installer verifies the Core wheel against this digest, so the two constants that carry it
+# must agree. They live in different scripts and 0.1.7 shipped them briefly out of step, which
+# fails the install with an integrity error rather than anything readable.
+def test_the_two_pinned_core_digests_agree() -> None:
+    def _pinned(relative_path: str) -> tuple[str, str]:
+        text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        digests = re.findall(r'"([0-9a-f]{64})"', text)
+        versions = re.findall(r'^(?:CORE_VERSION|VERSION) = "([^"]+)"', text, re.MULTILINE)
+        assert len(digests) == 1, f"{relative_path}: expected one digest, found {len(digests)}"
+        assert len(versions) == 1, f"{relative_path}: expected one version, found {len(versions)}"
+        return versions[0], digests[0]
+
+    bootstrap = _pinned("scripts/bootstrap-ficelle.py")
+    canary = _pinned("scripts/verify-launch-cutover.py")
+    assert bootstrap == canary, (
+        f"bootstrap pins {bootstrap} but the launch canary pins {canary}"
+    )
+    assert bootstrap[0] == ficelle.__version__

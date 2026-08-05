@@ -133,6 +133,64 @@ def model_matches_profile_requirements(
     return safe_int(model.get("context_length"), 0) >= min_context
 
 
+def profile_capability_metadata(requirements: dict[str, Any]) -> dict[str, Any]:
+    """What a virtual model guarantees about whichever candidate ends up answering.
+
+    Read off the profile's requirements, not off today's candidates, because the
+    requirements are a hard contract: `select_models_result_from_typed_rows` applies
+    `model_matches_profile_requirements` BEFORE the manual_order/auto branch, both the
+    manual list and the auto tail are built from that filtered set, and the competence
+    gate's anti-empty fallback re-serves an already-filtered list. A model failing these
+    can therefore never be routed here — so these are promises, not observations that
+    change with cooldowns.
+
+    `structured` is reported only when the profile requires it. `None` means "not
+    required", not "not supported", and publishing `false` there would talk callers out
+    of a capability the routed model most likely has. Same reason `context_length` is the
+    required minimum: it is the floor the slot guarantees, while the model that answers
+    usually offers more.
+    """
+    input_modalities = sorted(
+        {
+            *safe_string_list(requirements.get("input_modalities")),
+            *safe_string_list(requirements.get("input_modalities_any")),
+        }
+    )
+    supported_parameters = sorted(
+        {
+            *safe_string_list(requirements.get("supported_parameters")),
+            *safe_string_list(requirements.get("supported_parameters_any")),
+        }
+    )
+    # Same default as the routing filter above, so the two cannot drift apart.
+    tools = bool(requirements.get("tools", True))
+    structured = requirements.get("structured") is True
+
+    capabilities = ["completion"]
+    if tools:
+        capabilities.append("tools")
+    if structured:
+        capabilities.append("structured")
+    # "vision" rather than "image": the name every client that reads this field uses.
+    if "image" in input_modalities:
+        capabilities.append("vision")
+    capabilities.extend(modality for modality in ("audio", "video") if modality in input_modalities)
+
+    metadata: dict[str, Any] = {
+        "context_length": safe_int(requirements.get("min_context"), 0),
+        "supports_tools": tools,
+        "supports_streaming": True,
+        "capabilities": capabilities,
+    }
+    if structured:
+        metadata["supports_structured_outputs"] = True
+    if input_modalities:
+        metadata["input_modalities"] = input_modalities
+    if supported_parameters:
+        metadata["supported_parameters"] = supported_parameters
+    return metadata
+
+
 def competence_gate_result(
     profile_id: str,
     candidates: list[dict[str, Any]],

@@ -7,7 +7,10 @@ from ficelle.use_cases.provider_auth import (
     ProviderAuthPorts,
     auth_row,
     auth_status,
+    invokable_provider_sources,
     provider_auth_row,
+    provider_key_setup_commands,
+    unconfigured_provider_sources,
 )
 
 
@@ -108,3 +111,49 @@ def test_auth_status_preserves_rows_for_each_provider_entry() -> None:
         "base_url": "https://nvidia.example/v1",
     }
     assert status["missing"]["reason"] == "missing provider"
+
+
+# --- first-run credential guidance ----------------------------------------------
+
+
+def test_invokable_sources_split_what_can_serve_from_what_cannot() -> None:
+    """`invokable` is the servability signal, not the presence of a row or a base URL."""
+    auth = {
+        "openrouter": {"invokable": False, "reason": "missing OPENROUTER_API_KEY", "base_url": "https://o.test/v1"},
+        "nous": {"invokable": True, "reason": "configured", "key_source": "env"},
+        # A keyless local provider serves without a key, so it must not be advertised
+        # as something the user still has to configure.
+        "localai": {"invokable": True, "reason": "keyless_local", "key_source": None},
+        "broken": "not a row",
+    }
+
+    assert invokable_provider_sources(auth) == ["nous", "localai"]
+    assert unconfigured_provider_sources(auth) == ["openrouter", "broken"]
+
+
+def test_no_provider_is_invokable_on_a_fresh_keyless_install() -> None:
+    auth = {
+        "openrouter": {"invokable": False, "reason": "missing OPENROUTER_API_KEY"},
+        "nous": {"invokable": False, "reason": "missing NOUS_API_KEY"},
+    }
+
+    assert invokable_provider_sources(auth) == []
+    assert unconfigured_provider_sources(auth) == ["openrouter", "nous"]
+
+
+def test_setup_commands_take_every_url_from_the_injected_registry() -> None:
+    lines = provider_key_setup_commands(
+        ["openrouter", "nous"],
+        {"openrouter": "https://openrouter.example/keys", "nous": "https://nous.example/"},
+    )
+
+    assert lines == [
+        "ficelle set-key openrouter  # create a key at https://openrouter.example/keys",
+        "ficelle set-key nous        # create a key at https://nous.example/",
+    ]
+
+
+def test_setup_commands_still_name_a_provider_the_registry_does_not_know() -> None:
+    """The command is the actionable half; a missing link must not drop the provider."""
+    assert provider_key_setup_commands(["mystery"], {}) == ["ficelle set-key mystery"]
+    assert provider_key_setup_commands([], {"openrouter": "https://o.test/keys"}) == []

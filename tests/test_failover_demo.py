@@ -23,7 +23,9 @@ from ficelle.use_cases.chat_completion import (
     ChatCompletionRouter,
     CompressionRoutePlan,
 )
+from ficelle.provider_credentials import ProviderCredentialsUnavailable
 from ficelle.use_cases.failover_demo import (
+    CREDENTIALS_UNAVAILABLE_ERROR_TYPE,
     SIMULATED_OUTAGE_CODE,
     SIMULATED_OUTAGE_STATUS,
     FailoverDemoAttempt,
@@ -35,6 +37,7 @@ from ficelle.use_cases.failover_demo import (
     knocked_out_candidate_ids,
     render_failover_demo,
     simulated_outage_payload,
+    unroutable_pool_message,
 )
 
 
@@ -219,6 +222,101 @@ def test_render_reports_an_exhausted_pool_without_claiming_a_reroute():
     assert "Answered by" not in text
 
 
+def unkeyed_attempt(model: str, source: str) -> FailoverDemoAttempt:
+    """What the router records for a candidate whose provider has no key configured."""
+    return FailoverDemoAttempt(
+        model,
+        source,
+        model.split("/", 1)[-1],
+        "exception",
+        "unavailable",
+        0.0,
+        False,
+        CREDENTIALS_UNAVAILABLE_ERROR_TYPE,
+    )
+
+
+def test_render_blames_the_missing_key_not_the_pool_on_a_keyless_install():
+    """The old text sent a user with no API key hunting a provider outage."""
+    text = render_failover_demo(
+        demo_result(
+            attempts=[
+                FailoverDemoAttempt("a/one", "a", "one", 429, "rate_limited", 0.002, True),
+                unkeyed_attempt("b/two", "b"),
+            ],
+            answer=None,
+        ),
+        key_urls={"b": "https://b.example/keys"},
+    )
+
+    assert "no provider API key is configured" in text
+    assert "ficelle set-key b  # create a key at https://b.example/keys" in text
+    # The candidate was skipped, not tried: calling that a failure is the same lie.
+    assert "not called: no API key configured for b" in text
+    assert "The pool is exhausted or offline" not in text
+
+
+def test_render_keeps_the_exhausted_pool_message_when_a_provider_really_answered_badly():
+    """One configured provider that genuinely failed makes the outage reading the honest one."""
+    text = render_failover_demo(
+        demo_result(
+            attempts=[
+                FailoverDemoAttempt("a/one", "a", "one", 429, "rate_limited", 0.002, True),
+                unkeyed_attempt("b/two", "b"),
+                FailoverDemoAttempt("c/three", "c", "three", 503, "server_error", 0.4, False),
+            ],
+            answer=None,
+        ),
+        key_urls={"b": "https://b.example/keys"},
+    )
+
+    assert "The pool is exhausted or offline" in text
+    assert "no provider API key is configured" not in text
+
+
+def test_unkeyed_sources_ignores_the_fabricated_outage():
+    """The knocked-out candidate is never contacted, so it proves nothing about the keys."""
+    result = demo_result(
+        attempts=[
+            FailoverDemoAttempt("a/one", "a", "one", 429, "rate_limited", 0.002, True),
+            unkeyed_attempt("b/two", "b"),
+            unkeyed_attempt("b/three", "b"),
+        ],
+        answer=None,
+    )
+
+    assert result.unkeyed_sources == ["b"]
+    assert failover_demo_payload(result)["unkeyed_sources"] == ["b"]
+
+
+def test_a_run_that_answered_is_never_reported_as_unkeyed():
+    assert demo_result().unkeyed_sources == []
+
+
+def test_an_empty_pool_is_explained_by_the_missing_key_when_there_is_one():
+    message = unroutable_pool_message(
+        "ficelle/auto-tools",
+        {"openrouter": {"invokable": False, "reason": "missing OPENROUTER_API_KEY"}},
+        {"openrouter": "https://openrouter.example/keys"},
+    )
+
+    assert "Nothing is routable for ficelle/auto-tools: no provider API key is configured." in message
+    assert "ficelle set-key openrouter  # create a key at https://openrouter.example/keys" in message
+
+
+def test_an_empty_pool_stays_a_routing_problem_once_a_provider_is_configured():
+    message = unroutable_pool_message(
+        "ficelle/auto-tools",
+        {"openrouter": {"invokable": True, "reason": "configured"}, "nous": {"invokable": False}},
+        {"openrouter": "https://openrouter.example/keys"},
+    )
+
+    assert message == (
+        "No model is currently routable for ficelle/auto-tools. Run `ficelle doctor --text` "
+        "to see which providers are configured and reachable."
+    )
+
+
 def test_cost_is_only_claimed_when_the_router_could_not_have_paid():
     assert demo_result().upstream_cost == "0.00"
     assert demo_result(paid_fallback_allowed=True).upstream_cost == "unknown"
@@ -322,6 +420,69 @@ def test_the_production_router_really_fails_over_off_the_simulated_outage():
     assert [request.model["id"] for request in cooldowns] == ["a/one"]
 
 
+def test_a_missing_key_reaches_the_demo_as_a_recognisable_attempt():
+    """The signal the renderer keys on has to survive the real attempt recorder.
+
+    `evaluate_invocation_exception` keeps `error_type` and drops the message, so this
+    is the test that would catch the day the router goes back to raising a bare
+    RuntimeError and the demo silently reverts to blaming the pool.
+    """
+    candidates = [free_model("a/one", "a"), free_model("b/two", "b")]
+    telemetry: list[Any] = []
+
+    def unkeyed_invoke(model, body, config, **kwargs):
+        raise ProviderCredentialsUnavailable("credentials unavailable: missing B_API_KEY")
+
+    demo_router = ChatCompletionRouter(
+        config={},
+        load_catalog=lambda _config: {"models": candidates},
+        select_candidates=lambda *_args, **_kwargs: candidates,
+        is_fusion_profile=lambda _model: False,
+        is_virtual_model=lambda _model: True,
+        response_headers=lambda request_id, requested_model: {},
+        record_last_route=lambda *_args, **_kwargs: None,
+        write_route_log=lambda *_args, **_kwargs: None,
+        max_attempts_for_request=lambda _model, _config, count: count,
+        prepare_compression_route_body=lambda body, _config: CompressionRoutePlan(body=body, metadata=None),
+        now=lambda: 100.0,
+    )
+
+    def ports(_plan: ChatCompletionAttemptPlan) -> ChatCompletionAttemptPorts:
+        return ChatCompletionAttemptPorts(
+            invoke_model=forced_failure_invoker(
+                unkeyed_invoke,
+                knocked_out=["a/one"],
+                build_response=lambda status, payload: FakeResponse(status, payload),
+            ),
+            apply_cooldown=lambda _cooldown: None,
+            record_success=lambda _model, _latency: None,
+            resolve_competence=lambda _profile, _model: "verified",
+            record_telemetry=telemetry.append,
+            stream_response=lambda *_args: pytest.fail("the demo never streams"),
+            detect_success_error=lambda *_args: None,
+            has_deliverable=lambda _payload: True,
+            classify_failure=lambda status, text, model=None, **_kwargs: classify_failure_result(
+                status, text, upstream_model_id=str((model or {}).get("upstream_id") or "")
+            ),
+            is_timeout_exception=lambda _exc: False,
+            build_success_headers=lambda *_args, **_kwargs: {},
+            build_failure_error=lambda *_args, **_kwargs: {},
+            build_failure_headers=lambda *_args, **_kwargs: {},
+        )
+
+    demo_router.handle(
+        {"model": "ficelle/auto-tools", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+        request_id="demo-req",
+        request_started=99.0,
+        ports_factory=ports,
+    )
+
+    attempts = demo_attempts_from_route(telemetry[0].last_route.attempts, ["a/one"])
+    assert [(a.model, a.credentials_unavailable) for a in attempts] == [("a/one", False), ("b/two", True)]
+    result = demo_result(attempts=attempts, answer=None)
+    assert result.unkeyed_sources == ["b"]
+
+
 # --- the wiring in router.py ----------------------------------------------------
 
 
@@ -376,9 +537,33 @@ def test_run_failover_demo_refuses_a_pool_it_cannot_fail_over_in(monkeypatch, de
 
 def test_run_failover_demo_reports_an_empty_pool_instead_of_faking_one(monkeypatch, demo_wiring):
     monkeypatch.setattr(router, "select_models", lambda *a, **k: [])
+    monkeypatch.setattr(router, "auth_status", lambda _config: {"a": {"invokable": True, "reason": "configured"}})
 
     with pytest.raises(RuntimeError, match="No model is currently routable"):
         router.run_failover_demo({})
+
+
+def test_run_failover_demo_names_the_missing_key_when_nothing_can_be_called(monkeypatch, demo_wiring):
+    """This is what a keyless install actually hits, and it used to describe an empty pool.
+
+    Catalog entries carry their provider's `invokable` flag and selection drops the
+    ones that are not, so with no key every profile selects nothing and the demo
+    refuses before it can trace anything.
+    """
+    monkeypatch.setattr(router, "select_models", lambda *a, **k: [])
+    monkeypatch.setattr(
+        router,
+        "auth_status",
+        lambda _config: {"openrouter": {"invokable": False, "reason": "missing OPENROUTER_API_KEY"}},
+    )
+
+    with pytest.raises(RuntimeError) as refusal:
+        router.run_failover_demo({})
+
+    message = str(refusal.value)
+    assert "no provider API key is configured" in message
+    assert f"ficelle set-key openrouter  # create a key at {router.PROVIDER_KEY_URLS['openrouter']}" in message
+    assert "Then run `ficelle refresh` and try again." in message
 
 
 def test_simulated_outage_response_is_a_real_transport_object():
@@ -457,3 +642,25 @@ def test_demo_command_exits_non_zero_when_nothing_answered(monkeypatch, capsys):
 
     assert cli.main(["demo"]) == 1
     assert "No candidate answered" in capsys.readouterr().out
+
+
+def test_demo_command_points_an_unkeyed_install_at_the_real_key_page(monkeypatch, capsys):
+    """The URL comes from the shared registry, so the command names no link of its own."""
+    import ficelle.cli as cli
+
+    monkeypatch.setattr(
+        cli.router,
+        "run_failover_demo",
+        lambda *a, **k: demo_result(
+            attempts=[
+                FailoverDemoAttempt("or/one", "openrouter", "one", 429, "rate_limited", 0.002, True),
+                unkeyed_attempt("or/two", "openrouter"),
+            ],
+            answer=None,
+        ),
+    )
+
+    assert cli.main(["demo"]) == 1
+    printed = capsys.readouterr().out
+    assert "no provider API key is configured" in printed
+    assert f"ficelle set-key openrouter  # create a key at {cli.router.PROVIDER_KEY_URLS['openrouter']}" in printed

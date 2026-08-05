@@ -48,9 +48,17 @@ from ficelle.runtime_paths import RuntimePaths
 from ficelle.url_security import uses_secure_http_transport
 
 
-DEFAULT_UPDATE_MANIFEST_URL = (
-    "https://api.github.com/repos/TheBlueHouse75/ficelle-open-core/releases/latest"
-)
+# Ficelle's own manifest rather than the GitHub release API. Both answer the same question, and
+# the check runs either way — but asking here is what lets us count installs that are still
+# alive, which is otherwise unknowable: the product ships no telemetry, and stars or downloads
+# measure intent, not use. What the endpoint records is a tally against a UTC date, with no
+# address, identifier or user agent (ficelle.ai/privacy states this; the service drops the access
+# log line for the route so the request leaves no other trace).
+#
+# The trade is availability: GitHub's uptime was free, this is one small instance. A failed check
+# is already a degraded, retried state rather than an error the user must act on, and it never
+# blocks routing — set FICELLE_UPDATE_MANIFEST_URL to the GitHub API URL to opt back out.
+DEFAULT_UPDATE_MANIFEST_URL = "https://install.ficelle.ai/api/update/manifest"
 UPDATE_CHECK_TTL_SECONDS = 24 * 60 * 60
 UPDATE_CHECK_START_DELAY_SECONDS = 5
 UPDATE_CHECK_INTERVAL_SECONDS = 6 * 60 * 60

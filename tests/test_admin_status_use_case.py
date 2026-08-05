@@ -115,6 +115,15 @@ def test_admin_state_builder_assembles_operator_payload_and_runs_quota_probe():
             fusion_payload=lambda _config, _state: {"config": {"enabled": False}},
             router_settings_payload=lambda _config: {"config": {"max_attempts_per_request": 3}},
             redact_runtime_state=lambda source: {"last_routes": source.get("last_routes", {})},
+            stale_profile_model_rows=lambda _config, _catalog: [
+                {
+                    "profile_id": "ficelle/auto-fast",
+                    "model_id": "ficelle/openrouter/retired",
+                    "source": "openrouter",
+                    "field": "models",
+                    "disposition": "retired",
+                }
+            ],
             safe_int=lambda value, default: int(value) if value is not None else default,
             safe_string_list=lambda value: [str(item) for item in value]
             if isinstance(value, list)
@@ -129,6 +138,17 @@ def test_admin_state_builder_assembles_operator_payload_and_runs_quota_probe():
     assert calls == ["quota"]
     assert payload["catalog"]["scored"] is True
     assert payload["virtual_profiles"] == {"ficelle/auto-fast": {"mode": "auto"}}
+    # Carried into the operator payload beside the profiles it annotates: the dashboard needs
+    # both to tell "provider down, kept" from "retired, going away" on the same card.
+    assert payload["stale_profile_models"] == [
+        {
+            "profile_id": "ficelle/auto-fast",
+            "model_id": "ficelle/openrouter/retired",
+            "source": "openrouter",
+            "field": "models",
+            "disposition": "retired",
+        }
+    ]
     assert payload["profiles"]["ficelle/auto-fast"]["selected_model"] == "m1"
     assert payload["performance_history"] == {"ficelle/auto-fast": []}
     assert payload["compression"] == {"health_digest": "ok"}

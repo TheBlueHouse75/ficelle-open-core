@@ -533,6 +533,31 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 
     /* ---------- renderers ---------- */
 
+    // A card for an id the catalog no longer lists. Two very different things used to wear the
+    // same "Missing" badge: a provider that failed its last refresh (the id returns with it) and
+    // a model its provider stopped offering for free (it never returns, and the next refresh
+    // drops it from the order). The server already made that call in `stale_profile_models`;
+    // this only phrases it. Matched on the id alone — the answer is a property of the model and
+    // its provider, not of the virtual model it happens to sit in.
+    function staleModelNotice(id) {
+      const row = (state.stale_profile_models || []).find((r) => r.model_id === id);
+      if (!row) return { name: "Unknown model", badge: "danger", label: "Missing", title: "This id is not in the catalog. Remove it, or wait for the next refresh to decide." };
+      if (row.disposition === "held") {
+        return {
+          name: "Waiting on " + providerLabel(row.source),
+          badge: "warn",
+          label: "Provider down",
+          title: providerLabel(row.source) + " did not answer at the last catalog refresh, so Ficelle keeps your place in the order. The model comes back when the provider does.",
+        };
+      }
+      return {
+        name: "Retired model",
+        badge: "danger",
+        label: "Retiring",
+        title: providerLabel(row.source) + " no longer offers this model for free. Ficelle drops it from your order at the next catalog refresh — remove it now to drop it immediately.",
+      };
+    }
+
     function renderProfileList() {
       const profileCards = profileOrder.map((pid) => {
         const lab = profileLabels[pid] || [pid, ""];
@@ -601,7 +626,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       else {
         list.innerHTML = selectedIds.map((id, i) => {
           const m = models.get(id);
-          if (!m) return '<article class="mcard no-grip is-blocked" data-model="' + esc(id) + '" data-ctx="selected"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">Unknown model</div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-right"><span class="badge danger mcard-status" title="This id is no longer in the catalog. Ficelle keeps it in case the model comes back; remove it to drop it for good.">Missing</span><div class="mcard-actions"><button class="iconbtn danger" data-act="remove" data-id="' + esc(id) + '" title="Remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></button></div></div></div></article>';
+          if (!m) { const s = staleModelNotice(id); return '<article class="mcard no-grip is-blocked" data-model="' + esc(id) + '" data-ctx="selected"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">' + esc(s.name) + '</div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-right"><span class="badge ' + s.badge + ' mcard-status" title="' + esc(s.title) + '">' + esc(s.label) + '</span><div class="mcard-actions"><button class="iconbtn danger" data-act="remove" data-id="' + esc(id) + '" title="Remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></button></div></div></div></article>'; }
           return modelCard(m, "selected", i);
         }).join("");
       }
@@ -623,7 +648,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       }
       list.innerHTML = excluded.map((id, i) => {
         const m = models.get(id);
-        if (!m) return '<article class="mcard no-grip is-excluded" data-model="' + esc(id) + '" data-ctx="excluded"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">Unknown model</div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-right"><span class="badge warn mcard-status" title="Excluded from this virtual model, and no longer in the catalog either.">Excluded</span><div class="mcard-actions">' + iconBtn("restore", id, "Restore to this virtual model", ICONS.restore) + "</div></div></div></article>";
+        if (!m) { const s = staleModelNotice(id); return '<article class="mcard no-grip is-excluded" data-model="' + esc(id) + '" data-ctx="excluded"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">' + esc(s.name) + '</div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-right"><span class="badge warn mcard-status" title="Excluded from this virtual model. ' + esc(s.title) + '">Excluded</span><div class="mcard-actions">' + iconBtn("restore", id, "Restore to this virtual model", ICONS.restore) + "</div></div></div></article>"; }
         return modelCard(m, "excluded", i);
       }).join("");
       bindModelCard(list);
@@ -1409,6 +1434,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const cdP = activeCount(rt.provider_cooldowns);
       const cdQ = activeCount(rt.quota_cooldowns);
       const q = Object.keys(rt.quarantine || {}).length;
+      const stale = state.stale_profile_models || [];
+      const retiring = stale.filter((r) => r.disposition === "retired").length;
       const healthy = canary.status === "pass" && !cdM && !cdP && !cdQ && !q;
       const compressionMode = compression.configured_mode || "off";
       const compressionStatus = compression.last_status || (compressionMode === "off" ? "off" : "waiting");
@@ -1418,6 +1445,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         { k: "Canary check", ic: ICONS.canary, v: (canary.status === "pass" ? "Passing" : (canary.status || "Not run")), note: (sum.passed ?? 0) + " of " + (sum.total ?? 0) + " virtual models ok &middot; last run " + timeAgo(canary.last_run_at).label, cls: canary.status === "pass" ? "ok" : "warn" },
         { k: "Paused", ic: ICONS.paused, v: (cdM + cdP + cdQ), note: cdM + " models &middot; " + cdP + " providers &middot; " + cdQ + " free quotas", cls: (cdM + cdP + cdQ) ? "warn" : "ok" },
         { k: "Disabled", ic: ICONS.disable, v: q, note: q ? "manually held out of routing" : "nothing quarantined", cls: q ? "warn" : "ok" },
+        // Entries in a virtual model whose id left the catalog. Split, because the two halves
+        // end differently: retiring ones are removed by the next refresh, held ones return
+        // with their provider and must not be presented as a loss.
+        { k: "Missing models", ic: ICONS.exclude, v: stale.length, note: stale.length ? (retiring + " no longer offered free &middot; " + (stale.length - retiring) + " kept while their provider is unreachable") : "every model in your orders is still in the catalog", cls: retiring ? "warn" : "ok" },
         // blocked means a probe cooled/stopped its model; skipped counts still-due probes held
         // behind a cooldown; budget_capped means the pool's probing share of the budget was spent.
         { k: "Capability discovery", ic: ICONS.benchmark, v: (ab.last_run_at ? "Last run " + timeAgo(ab.last_run_at).label : "Not run yet"), note: ab.last_run_at ? ((ab.models ?? 0) + " models &middot; " + (ab.verified ?? 0) + " verified &middot; " + (ab.failed ?? 0) + " failed &middot; " + (ab.skipped ?? 0) + " paused &middot; " + (ab.blocked ?? 0) + " blocked &middot; " + (ab.budget_capped ?? 0) + " budget-capped") : "background discovery &middot; configure in Settings", cls: ((ab.skipped ?? 0) + (ab.blocked ?? 0) + (ab.budget_capped ?? 0)) ? "warn" : "ok" },
@@ -1444,6 +1475,19 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
             kind: "warn",
             badge: "Guarded",
           });
+        });
+      });
+      stale.forEach((row) => {
+        const label = profileLabels[row.profile_id]?.[0] || row.profile_id;
+        const retired = row.disposition === "retired";
+        guards.push({
+          title: row.model_id,
+          meta: label + " - " + (retired ? "no longer offered free by " + providerLabel(row.source) : providerLabel(row.source) + " unreachable at the last refresh"),
+          detail: retired
+            ? "Ficelle removes it from this virtual model at the next catalog refresh, and tells you when it does."
+            : "Kept in place on purpose: a provider that fails a refresh drops its whole listing, so a missing id proves nothing about the model.",
+          kind: retired ? "danger" : "warn",
+          badge: retired ? "Retiring" : "Kept",
         });
       });
       $("guardList").innerHTML = guards.length ? guards.map((g) =>
@@ -2027,11 +2071,42 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      if (!state) return;
 	      setProviderLabels(state.provider_labels);
 	      renderUpdateBanner();
+	      renderPruneBanner();
 	      renderProfileList(); renderActiveProfile(); renderFilterBar(); renderSelected(); renderExcluded(); renderAvailable();
 	      renderProviders(); renderFusion(); renderSettings(); renderCompression(); renderLicense(); renderHealth(); renderPerformance(); renderAudit(); renderNavCounts();
       syncLongRunningActions();
       syncSaveButton();
 	    }
+
+    // Keyed by audit id, not a boolean: dismissing one prune must not silence the next one.
+    const PRUNE_NOTICE_KEY = "ficelle.dismissedPruneAudit";
+    const readDismissedPrune = () => { try { return localStorage.getItem(PRUNE_NOTICE_KEY); } catch { return null; } };
+    const writeDismissedPrune = (id) => { try { localStorage.setItem(PRUNE_NOTICE_KEY, id); } catch { /* private mode: the banner simply comes back */ } };
+    function renderPruneBanner() {
+      const banner = $("pruneBanner");
+      if (!banner) return;
+      banner.hidden = true;
+      // Everything else in this dashboard shows what the user did. This is the one change
+      // Ficelle made on its own, so it has to announce itself rather than wait to be found
+      // in the Activity tab — with the Undo that puts the order back if the call was wrong.
+      const prune = state?.state?.last_profile_prune || {};
+      const models = prune.models || [];
+      if (!prune.audit_id || !models.length || readDismissedPrune() === prune.audit_id) return;
+      const lanes = (prune.profiles || []).map((pid) => profileLabels[pid]?.[0] || pid);
+      const providers = (prune.sources || []).map((src) => providerLabel(src));
+      const what = models.length === 1 ? "1 model" : models.length + " models";
+      const where = lanes.length ? " from " + esc(lanes.join(", ")) : "";
+      banner.hidden = false;
+      banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle removed ' + what + where + '</div>' +
+        '<div class="update-detail">' + esc(models.join(", ")) + " &mdash; no longer offered for free by " + esc(providers.join(", ") || "their provider") +
+        ", so " + (models.length === 1 ? "it was" : "they were") + " dropped from your order at the last catalog refresh." +
+        (prune.at ? " " + esc(timeAgo(prune.at).label) + "." : "") + "</div></div>" +
+        '<div class="update-actions"><button class="btn sm" type="button" id="prunePutBackBtn">Put them back</button><button class="btn ghost sm" type="button" id="pruneDismissBtn">Got it</button></div>';
+      // No local dismissal on this path: a successful undo clears the marker server-side, and
+      // reloading is what tells the two apart. A failed undo leaves the banner up, as it should.
+      $("prunePutBackBtn").addEventListener("click", async () => { await rollbackProfiles(prune.audit_id); await loadState(); });
+      $("pruneDismissBtn").addEventListener("click", () => { writeDismissedPrune(prune.audit_id); banner.hidden = true; });
+    }
 
     let updateInstallInFlight = false;
     let updateStatusTimer = null;

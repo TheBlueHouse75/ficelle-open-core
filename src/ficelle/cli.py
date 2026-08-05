@@ -24,6 +24,11 @@ from ficelle.service import (
     read_active_service_context,
     select_service_backend,
 )
+from ficelle.use_cases.provider_auth import (
+    invokable_provider_sources,
+    provider_key_setup_commands,
+    unconfigured_provider_sources,
+)
 
 LABEL = "com.ficelle.router"
 PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
@@ -320,6 +325,24 @@ def doctor_status() -> dict[str, Any]:
     }
 
 
+def doctor_provider_key_lines(auth: dict[str, Any]) -> list[str]:
+    """The credential half of the text report.
+
+    `status` above tracks the *service*, so a running router with no provider key
+    reads `status: ok` while every completion fails with `credentials unavailable`.
+    A diagnostic that stays silent about the commonest reason nothing works is the
+    bug, so the text report always states which providers can actually be called.
+    """
+    configured = invokable_provider_sources(auth)
+    if configured:
+        return [f"provider_keys: {', '.join(configured)}"]
+    missing = unconfigured_provider_sources(auth)
+    return [
+        "provider_keys: none configured — no completion can be served.",
+        *(f"  {line}" for line in provider_key_setup_commands(missing, router.PROVIDER_KEY_URLS)),
+    ]
+
+
 def doctor(*, json_output: bool = True) -> int:
     status = doctor_status()
     if json_output:
@@ -329,6 +352,8 @@ def doctor(*, json_output: bool = True) -> int:
         print(f"config: {status['config']}")
         print(f"catalog_exists: {status['catalog_exists']}")
         print(f"state_exists: {status['state_exists']}")
+        for line in doctor_provider_key_lines(status.get("auth") or {}):
+            print(line)
     return 0
 
 
@@ -520,7 +545,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
     if getattr(args, "json_output", False):
         print(json.dumps(failover_demo_payload(result), ensure_ascii=False, indent=2))
     else:
-        print(render_failover_demo(result))
+        print(render_failover_demo(result, key_urls=router.PROVIDER_KEY_URLS))
     # A pool that answered nothing is a real finding, not a crash: report it as a
     # non-zero exit so a scripted check can tell the two apart.
     return 0 if result.answered_by is not None else 1

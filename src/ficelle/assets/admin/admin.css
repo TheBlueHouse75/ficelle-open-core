@@ -263,6 +263,7 @@
     .update-banner .update-actions { display: flex; align-items: center; gap: 8px; flex: none; }
     .update-banner.is-progress { border-color: color-mix(in srgb, var(--info) 42%, transparent); background: color-mix(in srgb, var(--info) 9%, var(--surface-1)); }
     .update-banner.is-error { border-color: color-mix(in srgb, var(--danger) 42%, transparent); background: color-mix(in srgb, var(--danger) 8%, var(--surface-1)); }
+    .update-banner.is-prune { border-color: color-mix(in srgb, var(--warn) 42%, transparent); background: color-mix(in srgb, var(--warn) 9%, var(--surface-1)); }
 
     /* ============ Buttons ============
        Pill shape + the website's "solid drop" primary: the shadow is a flat

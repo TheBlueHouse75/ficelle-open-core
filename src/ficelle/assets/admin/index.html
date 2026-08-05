@@ -21,6 +21,10 @@
       </header>
 
       <section class="update-banner" id="updateBanner" hidden aria-live="polite"></section>
+      <!-- A prune is the only edit Ficelle makes to a virtual model on its own, so it says so
+           here once, next to the Undo it enables. Dismissed per audit id, so the next prune
+           speaks up again. -->
+      <section class="update-banner is-prune" id="pruneBanner" hidden aria-live="polite"></section>
       <!-- Shown only if the first state load is slow or fails; aria-live so the wait is
            announced, not just drawn. -->
       <div class="empty boot-notice" id="bootNotice" hidden aria-live="polite"></div>

@@ -28,10 +28,23 @@ Two invariants this module exists to hold:
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from ficelle.provider_credentials import ProviderCredentialsUnavailable
+from ficelle.use_cases.provider_auth import (
+    invokable_provider_sources,
+    provider_key_setup_commands,
+    unconfigured_provider_sources,
+)
+
+
+# The class name is what survives into an attempt record: `evaluate_invocation_exception`
+# stores `type(exc).__name__` and drops the message, so keying on the name is the only
+# way to recognise a missing key without string-matching prose. Taken from the class
+# itself rather than spelled out, so a rename cannot leave this reading a dead value.
+CREDENTIALS_UNAVAILABLE_ERROR_TYPE = ProviderCredentialsUnavailable.__name__
 
 # A rate limit is the outage this product is most often hired to survive, and 429 is
 # the one status every provider agrees on. `classify_failure` maps a 429 whose body
@@ -120,10 +133,20 @@ class FailoverDemoAttempt:
     reason: str
     latency_seconds: float | None
     simulated: bool
+    error_type: str = ""
 
     @property
     def succeeded(self) -> bool:
         return self.reason == "ok"
+
+    @property
+    def credentials_unavailable(self) -> bool:
+        """This candidate was never called: no key was configured for its provider.
+
+        ``reason`` is only ``unavailable`` here — the same value a dead socket
+        produces — so the failure has to be told apart by the exception type.
+        """
+        return self.error_type == CREDENTIALS_UNAVAILABLE_ERROR_TYPE
 
 
 @dataclass(frozen=True)
@@ -146,6 +169,21 @@ class FailoverDemoResult:
     def rerouted(self) -> bool:
         """A real failover happened: something was knocked out, and a later attempt answered."""
         return bool(self.knocked_out) and self.answered_by is not None
+
+    @property
+    def unkeyed_sources(self) -> list[str]:
+        """Providers that turned the run down for want of a key, in attempt order.
+
+        Empty unless *every* candidate the demo really tried was refused that way:
+        one configured provider that genuinely failed makes "the pool is offline" the
+        honest reading, and the demo must not answer a real outage with a lecture
+        about API keys. The knocked-out candidate is excluded — its outage is
+        fabricated, so it says nothing about how the install is configured.
+        """
+        attempted = [attempt for attempt in self.attempts if not attempt.simulated]
+        if not attempted or not all(attempt.credentials_unavailable for attempt in attempted):
+            return []
+        return list(dict.fromkeys(attempt.source for attempt in attempted if attempt.source))
 
     @property
     def upstream_cost(self) -> str:
@@ -179,6 +217,7 @@ def demo_attempts_from_route(
                 reason=str(raw.get("reason") or ""),
                 latency_seconds=float(latency) if isinstance(latency, (int, float)) else None,
                 simulated=model in knocked_out_ids,
+                error_type=str(raw.get("error_type") or ""),
             )
         )
     return attempts
@@ -226,12 +265,67 @@ def _truncated(text: str, limit: int) -> str:
     return stripped[: limit - 1].rstrip() + "…"
 
 
-def render_failover_demo(result: FailoverDemoResult, *, answer_limit: int = 220) -> str:
+def _key_setup_block(sources: Sequence[str], key_urls: Mapping[str, str]) -> list[str]:
+    return [
+        "Ficelle routes through your own provider accounts and ships no keys of its own,",
+        "so it cannot call a model until at least one key is stored:",
+        "",
+        *(f"  {line}" for line in provider_key_setup_commands(sources, key_urls)),
+        "",
+    ]
+
+
+def unroutable_pool_message(profile: str, auth: Mapping[str, Any], key_urls: Mapping[str, str]) -> str:
+    """Why the demo has no pool to work with, said in terms the user can act on.
+
+    A keyless install lands here rather than in the trace: catalog entries are stamped
+    with their provider's ``invokable`` flag at refresh time and selection drops the
+    ones that are not, so with no key configured *every* profile selects nothing. The
+    generic "nothing is routable" reading — a bad profile, a stale catalog, providers
+    genuinely down — is only honest once something can actually be called.
+    """
+    if invokable_provider_sources(auth):
+        return (
+            f"No model is currently routable for {profile}. Run `ficelle doctor --text` "
+            "to see which providers are configured and reachable."
+        )
+    return "\n".join(
+        [
+            f"Nothing is routable for {profile}: no provider API key is configured.",
+            *_key_setup_block(unconfigured_provider_sources(auth), key_urls),
+            "Then run `ficelle refresh` and try again.",
+        ]
+    )
+
+
+def _unkeyed_install_lines(sources: Sequence[str], key_urls: Mapping[str, str]) -> list[str]:
+    """What to print when the run failed because the install has no provider key.
+
+    The pool was never the problem here, and saying it was sends the one user who
+    most needs a key off hunting an outage that does not exist. The catalog loads
+    without credentials, so this is the first moment a fresh install is told.
+    """
+    return [
+        "No request was sent: no provider API key is configured.",
+        *_key_setup_block(sources, key_urls),
+        "`ficelle doctor --text` reports which providers are configured.",
+    ]
+
+
+def render_failover_demo(
+    result: FailoverDemoResult,
+    *,
+    answer_limit: int = 220,
+    key_urls: Mapping[str, str] | None = None,
+) -> str:
     """The human-readable trace. This is the demo's actual product.
 
     Reads top to bottom as a story with one line per attempt, because it is meant to
     be watched in a terminal recording, and the simulated attempt is labelled on its
     own line rather than in a footnote nobody reads.
+
+    ``key_urls`` is the caller's key-acquisition registry (``PROVIDER_KEY_URLS``),
+    used only to point an unconfigured install at the page where a key is created.
     """
     lines = [
         f"Ficelle failover demo · profile {result.profile}",
@@ -246,6 +340,10 @@ def render_failover_demo(result: FailoverDemoResult, *, answer_limit: int = 220)
             lines.append("     (fabricated by the demo; no request was sent to this provider)")
         elif attempt.succeeded:
             lines.append(f"{label} — answered, HTTP {attempt.status}{_format_latency(attempt.latency_seconds)}")
+        elif attempt.credentials_unavailable:
+            # "failed, HTTP exception → unavailable" reads as a broken provider. Nothing
+            # left the machine: the candidate was skipped for want of a key.
+            lines.append(f"{label} — not called: no API key configured for {attempt.source}")
         else:
             lines.append(
                 f"{label} — failed, HTTP {attempt.status} → {attempt.reason}"
@@ -265,6 +363,8 @@ def render_failover_demo(result: FailoverDemoResult, *, answer_limit: int = 220)
                 "That is the whole product: the model you were about to use went down, "
                 "and the request still came back."
             )
+    elif result.unkeyed_sources:
+        lines.extend(_unkeyed_install_lines(result.unkeyed_sources, key_urls or {}))
     else:
         lines.append(
             f"No candidate answered after {len(result.attempts)} attempt(s). "
@@ -287,6 +387,10 @@ def failover_demo_payload(result: FailoverDemoResult) -> dict[str, Any]:
         "answered_by": answered_by.model if answered_by is not None else None,
         "answer": result.answer,
         "duration_seconds": round(result.duration_seconds, 3),
+        # A `--json` consumer diagnosing a silent install needs the same distinction the
+        # rendered trace makes: nothing answered because nothing was configured, versus
+        # nothing answered because the pool is down.
+        "unkeyed_sources": result.unkeyed_sources,
         "upstream_cost": result.upstream_cost,
         "paid_fallback_allowed": result.paid_fallback_allowed,
         "all_candidates_free": result.all_candidates_free,
@@ -298,6 +402,7 @@ def failover_demo_payload(result: FailoverDemoResult) -> dict[str, Any]:
                 "upstream": attempt.upstream,
                 "status": attempt.status,
                 "reason": attempt.reason,
+                "error_type": attempt.error_type,
                 "latency_seconds": attempt.latency_seconds,
                 "simulated": attempt.simulated,
             }

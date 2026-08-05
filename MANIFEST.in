@@ -1,0 +1,33 @@
+# The sdist ships the installable package and its metadata — nothing else.
+#
+# `docs`, `scripts` and `plugins` used to be recursive-included here, which was harmless while
+# the sdist stayed a local artifact and a disclosure the day it reaches a public index: built
+# from the monorepo, that sdist carried 112 files under `docs/` (the grey-market provider
+# dossiers, the GTM plan, the Pro licensing PRD), `scripts/prepare-public-mirror.py` and
+# `scripts/dev-license-service.py`, plus the Pro-coupled tests. None of it is reachable at
+# runtime — the package only ever mentions those paths in docstrings — so dropping them costs
+# nothing and removes the whole class of leak.
+#
+# None of the patterns below can change the wheel: `[tool.setuptools.package-data]` already
+# matches every file under `src/ficelle/assets`, so builds with and without this file produce
+# the same 95 members. That matters because the installer pins the Core wheel by SHA-256, and
+# these edits therefore leave that digest valid. It is a property of the current patterns, not
+# of the file: `include-package-data` defaults to true under a pyproject config, so a future
+# pattern reaching a file under `src/ficelle/` *would* change the wheel and invalidate the pin.
+# Re-check the digest after any edit that touches the package directory.
+#
+# `scripts/audit-release-artifacts.py` enforces the resulting shape before anything is
+# uploaded, so a re-added pattern fails the publish rather than shipping.
+include CHANGELOG.md
+include LICENSE
+include README.md
+recursive-include src/ficelle/assets *
+# setuptools adds `tests/` to the sdist on its own, and from the monorepo that set includes
+# every file the public mirror deliberately denylists — `test_pro_licensing.py`,
+# `test_pro_loader.py`, `test_router.py`, `test_provider_adapters.py` — which name the closed
+# pack and the grey-market relays. Pruning keeps the sdist to `src/` plus metadata, a shape
+# the release audit can assert exactly instead of approximately.
+prune tests
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+global-exclude .DS_Store

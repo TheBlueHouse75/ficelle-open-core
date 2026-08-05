@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -17,6 +18,7 @@ from ficelle.install import (
     collect_preflight_checks,
     configure_hermes,
     copy_plugin_tree,
+    doctor_auth_report,
     dedicated_keychain_path,
     ensure_dedicated_keychain,
     ensure_hermes_compression_plugin_enabled,
@@ -263,6 +265,86 @@ def test_run_install_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_path)
         ["/usr/bin/python3", "-m", "pip", "install", "."],
         ["uv", "pip", "install", "--python", "/usr/bin/python3", "."],
     ]
+
+
+def install_with_doctor_auth(monkeypatch, tmp_path, auth, **option_overrides):
+    """Run a generic install whose `doctor --json` smoke check reports `auth`."""
+    monkeypatch.setattr("ficelle.install.run_preflight", lambda options, target=None: None)
+    monkeypatch.setattr("ficelle.install.install_package", lambda options, target=None, runtime_dir=None: None)
+    monkeypatch.setattr("ficelle.install.ensure_dedicated_keychain", lambda options: None)
+
+    def fake_run(command, *, dry_run, env=None):
+        if command[-2:] == ["doctor", "--json"] and auth is not None:
+            return CommandResult(command, 0, stdout=json.dumps({"status": "ok", "auth": auth}))
+        return CommandResult(command, 0)
+
+    monkeypatch.setattr("ficelle.install.run_command", fake_run)
+    options = make_options(
+        tmp_path,
+        target="generic",
+        dry_run=False,
+        skip_package=True,
+        skip_plugin=True,
+        **option_overrides,
+    )
+    assert run_install(options) == 0
+
+
+def test_run_install_tells_an_unkeyed_install_it_cannot_serve_anything(monkeypatch, tmp_path, capsys):
+    """The old closing lines sent a keyless user to `ficelle models`, which passes without a key."""
+    install_with_doctor_auth(
+        monkeypatch,
+        tmp_path,
+        {
+            "openrouter": {"invokable": False, "reason": "missing OPENROUTER_API_KEY"},
+            "nous": {"invokable": False, "reason": "missing NOUS_API_KEY"},
+        },
+    )
+    output = capsys.readouterr().out
+
+    assert "Ficelle setup complete." in output
+    assert "No provider API key is configured, so Ficelle cannot serve a completion yet." in output
+    assert "ficelle set-key openrouter  # create a key at https://openrouter.ai/keys" in output
+    assert "ficelle set-key nous" in output
+    assert "does NOT mean a request can be served" in output
+    # The one instruction that would have taught the user setup worked when it did not.
+    assert "Verify: `ficelle health` and `ficelle models`." not in output
+
+
+def test_run_install_leaves_a_configured_install_alone(monkeypatch, tmp_path, capsys):
+    install_with_doctor_auth(
+        monkeypatch,
+        tmp_path,
+        {
+            "openrouter": {"invokable": True, "reason": "configured", "key_source": "env"},
+            "nous": {"invokable": False, "reason": "missing NOUS_API_KEY"},
+        },
+    )
+    output = capsys.readouterr().out
+
+    assert "Verify: `ficelle health` and `ficelle models`." in output
+    assert "ficelle set-key" not in output
+
+
+def test_run_install_says_nothing_about_keys_when_it_could_not_read_them(monkeypatch, tmp_path, capsys):
+    """`--skip-smoke` leaves no credential report; a guess here would be a false alarm."""
+    install_with_doctor_auth(monkeypatch, tmp_path, None, skip_smoke=True)
+    output = capsys.readouterr().out
+
+    assert "Verify: `ficelle health` and `ficelle models`." in output
+    assert "ficelle set-key" not in output
+
+
+def test_doctor_auth_report_reads_the_block_and_refuses_to_guess(tmp_path):
+    payload = json.dumps({"status": "ok", "auth": {"nous": {"invokable": True}}})
+
+    assert doctor_auth_report(payload) == {"nous": {"invokable": True}}
+    # Setup echoes other lines around the smoke checks; the JSON still has to be found.
+    assert doctor_auth_report(f"legacy runtime detected\n{payload}\n") == {"nous": {"invokable": True}}
+    assert doctor_auth_report("") is None
+    assert doctor_auth_report("not json at all") is None
+    assert doctor_auth_report('{"status": "ok"}') is None
+    assert doctor_auth_report('{"auth": "not a mapping"}') is None
 
 
 def test_ensure_dedicated_keychain_creates_and_hardens_on_darwin(monkeypatch, tmp_path):

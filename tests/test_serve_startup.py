@@ -86,15 +86,22 @@ def test_serve_binds_before_catalog_warm(monkeypatch):
 
 
 def test_catalog_refresh_loop_keeps_catalog_fresh(monkeypatch):
-    """The catalog refresh daemon warms once, then force-refreshes well within the TTL,
-    so an idle instance never lets the catalog go stale — which admin_status would
-    otherwise report as a false '0 models / fail'. Regression for the long-idle-instance
-    degradation that previously required a manual restart to clear."""
+    """The catalog refresh daemon warms once, then refreshes well within the TTL, so an idle
+    instance never lets the catalog go stale — which admin_status would otherwise report as a
+    false '0 models / fail'. Regression for the long-idle-instance degradation that previously
+    required a manual restart to clear.
+
+    The periodic pass goes through `refresh_catalog`, not a forced `load_or_refresh_catalog`:
+    both rebuild and publish the same catalog, but only that one prunes ids their provider
+    stopped listing. Wiring the prune to the explicit paths alone left retired models sitting
+    in a user's order until they happened to click Refresh."""
     from ficelle import router
 
     calls: list = []
     monkeypatch.setattr(router, "refresh_capability_oracle_if_stale", lambda config: calls.append(("oracle", None)))
-    monkeypatch.setattr(router, "load_or_refresh_catalog", lambda config, force=False: calls.append(("refresh", force)))
+    monkeypatch.setattr(router, "load_or_refresh_catalog", lambda config, force=False: calls.append(("warm", force)))
+    monkeypatch.setattr(router, "refresh_catalog", lambda config: calls.append(("refresh", True)))
+    monkeypatch.setattr(router, "refresh_provider_budgets", lambda config: None)
 
     sleeps: list = []
 
@@ -113,10 +120,11 @@ def test_catalog_refresh_loop_keeps_catalog_fresh(monkeypatch):
     except _StopLoop:
         pass
 
-    refreshes = [call for call in calls if call[0] == "refresh"]
-    # Warmed once on startup (no force), then forced at least one periodic refresh.
-    assert refreshes[0] == ("refresh", False)
-    assert ("refresh", True) in refreshes
+    # Warmed once on startup from the cache, then at least one full periodic refresh.
+    assert ("warm", False) in calls
+    assert ("refresh", True) in calls
+    # The warm reads the cache and must not prune off a catalog it did not fetch.
+    assert calls.index(("warm", False)) < calls.index(("refresh", True))
     # Refreshes strictly more often than the TTL, so the catalog never crosses it.
     assert sleeps and all(interval < 3600 for interval in sleeps)
 

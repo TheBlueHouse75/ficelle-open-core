@@ -10,6 +10,17 @@ from ficelle.providers.base import ProviderAccess
 ProviderAccessResult = Callable[[str, dict[str, Any]], ProviderAccess]
 
 
+class ProviderCredentialsUnavailable(RuntimeError):
+    """No usable credential for a provider: the request was never sent upstream.
+
+    A named class rather than a bare ``RuntimeError`` because an attempt record keeps
+    the exception's *class name* (``error_type``) and drops its message, so this is the
+    only signal a downstream reader — the failover demo — can key on without
+    string-matching prose that a later edit would silently invalidate. It stays a
+    ``RuntimeError`` subclass so every existing handler keeps catching it.
+    """
+
+
 class ProviderSecretStore(Protocol):
     label: str
 

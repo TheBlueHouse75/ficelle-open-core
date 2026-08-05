@@ -57,7 +57,7 @@ Install the versioned open Core from its GitHub Release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.7/scripts/bootstrap-ficelle.py | python3 -
-~/.local/bin/ficelle models
+~/.local/bin/ficelle doctor --text
 ```
 
 The installer uses an isolated runtime and auto-detects Hermes; Ficelle remains fully
@@ -72,14 +72,31 @@ key in shell history, enter it silently before running the same command:
 )
 ```
 
-Point your client at `http://127.0.0.1:8646/v1`, configure a provider key (e.g.
-`OPENROUTER_API_KEY`), and check the router:
+### Add a provider key — nothing routes without one
+
+Ficelle routes with **your** provider accounts and ships no keys of its own, so a
+fresh install cannot serve a single completion until you store one. It prompts for
+the key with hidden input and keeps it out of your shell history:
 
 ```bash
-ficelle doctor --json
+ficelle set-key openrouter   # create a key at https://openrouter.ai/keys
+ficelle set-key nous         # create a key at https://portal.nousresearch.com/
+```
+
+One is enough; Ficelle fails over across whichever providers you have configured.
+Keys stay on your machine, in your OS secret store or `~/.ficelle/.env`.
+
+`ficelle models` reads the providers' public catalogs, which they serve without
+credentials — so a long model list does **not** mean a request can be served.
+`ficelle doctor --text` reports which providers are actually configured:
+
+```bash
+ficelle doctor --text
 ficelle health
 curl -s http://127.0.0.1:8646/admin/status.json | python3 -m json.tool
 ```
+
+Point your client at `http://127.0.0.1:8646/v1`.
 
 The local endpoint works with the OpenAI client without a hosted Ficelle account:
 

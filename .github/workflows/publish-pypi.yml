@@ -1,0 +1,165 @@
+# Publishes the open Core to PyPI through trusted publishing (OIDC), so no API token is stored
+# anywhere. PyPI mints a short-lived credential for this exact repository, workflow file and
+# environment; a fork, a branch or a renamed file gets nothing.
+#
+# It uploads the artifacts **attached to the GitHub Release**, and never rebuilds them. Wheels
+# are not reproducible here (setuptools stamps file mtimes into the zip), so a rebuild would
+# produce a different digest than the one `bootstrap-ficelle.py` pins — PyPI and the bootstrap
+# would then serve two different wheels for the same version. Publishing the release asset
+# keeps one artifact, one digest, three channels.
+#
+# PyPI never replaces the bootstrap path: the pinned-and-verified install stays the default.
+name: publish-pypi
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v0.1.7"
+        required: true
+        type: string
+      index:
+        description: "Index to publish to"
+        required: true
+        default: testpypi
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    # The private monorepo shares this workflow file through the mirror assembler, so pin the
+    # job to the public repository. Nothing else may ever upload under this project name.
+    if: github.repository == 'TheBlueHouse75/ficelle-open-core'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.pin.outputs.version }}
+    steps:
+      - name: Resolve the release tag
+        id: tag
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          test -n "$TAG" || { echo "::error::no release tag to publish"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Read the pinned Core version
+        id: pin
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          VERSION=$(sed -n 's/^CORE_VERSION = "\(.*\)"$/\1/p' scripts/bootstrap-ficelle.py)
+          test -n "$VERSION" || { echo "::error::no CORE_VERSION in scripts/bootstrap-ficelle.py"; exit 1; }
+          # A tag that disagrees with the pin means the bump script was not run before tagging,
+          # and the digest recorded in the installer belongs to another build.
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG does not match CORE_VERSION $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download every asset attached to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          mkdir -p staging
+          # No --pattern on purpose: an asset that should not be there must fail the audit
+          # loudly, not be filtered out and go unnoticed until the next release.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir staging
+          ls -l staging
+
+      - name: Audit the artifacts
+        run: python scripts/audit-release-artifacts.py staging
+
+      - name: Stage only the audited artifacts
+        env:
+          VERSION: ${{ steps.pin.outputs.version }}
+        run: |
+          mkdir -p dist
+          # Copied by exact name rather than by glob: the audit has already proved these two
+          # filenames are the only distributions present, so nothing else can ride along.
+          cp "staging/ficelle_router-$VERSION-py3-none-any.whl" dist/
+          cp "staging/ficelle_router-$VERSION.tar.gz" dist/
+          ls -l dist
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # `twine check --strict` renders the long description the way PyPI does. It is the only
+      # way to learn *before* publishing that the project page would come out broken, and the
+      # page cannot be fixed without cutting a new version.
+      - name: Check the rendered project page
+        run: |
+          python -m pip install --disable-pip-version-check --quiet twine
+          python -m twine check --strict dist/*
+
+      - name: Upload the audited artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ficelle-router-${{ steps.pin.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+  testpypi:
+    needs: audit
+    if: inputs.index == 'testpypi'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/ficelle-router
+    permissions:
+      # The OIDC token PyPI exchanges for an upload credential. No secret is stored.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ficelle-router-${{ needs.audit.outputs.version }}
+          path: dist
+      # `release/v1` rather than a commit SHA: PyPA maintains this branch as the supported
+      # reference for this action specifically, so security fixes to the upload path land
+      # without a manual bump. Pinning the SHA instead is a defensible trade — it costs a
+      # manual bump per fix — but do it in both jobs at once or they publish differently.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          print-hash: true
+
+  pypi:
+    needs: audit
+    if: github.event_name == 'release' || inputs.index == 'pypi'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/ficelle-router
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ficelle-router-${{ needs.audit.outputs.version }}
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true

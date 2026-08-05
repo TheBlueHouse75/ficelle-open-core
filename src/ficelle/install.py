@@ -13,10 +13,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
-from typing import Callable, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from ficelle.runtime_paths import FICELLE_CREDENTIAL_FILENAMES, RuntimePaths
 from ficelle.service import active_home_pointer_path, persist_active_service_context
+from ficelle.use_cases.provider_auth import (
+    invokable_provider_sources,
+    provider_key_setup_commands,
+    unconfigured_provider_sources,
+)
 
 MANAGED_CONFIG_BEGIN = "# BEGIN FICELLE MANAGED CONFIG"
 MANAGED_CONFIG_END = "# END FICELLE MANAGED CONFIG"
@@ -1007,6 +1012,59 @@ def configure_hermes(options: InstallOptions) -> None:
     print(f"Hermes config Ficelle block updated: {config_path}")
 
 
+def doctor_auth_report(stdout: str) -> dict[str, Any] | None:
+    """The `auth` block of a `ficelle doctor --json` run, or ``None`` when unreadable.
+
+    Read from the smoke check that already ran rather than from an import of the
+    router: setup drives the *installed* interpreter (`--python` need not be the one
+    running this file), so its answer is the only one that describes the install the
+    user is about to use. ``None`` means "not known" — a dry run, `--skip-smoke`, or
+    output this cannot parse — and callers must then say nothing rather than guess.
+    """
+    text = str(stdout or "")
+    try:
+        # Setup narrates its own steps around the smoke checks, so the report is found
+        # from its first brace rather than assumed to start at the first byte.
+        payload = json.loads(text[text.index("{"):])
+    except ValueError:  # no brace at all, or a body that is not JSON
+        return None
+    auth = payload.get("auth") if isinstance(payload, dict) else None
+    return auth if isinstance(auth, dict) else None
+
+
+def first_run_provider_key_notice(auth: dict[str, Any] | None) -> list[str]:
+    """The closing block for an install that cannot serve a request yet.
+
+    Empty when a provider is configured — a working install must not be nagged — and
+    empty when credentials could not be read at all, since a false alarm here would
+    send a configured user hunting a problem they do not have.
+    """
+    if auth is None or invokable_provider_sources(auth):
+        return []
+    # Imported here, not at module scope: the registry lives in router.py beside the
+    # provider definitions, and router pulls in the HTTP stack that a source-checkout
+    # bootstrap has not necessarily installed at the time this module is imported.
+    try:
+        from ficelle.router import PROVIDER_KEY_URLS
+    except Exception:  # noqa: BLE001 - the advice is worth printing without its links
+        PROVIDER_KEY_URLS = {}
+    return [
+        "",
+        "No provider API key is configured, so Ficelle cannot serve a completion yet.",
+        "Ficelle routes through your own provider accounts and ships no keys of its own.",
+        "Create a key, then store it (input is hidden and never reaches shell history):",
+        "",
+        *(
+            f"  {line}"
+            for line in provider_key_setup_commands(unconfigured_provider_sources(auth), PROVIDER_KEY_URLS)
+        ),
+        "",
+        "`ficelle models` lists the providers' public catalogs, which they serve without",
+        "credentials — a populated model list does NOT mean a request can be served.",
+        "`ficelle doctor --text` reports which providers are actually configured.",
+    ]
+
+
 def run_install(options: InstallOptions) -> int:
     if options.rollback:
         if options.target != "hermes":
@@ -1052,8 +1110,11 @@ def run_install(options: InstallOptions) -> int:
     if target == "hermes" and options.configure_hermes:
         configure_hermes(options)
 
+    provider_auth: dict[str, Any] | None = None
     if not options.skip_smoke:
-        ensure_success(run_command([options.python, "-m", "ficelle.cli", "doctor", "--json"], dry_run=options.dry_run, env=env))
+        doctor_result = run_command([options.python, "-m", "ficelle.cli", "doctor", "--json"], dry_run=options.dry_run, env=env)
+        ensure_success(doctor_result)
+        provider_auth = doctor_auth_report(doctor_result.stdout)
         ensure_success(run_command([options.python, "-m", "ficelle.cli", "health"], dry_run=options.dry_run, env=env))
         ensure_success(run_command([options.python, "-m", "ficelle.cli", "models"], dry_run=options.dry_run, env=env))
 
@@ -1067,6 +1128,8 @@ def run_install(options: InstallOptions) -> int:
         ):
             raise SystemExit("Ficelle setup could not persist the selected --ficelle-home.")
 
+    key_notice = first_run_provider_key_notice(provider_auth)
+
     print("Ficelle setup complete.")
     if target == "hermes":
         if options.configure_hermes:
@@ -1077,13 +1140,19 @@ def run_install(options: InstallOptions) -> int:
         print("Do not make Ficelle the main Hermes model until dogfood/canaries stay green.")
     else:
         print("Local OpenAI-compatible base URL: http://127.0.0.1:8646/v1")
-        print("Verify: `ficelle health` and `ficelle models`.")
+        # `ficelle models` answers from the public catalogs, which the reference providers
+        # serve without credentials — so pointing an unconfigured install at it as its
+        # verification step is what teaches the user that setup worked when it did not.
+        if not key_notice:
+            print("Verify: `ficelle health` and `ficelle models`.")
         print(
             "OpenAI client: `OpenAI(base_url=\"http://127.0.0.1:8646/v1\", "
             "api_key=\"ficelle-local\")`."
         )
         if target == "openclaw":
             print("OpenClaw target is experimental; merge `/admin/export/openclaw` into OpenClaw manually.")
+    for line in key_notice:
+        print(line)
     return 0
 
 
