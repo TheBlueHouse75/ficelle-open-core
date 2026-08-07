@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from ficelle.failures import (
+    ACCOUNT_RATE_LIMIT_TEXT_MARKERS,
     BENCHMARK_ROUTE_BLOCKING_REASONS,
     CALLER_CAUSED_FAILURE_REASONS,
     FALSE_FREE_PAYMENT_DEMAND_MARKERS,
@@ -136,6 +137,56 @@ def test_saturated_model_pool_is_model_scoped_not_a_provider_outage():
     # No provider error either: the provider card must not read "last error: rate limited" for an
     # account that is answering fine on every other model.
     assert policy.record_provider_error is False
+
+
+def test_a_403_naming_a_model_that_must_be_switched_on_does_not_cool_the_provider():
+    """A per-model entitlement is not a rejected key, and must not bench a working account.
+
+    Observed live on Mistral: discovery probed `labs-leanstral-1-5`, got 403, and `401/403 ->
+    auth_or_credit` cooled ALL of Mistral for an hour — while `/v1/models` answered 200 on the same
+    key and `mistral-large-latest` was serving. The probe returned when the hour expired and did it
+    again; the state file carries the same failure on three Labs ids, dated 04/08 and 07/08.
+
+    Same fail-closed shape as the 429 branch above: the marker alone must not disarm the
+    provider-wide guard, because a dead key also returns 403. The discriminator is that a dead key
+    never names a model.
+    """
+    labs = (
+        '{"object":"error","message":"Model labs-leanstral-2603 is a Labs model. To use Labs models, '
+        'an admin must enable them in your organization settings at https://admin.mistral.ai/"}'
+    )
+    model_id = "labs-leanstral-2603"
+    assert classify_failure(403, labs, upstream_model_id=model_id) == "model_not_found"
+
+    # The three ways it must stay provider-scoped.
+    assert classify_failure(403, labs) == "auth_or_credit"                              # no id proven
+    assert classify_failure(403, labs, upstream_model_id="other-model") == "auth_or_credit"
+    assert classify_failure(403, '{"message":"Unauthorized"}', upstream_model_id=model_id) == "auth_or_credit"
+
+    # Real-world 403s that name a model AND read like an entitlement, but are account-wide. Every
+    # one of these came from attacking the branch: the region case actually got through an earlier
+    # version, which would have quarantined one model while leaving a provider that fails every
+    # request uncooled — the expensive direction to be wrong in.
+    for body in (
+        "Access denied for gpt-4o-mini: your API key has been revoked",
+        "You do not have access to gpt-4o-mini from your region",
+        "gpt-4o-mini: your account is suspended and not enabled",
+        "Your organization must be enabled to use gpt-4o-mini",
+        "Your account is not enabled for gpt-4o-mini",
+        "You are not authorized to use gpt-4o-mini",
+    ):
+        assert classify_failure(403, body, upstream_model_id="gpt-4o-mini") == "auth_or_credit", body
+    # 401 is never a per-model verdict: nothing about a key is model-scoped.
+    assert classify_failure(401, labs, upstream_model_id=model_id) == "auth_or_credit"
+
+    # The account-scope guard of the 429 branch is deliberately NOT reused here: this very message
+    # trips it while meaning the opposite — "organization" locates the switch, not the fault. Read
+    # off the real constant so a later tidy-up that "unifies" the two branches turns this red.
+    assert any(marker in labs.lower() for marker in ACCOUNT_RATE_LIMIT_TEXT_MARKERS)
+
+    # The remedy — quarantine, no provider error, no model cooldown, so the hourly re-probe stops —
+    # is owned by test_hard_quarantine_policies_skip_recoverable_cooldowns, which pins all of it
+    # for this reason. Not restated here.
 
 
 def test_quota_exhausted_policy_sets_recoverable_quota_cooldown_only():

@@ -154,6 +154,10 @@ UPSTREAM_RATE_LIMIT_TEXT_MARKERS = (
 # Stronger account-scope signals win over the upstream-pool wording. Some first-party providers name
 # both the model and the organization/API key whose RPM budget was consumed; the model id alone must
 # not weaken that provider-wide protection.
+# Account-scope evidence *for a rate limit only*. These words are not a general scope signal:
+# a 403 saying "an admin must enable them in your organization settings" is model-scoped and
+# carries "organization" as a location, not as the thing at fault. The 403 branch deliberately
+# does not consult this tuple — see it for why.
 ACCOUNT_RATE_LIMIT_TEXT_MARKERS = (
     "account",
     "organization",
@@ -170,6 +174,38 @@ MODEL_NOT_FOUND_TEXT_MARKERS = (
     "unknown model",
     "model_not_found",
     "gone",
+)
+
+# The other half of "not serveable": the id IS deployed, but this account may not call it — a
+# preview/Labs tier an admin has to switch on. Mistral says "Model <id> is a Labs model. To use
+# Labs models, an admin must enable them in your organization settings". Deliberately narrow
+# phrasings: they must not fire on a plain dead-key body, which is what the fail-closed default
+# below still has to catch.
+# Words that place a 403 at the ACCOUNT level even when the body names a model: a region block, a
+# revoked key, a billing switch. Found by attacking the branch below with real-world 403 bodies —
+# "You do not have access to <model> from your region" satisfied both of its other conditions and
+# would have quarantined one model while leaving a provider that fails every request uncooled.
+# Distinct from ACCOUNT_RATE_LIMIT_TEXT_MARKERS, which is 429-only and would misfire here.
+ACCOUNT_SCOPE_403_MARKERS = (
+    "region",
+    "country",
+    "billing",
+    "revoked",
+    "suspended",
+    "api key",
+)
+
+MODEL_NOT_ENTITLED_TEXT_MARKERS = (
+    "must enable",
+    "request access",
+)
+
+# What "not serveable" means, in one place. Three readers used to carry their own copy of this
+# sentence and the widening from 404/410-only reached two of them, leaving a 502 body and a
+# quarantine note describing a status the failure never had.
+MODEL_NOT_SERVEABLE_NOTE = (
+    "the provider will not serve this model id to this account — a 404/410 (listed in its catalog "
+    "but not deployed), or a 403 naming it as a tier an admin has to switch on"
 )
 
 # A provider that wraps its rejection in an HTTP 200 payload puts the status in `error.code` or
@@ -279,6 +315,7 @@ class FailureMarkers:
     quota_exhausted: tuple[str, ...] = QUOTA_EXHAUSTED_TEXT_MARKERS
     free_tier_zero_allocation: tuple[str, ...] = FREE_TIER_ZERO_ALLOCATION_MARKERS
     model_not_found: tuple[str, ...] = MODEL_NOT_FOUND_TEXT_MARKERS
+    model_not_entitled: tuple[str, ...] = MODEL_NOT_ENTITLED_TEXT_MARKERS
     upstream_rate_limit: tuple[str, ...] = UPSTREAM_RATE_LIMIT_TEXT_MARKERS
 
     def with_extra(
@@ -288,6 +325,7 @@ class FailureMarkers:
         quota_exhausted: tuple[str, ...] = (),
         free_tier_zero_allocation: tuple[str, ...] = (),
         model_not_found: tuple[str, ...] = (),
+        model_not_entitled: tuple[str, ...] = (),
         upstream_rate_limit: tuple[str, ...] = (),
     ) -> "FailureMarkers":
         return FailureMarkers(
@@ -299,6 +337,7 @@ class FailureMarkers:
             quota_exhausted=self.quota_exhausted + quota_exhausted,
             free_tier_zero_allocation=self.free_tier_zero_allocation + free_tier_zero_allocation,
             model_not_found=self.model_not_found + model_not_found,
+            model_not_entitled=self.model_not_entitled + model_not_entitled,
             upstream_rate_limit=self.upstream_rate_limit + upstream_rate_limit,
         )
 
@@ -444,7 +483,7 @@ def cooldown_policy_for_reason(reason: str, *, source: str = "") -> CooldownPoli
             quarantine=CooldownQuarantinePolicy(
                 reason="model_not_found",
                 source="model_not_found_guard",
-                fallback_note="runtime reported 404/410 for this model id (catalog entry not deployed for this account)",
+                fallback_note=f"runtime reported that {MODEL_NOT_SERVEABLE_NOTE}",
             ),
             model_cooldown=False,
         )
@@ -477,6 +516,19 @@ def cooldown_policy_for_reason(reason: str, *, source: str = "") -> CooldownPoli
             ),
         )
     return CooldownPolicy(record_provider_error=False)
+
+
+def _body_names_our_model(lower_without_urls: str, upstream_model_id: str | None) -> bool:
+    """Does the upstream's own text name the exact model we asked for?
+
+    The evidence every model-scoped verdict rests on: a provider-wide failure — a dead key, an
+    account out of credit — describes the account, never one id. Both callers are fail-closed on
+    it, in opposite directions (an over-match leaves a dead provider uncooled on the 429 path, and
+    quarantines a healthy model on the 403 path), so the rule lives here once rather than in two
+    copies that can drift apart. The four-character floor keeps a short id from matching prose.
+    """
+    normalized = str(upstream_model_id or "").strip().lower()
+    return len(normalized) >= 4 and normalized in lower_without_urls
 
 
 def classify_failure(
@@ -528,8 +580,7 @@ def classify_failure(
         # The marker alone is not enough: an account/provider-level message may also mention an
         # upstream limit. Fail closed to the provider-scoped policy unless the body names the exact
         # model Ficelle called.
-        normalized_model_id = str(upstream_model_id or "").strip().lower()
-        names_model = len(normalized_model_id) >= 4 and normalized_model_id in lower_without_urls
+        names_model = _body_names_our_model(lower_without_urls, upstream_model_id)
         names_account_scope = any(marker in lower_without_urls for marker in ACCOUNT_RATE_LIMIT_TEXT_MARKERS)
         if (
             names_model
@@ -558,6 +609,30 @@ def classify_failure(
     false_free = marker_set.false_free_payment_demand if quotes_caller_request else marker_set.false_free
     if status_code == 402 or named_status == 402 or false_free_pattern(false_free).search(lower_without_urls):
         return "billing_or_paid"
+    if status_code == 403:
+        # A 403 that names the model Ficelle asked for AND says it has to be switched on is a
+        # per-MODEL entitlement, not a rejected key: every sibling keeps answering, so cooling the
+        # provider benches a working account. Observed on Mistral, whose Labs tier 403s three ids
+        # while `/v1/models` and `mistral-large-latest` answer 200 on the same key — each probe
+        # cooled all of Mistral for an hour, and the probe came back an hour later.
+        #
+        # Fail-closed on three conditions, the same shape the 429 branch uses, and each one earns
+        # its place: a dead key returns 403 too and the marker alone would read it as one bad model
+        # (a dead key never names a model), while a region block manages both — it names the model
+        # *and* reads like an entitlement, which is how an earlier two-condition version let one
+        # through. That branch's account-scope constant is NOT reused: its markers include
+        # "organization", which this very message carries while meaning the opposite ("enable them
+        # in your organization settings" locates the switch, not the fault).
+        names_model = _body_names_our_model(lower_without_urls, upstream_model_id)
+        names_account_scope = any(marker in lower_without_urls for marker in ACCOUNT_SCOPE_403_MARKERS)
+        if (
+            names_model
+            and not names_account_scope
+            and any(marker in lower_without_urls for marker in marker_set.model_not_entitled)
+        ):
+            # `model_not_found` is the policy for "this id is not serveable to us", which is what
+            # this is — it quarantines rather than cooling, so the hourly re-probe stops too.
+            return "model_not_found"
     if status_code in {401, 403}:
         return "auth_or_credit"
     if status_code in {404, 410} and any(marker in lower for marker in marker_set.model_not_found):
@@ -616,7 +691,11 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
     if reason_counts.get("no_free_quota"):
         actions.append("Provider reported a zero free-tier allocation (limit: 0) for this model; it is quarantined and will stop being proposed. Use a free-tier model or upgrade the account.")
     if reason_counts.get("model_not_found"):
-        actions.append("Provider returned 404/410 for this model id (listed in the catalog but not deployed for this account); it is quarantined and will stop being benchmarked. Clear the quarantine to retry if the provider deploys it later.")
+        actions.append(
+            f"Not serveable: {MODEL_NOT_SERVEABLE_NOTE}. It is quarantined and will stop being "
+            "benchmarked. Clear the quarantine to retry once the provider deploys it, or once an "
+            "admin enables the tier."
+        )
     if reason_counts.get("server_error"):
         actions.append("Retry after the short model cooldown or quarantine the unstable upstream.")
     if reason_counts.get("timeout"):

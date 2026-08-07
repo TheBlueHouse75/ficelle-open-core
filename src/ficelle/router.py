@@ -8804,7 +8804,12 @@ class RouterHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        # `charset=utf-8` is not optional here even though JSON is UTF-8 by definition:
+        # `ensure_ascii=False` above puts raw multi-byte characters on the wire, and the
+        # `nosniff` header below forbids the browser from working the encoding out for
+        # itself. Without the declaration a browser opening one of these URLs falls back to
+        # a legacy 8-bit encoding and renders the em dash in the 404 hint as `â€"`.
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         # Admin JSON carries provider-controlled strings (model ids, upstream error text); refusing
         # content sniffing keeps a browser from ever reading one of these bodies as HTML.
         self.send_header("X-Content-Type-Options", "nosniff")

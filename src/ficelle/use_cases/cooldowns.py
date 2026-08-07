@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ficelle.failures import CALLER_CAUSED_FAILURE_REASONS, CooldownPolicy
+from ficelle.failures import CALLER_CAUSED_FAILURE_REASONS, MODEL_NOT_SERVEABLE_NOTE, CooldownPolicy
 
 
 StateMutator = Callable[[dict[str, Any]], dict[str, Any] | None]
@@ -255,7 +255,7 @@ def set_model_not_found_quarantine_in_state(
         "model_not_found",
         detail,
         source,
-        fallback_note or "provider returned 404/410 for this model id (listed in the catalog but not deployed for this account)",
+        fallback_note or f"provider reported that {MODEL_NOT_SERVEABLE_NOTE}",
         ports=ports,
     )
 
