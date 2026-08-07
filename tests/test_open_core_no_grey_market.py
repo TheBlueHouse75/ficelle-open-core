@@ -20,6 +20,11 @@ import pytest
 
 CORE_ROOT = Path(__file__).resolve().parents[1] / "src" / "ficelle"
 
+# Scan every text asset, not just code: marks (.svg), docs (.md) and config can leak too.
+# The mirror assembler runs the same scan with the pack present and must cover the same
+# suffixes; a module constant rather than a local so that parity can be asserted.
+TEXT_SUFFIXES = {".py", ".json", ".md", ".svg", ".txt", ".toml", ".cfg", ".yaml", ".yml", ".js", ".html", ".css"}
+
 try:
     from ficelle_pro.provider_pack import GREY_MARKET_IDENTIFIERS
 except ImportError:
@@ -30,11 +35,9 @@ def test_open_core_has_no_grey_market_identifiers() -> None:
     if not GREY_MARKET_IDENTIFIERS:
         pytest.skip("ficelle_pro absent (core-only / public mirror) — the closed pack owns the forbidden list")
     forbidden = re.compile("|".join(re.escape(name) for name in GREY_MARKET_IDENTIFIERS), re.IGNORECASE)
-    # Scan every text asset, not just code: marks (.svg), docs (.md) and config can leak too.
-    text_suffixes = {".py", ".json", ".md", ".svg", ".txt", ".toml", ".cfg", ".yaml", ".yml", ".js", ".html", ".css"}
     offenders: list[str] = []
     for path in sorted(CORE_ROOT.rglob("*")):
-        if not path.is_file() or path.suffix not in text_suffixes:
+        if not path.is_file() or path.suffix not in TEXT_SUFFIXES:
             continue
         for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
             if forbidden.search(line):

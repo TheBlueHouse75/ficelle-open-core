@@ -96,6 +96,7 @@ def test_fusion_admin_status_filters_and_redacts_last_run_metadata():
 
 def test_admin_state_builder_assembles_operator_payload_and_runs_quota_probe():
     calls: list[str] = []
+    stale_row_states: list[dict] = []
     catalog = {"models": [{"id": "m1", "invokable": True}]}
     state = {"last_routes": {"ficelle/auto-fast": {"status": "ok"}}}
 
@@ -115,7 +116,8 @@ def test_admin_state_builder_assembles_operator_payload_and_runs_quota_probe():
             fusion_payload=lambda _config, _state: {"config": {"enabled": False}},
             router_settings_payload=lambda _config: {"config": {"max_attempts_per_request": 3}},
             redact_runtime_state=lambda source: {"last_routes": source.get("last_routes", {})},
-            stale_profile_model_rows=lambda _config, _catalog: [
+            stale_profile_model_rows=lambda _config, _catalog, row_state: stale_row_states.append(row_state)
+            or [
                 {
                     "profile_id": "ficelle/auto-fast",
                     "model_id": "ficelle/openrouter/retired",
@@ -149,6 +151,9 @@ def test_admin_state_builder_assembles_operator_payload_and_runs_quota_probe():
             "disposition": "retired",
         }
     ]
+    # The un-redacted runtime state, not the payload's redacted copy: the previous refresh's
+    # per-provider counts live there, and they are what separates "retired" from "cannot tell".
+    assert stale_row_states == [state]
     assert payload["profiles"]["ficelle/auto-fast"]["selected_model"] == "m1"
     assert payload["performance_history"] == {"ficelle/auto-fast": []}
     assert payload["compression"] == {"health_digest": "ok"}

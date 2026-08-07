@@ -571,7 +571,7 @@ def test_benchmark_runner_falls_back_to_next_candidate_after_semantic_failure():
         record_benchmark_result=lambda _profile_id, model, result: events.append(
             ("result", model["id"], result["status"])
         ),
-        record_success=lambda model, _latency: events.append(("success", model["id"], None)),
+        record_success=lambda model, _latency, **_kwargs: events.append(("success", model["id"], None)),
         record_verified_capability=lambda _profile_id, model, result: events.append(
             ("verified", model["id"], result["status"])
         ),
@@ -653,7 +653,7 @@ def test_capability_discovery_records_shape_rejection_without_cooldown():
         record_verified_capability=lambda _profile_id, result_model, result: events.append(
             ("verified", result_model["id"], result["status"])
         ),
-        record_success=lambda result_model, _latency: events.append(("success", result_model["id"], None)),
+        record_success=lambda result_model, _latency, **_kwargs: events.append(("success", result_model["id"], None)),
         extract_message_text=lambda payload: payload["choices"][0]["message"]["content"],
         safe_detail=lambda value, *_args: str(value),
         now_iso=lambda: "2026-06-21T00:00:00Z",

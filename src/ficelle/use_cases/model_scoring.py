@@ -30,10 +30,26 @@ class ModelScoreExplanationPorts:
     model_has_any: Callable[[dict[str, Any], str, list[str]], bool]
 
 
+def _safe_float(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if number > 0 else 0.0
+
+
 def success_rate_for_model(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> float:
     record = ((state.get("stats") or {}).get(ports.cooldown_key(model)) or {}) if isinstance(state, dict) else {}
-    successes = ports.safe_int(record.get("successes"), 0)
-    failures = ports.safe_int(record.get("failures"), 0)
+    # Decayed counters when present: cumulative lifetime totals let a model coast on wins from
+    # weeks ago (on this install, half the models last ran 48 days back) or stay punished for
+    # equally old failures. A state written before decay existed has neither field, so fall back
+    # to the lifetime totals rather than scoring it as brand new.
+    if record.get("scored_at") is not None:
+        successes = _safe_float(record.get("scored_successes"))
+        failures = _safe_float(record.get("scored_failures"))
+    else:
+        successes = float(ports.safe_int(record.get("successes"), 0))
+        failures = float(ports.safe_int(record.get("failures"), 0))
     total = successes + failures
     if total <= 0:
         return 0.72

@@ -488,10 +488,15 @@ def test_caller_caused_failures_are_the_only_ones_exempt_from_the_streak():
     malformed request body, or its own mid-stream hangup would let one misbehaving client
     progressively demote every candidate it touches. The failure is still counted in
     `requests`/`failures` and still shown — only the streak is left alone.
+
+    `bad_upstream_contract` is the one member no caller caused: the exemption is there because the
+    turn that fails is the one Ficelle learns the model's trace on, and the next one succeeds.
+    Cooling or demoting a model over it would bench a working candidate for being fixed.
     """
     assert CALLER_CAUSED_FAILURE_REASONS == {
         "truncated_before_content",
         "bad_upstream_request",
+        "bad_upstream_contract",
         "client_disconnected",
     }
     for upstream_fault in ("unavailable", "server_error", "timeout", "empty_assistant_message"):

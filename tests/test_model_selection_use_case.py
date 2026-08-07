@@ -37,6 +37,7 @@ def make_ports(
     *,
     due_keys: list[str] | None = None,
     probe_calls: list[set[str]] | None = None,
+    scheduled_calls: list[set[str]] | None = None,
 ) -> ModelSelectionPorts:
     def fresh_runtime_state() -> dict[str, Any]:
         if len(states) > 1:
@@ -48,11 +49,16 @@ def make_ports(
             probe_calls.append(set(kwargs.get("keys") or set()))
         return {"status": "ok", "probed_count": len(kwargs.get("keys") or set()), "results": []}
 
+    def schedule_quota_probes(_config: dict[str, Any], _catalog: dict[str, Any], **kwargs: Any) -> None:
+        if scheduled_calls is not None:
+            scheduled_calls.append(set(kwargs.get("keys") or set()))
+
     return ModelSelectionPorts(
         load_config=lambda: {},
         fresh_runtime_state=fresh_runtime_state,
         due_quota_probe_keys_for_request=lambda *_args: list(due_keys or []),
         run_due_quota_probes=run_due_quota_probes,
+        schedule_quota_probes=schedule_quota_probes,
         safe_int=lambda value, default: int(value) if value is not None else default,
         apply_verified_capability_ttl=lambda _config: None,
         apply_route_on_capability_reference=lambda _config: None,
@@ -85,6 +91,46 @@ def test_model_selection_runner_runs_limited_due_quota_probes_and_reloads_state(
 
     assert probe_calls == [{"provider:first"}]
     assert [model.id for model in result.candidates] == ["ficelle/openrouter/ok"]
+
+
+def test_model_selection_defers_the_probes_the_inline_limit_drops():
+    # The inline probe is what puts a recovered model back into THIS request's candidate list,
+    # so it stays on the request thread. What used to be lost is everything past the limit: those
+    # keys were dropped and waited for some later request to make them due again. They are now
+    # handed to the background instead, without changing what this request routes to.
+    probe_calls: list[set[str]] = []
+    scheduled_calls: list[set[str]] = []
+    ports = make_ports(
+        [{"stats": {}}, {"stats": {}}],
+        due_keys=["provider:first", "provider:second", "provider:third"],
+        probe_calls=probe_calls,
+        scheduled_calls=scheduled_calls,
+    )
+    runner = ModelSelectionRunner(ports)
+    catalog = {"models": [{"id": "ficelle/openrouter/ok", "source": "openrouter", "upstream_id": "ok", "invokable": True}]}
+
+    runner.select_models_result("ficelle/auto-tools", catalog, {"quota_inline_probe_limit": 1})
+
+    assert probe_calls == [{"provider:first"}]
+    assert scheduled_calls == [{"provider:second", "provider:third"}]
+
+
+def test_model_selection_schedules_nothing_when_every_due_key_ran_inline():
+    probe_calls: list[set[str]] = []
+    scheduled_calls: list[set[str]] = []
+    ports = make_ports(
+        [{"stats": {}}, {"stats": {}}],
+        due_keys=["provider:only"],
+        probe_calls=probe_calls,
+        scheduled_calls=scheduled_calls,
+    )
+    runner = ModelSelectionRunner(ports)
+    catalog = {"models": [{"id": "ficelle/openrouter/ok", "source": "openrouter", "upstream_id": "ok", "invokable": True}]}
+
+    runner.select_models_result("ficelle/auto-tools", catalog, {"quota_inline_probe_limit": 1})
+
+    assert probe_calls == [{"provider:only"}]
+    assert scheduled_calls == []
 
 
 def test_model_selection_from_state_does_not_read_runtime_state_or_probe_quota():

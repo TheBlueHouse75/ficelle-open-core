@@ -10,6 +10,8 @@ from ficelle.use_cases.catalog_refresh import (
     CatalogRefreshRunner,
     StateMutator,
     load_or_refresh_catalog,
+    previous_catalog_baseline,
+    publish_catalog,
     refresh_catalog,
 )
 
@@ -252,6 +254,7 @@ def test_refresh_catalog_persists_catalog_and_refresh_state(tmp_path):
         ),
         virtual_models={"ficelle/auto-fast"},
         catalog_path=tmp_path / "catalog.json",
+        load_json=lambda _path, default: default,
         atomic_write_json=atomic_write_json,
         update_state=update_state,
     )
@@ -264,6 +267,71 @@ def test_refresh_catalog_persists_catalog_and_refresh_state(tmp_path):
         "quota_probe_results": {},
         "quarantine": {},
         "last_catalog_refresh_at": catalog["generated_at"],
+        # No catalog on disk to replace, so there is nothing to check a later listing
+        # against. Recorded as empty rather than skipped — absent and "provider listed
+        # nothing" must not be readable as the same thing.
+        "previous_catalog_provider_raw_counts": {},
+        "catalog_provider_raw_counts": {
+            "generated_at": catalog["generated_at"],
+            "counts": {"fake": 1},
+        },
+    }
+
+
+def test_publish_records_the_sizes_of_the_catalog_it_replaces(tmp_path):
+    """The catalog file is overwritten on every publish; its sizes have to survive it.
+
+    Nothing that runs *between* two refreshes — the dashboard above all — can otherwise
+    tell a provider that dropped a model from one that answered with a truncated list.
+    """
+    state: dict[str, Any] = {}
+    disk: dict[str, Any] = {}
+    path = tmp_path / "catalog.json"
+
+    def update_state(mutator: StateMutator, _reason: str | None = None) -> dict[str, Any]:
+        mutator(state)
+        return state
+
+    def publish(generated_at: str, providers: dict[str, Any]) -> dict[str, Any]:
+        catalog = {"generated_at": generated_at, "providers": providers}
+        publish_catalog(
+            catalog,
+            catalog_path=path,
+            load_json=lambda p, default: disk.get(str(p), default),
+            atomic_write_json=lambda p, data: disk.__setitem__(str(p), data),
+            update_state=update_state,
+        )
+        return catalog
+
+    first = publish("2026-06-21T22:00:00+00:00", {"openrouter": {"raw_count": 400}})
+    assert previous_catalog_baseline(state, first) == {}, "the first publish replaces nothing"
+
+    second = publish("2026-06-21T23:00:00+00:00", {"openrouter": {"raw_count": 100}})
+    assert previous_catalog_baseline(state, second) == {
+        "providers": {"openrouter": {"raw_count": 400}}
+    }
+    # The baseline belongs to one catalog generation and is refused for any other. A publish
+    # writes the catalog file before the state, and readers take no catalog lock, so holding
+    # a catalog the state has not caught up with is a real window — one where a truncated
+    # listing measured against a two-generations-old count looks complete.
+    assert previous_catalog_baseline(state, first) == {}
+
+    # A provider that errored leaves a hole, not a zero: recording 0 would make the next
+    # listing look like a recovery and re-arm every conclusion the guard exists to block.
+    third = publish("2026-06-22T00:00:00+00:00", {"openrouter": {"raw_count": 0, "error": "HTTP 503"}})
+    assert previous_catalog_baseline(state, third) == {
+        "providers": {"openrouter": {"raw_count": 100}}
+    }
+    fourth = publish("2026-06-22T01:00:00+00:00", {"openrouter": {"raw_count": 100}})
+    assert previous_catalog_baseline(state, fourth) == {}
+
+    # The baseline is read off the file being replaced, not carried forward from the last
+    # publish's own state entry, so a wiped state cannot leave a later refresh comparing
+    # against a generation that is quietly two old.
+    state.clear()
+    fifth = publish("2026-06-22T02:00:00+00:00", {"openrouter": {"raw_count": 50}})
+    assert previous_catalog_baseline(state, fifth) == {
+        "providers": {"openrouter": {"raw_count": 100}}
     }
 
 

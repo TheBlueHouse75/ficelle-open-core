@@ -51,7 +51,7 @@ NowIso: TypeAlias = Callable[[], str]
 ApplyConfigRule: TypeAlias = Callable[[dict[str, Any]], None]
 LoadCatalog: TypeAlias = Callable[[dict[str, Any]], dict[str, Any]]
 StaleProfileModelRows: TypeAlias = Callable[
-    [dict[str, Any], dict[str, Any]],
+    [dict[str, Any], dict[str, Any], dict[str, Any]],
     list[dict[str, Any]],
 ]
 RunQuotaProbes: TypeAlias = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
@@ -205,9 +205,11 @@ class AdminStateBuilder:
             "virtual_profiles": profiles,
             # Ids a virtual model still points at that the catalog dropped. Sent even when
             # empty: the dashboard renders those cards from `virtual_profiles`, and without
-            # this it can only say "Unknown model" — not whether the provider is down or the
-            # model is gone for good.
-            "stale_profile_models": self.ports.stale_profile_model_rows(config, catalog),
+            # this it can only say "Unknown model" — not whether the provider is down, the
+            # model is gone for good, or the listing was too incomplete to tell. `state`
+            # carries the previous refresh's per-provider counts, which is what that last
+            # distinction rests on.
+            "stale_profile_models": self.ports.stale_profile_model_rows(config, catalog, state),
             "profiles": status_payload.get("profiles") or {},
             "performance_history": status_payload.get("performance_history") or {},
             "compression": status_payload.get("compression") or {},

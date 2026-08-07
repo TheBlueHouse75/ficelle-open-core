@@ -19,6 +19,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -27,7 +28,7 @@ import uuid
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _StdThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 from urllib.parse import parse_qs, urlparse
@@ -86,13 +87,18 @@ from ficelle.provider_credentials import (
     PROVIDER_ENV_ALIASES,
     PROVIDER_KEY_VALIDATORS,
     PROVIDER_SERVICE_ALIASES,
+    CredentialLocation,
+    CredentialLocationPorts,
     ProviderCredentialsUnavailable,
     generic_provider_credential_aliases,
     generic_provider_credential_activation_fingerprint as generic_provider_credential_activation_fingerprint_use_case,
     is_usable_openrouter_key,
+    legacy_credential_sources as legacy_credential_sources_use_case,
+    provider_credential_locations as provider_credential_locations_use_case,
     provider_primary_service as provider_primary_service_use_case,
+    purge_legacy_credentials as purge_legacy_credentials_use_case,
     remove_provider_key as remove_provider_key_use_case,
-    resolve_provider_credentials,
+    resolve_provider_access,
     store_provider_key as store_provider_key_use_case,
 )
 from ficelle.selection import (
@@ -175,6 +181,7 @@ from ficelle.use_cases.catalog_refresh import (
     CatalogRefreshRunner,
     CatalogRefreshPorts,
     load_or_refresh_catalog as load_or_refresh_catalog_use_case,
+    previous_catalog_baseline,
     publish_catalog as publish_catalog_use_case,
 )
 from ficelle.use_cases.catalog_fingerprint import (
@@ -231,9 +238,12 @@ from ficelle.use_cases.admin_status import (
     safe_quota_cooldown_row as safe_quota_cooldown_row_use_case,
 )
 from ficelle.use_cases.admin_security import (
+    ADMIN_HTML_SECURITY_HEADERS,
+    LOOPBACK_BIND_HOSTS,
     admin_origin_allowed,
     admin_token_matches,
     is_loopback_origin as is_loopback_origin_use_case,
+    request_host_allowed,
 )
 from ficelle.use_cases.cooldowns import (
     CooldownMutationPorts,
@@ -409,7 +419,6 @@ from ficelle.use_cases.model_scoring import (
 )
 from ficelle.use_cases.provider_auth import (
     ProviderAuthPorts,
-    auth_row as auth_row_use_case,
     auth_status as auth_status_use_case,
     provider_auth_row as provider_auth_row_use_case,
 )
@@ -457,6 +466,10 @@ from ficelle.use_cases.router_settings import (
 )
 from ficelle.json_store import atomic_write_json as store_atomic_write_json
 from ficelle.json_store import load_json as store_load_json
+from ficelle.json_store import open_private_append
+from ficelle.json_store import rotate_if_oversized
+from ficelle.json_store import sweep_orphan_temp_files
+from ficelle.json_store import write_private_text
 from ficelle.providers.base import (
     FREE_ACCESS_MODES,
     FREE_ACCESS_SCOPES,
@@ -480,6 +493,12 @@ except ImportError:  # pragma: no cover - core-only install without the closed p
     PROVIDER_PACK_KEY_URLS: dict[str, str] = {}
     PROVIDER_PACK_LABELS: dict[str, str] = {}
 from ficelle.providers.registry import provider_catalog_adapter
+from ficelle.reasoning_replay import (
+    ReasoningReplayStore,
+    ReasoningStreamObserver,
+    observe_stream_chunks,
+    record_completion_payload,
+)
 from ficelle.redaction import redact_sensitive_json, redact_sensitive_text, sanitize_error_detail
 
 try:
@@ -489,6 +508,22 @@ except Exception as exc:  # pragma: no cover - startup guard
 
 STATE_BACKUP_KEEP = 20
 STATE_BACKUP_MIN_INTERVAL_SECONDS = 600
+# Connecting is either fast or never: a provider whose endpoint black-holes should cost one
+# failover, not the profile's whole answer budget.
+CONNECT_TIMEOUT_SECONDS = 5.0
+# Generous enough for a full 128k-context request with image parts, small enough that a single
+# caller cannot exhaust the process everyone else is sharing.
+MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+# A provider is untrusted output: a multi-GB answer must fail this attempt, not the daemon.
+MAX_UPSTREAM_RESPONSE_BYTES = 256 * 1024 * 1024
+
+
+class RequestBodyTooLarge(ValueError):
+    """Raised when a caller declares a body past ``MAX_REQUEST_BODY_BYTES`` (answered as 413)."""
+
+
+class UpstreamResponseTooLarge(Exception):
+    """Raised when a provider's response passes ``MAX_UPSTREAM_RESPONSE_BYTES``."""
 RUNTIME_STATE_HISTORY_KEYS = state_store_module.RUNTIME_STATE_HISTORY_KEYS
 
 # Static admin assets shipped inside the package (not under HERMES_HOME).
@@ -496,6 +531,7 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 RUNTIME_PATHS = RuntimePaths.from_env(package_dir=PACKAGE_DIR)
 HERMES_HOME = RUNTIME_PATHS.hermes_home
 ROUTER_DIR = RUNTIME_PATHS.router_dir
+_ADMIN_TOKEN: str | None = None
 CATALOG_PATH = RUNTIME_PATHS.catalog_path
 CATALOG_LOCK_PATH = CATALOG_PATH.with_suffix(".lock")
 STATE_PATH = RUNTIME_PATHS.state_path
@@ -1130,6 +1166,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ficelle/auto-long": 90,
     },
     "max_attempts_per_request": 4,
+    # Total wall-clock budget for one request, across every attempt. Sized from 52 days of this
+    # install's own route log (2074 successful requests): p95 51 s, p99 110 s, slowest 281 s — so
+    # 300 s cuts none of them, while bounding the pathological case, which was 4 attempts × the
+    # 120 s profile timeout plus probes. It is a ceiling on failure, not a target for success.
+    "request_deadline_seconds": 300,
     "catalog_timeout_seconds": 30,
     "cooldown_seconds": {
         "rate_limited": 900,
@@ -1141,7 +1182,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "quota_exhausted": 3600,
         "auth_or_credit": 3600,
         "billing_or_paid": 86400,
-        "benchmark_failed": 3600,
         "server_error": 180,
         "timeout": 300,
         "unavailable": 600,
@@ -1191,6 +1231,59 @@ def runtime_read_path(path: Path) -> Path:
 def load_runtime_json(path: Path, default: Any) -> Any:
     """Read a canonical runtime JSON file with canonical-first legacy fallback."""
     return load_json(runtime_read_path(path), default)
+
+
+_CATALOG_DOCUMENT_CACHE: tuple[tuple[str, int, int], dict[str, Any]] | None = None
+_CATALOG_DOCUMENT_CACHE_LOCK = threading.Lock()
+
+
+def load_catalog_document() -> dict[str, Any]:
+    """Parse `catalog.json` at most once per version of the file.
+
+    A single request parses this 778 KB document twice — once for the license-transition check
+    and once inside the refresh use case — plus two fingerprint derivations over the result, all
+    re-deriving values that only change when the file changes. Keyed on the file's identity;
+    `atomic_write_json` publishes by rename, so a new catalog always changes that signature.
+
+    Returns a fresh top-level dict each call because `admin_status` blanks `models`/`providers`
+    in place on a structurally stale catalog. The nested lists and model rows ARE shared, so
+    callers must keep treating them as read-only — which is what every caller does today, and
+    `test_catalog_document_cache_does_not_leak_caller_mutations` holds the line.
+    """
+    global _CATALOG_DOCUMENT_CACHE
+    path = runtime_read_path(CATALOG_PATH)
+    try:
+        stat = path.stat()
+        signature = (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return load_json(path, {})
+    with _CATALOG_DOCUMENT_CACHE_LOCK:
+        cached = _CATALOG_DOCUMENT_CACHE
+        if cached is not None and cached[0] == signature:
+            return dict(cached[1])
+    document = load_json(path, {})
+    if not isinstance(document, dict):
+        return document
+    with _CATALOG_DOCUMENT_CACHE_LOCK:
+        _CATALOG_DOCUMENT_CACHE = (signature, document)
+    return dict(document)
+
+
+def invalidate_catalog_document_cache() -> None:
+    global _CATALOG_DOCUMENT_CACHE
+    with _CATALOG_DOCUMENT_CACHE_LOCK:
+        _CATALOG_DOCUMENT_CACHE = None
+
+
+def _load_runtime_json_for_catalog_use_case(path: Path, default: Any) -> Any:
+    """`load_json` port for the catalog use case, served from the parse cache for the catalog.
+
+    The use case is handed a path rather than a document, so the cache is applied here instead of
+    at its call site; every other path it might read stays a direct read.
+    """
+    if path == CATALOG_PATH:
+        return load_catalog_document()
+    return load_runtime_json(path, default)
 
 
 def load_runtime_state() -> dict[str, Any]:
@@ -1263,13 +1356,31 @@ def write_auto_benchmark_state(state: dict[str, Any]) -> None:
     _STATE_STORE.update(mutate, reason="write_auto_benchmark_state")
 
 
+# Sized so a busy host keeps roughly a week of routing history without ever being the reason a
+# disk fills. Both readers tolerate rotation: the request index detects truncation and identity
+# change and re-reads from the start.
+MAX_JSONL_LOG_BYTES = 32 * 1024 * 1024
+_JSONL_APPEND_LOCK = threading.Lock()
+
+
+def _append_jsonl_line(path: Path, line: str) -> None:
+    """Append one JSONL row atomically enough that concurrent writers cannot interleave.
+
+    Buffered text I/O flushes a row larger than the stdio buffer in several write(2) calls, so
+    two handler threads could splice their rows together — the ingester then drops both as
+    unparseable, which reads as telemetry that was never recorded rather than as an error.
+    """
+    with _JSONL_APPEND_LOCK:
+        rotate_if_oversized(path, MAX_JSONL_LOG_BYTES)
+        with open_private_append(path) as handle:
+            handle.write(line + "\n")
+
+
 def write_route_log(row: dict[str, Any], path: Path = ROUTE_LOG_PATH) -> None:
     """Append one redacted routing event. Never include prompts, messages, or credentials."""
     safe_row = redact_sensitive_json(dict(row))
     safe_row.setdefault("logged_at", now_iso())
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(safe_row, ensure_ascii=False, sort_keys=True) + "\n")
+    _append_jsonl_line(path, json.dumps(safe_row, ensure_ascii=False, sort_keys=True))
 
 
 def write_admin_audit(
@@ -1290,9 +1401,7 @@ def write_admin_audit(
         row["before"] = redact_sensitive_json(before)
     if after is not None:
         row["after"] = redact_sensitive_json(after)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    _append_jsonl_line(path, json.dumps(row, ensure_ascii=False, sort_keys=True))
     return row
 
 
@@ -1821,11 +1930,7 @@ def validate_virtual_profiles_payload(
     if not isinstance(raw_profiles, dict):
         raise ValueError("virtual_profiles must be an object")
 
-    known_model_ids = {
-        str(model.get("id"))
-        for model in catalog.get("models", [])
-        if isinstance(model, dict) and model.get("id")
-    }
+    known_model_ids = catalog_model_ids(catalog)
 
     # A saved id that is no longer in the catalog is the catalog moving, not a bad
     # request: free models come and go, and a provider that fails during a refresh
@@ -1875,6 +1980,99 @@ def model_id_source(model_id: str) -> str:
     return parts[1] if len(parts) == 3 and parts[0] == "ficelle" else ""
 
 
+PROVIDER_LISTING_PEAKS_KEY = "provider_listing_peaks"
+# How long the truncation guard remembers a provider's biggest listing, and how many refreshes
+# have to confirm a smaller one before that memory is retired. Both conditions must hold: the
+# clock alone would drop the reference on the first refresh after a laptop slept a week, which is
+# exactly when it is most needed. Seven days is deliberately far longer than the refresh cycle —
+# a genuinely retired model is already visible as `retired` in the dashboard, with a manual
+# remove, so a slow prune costs noise while a wrong one costs the user's manual order.
+PROVIDER_LISTING_PEAK_TTL_SECONDS = 7 * 24 * 3600
+PROVIDER_LISTING_PEAK_LOW_REFRESHES = 6
+
+
+def answered_in_full(catalog: dict[str, Any]) -> dict[str, int]:
+    """`source -> raw_count`, for the providers that returned a non-empty listing with no error.
+
+    The shared precondition of both source filters below. A provider that failed
+    mid-refresh, or answered `200` with nothing at all, has told us nothing to conclude
+    from — in either direction.
+    """
+    answered: dict[str, int] = {}
+    for source, summary in (catalog.get("providers") or {}).items():
+        if not isinstance(summary, dict) or summary.get("error"):
+            continue
+        raw_count = safe_int(summary.get("raw_count"), 0)
+        if raw_count > 0:
+            answered[str(source)] = raw_count
+    return answered
+
+
+def provider_listing_peak_expired(entry: dict[str, Any], now: float) -> bool:
+    """Whether a recorded peak has stopped being evidence about the provider's real size."""
+    if safe_int(entry.get("low_refreshes"), 0) < PROVIDER_LISTING_PEAK_LOW_REFRESHES:
+        return False
+    seen_at = parse_iso_timestamp(entry.get("at"))
+    return seen_at is None or now - seen_at >= PROVIDER_LISTING_PEAK_TTL_SECONDS
+
+
+def trusted_provider_listing_peaks(state: dict[str, Any]) -> dict[str, int]:
+    """Each provider's largest recent listing, minus the peaks that have aged out."""
+    now = time.time()
+    raw = state.get(PROVIDER_LISTING_PEAKS_KEY)
+    peaks: dict[str, int] = {}
+    for source, entry in (raw if isinstance(raw, dict) else {}).items():
+        if not isinstance(entry, dict):
+            continue
+        raw_count = safe_int(entry.get("raw_count"), 0)
+        if raw_count > 0 and not provider_listing_peak_expired(entry, now):
+            peaks[str(source)] = raw_count
+    return peaks
+
+
+def record_provider_listing_peaks(catalog: dict[str, Any], previous: dict[str, Any]) -> None:
+    """Remember how big each provider's listing was, so the guard has a memory to compare against.
+
+    Only providers that actually answered with rows are recorded. An outage must neither raise a
+    peak nor age one out — being down is not evidence that the provider got smaller.
+
+    `previous` counts as an observation too, and has to: it is the last published catalog, from
+    whichever path published it, and most of those paths never reach this function (the daemon's
+    startup warm, a TTL reload behind a routing request, a rebuild forced by a credential change).
+    Forgetting it costs exactly the case this guard exists for — on a state file with no peak yet,
+    the first refresh to see a truncated listing would be held back correctly by `previous`, then
+    record *the truncated count* as the peak and let the round after it delete the user's order.
+    """
+    observed = answered_in_full(catalog)
+    if not observed:
+        return
+    for source, raw_count in answered_in_full(previous).items():
+        if source in observed:
+            observed[source] = max(observed[source], raw_count)
+    seen_at = now_iso()
+
+    def mutate(state: dict[str, Any]) -> None:
+        stored = state.get(PROVIDER_LISTING_PEAKS_KEY)
+        peaks = stored if isinstance(stored, dict) else {}
+        now = time.time()
+        for source, raw_count in observed.items():
+            stored_entry = peaks.get(source)
+            entry = stored_entry if isinstance(stored_entry, dict) else {}
+            peak = safe_int(entry.get("raw_count"), 0)
+            if raw_count >= peak or provider_listing_peak_expired(entry, now):
+                peaks[source] = {"raw_count": raw_count, "at": seen_at, "low_refreshes": 0}
+                continue
+            # Peak held, but one more refresh has now seen the provider below it.
+            peaks[source] = {
+                "raw_count": peak,
+                "at": entry.get("at") or seen_at,
+                "low_refreshes": safe_int(entry.get("low_refreshes"), 0) + 1,
+            }
+        state[PROVIDER_LISTING_PEAKS_KEY] = peaks
+
+    _STATE_STORE.update(mutate, reason="provider_listing_peaks")
+
+
 def prunable_catalog_sources(catalog: dict[str, Any], previous: dict[str, Any]) -> set[str]:
     """Providers whose listing is trustworthy enough to conclude a model is gone.
 
@@ -1888,27 +2086,37 @@ def prunable_catalog_sources(catalog: dict[str, Any], previous: dict[str, Any]) 
       OpenRouter retiring a `:free` variant while keeping the paid model. That id is
       not coming back, and leaving it in a virtual model is permanent noise.
 
-    A provider can also answer `200` with a truncated listing. `raw_count` collapsing
-    against the previous refresh is the cheap tell, so a halved catalog is treated as
-    suspect rather than as mass deletion.
+    A provider can also answer `200` with a truncated listing, and `raw_count` collapsing
+    to less than half is the cheap tell. What it is compared against is the point: the
+    previous refresh alone gave the guard a one-round memory, so a *persistent* truncation
+    walked straight through it. Upstream paginates, 400 models read as 100, that round is
+    held back — and publishes a catalog whose `raw_count` is 100. Next round compares 100
+    against 100, finds nothing suspect, and deletes 300 live ids from the user's order.
+
+    So the reference is the largest listing the provider has actually shown recently
+    (`provider_listing_peaks` in runtime state, written by `record_provider_listing_peaks`),
+    falling back to the previous refresh when state has no peak yet — after a state reset,
+    the cached catalog is the only history left. The peak expires (see
+    `provider_listing_peak_expired`) so a provider that genuinely and permanently shrinks
+    its free pool becomes prunable again; never pruning at all would be the worse bug.
     """
     previous_providers = previous.get("providers") if isinstance(previous.get("providers"), dict) else {}
+    peaks = trusted_provider_listing_peaks(load_runtime_state())
     prunable: set[str] = set()
-    for source, summary in (catalog.get("providers") or {}).items():
-        if not isinstance(summary, dict) or summary.get("error"):
-            continue
-        raw_count = safe_int(summary.get("raw_count"), 0)
-        if raw_count <= 0:
-            continue
+    for source, raw_count in answered_in_full(catalog).items():
+        # Read straight off the previous summary rather than through `answered_in_full`:
+        # a previous refresh that errored still carries the count this one collapsed
+        # against, and dropping that reading would quietly disarm the halving guard.
         previous_summary = previous_providers.get(source)
         previous_raw = (
             safe_int(previous_summary.get("raw_count"), 0)
             if isinstance(previous_summary, dict)
             else 0
         )
-        if previous_raw > 0 and raw_count * 2 < previous_raw:
+        reference = max(previous_raw, peaks.get(source, 0))
+        if reference > 0 and raw_count * 2 < reference:
             continue
-        prunable.add(str(source))
+        prunable.add(source)
     return prunable
 
 
@@ -1933,15 +2141,16 @@ def prune_stale_profile_models(
     read and the write would be overwritten by a snapshot taken before it, silently losing
     the order the user had just saved. Narrow window, but this now runs unattended every
     refresh cycle, and "never destroy a manual order on its own" is the whole point.
+
+    This is also where each provider's listing size is remembered, from this refresh and from
+    the one cached before it. Decide first, record after, so a refresh is judged against the
+    history that preceded it rather than against itself.
     """
     prunable = prunable_catalog_sources(catalog, previous)
+    record_provider_listing_peaks(catalog, previous)
     if not prunable:
         return {}
-    known_ids = {
-        str(model.get("id"))
-        for model in catalog.get("models", [])
-        if isinstance(model, dict) and model.get("id")
-    }
+    known_ids = catalog_model_ids(catalog)
     outcome: dict[str, Any] = {}
 
     def apply_prune(disk_config: dict[str, Any]) -> None:
@@ -2020,25 +2229,201 @@ def record_last_profile_prune(
     _STATE_STORE.update(mutate, reason="profiles_prune")
 
 
-def stale_profile_model_rows(config: dict[str, Any], catalog: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every id a virtual model still points at that the catalog no longer lists.
+# How long a newly free model stays worth announcing. The catalog refreshes hourly and the
+# dashboard is opened far less often, so replacing the record each refresh — the way the prune
+# does — would drop every batch but the last. A week of accumulation means a user who was away
+# still sees what arrived while they were.
+CATALOG_ADDITION_RETENTION_SECONDS = 7 * 24 * 3600
+# Safety bound on the ids carried to the dashboard. A provider opening its whole catalogue
+# at once must not put an unbounded list in an admin payload; the announced count stays
+# exact either way, and the record itself is bounded by the retention window above.
+CATALOG_ADDITION_ID_CAP = 200
 
-    Two very different situations wear the same "Unknown model" card, and nothing told
-    them apart: a provider that is merely down (the id returns with it) and a model its
-    provider stopped offering for free (it never returns, and the next refresh prunes
-    it). `disposition` is that distinction, so the dashboard can stop guessing.
 
-    `prunable_catalog_sources` is reused with no previous catalog on purpose — its
-    halving guard compares two refreshes, which a read-only view does not have. The
-    worst case is calling a truncated listing `retired` one cycle early; the prune
-    itself still re-reads the previous catalog before removing anything.
+def unexpired_catalog_additions(entries: Any) -> dict[str, str]:
+    """The `{model_id: first_seen}` pairs still inside the announcement window.
+
+    Applied on write, which is what keeps the state key from growing, and again on read,
+    so a fortnight with no arrival cannot leave a two-week-old banner up. One predicate
+    for both, or the two sides could drift into disagreeing on what counts as recent.
     """
-    prunable = prunable_catalog_sources(catalog, {})
-    known_ids = {
+    if not isinstance(entries, dict):
+        return {}
+    cutoff = time.time() - CATALOG_ADDITION_RETENTION_SECONDS
+    return {
+        str(model_id): str(first_seen)
+        for model_id, first_seen in entries.items()
+        if (parse_iso_timestamp(first_seen) or 0.0) >= cutoff
+    }
+
+
+def comparable_catalog_sources(catalog: dict[str, Any], previous: dict[str, Any]) -> set[str]:
+    """Providers whose two listings can be diffed for models that are genuinely new.
+
+    The mirror of `prunable_catalog_sources`, and the noise it has to reject is the
+    opposite one. An id absent from the previous catalog is news only when the previous
+    catalog was in a position to have listed it:
+
+    - the provider must have answered in full THIS round, or the ids it did not send
+      prove nothing;
+    - it must also have answered in full the PREVIOUS round. A key the user has just
+      connected, or a provider coming back from an outage, has no history here — calling
+      its whole catalog "new" is the user's own action read back to them as discovery.
+    - `raw_count` must not have more than doubled. A truncated previous listing (12 rows
+      where the provider has 337) would otherwise announce 325 models as newly free. Same
+      halving threshold as the prune, taken in the other direction.
+    """
+    previous_counts = answered_in_full(previous)
+    return {
+        source
+        for source, raw_count in answered_in_full(catalog).items()
+        if source in previous_counts and raw_count <= previous_counts[source] * 2
+    }
+
+
+def catalog_model_ids(catalog: dict[str, Any]) -> set[str]:
+    return {
         str(model.get("id"))
-        for model in catalog.get("models", [])
+        for model in catalog.get("models") or []
         if isinstance(model, dict) and model.get("id")
     }
+
+
+def catalog_additions(catalog: dict[str, Any], previous: dict[str, Any]) -> list[str]:
+    """Model ids this refresh offers for free that the previous one did not.
+
+    The catalog is free-only by construction, so this covers both a model that did not
+    exist last hour and one that just lost its price tag — from the user's side they are
+    the same event: something new is available to route to.
+
+    Both catalogs must also have been answering the same local question. `raw_count` is
+    the provider's listing BEFORE Ficelle filters it, so relaxing `min_context_length` or
+    a provider's id patterns re-admits a batch of ids without moving a single
+    provider-side signal — and Ficelle would announce its own loosened filter as the
+    provider's generosity. The structural fingerprint is exactly that question, already
+    stamped on every catalog; credentials are excluded from it on purpose, since rotating
+    a key does not change what gets filtered out.
+
+    A missing fingerprint is not a match, it is an absence of evidence: two catalogs that
+    both lack one — a baseline left by an older build, or a truncated file on disk — would
+    otherwise agree by way of `None == None` and clear a guard that proved nothing.
+    """
+    fingerprint = catalog.get("config_structural_fingerprint")
+    if (
+        not isinstance(fingerprint, str)
+        or not fingerprint
+        or previous.get("config_structural_fingerprint") != fingerprint
+    ):
+        return []
+    sources = comparable_catalog_sources(catalog, previous)
+    if not sources:
+        return []
+    known = catalog_model_ids(previous)
+    return sorted(
+        model_id
+        for model_id in catalog_model_ids(catalog)
+        if model_id not in known and model_id_source(model_id) in sources
+    )
+
+
+def record_catalog_additions(catalog: dict[str, Any], previous: dict[str, Any]) -> list[str]:
+    """Leave newly free model ids where the dashboard can find them.
+
+    The counterpart to `record_last_profile_prune`, with one deliberate difference: no
+    audit entry. A prune edits the user's own order, which is a local change and belongs
+    in the log; nothing local changes here — the provider's catalog did — so this stays a
+    state marker only.
+
+    Accumulated rather than replaced. Each id keeps the timestamp it was first seen at,
+    entries past the retention window are dropped on every write (which is what bounds
+    this key), and `at` tracks the latest batch.
+
+    `at` is the dashboard's dismissal key, so it moves only for an id this record has not
+    seen before. Re-deriving the same diff — which the caller cannot rule out, since it
+    compares against whatever catalogue was on disk — must not reopen a banner the user
+    already dismissed for those very models.
+
+    Returns the ids actually recorded, which is what is genuinely new; an id already in
+    the window is not reported twice.
+    """
+    diffed = catalog_additions(catalog, previous)
+    if not diffed:
+        return []
+    at = now_iso()
+    added: list[str] = []
+
+    def mutate(state: dict[str, Any]) -> None:
+        nonlocal added
+        recorded = state.get("catalog_additions") if isinstance(state.get("catalog_additions"), dict) else {}
+        known = recorded.get("models") if isinstance(recorded.get("models"), dict) else {}
+        seen = unexpired_catalog_additions(known)
+        added = [model_id for model_id in diffed if model_id not in seen]
+        if added:
+            seen.update(dict.fromkeys(added, at))
+            state["catalog_additions"] = {"at": at, "models": seen}
+        elif len(seen) < len(known):
+            # Nothing arrived; this pass only aged entries out, so the batch stamp stands.
+            state["catalog_additions"] = {"at": recorded.get("at"), "models": seen}
+
+    _STATE_STORE.update(mutate, reason="catalog_additions")
+    return added
+
+
+def stale_profile_model_rows(
+    config: dict[str, Any],
+    catalog: dict[str, Any],
+    state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Every id a virtual model still points at that the catalog no longer lists.
+
+    Three different situations wore the same "Unknown model" card, and nothing told them
+    apart: a provider that is merely down (the id returns with it), a model its provider
+    stopped offering for free (it never returns, and the next refresh prunes it), and a
+    provider whose listing cannot be trusted to be complete. `disposition` is that
+    distinction, so the dashboard can stop guessing:
+
+    - `retired` — the provider answered, its listing is the size the previous refresh
+      recorded, and the id is not in it. Safe to say it is gone.
+    - `held` — the provider errored or listed nothing, so its whole section dropped out
+      of the catalog and a missing id proves nothing.
+    - `unverified` — the provider answered, but there is no trustworthy baseline to
+      check the listing against: its count collapsed since the last publish, or no
+      previous publish was recorded at all. Nothing can be concluded either way.
+
+    That last case is why the baseline is read from runtime state rather than passing
+    `{}` for `previous`. With no comparison, a provider returning 100 of its 400 models
+    made every one of the missing 300 read as "no longer offered for free" — an
+    assertion the code could not back, in front of a Remove button.
+
+    A baseline that does not describe the catalog in hand is discarded rather than
+    stretched, so an install that has not published since it was upgraded reads
+    `unverified` until it refreshes once. Understating for one cycle is the price of
+    never overstating.
+    """
+    baseline = previous_catalog_baseline(state if isinstance(state, dict) else {}, catalog)
+    baselined_sources = baseline.get("providers") or {}
+    prunable = prunable_catalog_sources(catalog, baseline)
+    providers = catalog.get("providers") or {}
+
+    def disposition_for(source: str) -> str:
+        if source in prunable and source in baselined_sources:
+            return "retired"
+        # "Did the provider answer?" is read off the summary rather than borrowed from
+        # `prunable_catalog_sources(catalog, {})`, which happens to return the same set
+        # today. They are different questions — one is about the response, the other about
+        # whether the response can be trusted to be exhaustive — and conflating them is how
+        # this function came to call a truncated listing `retired`. A future reason to
+        # refuse a source there must land in `unverified`, not in `held`, which claims to
+        # the user that the provider did not answer at all.
+        summary = providers.get(source)
+        answered = (
+            isinstance(summary, dict)
+            and not summary.get("error")
+            and safe_int(summary.get("raw_count"), 0) > 0
+        )
+        return "unverified" if answered else "held"
+
+    known_ids = catalog_model_ids(catalog)
     rows: list[dict[str, Any]] = []
     for profile_id, profile in normalized_virtual_profiles(config).items():
         for field in ("models", "excluded_models"):
@@ -2052,7 +2437,7 @@ def stale_profile_model_rows(config: dict[str, Any], catalog: dict[str, Any]) ->
                         "model_id": str(model_id),
                         "source": source,
                         "field": field,
-                        "disposition": "retired" if source in prunable else "held",
+                        "disposition": disposition_for(source),
                     }
                 )
     return rows
@@ -2369,12 +2754,9 @@ def env_file_set_key(path: Path, key: str, value: str) -> None:
             break
     if not replaced:
         lines.append(f"{key}={value}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    # A failure to make this 0600 must surface: it is a credential file, and the previous
+    # swallow left it readable by every local account with nothing said.
+    write_private_text(path, "\n".join(lines) + "\n")
 
 
 def env_file_delete_key(path: Path, key: str) -> bool:
@@ -2389,6 +2771,41 @@ def env_file_delete_key(path: Path, key: str) -> bool:
     return True
 
 
+# Resolving credentials spawns one `security` subprocess per provider per keychain, and the
+# catalog filter resolves EVERY enabled provider on every request — measured at 812 ms and 30-45
+# subprocesses for a single chat completion on a 15-provider install. The answer is identical
+# across those calls, so cache the subprocess results for a short window.
+#
+# Only the `security` calls are cached, never a resolution *decision*: `.env` reads, provider
+# policy and activation state stay live, so the cache can never keep a disabled provider in the
+# pool. Values live in memory only (the process already holds keys to make requests) and a write
+# through Ficelle drops the cache immediately, so the TTL is only the ceiling for a key changed
+# behind our back with the `security` CLI.
+_KEYCHAIN_CACHE_TTL_SECONDS = 30.0
+_KEYCHAIN_CACHE: dict[tuple[str, str], tuple[float, Any]] = {}
+_KEYCHAIN_CACHE_LOCK = threading.Lock()
+
+
+def _keychain_cached(key: tuple[str, str], compute: Callable[[], Any]) -> Any:
+    now = time.monotonic()
+    with _KEYCHAIN_CACHE_LOCK:
+        cached = _KEYCHAIN_CACHE.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    # Deliberately outside the lock: holding it across a subprocess would serialize exactly the
+    # calls this cache exists to make cheap. Two threads racing a cold key each pay one probe.
+    value = compute()
+    with _KEYCHAIN_CACHE_LOCK:
+        _KEYCHAIN_CACHE[key] = (time.monotonic() + _KEYCHAIN_CACHE_TTL_SECONDS, value)
+    return value
+
+
+def invalidate_credential_cache() -> None:
+    """Drop cached `security` results so a key written through Ficelle takes effect at once."""
+    with _KEYCHAIN_CACHE_LOCK:
+        _KEYCHAIN_CACHE.clear()
+
+
 def _unlock_dedicated_keychain(keychain_path: Path) -> Path | None:
     """Return a dedicated keychain path, but ONLY when it exists and
     could be unlocked non-interactively with the empty password it is meant to
@@ -2398,19 +2815,21 @@ def _unlock_dedicated_keychain(keychain_path: Path) -> Path | None:
     daemon and never resolves (incident 2026-06-16)."""
     if not keychain_path.exists():
         return None
-    try:
-        result = subprocess.run(
-            ["security", "unlock-keychain", "-p", "", str(keychain_path)],
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-    return keychain_path
+
+    def unlock() -> bool:
+        try:
+            result = subprocess.run(
+                ["security", "unlock-keychain", "-p", "", str(keychain_path)],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    return keychain_path if _keychain_cached(("unlock", str(keychain_path)), unlock) else None
 
 
 def _unlock_ficelle_keychain() -> Path | None:
@@ -2457,17 +2876,22 @@ def _login_keychain_path() -> Path:
 
 
 def _read_scoped_keychain_secret(service: str, keychain: Path) -> str:
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-w", str(keychain)],
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return ""
-    return result.stdout.strip() if result.returncode == 0 else ""
+    def read() -> str:
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-w", str(keychain)],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    # The empty answer is cached too: on a 15-provider install most lookups miss, and those
+    # misses are the bulk of the per-request subprocess storm.
+    return _keychain_cached((f"read:{service}", str(keychain)), read)
 
 
 def read_canonical_keychain_secret(service: str) -> str:
@@ -2493,17 +2917,45 @@ def unlock_and_read_legacy_keychain_secret(service: str) -> str:
 
 def _scoped_keychain_secret_exists(service: str, keychain: Path) -> bool:
     """Probe a scoped keychain entry without asking `security` for its value."""
+
+    def exists() -> bool:
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", service, str(keychain)],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0
+
+    return _keychain_cached((f"exists:{service}", str(keychain)), exists)
+
+
+def _scoped_keychain_delete(service: str, keychain: Path) -> bool:
+    """Delete an item from a scoped keychain. Returns True when an item was removed;
+    never raises.
+
+    Scoping the call to one keychain is what keeps it non-interactive for the dedicated
+    stores: callers on that path pass a keychain ``_unlock_dedicated_keychain`` already
+    accepted. The login keychain (``keychain_store_delete``) is the CLI-only exception and
+    can still prompt, exactly as it did before — a daemon must not reach it (R9)."""
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-s", service, str(keychain)],
+            ["security", "delete-generic-password", "-s", service, str(keychain)],
             text=True,
             capture_output=True,
-            timeout=5,
+            timeout=10,
             check=False,
         )
     except Exception:
         return False
-    return result.returncode == 0
+    succeeded = result.returncode == 0
+    if succeeded:
+        invalidate_credential_cache()
+    return succeeded
 
 
 def unlock_and_list_legacy_keychain_secret_sources(
@@ -2553,6 +3005,32 @@ class SecretStore:
     def get_legacy(self, service: str) -> str | None:
         return None
 
+    def probe_legacy(self, services: Sequence[str]) -> list[str]:
+        """Which of ``services`` the legacy tier holds, as redacted labels.
+
+        Derived from ``get_legacy`` so a backend that can read a migration secret reports
+        it without having to remember to: a store with no legacy tier answers ``None`` for
+        every service and this is empty, which is all it ever meant. A backend overrides it
+        when it can answer presence more cheaply or more safely than by reading —
+        ``KeychainStore`` does, because listing without ``-w`` never pulls a secret at all.
+
+        The label shape matches the one the legacy location's own ``read`` produces
+        (``_alias_reader`` over ``get_legacy`` in ``provider_credentials.py``), so the two
+        sides of that location agree by default as they do everywhere else in the registry.
+        """
+        return [f"{self.label}:{service}" for service in services if self.get_legacy(service)]
+
+    def delete_legacy(self, services: Sequence[str]) -> list[str]:
+        """Clear the legacy entries for ``services``; return the labels cleared.
+
+        The one legacy operation with no generic default — deleting has to know where the
+        entries live — so it is what a backend must write itself once it can read that tier.
+        Returning nothing here is correct only for a store that reads nothing:
+        ``test_a_store_that_reads_a_legacy_secret_can_also_clear_it`` fails the suite when
+        the two stop agreeing, rather than leaving it to a user's removal.
+        """
+        return []
+
     def set(self, service: str, secret: str) -> bool:
         return False
 
@@ -2578,7 +3056,12 @@ def keychain_store_write(service: str, secret: str) -> bool:
     server-side write path targets a non-interactive store or the ``.env`` file."""
     try:
         result = subprocess.run(
-            ["security", "add-generic-password", "-a", os.getenv("USER") or "", "-s", service, "-w", secret, "-U"],
+            # `-w` with no value reads the secret from stdin: passing it in argv put it in the
+            # output of any same-user `ps` for the lifetime of the call. It prompts TWICE for
+            # confirmation, and answers rc=0 even when the two do not match — so sending the
+            # secret once "succeeds" while storing nothing. Verified live, both ways.
+            ["security", "add-generic-password", "-a", os.getenv("USER") or "", "-s", service, "-U", "-w"],
+            input=f"{secret}\n{secret}\n",
             text=True,
             capture_output=True,
             timeout=10,
@@ -2586,29 +3069,16 @@ def keychain_store_write(service: str, secret: str) -> bool:
         )
     except Exception:
         return False
-    return result.returncode == 0
+    succeeded = result.returncode == 0
+    if succeeded:
+        invalidate_credential_cache()
+    return succeeded
 
 
 def keychain_store_delete(service: str) -> bool:
     """Delete a generic-password item from the macOS login Keychain. Returns True when
     an item was removed; never raises."""
-    try:
-        result = subprocess.run(
-            [
-                "security",
-                "delete-generic-password",
-                "-s",
-                service,
-                str(_login_keychain_path()),
-            ],
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except Exception:
-        return False
-    return result.returncode == 0
+    return _scoped_keychain_delete(service, _login_keychain_path())
 
 
 class KeychainStore(SecretStore):
@@ -2621,6 +3091,15 @@ class KeychainStore(SecretStore):
 
     def get_legacy(self, service: str) -> str | None:
         return unlock_and_read_legacy_keychain_secret(service) or None
+
+    # The legacy tier is keychain files, so all three operations address it as such: one
+    # entry per service per keychain, listed and cleared by path. Kept next to the read
+    # they belong with — a backend owns its whole tier or has none.
+    def probe_legacy(self, services: Sequence[str]) -> list[str]:
+        return _legacy_keychain_credential_sources(services)
+
+    def delete_legacy(self, services: Sequence[str]) -> list[str]:
+        return _purge_legacy_keychain_credentials(services)
 
     def set(self, service: str, secret: str) -> bool:
         return keychain_store_write(service, secret)
@@ -2852,7 +3331,17 @@ def dedicated_keychain_write(service: str, secret: str) -> bool:
         return False
     try:
         result = subprocess.run(
-            ["security", "add-generic-password", "-a", os.getenv("USER") or "", "-s", service, "-w", secret, "-U", str(keychain)],
+            # The keychain MUST stay the trailing positional argument and `-w` MUST carry the
+            # secret. `security` has no stdin form for the password that also accepts a scoped
+            # keychain: with the keychain before a valueless `-w` it rejects the whole command
+            # (rc=2, usage), and with `-U -w <keychain>` it silently reads the keychain path as
+            # the password and writes the item to the *login* keychain with rc=0 — a success
+            # that stores the wrong secret in the wrong place. `security -i` batch mode does
+            # keep the secret off argv, but it re-splits the line with shell-like quoting, so a
+            # key containing `"` or `\` fails or is silently mangled; argv is worth the `ps`
+            # caveat over corrupting a key. Any change here must be run against real `security`,
+            # not just the mocked subprocess: the mock returns rc=0 for a command it never runs.
+            ["security", "add-generic-password", "-a", os.getenv("USER") or "", "-s", service, "-U", "-w", secret, str(keychain)],
             text=True,
             capture_output=True,
             timeout=10,
@@ -2860,7 +3349,10 @@ def dedicated_keychain_write(service: str, secret: str) -> bool:
         )
     except Exception:
         return False
-    return result.returncode == 0
+    succeeded = result.returncode == 0
+    if succeeded:
+        invalidate_credential_cache()
+    return succeeded
 
 
 def dedicated_keychain_delete(service: str) -> bool:
@@ -2869,17 +3361,7 @@ def dedicated_keychain_delete(service: str) -> bool:
     keychain = _unlock_ficelle_keychain()
     if keychain is None:
         return False
-    try:
-        result = subprocess.run(
-            ["security", "delete-generic-password", "-s", service, str(keychain)],
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except Exception:
-        return False
-    return result.returncode == 0
+    return _scoped_keychain_delete(service, keychain)
 
 
 class DedicatedKeychainStore(SecretStore):
@@ -2920,6 +3402,86 @@ def server_secret_store() -> SecretStore:
     return NullSecretStore()
 
 
+def _legacy_keychain_label(keychain: Path, entry: str) -> str:
+    """The one redacted label shape for a legacy keychain entry, or `locked` for a keychain
+    that could not be opened. Shared so the report and the purge can never name the same
+    entry differently — which is how they would start disagreeing again."""
+    return f"keychain:{keychain}:{entry}"
+
+
+def _legacy_keychain_credential_sources(services: Sequence[str]) -> list[str]:
+    """Redacted labels for the legacy keychain entries holding one of ``services``.
+
+    A locked legacy keychain cannot safely be queried: `security find` or `delete` would
+    open a GUI password prompt and hang the daemon (incident 2026-06-16). It can still
+    contain the provider key, though, so retain a redacted, conservative remaining-source
+    label rather than falsely reporting complete removal.
+    """
+    sources = [
+        _legacy_keychain_label(keychain_path, service)
+        for service, keychain_path in unlock_and_list_legacy_keychain_secret_sources(services)
+    ]
+    sources.extend(
+        _legacy_keychain_label(keychain_path, "locked")
+        for keychain_path in _legacy_credential_keychain_paths()
+        if keychain_path.exists() and _unlock_dedicated_keychain(keychain_path) is None
+    )
+    return sources
+
+
+def _purge_legacy_keychain_credentials(services: Sequence[str]) -> list[str]:
+    """Delete the legacy keychain entries for ``services``; return the labels cleared.
+
+    Reuses the enumeration that reports the remaining sources, so the purge and the report
+    can never disagree about what exists — and so a locked keychain is skipped here for the
+    same reason it is skipped there. It also means only entries that actually exist are
+    deleted, instead of one `security` call per alias per keychain.
+    """
+    return [
+        _legacy_keychain_label(keychain, service)
+        for service, keychain in unlock_and_list_legacy_keychain_secret_sources(services)
+        if _scoped_keychain_delete(service, keychain)
+    ]
+
+
+def _credential_locations(
+    env_names: Sequence[str],
+    services: Sequence[str],
+    *,
+    store: SecretStore | None = None,
+) -> tuple[CredentialLocation, ...]:
+    """Bind the credential-location registry to this host's files, stores and keychains."""
+    store = store if store is not None else default_secret_store()
+    return provider_credential_locations_use_case(
+        env_names,
+        services,
+        ports=CredentialLocationPorts(
+            env_get=os.getenv,
+            parse_env_file=parse_env_file,
+            env_file_delete_key=env_file_delete_key,
+            credential_env_file=CREDENTIAL_ENV_FILE,
+            legacy_credential_env_files=_legacy_credential_env_file_paths(),
+            store=store,
+        ),
+    )
+
+
+def provider_credential_locations(
+    source: str,
+    config: dict[str, Any],
+    *,
+    store: SecretStore | None = None,
+) -> tuple[CredentialLocation, ...]:
+    """Every place ``source``'s key can live, in resolution precedence order.
+
+    The single enumeration behind resolution, legacy reporting and both removal paths, so
+    a read path can no longer reach a place a write path does not.
+    """
+    provider_cfg = (config.get("providers") or {}).get(source) or {}
+    env_names, services = generic_provider_credential_aliases(source, provider_cfg)
+    return _credential_locations(env_names, services, store=store)
+
+
 def resolve_credentials(
     env_names: list[str],
     services: list[str],
@@ -2929,58 +3491,21 @@ def resolve_credentials(
 ) -> tuple[str | None, str]:
     """Resolve env, canonical file/store, then read-only legacy fallbacks.
 
-    ``env_names`` are tried in order against the process environment and the
-    canonical ``.env`` file; ``services`` are then tried against the canonical OS
-    store. Legacy Hermes ``.env`` and keychains are consulted last. ``validator``
-    optionally gates each candidate (e.g. the OpenRouter ``sk-or-`` format check).
-    Returns ``(key, source)`` with redacted source/reason labels only.
+    Walks ``_credential_locations`` in precedence order and takes the first accepted
+    candidate: ``env_names`` against the process environment and the canonical ``.env``
+    file, ``services`` against the canonical OS store, then the legacy Hermes ``.env`` and
+    keychains. ``validator`` optionally gates each candidate (e.g. the OpenRouter
+    ``sk-or-`` format check); a rejected one is recorded and the walk continues, so an
+    invalid high-priority copy cannot mask a valid lower one. Returns ``(key, source)``
+    with redacted source/reason labels only.
     """
-    store = store if store is not None else default_secret_store()
     invalid_sources: list[str] = []
-
-    def accept(value: Any, source: str) -> bool:
-        if not value:
-            return False
-        if validator is not None and not validator(value):
-            invalid_sources.append(source)
-            return False
-        return True
-
-    for env_name in env_names:
-        value = os.getenv(env_name)
-        source = f"env:{env_name}"
-        if accept(value, source):
+    for location in _credential_locations(env_names, services, store=store):
+        for value, source in location.read():
+            if validator is not None and not validator(value):
+                invalid_sources.append(source)
+                continue
             return str(value).strip(), source
-
-    canonical_env_values = parse_env_file(CREDENTIAL_ENV_FILE)
-    for env_name in env_names:
-        value = canonical_env_values.get(env_name)
-        source = f"{CREDENTIAL_ENV_FILE}:{env_name}"
-        if accept(value, source):
-            return str(value).strip(), source
-
-    for service in services:
-        value = store.get(service)
-        source = f"{store.label}:{service}"
-        if accept(value, source):
-            return str(value).strip(), source
-
-    for credential_file in _legacy_credential_env_file_paths():
-        env_values = parse_env_file(credential_file)
-        for env_name in env_names:
-            value = env_values.get(env_name)
-            source = f"{credential_file}:{env_name}"
-            if accept(value, source):
-                return str(value).strip(), source
-
-    legacy_get = getattr(store, "get_legacy", None)
-    if callable(legacy_get):
-        for service in services:
-            value = legacy_get(service)
-            source = f"{store.label}:{service}"
-            if accept(value, source):
-                return str(value).strip(), source
-
     if invalid_sources:
         return None, f"invalid {env_names[0]} from {', '.join(invalid_sources)}"
     return None, f"missing {env_names[0]}"
@@ -2991,23 +3516,22 @@ def legacy_provider_credential_sources(
     config: dict[str, Any],
 ) -> list[str]:
     """Return redacted, read-only labels for configured legacy credential sources."""
-    provider_cfg = (config.get("providers") or {}).get(source) or {}
-    env_names, services = generic_provider_credential_aliases(source, provider_cfg)
-    configured: list[str] = []
-    for credential_file in _legacy_credential_env_file_paths():
-        env_values = parse_env_file(credential_file)
-        configured.extend(
-            f"{credential_file}:{env_name}"
-            for env_name in env_names
-            if env_values.get(env_name)
-        )
-    configured.extend(
-        f"keychain:{keychain_path}:{service}"
-        for service, keychain_path in unlock_and_list_legacy_keychain_secret_sources(
-            services
-        )
-    )
-    return configured
+    return legacy_credential_sources_use_case(provider_credential_locations(source, config))
+
+
+def purge_legacy_provider_credentials(source: str, config: dict[str, Any]) -> list[str]:
+    """Delete a provider's credentials from the read-only legacy fallbacks.
+
+    Never reached by the default removal: a legacy store may still be owned by another
+    install, so clearing it takes an explicit opt-in (``remove-key --purge-legacy`` or a
+    confirmed admin removal). Returns the redacted labels cleared, matching the shape
+    ``legacy_provider_credential_sources`` reports — both walk the same locations.
+    """
+    cleared = purge_legacy_credentials_use_case(provider_credential_locations(source, config))
+    if cleared:
+        invalidate_credential_cache()
+        invalidate_provider_budget(source)
+    return cleared
 
 
 # Per-OS secret-store backends report their store via ``SecretStore.label``; map those
@@ -3094,7 +3618,9 @@ def resolve_via_external_resolvers(provider: str, fallback_reason: str) -> tuple
         try:
             result = resolver(provider)
         except Exception as exc:
-            remember((None, None, f"{type(exc).__name__}: {exc}"))
+            # Redacted: an external resolver's message can carry the very value it failed on,
+            # and this string reaches doctor output and catalog.json.
+            remember((None, None, sanitize_error_detail(f"{type(exc).__name__}: {exc}")))
             continue
         if result is None:
             continue
@@ -3794,30 +4320,10 @@ def remove_provider_key(source: str, config: dict[str, Any], *, store: SecretSto
     legacy fallbacks are intentionally left untouched; callers report any remaining
     legacy sources separately.
     """
-    store = store if store is not None else default_secret_store()
-    cleared = remove_provider_key_use_case(
-        source,
-        config,
-        store=store,
-        credential_env_file=CREDENTIAL_ENV_FILE,
-        env_file_delete_key=env_file_delete_key,
-    )
+    cleared = remove_provider_key_use_case(provider_credential_locations(source, config, store=store))
     if cleared:
         invalidate_provider_budget(source)
     return cleared
-
-
-def _auth_row(invokable: bool, key: Any, reason: str, base_url: Any) -> dict[str, Any]:
-    """Build a redacted provider auth row. ``reason`` doubles as the resolution source
-    when ``key`` is set, so ``key_source`` exposes the coarse store (keychain/.env/…)
-    without ever leaking the secret."""
-    return auth_row_use_case(
-        invokable,
-        key,
-        reason,
-        base_url,
-        credential_source_label=credential_source_label,
-    )
 
 
 def provider_auth_ports() -> ProviderAuthPorts:
@@ -4114,6 +4620,9 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
         # The dashboard announces this one: a prune is the only change to a virtual model the
         # user did not ask for. Model ids are catalog ids, never a credential.
         "last_profile_prune": last_profile_prune_row(source.get("last_profile_prune")),
+        # And the other direction: models a provider started offering for free. Same kind of
+        # payload — catalog ids and provider sources, nothing account-specific.
+        "catalog_additions": catalog_additions_row(source.get("catalog_additions")),
     }
 
 
@@ -4126,6 +4635,34 @@ def last_profile_prune_row(raw_value: Any) -> dict[str, Any]:
         "models": safe_string_list(raw_value.get("models")),
         "profiles": safe_string_list(raw_value.get("profiles")),
         "sources": safe_string_list(raw_value.get("sources")),
+    }
+
+
+def catalog_additions_row(raw_value: Any) -> dict[str, Any]:
+    """The announceable half of `catalog_additions`, aged on read.
+
+    The retention window is applied here rather than only at write time: entries are
+    purged when a new batch lands, so an install that sees nothing new for a fortnight
+    would otherwise keep showing a two-week-old banner. An empty result hides it.
+
+    `count` is the real total; `models` is capped, so a provider opening its whole
+    catalogue at once cannot turn one admin payload into an unbounded list.
+
+    Newest first, because the dashboard's banner names only the first few: with a week of
+    accumulation, "first alphabetically" and "what just arrived" are rarely the same
+    models, and the banner would announce a batch while naming last Monday's.
+    """
+    if not isinstance(raw_value, dict):
+        return {}
+    fresh = unexpired_catalog_additions(raw_value.get("models"))
+    if not fresh:
+        return {}
+    ordered = sorted(fresh, key=lambda model_id: (fresh[model_id], model_id), reverse=True)
+    return {
+        "at": raw_value.get("at"),
+        "models": safe_string_list(ordered[:CATALOG_ADDITION_ID_CAP]),
+        "sources": sorted({source for source in map(model_id_source, ordered) if source}),
+        "count": len(ordered),
     }
 
 
@@ -4715,7 +5252,7 @@ def build_admin_status(catalog: dict[str, Any], config: dict[str, Any], state: d
 
 
 def load_cached_catalog_for_admin_status(config: dict[str, Any]) -> dict[str, Any]:
-    catalog = load_runtime_json(CATALOG_PATH, {})
+    catalog = load_catalog_document()
     return load_cached_catalog_for_admin_status_use_case(
         catalog,
         config,
@@ -4811,20 +5348,32 @@ def admin_token() -> str:
     The token guards the admin credential-write endpoint against cross-site browser
     requests: it is embedded in the same-origin admin page (see ``admin_page_html``),
     so a page from another origin cannot read it and cannot forge the write."""
+    global _ADMIN_TOKEN
+    if _ADMIN_TOKEN:
+        return _ADMIN_TOKEN
     path = ROUTER_DIR / "admin-token"
     try:
         existing = path.read_text().strip()
         if existing:
+            try:
+                # Existing installs may carry the old create-then-chmod mode. Tighten it on
+                # read, but retain the token if a read-only home prevents that repair.
+                write_private_text(path, existing)
+            except OSError:
+                pass
+            _ADMIN_TOKEN = existing
             return existing
     except OSError:
         pass
     token = uuid.uuid4().hex
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(token)
-        path.chmod(0o600)
+        write_private_text(path, token)
     except OSError:
+        # Kept tolerant on purpose: a read-only home must still serve, and the in-memory token
+        # stays usable for this process. What changed is that when the write does land, it is
+        # never briefly world-readable.
         pass
+    _ADMIN_TOKEN = token
     return token
 
 
@@ -4890,13 +5439,47 @@ def _build_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, Any
     ).refresh_catalog(config)
 
 
+_UPSTREAM_SESSION: Any = None
+_UPSTREAM_SESSION_LOCK = threading.Lock()
+
+
+def upstream_session() -> Any:
+    """One pooled HTTPS session for provider traffic.
+
+    Module-level `requests.post` builds a fresh `Session` per call, so every request — and every
+    failover attempt behind it — paid a full TCP and TLS handshake to a provider it had just
+    talked to. One session with per-host pools keeps those connections warm.
+    """
+    global _UPSTREAM_SESSION
+    session = _UPSTREAM_SESSION
+    if session is not None:
+        return session
+    with _UPSTREAM_SESSION_LOCK:
+        if _UPSTREAM_SESSION is None:
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=32)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            _UPSTREAM_SESSION = session
+        return _UPSTREAM_SESSION
+
+
+def upstream_post(url: str, **kwargs: Any) -> Any:
+    """Single exit for chat traffic, so pooling (and any future policy) has one place to live."""
+    return upstream_session().post(url, **kwargs)
+
+
 def _publish_catalog_unlocked(catalog: dict[str, Any]) -> None:
     publish_catalog_use_case(
         catalog,
         catalog_path=CATALOG_PATH,
+        load_json=load_runtime_json,
         atomic_write_json=atomic_write_json,
         update_state=_STATE_STORE.update,
     )
+    # The parse cache keys on (mtime_ns, size) and would notice this anyway, but dropping it here
+    # means a publish is never one filesystem-timestamp granularity away from being missed.
+    invalidate_catalog_document_cache()
 
 
 def _publish_catalog(catalog: dict[str, Any]) -> None:
@@ -4905,20 +5488,34 @@ def _publish_catalog(catalog: dict[str, Any]) -> None:
 
 
 def _refresh_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, Any]:
+    # The arrivals notice compares this catalog against the one it is about to overwrite, so
+    # it has to sit where the overwrite happens — not in `refresh_catalog`. The prune can
+    # live on the explicit paths because it is convergent: it compares the user's config to
+    # the current catalog, so whichever path published last, the next explicit refresh
+    # reaches the same conclusion. This comparison is edge-triggered on the file itself, and
+    # a rebuild it did not see becomes the baseline for the next one — which silently
+    # swallows that batch of arrivals for good rather than merely delaying it. The TTL
+    # reload behind a routing request is exactly such a rebuild.
+    #
+    # Safe on that path in a way the prune is not: this writes runtime state, never config.
+    previous = load_runtime_json(CATALOG_PATH, {})
     catalog = _build_catalog_for_effective_config(config)
     _publish_catalog(catalog)
+    record_catalog_additions(catalog, previous if isinstance(previous, dict) else {})
     return catalog
 
 
 def refresh_catalog(config: dict[str, Any]) -> dict[str, Any]:
-    # Read the cache before publishing over it: prunable_catalog_sources compares each
-    # provider's raw_count against the previous refresh to spot a truncated listing.
-    # Every caller of this function is an explicit action (the Refresh button, a
-    # credential change, `ficelle --refresh`) — the TTL reload on a routing request
-    # goes through _load_or_refresh_catalog_for_effective_config instead, so a chat
-    # call never triggers the prune below.
+    # Read the cache before publishing over it: prunable_catalog_sources falls back to the
+    # previous refresh's raw_count when runtime state holds no peak for a provider yet.
+    # Callers are the explicit actions (the Refresh button, a credential change,
+    # `ficelle --refresh`) and the periodic `catalog_refresh_loop` — the TTL reload on a
+    # routing request goes through _load_or_refresh_catalog_for_effective_config instead,
+    # so a chat call never triggers the prune below.
     previous = load_runtime_json(CATALOG_PATH, {})
     effective = effective_runtime_config(config)
+    # Publishes, and records the arrivals against the catalog it replaced — every rebuild
+    # does, not only this one.
     catalog = _refresh_catalog_for_effective_config(effective)
     prune_stale_profile_models(config, catalog, previous if isinstance(previous, dict) else {})
     refresh_provider_budgets(effective)
@@ -4977,7 +5574,7 @@ def _load_or_refresh_catalog_for_effective_config(config: dict[str, Any], force:
     catalog = load_or_refresh_catalog_use_case(
         config,
         catalog_path=CATALOG_PATH,
-        load_json=load_runtime_json,
+        load_json=_load_runtime_json_for_catalog_use_case,
         refresh_catalog=_refresh_catalog_for_effective_config,
         catalog_config_fingerprint=catalog_config_fingerprint,
         now_seconds=time.time,
@@ -5073,7 +5670,7 @@ def _cached_catalog_for_license_transition(
     canonical_config: dict[str, Any],
     effective_config: dict[str, Any],
 ) -> dict[str, Any] | None:
-    catalog = load_runtime_json(CATALOG_PATH, {})
+    catalog = load_catalog_document()
     if not isinstance(catalog, dict) or not catalog.get("models"):
         return None
     cached_structural_fingerprint = catalog.get("config_structural_fingerprint")
@@ -5107,6 +5704,36 @@ def load_or_refresh_catalog(
     if cached_transition is not None:
         return cached_transition
     return _load_or_refresh_catalog_for_effective_config(effective_config)
+
+
+_QUOTA_PROBES_IN_FLIGHT: set[str] = set()
+_QUOTA_PROBE_DISPATCH_LOCK = threading.Lock()
+
+
+def schedule_quota_probes(config: dict[str, Any], catalog: dict[str, Any], *, keys: set[str]) -> None:
+    """Run due quota probes off the request thread.
+
+    Selection asks for these while answering a request, but a probe is a full upstream
+    completion plus several state writes, so doing it inline charged one unlucky caller for
+    everyone's recovery. Keys already being probed are skipped, so a burst of requests that all
+    see the same key come due dispatches it once.
+    """
+    with _QUOTA_PROBE_DISPATCH_LOCK:
+        fresh = {key for key in keys if key not in _QUOTA_PROBES_IN_FLIGHT}
+        if not fresh:
+            return
+        _QUOTA_PROBES_IN_FLIGHT.update(fresh)
+
+    def run() -> None:
+        try:
+            run_due_quota_probes(config, catalog, keys=fresh)
+        except Exception as exc:  # never let a probe thread kill the process
+            print(f"ficelle: background quota probe failed: {safe_detail(exc)}", file=sys.stderr)
+        finally:
+            with _QUOTA_PROBE_DISPATCH_LOCK:
+                _QUOTA_PROBES_IN_FLIGHT.difference_update(fresh)
+
+    threading.Thread(target=run, name="ficelle-quota-probe", daemon=True).start()
 
 
 def cooldown_key(model: dict[str, Any]) -> str:
@@ -5283,6 +5910,11 @@ def budget_meter_key(model: dict[str, Any]) -> str:
     return quota_cooldown_key_for_scope(model, budget_pool_scope(quota_cooldown_scope(model)))
 
 
+# Traces a thinking model emitted, so the next turn can hand them back. Process-local and
+# bounded; see `ficelle.reasoning_replay` for why it is not persisted.
+REASONING_REPLAY_STORE = ReasoningReplayStore()
+
+
 def record_upstream_spend(model: dict[str, Any]) -> None:
     """Count one request's cost against its pool's budget.
 
@@ -5334,6 +5966,7 @@ def cooldown_stats_ports() -> CooldownStatsPorts:
         safe_int=safe_int,
         safe_detail=safe_detail,
         now_iso=now_iso,
+        now_epoch=time.time,
         cooldown_key=cooldown_key,
         canonical_virtual_model_id=canonical_virtual_model_id,
     )
@@ -5343,8 +5976,20 @@ def update_failure_stats(state: dict[str, Any], model: dict[str, Any], reason: s
     update_failure_stats_use_case(state, model, reason, ports=cooldown_stats_ports())
 
 
-def update_success_stats(state: dict[str, Any], model: dict[str, Any], latency_seconds: float) -> None:
-    update_success_stats_use_case(state, model, latency_seconds, ports=cooldown_stats_ports())
+def update_success_stats(
+    state: dict[str, Any],
+    model: dict[str, Any],
+    latency_seconds: float,
+    *,
+    representative_latency: bool = True,
+) -> None:
+    update_success_stats_use_case(
+        state,
+        model,
+        latency_seconds,
+        ports=cooldown_stats_ports(),
+        representative_latency=representative_latency,
+    )
 
 
 def record_model_error_in_state(
@@ -5552,6 +6197,30 @@ def record_last_route(
     competence: str | None = None,
     compression: dict[str, Any] | None = None,
 ) -> None:
+    _STATE_STORE.update(
+        build_last_route_mutator(
+            requested_model, status, reason, request_id, candidate_count, attempt_count,
+            latency_seconds, model, attempts, competence, compression,
+        ),
+        reason="record_last_route",
+    )
+
+
+def build_last_route_mutator(
+    requested_model: str,
+    status: str,
+    reason: str,
+    request_id: str,
+    candidate_count: int,
+    attempt_count: int,
+    latency_seconds: float,
+    model: dict[str, Any] | None = None,
+    attempts: list[dict[str, Any]] | None = None,
+    competence: str | None = None,
+    compression: dict[str, Any] | None = None,
+) -> Any:
+    """The state mutation behind `record_last_route`, so callers can batch it with another."""
+
     def mutate(state: dict[str, Any]) -> None:
         last_routes = state.setdefault("last_routes", {})
         row = {
@@ -5578,7 +6247,40 @@ def record_last_route(
         update_compression_error_stats(state, str(requested_model), compression_metadata)
         last_routes[str(requested_model)] = row
 
-    _STATE_STORE.update(mutate, reason="record_last_route")
+    return mutate
+
+
+def record_success_with_telemetry(
+    model: dict[str, Any],
+    latency_seconds: float,
+    telemetry: ChatCompletionRouteTelemetry,
+) -> None:
+    """Record a successful route and its telemetry in ONE state write.
+
+    These were two `StateStore.update` calls back to back — each a full read, merge and rewrite
+    of the state file — separated only by a competence lookup that does not depend on either.
+    """
+    last_route = telemetry.last_route
+    apply_last_route = build_last_route_mutator(
+        last_route.safe_requested_model,
+        last_route.status,
+        last_route.reason,
+        last_route.request_id,
+        last_route.candidate_count,
+        last_route.attempt_count,
+        last_route.duration_seconds,
+        last_route.selected_model,
+        last_route.attempts,
+        last_route.competence,
+        last_route.compression,
+    )
+
+    def mutate(state: dict[str, Any]) -> None:
+        record_success_in_state_use_case(state, model, latency_seconds, ports=cooldown_success_ports())
+        apply_last_route(state)
+
+    _STATE_STORE.update(mutate, reason="record_success_with_telemetry")
+    write_route_log(telemetry.route_log)
 
 
 def update_provider_failure_stats(state: dict[str, Any], source: str, reason: str) -> None:
@@ -5719,9 +6421,19 @@ def cooldown_success_ports() -> CooldownSuccessPorts:
     )
 
 
-def record_success(model: dict[str, Any], latency_seconds: float) -> None:
+def record_success(model: dict[str, Any], latency_seconds: float, *, representative_latency: bool = True) -> None:
+    """Record a successful call. Probe callers pass ``representative_latency=False``: their
+    completions are a handful of tokens, so their timing must not steer the latency score that
+    ranks models for real requests."""
+
     def mutate(state: dict[str, Any]) -> None:
-        record_success_in_state_use_case(state, model, latency_seconds, ports=cooldown_success_ports())
+        record_success_in_state_use_case(
+            state,
+            model,
+            latency_seconds,
+            ports=cooldown_success_ports(),
+            representative_latency=representative_latency,
+        )
 
     _STATE_STORE.update(mutate, reason="record_success")
 
@@ -5908,11 +6620,11 @@ def probe_quota_cooldown(key: str, model: dict[str, Any], config: dict[str, Any]
         _STATE_STORE.update(mutate, reason=f"probe_quota_cooldown:{reason}")
         return {"status": "fail", "reason": reason, "key": key, "model_id": model.get("id")}
 
-    started = time.time()
+    started = time.monotonic()
     try:
         timeout = max(1.0, safe_float(config.get("quota_probe_timeout_seconds"), 10.0))
         response = invoke_model(model, quota_probe_body(model, config), config, timeout_seconds=timeout)
-        latency = time.time() - started
+        latency = time.monotonic() - started
     except requests.exceptions.Timeout as exc:
         return record_failed_probe("timeout", f"quota probe timeout: {type(exc).__name__}", f"{type(exc).__name__}: {exc}")
     except Exception as exc:
@@ -6195,6 +6907,7 @@ def model_selection_runner() -> ModelSelectionRunner:
             fresh_runtime_state=fresh_runtime_state,
             due_quota_probe_keys_for_request=due_quota_probe_keys_for_request,
             run_due_quota_probes=run_due_quota_probes,
+            schedule_quota_probes=schedule_quota_probes,
             safe_int=safe_int,
             apply_verified_capability_ttl=apply_verified_capability_ttl,
             apply_route_on_capability_reference=apply_route_on_capability_reference,
@@ -6258,8 +6971,14 @@ def select_models(
     return select_models_result(requested_model, catalog, config, purpose=purpose).as_legacy_models()
 
 
-def provider_credentials(source: str, config: dict[str, Any]) -> tuple[str | None, str | None, str]:
-    return resolve_provider_credentials(
+def provider_access_for(source: str, config: dict[str, Any]) -> ProviderAccess:
+    """The access record invocation runs on, and the one it decides with.
+
+    Resolved with ``require_base_url=True``, which changes only the diagnostic a missing
+    URL returns, never the verdict — `test_auth_row_invokable_matches_the_gate_invoke_model_applies`
+    pins that both ways round.
+    """
+    return resolve_provider_access(
         source,
         config,
         lambda provider_source, provider_cfg: provider_access_result(
@@ -6268,6 +6987,18 @@ def provider_credentials(source: str, config: dict[str, Any]) -> tuple[str | Non
             require_base_url=True,
         ),
     )
+
+
+def provider_credentials(source: str, config: dict[str, Any]) -> tuple[str | None, str | None, str]:
+    """The three credential fields of `provider_access_for`, without its verdict.
+
+    No caller in `src/` unpacks the record any more — `invoke_model` reads the whole thing —
+    so this is the tuple view the tests still resolve through, including the parity test that
+    compares the status row against the gate. Anything asking "would this be sent?" must go
+    through `ProviderAccess.can_invoke`, not rebuild it from these three fields.
+    """
+    access = provider_access_for(source, config)
+    return access.key, access.base_url, access.reason
 
 
 def classify_failure(
@@ -6398,14 +7129,19 @@ def invoke_model(
     extra_headers: dict[str, str] | None = None,
 ) -> requests.Response:
     source = str(model.get("source"))
-    key, base_url, reason = provider_credentials(source, config)
-    if not base_url or (not key and reason != "keyless_local"):
-        raise ProviderCredentialsUnavailable(f"credentials unavailable: {reason}")
+    access = provider_access_for(source, config)
+    if not access.can_invoke:
+        raise ProviderCredentialsUnavailable(f"credentials unavailable: {access.reason}")
+    key, base_url = access.key, access.base_url
     requested_model = normalize_chat_completion_request(body).requested_model
     payload = dict(body)
     payload.pop("_ficelle_timeout_seconds", None)
     payload.pop("_ficelle_extra_headers", None)
     payload["model"] = model["upstream_id"]
+    # Restore a thinking model's own trace on replayed tool calls. A no-op for every model
+    # that has not been seen emitting one, which is nearly all of them. See
+    # `ficelle.reasoning_replay` for why this is the one body rewrite Ficelle performs.
+    payload = REASONING_REPLAY_STORE.replay_into_body(str(model.get("id") or ""), payload, now=time.time())
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json" if not payload.get("stream") else "text/event-stream",
@@ -6420,13 +7156,49 @@ def invoke_model(
     except Exception:
         timeout = request_timeout_seconds_for_profile(requested_model, config)
     record_upstream_spend(model)
-    return requests.post(
+    # `upstream_post` (pooled single exit for chat traffic) keeps main's connection reuse;
+    # binding the result is what lets the trace be observed before the response is returned.
+    response = upstream_post(
         f"{base_url.rstrip('/')}/chat/completions",
         headers=headers,
         json=payload,
-        timeout=timeout,
+        # Separate, short connect timeout so a black-holed provider endpoint fails over in
+        # seconds instead of holding the whole profile timeout at connect — the same policy the
+        # catalog fetch already applies (providers/openai_compatible.py). A model that is simply
+        # slow to *answer* still gets the full read budget.
+        timeout=(min(CONNECT_TIMEOUT_SECONDS, timeout), timeout),
         stream=bool(payload.get("stream")),
     )
+    if not bool(payload.get("stream")):
+        observe_reasoning_trace(model, response)
+    return response
+
+
+def observe_reasoning_trace(model: dict[str, Any], response: Any) -> None:
+    """Learn a thinking model's trace from a buffered completion, for the next turn.
+
+    Non-streaming callers only, and the caller decides — reading ``.content`` on a streamed
+    response would consume the very bytes the relay is about to forward. A streamed turn is
+    observed instead by `ReasoningStreamObserver`, watching the chunks go past.
+
+    The byte test before parsing keeps this off the hot path for every response carrying
+    neither field, which is nearly all of them. `requests` has already buffered the body by
+    this point, so the cost when it does parse is the parse alone.
+    """
+    try:
+        if not (200 <= int(response.status_code) < 300):
+            return
+        content = response.content
+        if b"tool_calls" not in content or b"reasoning" not in content:
+            return
+        record_completion_payload(
+            REASONING_REPLAY_STORE,
+            str(model.get("id") or ""),
+            json.loads(content.decode("utf-8")),
+            now=time.time(),
+        )
+    except Exception:
+        return
 
 
 def model_family(model: dict[str, Any]) -> str:
@@ -6522,7 +7294,11 @@ def fusion_panel_policy_ports() -> FusionPanelPolicyPorts:
 
 
 def fusion_deadline_seconds(deadline: float) -> float:
-    return fusion_deadline_seconds_use_case(deadline, time.time)
+    # Monotonic, because the deadline is built from the chat path's `request_started`.
+    # Mixing the two clocks makes every remaining budget hugely negative — Fusion then
+    # believes it has no time at all. The suite catches it; this comment is so the next
+    # reader does not have to.
+    return fusion_deadline_seconds_use_case(deadline, time.monotonic)
 
 
 def fusion_timeout_config(fusion: dict[str, Any], deadline: float) -> dict[str, Any]:
@@ -6564,7 +7340,7 @@ def build_fusion_runner() -> FusionRunner:
         set_cooldown=set_cooldown,
         is_timeout_exception=lambda exc: isinstance(exc, requests.exceptions.Timeout),
         fusion_model_id=FUSION_MODEL_ID,
-        now=time.time,
+        now=time.monotonic,
     )
 
 
@@ -6593,7 +7369,7 @@ def build_fusion_panel_stage() -> FusionPanelStage:
         record_success=record_success,
         set_cooldown=set_cooldown,
         fusion_model_id=FUSION_MODEL_ID,
-        now=time.time,
+        now=time.monotonic,
     )
 
 
@@ -6853,7 +7629,7 @@ def run_fusion_chat_completion(
             extra=panel_selection_metadata,
         )
         persist_fusion_run(metadata)
-        record_last_route(FUSION_MODEL_ID, "fail", "no_panel_candidates", request_id, 0, 0, time.time() - request_started, attempts=[])
+        record_last_route(FUSION_MODEL_ID, "fail", "no_panel_candidates", request_id, 0, 0, time.monotonic() - request_started, attempts=[])
         write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": 503, "final_reason": "no_panel_candidates", "candidate_count": 0, "attempt_count": 0, "attempts": [], "stream": False})
         return 503, fusion_error_payload("no eligible strict-zero panel candidates for ficelle/auto-fusion", request_id, "no_available_model"), fusion_response_headers(request_id, None, 0, metadata)
 
@@ -6879,7 +7655,7 @@ def run_fusion_chat_completion(
             extra={**panel_selection_metadata, "timeout_reached": timeout_reached},
         )
         persist_fusion_run(metadata)
-        record_last_route(FUSION_MODEL_ID, "fail", "upstream_failure", request_id, len(panel_candidates), len(panel_results), time.time() - request_started, attempts=panel_attempts)
+        record_last_route(FUSION_MODEL_ID, "fail", "upstream_failure", request_id, len(panel_candidates), len(panel_results), time.monotonic() - request_started, attempts=panel_attempts)
         panel_failure_status = upstream_failure_status(errors)
         write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": panel_failure_status, "final_reason": "insufficient_panel_success", "candidate_count": len(panel_candidates), "attempt_count": len(panel_results), "attempts": panel_attempts, "stream": False})
         return panel_failure_status, build_upstream_failure_error(FUSION_MODEL_ID, request_id, len(panel_candidates), panel_attempts, errors), fusion_response_headers(request_id, None, len(panel_results), metadata)
@@ -6895,7 +7671,7 @@ def run_fusion_chat_completion(
     # so it is safe to run while the judge writes its own results.
     ranking_executor = None
     ranking_future = None
-    ranking_started = time.time()
+    ranking_started = time.monotonic()
     if peer_ranking_enabled:
         ranking_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         ranking_future = ranking_executor.submit(run_fusion_ranking_round, successes, body, config, fusion, deadline)
@@ -6953,7 +7729,7 @@ def run_fusion_chat_completion(
                 ranking_executor.shutdown(wait=False)
         # Wall-clock since the ranking was submitted (before the judge); it overlaps
         # the judge stage, so it is an upper bound, not additive with judge latency.
-        ranking_latency = time.time() - ranking_started
+        ranking_latency = time.monotonic() - ranking_started
         ranking_outcome = resolve_peer_ranking_outcome(
             ranking_result,
             peer_ranking_config,
@@ -7024,10 +7800,10 @@ def run_fusion_chat_completion(
         synth_failure_errors = synth_errors or [{"reason": "synthesizer_unavailable"}]
         synth_failure_candidate_count = max(synth_candidate_count, len(synth_failure_errors))
         synth_failure_status = upstream_failure_status(synth_failure_errors)
-        record_last_route(FUSION_MODEL_ID, "fail", reason_code, request_id, len(panel_candidates), len(attempts), time.time() - request_started, attempts=attempts)
+        record_last_route(FUSION_MODEL_ID, "fail", reason_code, request_id, len(panel_candidates), len(attempts), time.monotonic() - request_started, attempts=attempts)
         write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": synth_failure_status, "final_reason": reason_code, "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
         return synth_failure_status, build_upstream_failure_error(FUSION_MODEL_ID, request_id, synth_failure_candidate_count, synth_failure_errors, synth_failure_errors), fusion_response_headers(request_id, None, len(attempts), metadata)
-    record_last_route(FUSION_MODEL_ID, "ok", "ok", request_id, len(panel_candidates), len(attempts), time.time() - request_started, selected_synth, attempts)
+    record_last_route(FUSION_MODEL_ID, "ok", "ok", request_id, len(panel_candidates), len(attempts), time.monotonic() - request_started, selected_synth, attempts)
     write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "selected_model": selected_synth.get("id") if selected_synth else None, "final_status": 200, "final_reason": "ok", "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
     return 200, fusion_openai_response(request_id, final_text), fusion_response_headers(request_id, selected_synth, len(attempts), metadata)
 
@@ -7106,6 +7882,45 @@ def sse_error_event(code: str, detail: str | None = None) -> bytes:
     return b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n"
 
 
+def upstream_stream_error_payload(chunk: bytes) -> dict[str, Any] | None:
+    """The error object a provider put in its first streamed chunk, or None.
+
+    A provider can answer HTTP 200 and then stream an error instead of content. Those bytes were
+    forwarded verbatim and the request recorded as a success, so the failover that was still
+    legal (nothing had reached the client yet) never happened, and the model's success rate — the
+    input that drives routing order — counted a failure as a win.
+
+    Deliberately conservative: it reports an error only when it can positively identify one, so a
+    normal chunk, a keep-alive comment or an unfamiliar shape all stream through untouched.
+    """
+    try:
+        text = chunk.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    candidates: list[str] = []
+    if text.startswith("data:"):
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                payload = line[len("data:"):].strip()
+                if payload and payload != "[DONE]":
+                    candidates.append(payload)
+    elif text.startswith("{"):
+        # Some providers drop the SSE framing entirely and answer with a bare JSON error.
+        candidates.append(text)
+    for payload in candidates:
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), (dict, str)):
+            error = parsed["error"]
+            return error if isinstance(error, dict) else {"message": error}
+    return None
+
+
 def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: Any) -> dict[str, Any]:
     response_committed = False
     # True only while a call into `write_chunk`/`flush` is in flight — the delivery side. An
@@ -7122,6 +7937,27 @@ def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: An
         for chunk in chunks:
             if not chunk:
                 continue
+            if bytes_sent + len(chunk) > MAX_UPSTREAM_RESPONSE_BYTES:
+                # Check before delivery: a provider can yield one arbitrarily large chunk, so a
+                # post-write check would still send an unbounded response to the client.
+                # This remains outside the delivery window and therefore is an upstream failure.
+                raise UpstreamResponseTooLarge(
+                    f"upstream streamed past the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
+                )
+            if not response_committed:
+                # Inspecting only the FIRST chunk keeps the first-byte rule intact and bounds the
+                # added TTFB to one already-received chunk: nothing is buffered or waited for.
+                stream_error = upstream_stream_error_payload(chunk)
+                if stream_error is not None:
+                    return {
+                        "status": "error",
+                        "reason": "pre_stream_failure",
+                        "stream_started": False,
+                        "chunk_count": 0,
+                        "bytes_sent": 0,
+                        "error_type": str(stream_error.get("type") or stream_error.get("code") or "upstream_error"),
+                        "message": safe_detail(str(stream_error.get("message") or stream_error)),
+                    }
             # The writer may emit HTTP headers before attempting the first body write. Mark
             # the response as committed before calling it so a body failure cannot trigger a
             # fallback on an already-started HTTP 200; update byte/tail metrics only after the
@@ -7383,7 +8219,23 @@ def record_benchmark_failure(model: dict[str, Any], reason: str, profile_id: str
     _STATE_STORE.update(mutate, reason=f"record_benchmark_failure:{reason}")
 
 
+_BENCHMARK_RUN_LOCK = threading.Lock()
+
+
 def benchmark_profile(profile_id: str, config: dict[str, Any], *, all_candidates: bool = False, only_model_id: str | None = None) -> dict[str, Any]:
+    # Guarded against the auto-discovery cycle: both spend the same free-tier allowance, and the
+    # probe pacer only bounds the RATE within one prober — two at once simply double it.
+    # Non-blocking on purpose: a cycle runs for minutes, so waiting would hang the dashboard on
+    # what looks like a dead button. Refusing says what is happening and costs nothing.
+    if not _BENCHMARK_RUN_LOCK.acquire(blocking=False):
+        return {"status": "skipped", "reason": "benchmark_already_running", "profile": profile_id, "results": []}
+    try:
+        return _benchmark_profile_locked(profile_id, config, all_candidates=all_candidates, only_model_id=only_model_id)
+    finally:
+        _BENCHMARK_RUN_LOCK.release()
+
+
+def _benchmark_profile_locked(profile_id: str, config: dict[str, Any], *, all_candidates: bool = False, only_model_id: str | None = None) -> dict[str, Any]:
     return build_benchmark_runner().benchmark_profile(
         profile_id,
         config,
@@ -7559,6 +8411,18 @@ def run_auto_benchmark_cycle(config: dict[str, Any]) -> dict[str, Any]:
     the verified-capability TTL re-opens verdicts for re-discovery. Records a privacy-safe marker in
     state. Never raises out (the loop also guards).
     """
+    # Same guard as the admin benchmark path. Skipping rather than queueing is right here: the
+    # cycle is periodic and converges, so yielding to an operator's click just means this pass
+    # happens on the next interval.
+    if not _BENCHMARK_RUN_LOCK.acquire(blocking=False):
+        return {"status": "skipped", "reason": "benchmark_already_running", "models": 0}
+    try:
+        return _run_auto_benchmark_cycle_locked(config)
+    finally:
+        _BENCHMARK_RUN_LOCK.release()
+
+
+def _run_auto_benchmark_cycle_locked(config: dict[str, Any]) -> dict[str, Any]:
     result = build_capability_discovery_job().run_auto_benchmark_cycle(
         config,
         auto_benchmark_enabled=auto_benchmark_enabled,
@@ -7744,7 +8608,7 @@ def run_failover_demo(
             cfg,
             entitled=entitled,
         ),
-        now=time.time,
+        now=time.monotonic,
     )
 
     def demo_ports(_attempt_plan: ChatCompletionAttemptPlan) -> ChatCompletionAttemptPorts:
@@ -7755,9 +8619,10 @@ def run_failover_demo(
                 build_response=simulated_outage_response,
             ),
             apply_cooldown=lambda _cooldown: None,
-            record_success=lambda _model, _latency: None,
+            record_success=lambda _model, _latency, **_kwargs: None,
             resolve_competence=lambda profile_id, model: model_route_competence(profile_id, model, fresh_runtime_state()),
             record_telemetry=capture_telemetry,
+            record_success_with_telemetry=lambda _model, _latency, telemetry: capture_telemetry(telemetry),
             stream_response=refuse_stream,
             detect_success_error=success_error_payload_failure,
             has_deliverable=has_deliverable_message,
@@ -7774,7 +8639,7 @@ def run_failover_demo(
         "stream": False,
         "max_tokens": 160,
     }
-    started = time.time()
+    started = time.monotonic()
     result = demo_router.handle(
         body,
         request_id=uuid.uuid4().hex,
@@ -7799,7 +8664,7 @@ def run_failover_demo(
         knocked_out=knocked_out,
         attempts=attempts,
         answer=answer,
-        duration_seconds=float(captured["duration_seconds"] or (time.time() - started)),
+        duration_seconds=float(captured["duration_seconds"] or (time.monotonic() - started)),
         all_candidates_free=all(
             model_is_strict_zero(model) for model in candidates if str(model.get("id") or "") in attempted_ids
         ),
@@ -7920,13 +8785,29 @@ def hermes_config_export(config: dict[str, Any]) -> dict[str, Any]:
     return export
 
 
+class ThreadingHTTPServer(_StdThreadingHTTPServer):
+    # socketserver's default listen backlog is 5. An agent fanning out parallel subagents opens
+    # more than that at once, and the overflowed SYNs are dropped silently — the client just
+    # waits out a retransmit before its request is even seen.
+    request_queue_size = 128
+
+
 class RouterHandler(BaseHTTPRequestHandler):
     server_version = "Ficelle/0.1"
+    # BaseHTTPRequestHandler defaults to HTTP/1.0, which closes the socket after every response:
+    # each turn of an agent conversation paid a fresh TCP connection and a fresh thread. Every
+    # response here already sends Content-Length, which is what makes keep-alive safe.
+    protocol_version = "HTTP/1.1"
+    # A client that connects and then says nothing must not park a handler thread forever.
+    timeout = 60
 
     def _send_json(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        # Admin JSON carries provider-controlled strings (model ids, upstream error text); refusing
+        # content sniffing keeps a browser from ever reading one of these bodies as HTML.
+        self.send_header("X-Content-Type-Options", "nosniff")
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(data)))
@@ -7937,6 +8818,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         data = html.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        for key, value in ADMIN_HTML_SECURITY_HEADERS.items():
+            self.send_header(key, value)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -7959,6 +8842,15 @@ class RouterHandler(BaseHTTPRequestHandler):
     def _send_bytes(self, status: int, data: bytes, content_type: str, cache_seconds: int = 0, no_cache: bool = False) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        # The dashboard is reachable as a static asset too (`/admin/static/index.html` serves the
+        # same document as `/admin`), so the framing and script policy has to travel with the
+        # bytes, not with one route — otherwise an attacker just frames the other URL. nosniff
+        # goes on every asset regardless of type.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if content_type.startswith("text/html"):
+            for key, value in ADMIN_HTML_SECURITY_HEADERS.items():
+                if key != "X-Content-Type-Options":
+                    self.send_header(key, value)
         self.send_header("Content-Length", str(len(data)))
         if cache_seconds:
             self.send_header("Cache-Control", f"public, max-age={cache_seconds}, immutable")
@@ -8058,7 +8950,18 @@ class RouterHandler(BaseHTTPRequestHandler):
         self._write_sse_raw(f"{prefix}event: {event}\ndata: {data}\n\n")
 
     def _read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError as exc:
+            raise ValueError(f"invalid Content-Length: {exc}") from exc
+        if length < 0:
+            raise ValueError("invalid Content-Length")
+        # Read the declared length into memory only up to a ceiling: an unbounded read is a
+        # one-request memory exhaustion of a process that is also serving everyone else.
+        if length > MAX_REQUEST_BODY_BYTES:
+            raise RequestBodyTooLarge(
+                f"request body of {length} bytes exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit"
+            )
         raw = self.rfile.read(length) if length else b"{}"
         try:
             data = json.loads(raw.decode("utf-8"))
@@ -8068,14 +8971,66 @@ class RouterHandler(BaseHTTPRequestHandler):
             raise ValueError("JSON body must be an object")
         return data
 
+    def _bind_is_loopback(self) -> bool:
+        return str(self.config.get("host") or "127.0.0.1").strip().lower() in LOOPBACK_BIND_HOSTS
+
     def _admin_origin_ok(self) -> bool:
         """CSRF guard for admin mutations. A browser always sends ``Origin`` on a POST;
         accept it only when it is this exact loopback server (host AND port), which
         blocks both cross-site pages and other local apps on a different port. A request
-        with no ``Origin`` (curl/CLI) is allowed — it cannot be driven cross-site."""
+        with no ``Origin`` (curl/CLI) is allowed — it cannot be driven cross-site.
+
+        That last allowance only holds while the socket itself is the boundary. On a
+        non-loopback bind anyone on the network can send an Origin-less POST, so there the
+        admin token becomes the gate instead (see ``_admin_write_authorized``)."""
         return admin_origin_allowed(
             self.headers.get("Origin"),
             self.server.server_address[1],  # type: ignore[attr-defined]
+        )
+
+    def _admin_mutation_authorized(self) -> bool:
+        """Guard for the whole admin write surface, bind-aware."""
+        if not self._admin_origin_ok():
+            return False
+        if self._bind_is_loopback():
+            return True
+        # Exposed bind: an absent Origin no longer proves a local caller, so require the token
+        # that only the served admin page (and the operator) can hold.
+        return admin_token_matches(self.headers.get("X-Ficelle-Admin-Token") or "", admin_token())
+
+    def _host_header_ok(self) -> bool:
+        """Anti-DNS-rebinding guard, applied to every method before routing.
+
+        The Origin guard only runs on admin POSTs, so without this a page on an attacker domain
+        rebound to 127.0.0.1 reads the entire GET surface — the admin token included — and can
+        spend free quota through /v1. Checking ``Host`` makes the attacker's own name fail.
+        """
+        return request_host_allowed(
+            self.headers.get("Host"),
+            self.server.server_address[1],  # type: ignore[attr-defined]
+            str(self.config.get("host") or "127.0.0.1"),
+        )
+
+    def _reject_foreign_host(self) -> None:
+        self._send_json(403, {"error": {"code": "forbidden", "message": "unexpected Host header"}})
+
+    def _reject_unread_body(self, status: int, code: str, message: str) -> None:
+        # The declared (or chunked) body remains unread. HTTP/1.1 would otherwise interpret
+        # those bytes as another request on a reused socket, so this response must close it.
+        self.close_connection = True
+        self._send_json(status, {"error": {"code": code, "message": message}}, headers={"Connection": "close"})
+
+    def _reject_payload_too_large(self) -> None:
+        self._reject_unread_body(
+            413, "payload_too_large", f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"
+        )
+
+    def _reject_chunked_body(self) -> None:
+        # Not a size problem, so not a 413: BaseHTTPRequestHandler never decoded chunked bodies,
+        # so such a request was already being read as an empty `{}` with its data left on the
+        # socket. Saying "length required" is what actually tells a client how to succeed.
+        self._reject_unread_body(
+            411, "length_required", "chunked request bodies are not supported; send Content-Length"
         )
 
     def _admin_write_authorized(self) -> bool:
@@ -8096,6 +9051,9 @@ class RouterHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         try:
+            if not self._host_header_ok():
+                self._reject_foreign_host()
+                return
             path = urlparse(self.path).path.rstrip("/") or "/"
             if path in {"/health", "/v1/health"}:
                 catalog = load_or_refresh_catalog(self.config)
@@ -8108,7 +9066,11 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(200, admin_state(self.config))
                 return
             if path == "/admin/status.json":
-                self._send_json(200, admin_status(self.config))
+                # A GET must not spend free quota. Probing stays available through an explicit
+                # opt-in, so `ficelle doctor` and the dashboard's polling — which hit this on a
+                # timer — can no longer fire upstream calls as a side effect of being read.
+                probe = (parse_qs(urlparse(self.path).query).get("probe") or [""])[0] == "1"
+                self._send_json(200, admin_status(self.config, run_quota_probes=probe))
                 return
             if path == "/admin/update":
                 self._send_json(200, update_service.public_update_status())
@@ -8242,10 +9204,37 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._send_json(500, safe_error_body(exc))
 
     def do_POST(self) -> None:  # noqa: N802
+        # Guarded: unlike do_GET this method has no top-level try, so a raise here would answer
+        # nothing at all and drop the connection rather than surfacing an error.
+        try:
+            if not self._host_header_ok():
+                self._reject_foreign_host()
+                return
+            # Checked once here rather than per route: every handler funnels through _read_body,
+            # whose RequestBodyTooLarge subclasses ValueError and would otherwise be answered as
+            # a 400 by each route's own error branch.
+            # BaseHTTPRequestHandler does not decode chunked request bodies. Reject them before
+            # routing (and close the connection) rather than treating their first chunk header as
+            # the next HTTP request or accepting an unbounded body with no Content-Length.
+            if self.headers.get("Transfer-Encoding"):
+                self._reject_chunked_body()
+                return
+            declared = self.headers.get("Content-Length")
+            if declared is not None:
+                try:
+                    declared_length = int(declared)
+                except ValueError:
+                    declared_length = None
+                if declared_length is not None and declared_length > MAX_REQUEST_BODY_BYTES:
+                    self._reject_payload_too_large()
+                    return
+        except Exception as exc:
+            self._send_json(500, safe_error_body(exc))
+            return
         path = urlparse(self.path).path.rstrip("/") or "/"
         # CSRF guard for the whole admin mutation surface: a cross-origin browser POST is
         # rejected here. /v1/* (the inference API) is intentionally not gated.
-        if path.startswith("/admin/") and not self._admin_origin_ok():
+        if path.startswith("/admin/") and not self._admin_mutation_authorized():
             self._send_json(403, {"error": {"code": "forbidden", "message": "cross-origin admin request rejected"}})
             return
         if path == "/admin/refresh":
@@ -8497,6 +9486,51 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(500, safe_error_body(exc))
             return
 
+        if path == "/admin/providers/toggle":
+            # The dashboard has posted here since the provider card shipped; the route never
+            # existed, so the enable/disable button answered 404 and silently did nothing.
+            try:
+                body = self._read_body()
+                source = str(body.get("source") or body.get("provider") or "").strip()
+                action = str(body.get("action") or "").strip().lower()
+                if not source:
+                    raise ValueError("source is required")
+                if action not in {"enable", "disable"}:
+                    raise ValueError("action must be 'enable' or 'disable'")
+                providers = self.config.get("providers")
+                provider = providers.get(source) if isinstance(providers, dict) else None
+                if not isinstance(provider, dict):
+                    raise ValueError(f"unknown provider: {source}")
+                # Validated against the configured registry, not the enabled-filtered catalog:
+                # a disabled provider is absent from the latter, so re-enabling one would be
+                # rejected as unknown.
+                enabled = action == "enable"
+                before_enabled = bool(provider.get("enabled", True))
+
+                def apply_toggle(cfg: dict[str, Any]) -> None:
+                    cfg_providers = cfg.get("providers")
+                    cfg_provider = cfg_providers.get(source) if isinstance(cfg_providers, dict) else None
+                    if not isinstance(cfg_provider, dict):
+                        raise ValueError(f"unknown provider: {source}")
+                    cfg_provider["enabled"] = enabled
+
+                runtime_config_store().update(apply_toggle)
+                # Keep the live config in step so the change takes effect without a restart,
+                # the same way the other admin saves do.
+                provider["enabled"] = enabled
+                write_admin_audit(
+                    "admin.providers.toggle",
+                    before={"enabled": before_enabled},
+                    after={"enabled": enabled},
+                    metadata={"source": source, "enabled": enabled},
+                )
+                self._send_json(200, {"source": source, "enabled": enabled})
+            except ValueError as exc:
+                self._send_json(400, bad_request_body(exc))
+            except Exception as exc:
+                self._send_json(500, safe_error_body(exc))
+            return
+
         if path.startswith("/admin/providers/") and path.endswith("/key"):
             try:
                 if not self._admin_write_authorized():
@@ -8512,27 +9546,48 @@ class RouterHandler(BaseHTTPRequestHandler):
                 # Manager / libsecret), never the login keychain, and fall back to .env
                 # where none is available (R9). Cross-platform, never macOS-only.
                 if body.get("remove"):
+                    # Opt-in second pass: without it a key held only in a legacy store stays
+                    # resolvable and the remove looks like it silently failed.
+                    raw_purge_legacy = body.get("purge_legacy", False)
+                    if not isinstance(raw_purge_legacy, bool):
+                        raise ValueError("purge_legacy must be a boolean")
+                    purge_legacy = raw_purge_legacy
                     cleared = remove_provider_key(source, self.config, store=server_secret_store())
+                    purged_legacy = (
+                        purge_legacy_provider_credentials(source, self.config)
+                        if purge_legacy
+                        else []
+                    )
                     remaining_legacy_sources = legacy_provider_credential_sources(
                         source,
                         self.config,
                     )
                     refresh_catalog(self.config)
+                    # The post-removal verdict: resolution re-run after the delete and after
+                    # refresh_catalog, so it names whatever store would still serve this
+                    # provider — process env and external resolvers included, which
+                    # `remaining_legacy_sources` does not enumerate. Computed once so the audit
+                    # entry and the response body can never disagree about it.
+                    auth = provider_auth_row(source, self.config)
                     write_admin_audit(
                         "admin.providers.remove_key",
                         after={
                             "cleared": cleared,
+                            "purged_legacy": purged_legacy,
                             "remaining_legacy_sources": remaining_legacy_sources,
+                            "still_resolved_from": auth.get("key_source"),
                         },
-                        metadata={"source": source},
+                        metadata={"source": source, "purge_legacy": purge_legacy},
                     )
                     self._send_json(
                         200,
                         {
                             "source": source,
-                            "removed": cleared,
+                            # One list: what the removal cleared. The canonical/legacy split
+                            # only matters to the audit trail, which keeps it separately.
+                            "removed": [*cleared, *purged_legacy],
                             "remaining_legacy_sources": remaining_legacy_sources,
-                            "auth": provider_auth_row(source, self.config),
+                            "auth": auth,
                         },
                     )
                     return
@@ -8732,7 +9787,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         request_id = uuid.uuid4().hex
         requested_model = DEFAULT_CHAT_COMPLETION_MODEL
-        request_started = time.time()
+        request_started = time.monotonic()
         try:
             body = self._read_body()
             chat_request = normalize_chat_completion_request(body)
@@ -8758,7 +9813,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     config,
                     entitled=entitled,
                 ),
-                now=time.time,
+                now=time.monotonic,
             )
             def attempt_ports_factory(attempt_plan: ChatCompletionAttemptPlan) -> ChatCompletionAttemptPorts:
                 compression_metadata = attempt_plan.compression_metadata
@@ -8785,11 +9840,23 @@ class RouterHandler(BaseHTTPRequestHandler):
                             self.send_header("Content-Type", stream_start.content_type)
                             for key, value in stream_start.headers.items():
                                 self.send_header(key, value)
+                            # A streamed body has no Content-Length and is not chunk-framed, so
+                            # its end is the close itself. Under HTTP/1.1 that has to be stated
+                            # or the client waits for a next response that never comes.
+                            self.send_header("Connection", "close")
+                            self.close_connection = True
                             self.end_headers()
                             headers_sent = True
                         self.wfile.write(chunk)
 
-                    return stream_chunks_to_writer(response.iter_content(chunk_size=None), write_stream_chunk, self.wfile.flush)
+                    # The chunks reach the writer untouched; the observer only reads them on
+                    # the way past, to learn a thinking model's trace for the next turn.
+                    observed = observe_stream_chunks(
+                        response.iter_content(chunk_size=None),
+                        ReasoningStreamObserver(REASONING_REPLAY_STORE, str(model.get("id") or "")),
+                        now_fn=time.time,
+                    )
+                    return stream_chunks_to_writer(observed, write_stream_chunk, self.wfile.flush)
 
                 return ChatCompletionAttemptPorts(
                     invoke_model=invoke_model,
@@ -8802,6 +9869,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     record_success=record_success,
                     resolve_competence=lambda profile, model: model_route_competence(profile, model, fresh_runtime_state()),
                     record_telemetry=apply_chat_route_telemetry,
+                    record_success_with_telemetry=record_success_with_telemetry,
                     stream_response=stream_response,
                     detect_success_error=success_error_payload_failure,
                     has_deliverable=has_deliverable_message,
@@ -8902,6 +9970,35 @@ def catalog_refresh_interval_seconds(config: dict[str, Any]) -> int:
     return min(max(60, ttl - 120), ttl - 1)
 
 
+# First retry delay for a failed catalog warm; doubles up to the normal refresh interval.
+CATALOG_WARM_RETRY_MIN_SECONDS = 5.0
+
+
+def record_catalog_refresh_error(detail: str | None) -> None:
+    """Publish the refresh loop's last error into state, or clear it on success.
+
+    `auto_benchmark_loop` already records `last_error` for the admin UI while this loop only
+    printed to the LaunchAgent log, so a permanently failing refresh (broken DNS, a bad cert)
+    was invisible in `/admin/status.json` except as an ever-aging catalog.
+    """
+
+    def mutate(state: dict[str, Any]) -> None:
+        row = state.setdefault("catalog_refresh", {})
+        if detail is None:
+            row.pop("last_error", None)
+            row.pop("last_error_at", None)
+            row["last_success_at"] = now_iso()
+        else:
+            row["last_error"] = detail
+            row["last_error_at"] = now_iso()
+
+    try:
+        _STATE_STORE.update(mutate, reason="catalog_refresh_error")
+    except Exception:
+        # Reporting a failure must never become a second failure.
+        pass
+
+
 def catalog_refresh_loop(config: dict[str, Any]) -> None:
     """Background daemon that keeps the cached catalog fresh. An idle instance gets no
     routing requests to trigger an on-demand refresh, so without this the catalog crosses
@@ -8909,12 +10006,22 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
     routing self-heals on demand. Warm once, then force a refresh well within the TTL so
     the catalog never goes stale. Re-reads the live ``config`` each cycle; daemon so it
     dies with the process."""
-    try:
-        refresh_capability_oracle_if_stale(config)
-        load_or_refresh_catalog(config)
-        refresh_provider_budgets(effective_runtime_config(config))
-    except Exception as exc:  # never let the warm crash the serving process
-        print(f"initial catalog warm failed: {exc}")
+    # A failed first warm used to wait the FULL refresh interval (~58 min at the default TTL)
+    # before trying again. This runs at login as a LaunchAgent, so a network that is not up yet
+    # is the common case, and the instance sat reporting "0 models / fail" for the best part of
+    # an hour. Back off from seconds instead, until the first warm lands.
+    backoff = CATALOG_WARM_RETRY_MIN_SECONDS
+    while True:
+        try:
+            refresh_capability_oracle_if_stale(config)
+            load_or_refresh_catalog(config)
+            refresh_provider_budgets(effective_runtime_config(config))
+            break
+        except Exception as exc:  # never let the warm crash the serving process
+            record_catalog_refresh_error(f"initial catalog warm failed: {safe_detail(exc)}")
+            print(f"initial catalog warm failed: {exc}; retrying in {backoff:.0f}s", flush=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, catalog_refresh_interval_seconds(config))
     while True:
         time.sleep(catalog_refresh_interval_seconds(config))
         try:
@@ -8931,7 +10038,64 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
             # effective_config): a chat call must never rewrite the user's config.
             refresh_catalog(config)
         except Exception as exc:
-            print(f"periodic catalog refresh failed: {exc}")
+            record_catalog_refresh_error(f"periodic catalog refresh failed: {safe_detail(exc)}")
+            print(f"periodic catalog refresh failed: {exc}", flush=True)
+        else:
+            record_catalog_refresh_error(None)
+
+
+# How long a SIGTERM waits for requests already in flight. `ficelle stop` SIGKILLs after its own
+# grace period, so this stays comfortably under it: draining is worth doing, stalling a restart
+# is not.
+SHUTDOWN_DRAIN_SECONDS = 5.0
+
+
+def drain_inflight_requests(server: Any, timeout_seconds: float) -> int:
+    """Wait up to `timeout_seconds` for handler threads to finish. Returns how many still ran."""
+    threads = [thread for thread in getattr(server, "_threads", None) or [] if thread.is_alive()]
+    if not threads:
+        return 0
+    deadline = time.monotonic() + timeout_seconds
+    for thread in threads:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        thread.join(timeout=remaining)
+    still_running = sum(1 for thread in threads if thread.is_alive())
+    if still_running:
+        print(f"ficelle: {still_running} request(s) still running at exit", flush=True)
+    return still_running
+
+
+def install_shutdown_handler(server: Any) -> None:
+    """Stop accepting, let in-flight requests finish, then exit.
+
+    Every `ficelle stop`/`restart`/`update` runs `launchctl bootout`, which SIGTERMs the process.
+    With no handler and daemon handler threads, a streaming response was severed mid-SSE with no
+    terminal frame — the client saw a truncated HTTP 200 — and the in-flight request's route-log
+    row was never written. State stays consistent either way (writes are atomic); what was lost
+    was the client's ability to tell a finished answer from a killed one.
+    """
+    draining = threading.Event()
+
+    def handle(signum: int, _frame: Any) -> None:
+        if draining.is_set():
+            return
+        draining.set()
+        print(f"ficelle: signal {signum} received, draining for up to {SHUTDOWN_DRAIN_SECONDS}s", flush=True)
+
+        def drain() -> None:
+            # shutdown() blocks until serve_forever returns, so it cannot run on this thread.
+            server.shutdown()
+
+        threading.Thread(target=drain, name="ficelle-shutdown", daemon=True).start()
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signum, handle)
+        except ValueError:
+            # Not the main thread (embedded/test use); the caller keeps its own lifecycle.
+            return
 
 
 def serve(config: dict[str, Any]) -> None:
@@ -8959,8 +10123,22 @@ def serve(config: dict[str, Any]) -> None:
     # letting the Settings toggle take effect without a restart. Daemon so it dies with the process.
     threading.Thread(target=auto_benchmark_loop, args=(config,), name="ficelle-auto-benchmark", daemon=True).start()
     threading.Thread(target=update_service.update_check_loop, name="ficelle-update-check", daemon=True).start()
+    # A SIGKILL between create and rename leaves a temp file behind for good; startup is the
+    # natural moment to clear them, when no write of ours is in flight.
+    swept = sweep_orphan_temp_files(ROUTER_DIR)
+    if swept:
+        print(f"ficelle: removed {swept} orphaned temp file(s) from an interrupted write", flush=True)
+    install_shutdown_handler(server)
     print(f"Ficelle listening on http://{host}:{port}/v1")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        # socketserver joins handler threads at server_close() with NO timeout, and a request
+        # waiting on a slow provider can run for minutes — that would hold up every restart. So
+        # stop it joining and bound the wait here instead.
+        server.block_on_close = False
+        server.server_close()
+        drain_inflight_requests(server, SHUTDOWN_DRAIN_SECONDS)
 
 
 def main_args(argv: list[str] | None = None) -> int:

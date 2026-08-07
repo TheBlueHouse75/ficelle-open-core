@@ -982,7 +982,7 @@ class BenchmarkRunner:
     set_cooldown: Callable[..., None]
     record_benchmark_failure: Callable[..., None]
     record_benchmark_result: Callable[[str, dict[str, Any], dict[str, Any]], None]
-    record_success: Callable[[dict[str, Any], float], None]
+    record_success: Callable[..., None]
     record_verified_capability: Callable[[str, dict[str, Any], dict[str, Any]], None]
     record_capability_discrepancy: Callable[[str, dict[str, Any], bool], None]
     extract_message_text: Callable[[Any], str]
@@ -1118,7 +1118,7 @@ class BenchmarkRunner:
         # limit, and the admin "Test candidates" button can fire it while a cycle is already running.
         source = str(model.get("source") or "")
         self.pacer.wait_turn(source, provider_probe_interval_seconds(config, source))
-        started = time.time()
+        started = time.monotonic()
         result: dict[str, Any] = {
             "profile_id": profile_id,
             "model_id": model.get("id"),
@@ -1129,7 +1129,7 @@ class BenchmarkRunner:
         }
         try:
             response = self.invoke_model(model, body, config)
-            latency = time.time() - started
+            latency = time.monotonic() - started
             result["latency_seconds"] = round(latency, 3)
             if not (200 <= response.status_code < 300):
                 return self._record_http_failure(profile_id, model, response, config, result)
@@ -1142,7 +1142,7 @@ class BenchmarkRunner:
                 "text_preview": self.safe_detail(text, 160),
             })
             if passed:
-                self.record_success(model, latency)
+                self.record_success(model, latency, representative_latency=False)
                 self.record_benchmark_result(profile_id, model, result)
                 self.record_verified_capability(profile_id, model, result)
                 self.record_capability_discrepancy(profile_id, model, True)

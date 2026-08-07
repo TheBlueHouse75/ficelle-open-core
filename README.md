@@ -118,19 +118,19 @@ ficelle demo
 Sends one real completion with the model that was about to answer forced to fail,
 and shows what happens next:
 
-```text
-  1. openrouter/llama-3.3-70b:free (openrouter) — SIMULATED OUTAGE, HTTP 429 → rate_limited
-     (fabricated by the demo; no request was sent to this provider)
-  2. nous/hermes-4-70b (nous) — answered, HTTP 200 · 412 ms
-
-Answered by nous/hermes-4-70b in 0.4s.
-Cost of this request: $0.00
-```
+![Terminal recording: the two leading candidates answer a simulated HTTP 429, each marked "fabricated by the demo; no request was sent to this provider", then a third candidate on a different provider answers HTTP 200 and the run reports a cost of $0.00.](assets/failover-demo.gif)
 
 Only the outage is simulated. The candidate order, the failure classification and
 the answer all come from the same code path that serves your agents, and the run
 writes nothing: no cooldown, no route log. `ficelle demo --json` prints the same
 run as a payload.
+
+The recording passes `--knock-out 2`, which fails the two leading candidates
+instead of one, so the reroute crosses a provider boundary rather than landing on
+the next model of the same provider. Every fabricated attempt is labelled on its
+own line whichever number you use. It is an unedited capture of a real run against
+the free pool: re-running it gives different models, a different latency, and a
+different sentence back.
 
 `ficelle-setup --target auto` selects Hermes only when it detects a reliable local
 Hermes signal; otherwise it selects the same standalone generic target. The explicit

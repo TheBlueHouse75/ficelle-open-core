@@ -311,7 +311,7 @@ class CapabilityDiscoveryJob:
             return "skip"
         source = str(model.get("source") or "")
         self.pacer.wait_turn(source, provider_probe_interval_seconds(config, source))
-        started = time.time()
+        started = time.monotonic()
         try:
             response = self.invoke_model(model, body, config)
         except Exception as exc:
@@ -348,12 +348,12 @@ class CapabilityDiscoveryJob:
             "status": "pass" if passed else "fail",
             "message": self.safe_detail(message),
             "text_preview": self.safe_detail(text, 160),
-            "latency_seconds": round(time.time() - started, 3),
+            "latency_seconds": round(time.monotonic() - started, 3),
         })
         self.record_benchmark_result(profile_id, model, result)
         self.record_verified_capability(profile_id, model, result)
         if passed:
-            self.record_success(model, round(time.time() - started, 3))
+            self.record_success(model, round(time.monotonic() - started, 3), representative_latency=False)
         return "verified" if passed else "failed"
 
     def _record_http_capability_result(

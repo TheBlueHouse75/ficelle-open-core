@@ -37,6 +37,8 @@ from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
     provider_key_setup_commands,
     unconfigured_provider_sources,
+    unusable_key_provider_block,
+    unusable_key_provider_reasons,
 )
 
 
@@ -266,6 +268,8 @@ def _truncated(text: str, limit: int) -> str:
 
 
 def _key_setup_block(sources: Sequence[str], key_urls: Mapping[str, str]) -> list[str]:
+    if not sources:
+        return []
     return [
         "Ficelle routes through your own provider accounts and ships no keys of its own,",
         "so it cannot call a model until at least one key is stored:",
@@ -289,10 +293,16 @@ def unroutable_pool_message(profile: str, auth: Mapping[str, Any], key_urls: Map
             f"No model is currently routable for {profile}. Run `ficelle doctor --text` "
             "to see which providers are configured and reachable."
         )
+    # A provider whose key resolves and still cannot be called is dropped by selection just
+    # the same, so it belongs in this message — but not under "no key is configured", and
+    # not behind a `set-key` line that would store the key it already has.
+    unusable = unusable_key_provider_reasons(auth)
+    cause = "no configured provider is usable." if unusable else "no provider API key is configured."
     return "\n".join(
         [
-            f"Nothing is routable for {profile}: no provider API key is configured.",
+            f"Nothing is routable for {profile}: {cause}",
             *_key_setup_block(unconfigured_provider_sources(auth), key_urls),
+            *unusable_key_provider_block(unusable),
             "Then run `ficelle refresh` and try again.",
         ]
     )

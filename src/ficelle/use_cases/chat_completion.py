@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - exercised only in core-only installs
 from ficelle.failures import (
     CALLER_CAUSED_FAILURE_REASONS,
     NON_RETRYABLE_FAILURE_REASONS,
+    UPSTREAM_DETAIL_LIMIT,
     caller_rejected_request,
     upstream_failure_status,
 )
@@ -319,6 +320,9 @@ class ChatCompletionAttemptPorts:
     record_success: SuccessRecorder
     resolve_competence: CompetenceResolver
     record_telemetry: TelemetryRecorder
+    # One state write for the success and its route telemetry. Kept alongside the two separate
+    # ports because the failure paths still record telemetry on its own.
+    record_success_with_telemetry: Callable[..., None]
     stream_response: StreamResponseHandler
     detect_success_error: SuccessErrorDetector
     has_deliverable: DeliverablePredicate
@@ -350,7 +354,12 @@ def malformed_tool_call_detail(body: Any) -> str | None:
     400 ("historical tool function name is invalid") — and since `bad_upstream_request` is
     non-retryable, that costs a full round trip to learn something knowable locally. On Fusion
     it costs one per panelist. Ficelle stays a passthrough: the body is never rewritten, only
-    refused with a message naming the offending index.
+    refused with a message naming the offending index. One deliberate exception exists, and it
+    does not weaken the rule — ``reasoning_replay`` restores a thinking model's own
+    ``reasoning_content`` on the way back out (see its module docstring for why the upstream
+    demands it and the schema gives the client no way to return it). It adds a field Ficelle
+    itself relayed outward; it never edits what the caller wrote, which is what this check
+    refuses to do.
 
     Deliberately narrow, because the provider remains the authority on everything else in the
     body: only a ``function`` object that IS present with a blank or non-string ``name`` is
@@ -379,6 +388,68 @@ def malformed_tool_call_detail(body: Any) -> str | None:
             if not isinstance(name, str) or not name.strip():
                 return f"messages[{message_index}].tool_calls[{call_index}].function.name is empty"
     return None
+
+
+def request_deadline(config: dict[str, Any] | None, request_started: float) -> float | None:
+    """Wall-clock instant past which no NEW attempt is started, or None when disabled.
+
+    Without this the worst case was `max_attempts_per_request` × the profile timeout — four
+    attempts at the 120 s default is over eight minutes with nothing to stop it. The budget is
+    deliberately generous: it exists to bound a request that is failing, not to trim the tail of
+    one that is working, and the default was sized against this install's own route log so that it
+    cuts none of the successes actually observed.
+    """
+    raw = (config or {}).get("request_deadline_seconds")
+    if raw is None:
+        return None
+    seconds = _safe_float(raw, 0.0)
+    if seconds <= 0:
+        return None
+    return request_started + seconds
+
+
+def attempts_with_source_diversity(
+    candidates: list[dict[str, Any]],
+    max_attempt_count: int,
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Take the attempt window in score order, but not all from one provider.
+
+    A provider-wide outage classifies correctly as a model-scoped `unavailable` per candidate —
+    that scoping rule is deliberate and unchanged here. The side effect was that when the top of
+    the pool belonged to one provider, all four attempts were spent inside the same outage while
+    healthy candidates sat below the window, and the caller got a 502 with a working pool.
+
+    Order is otherwise preserved: this only defers a candidate past its provider's quota, it never
+    promotes a worse-scoring model ahead of a better one from a provider that still has room.
+    """
+    if max_attempt_count <= 0 or not candidates:
+        return []
+    raw_cap = (config or {}).get("max_attempts_per_source")
+    cap = _safe_int(raw_cap, 0) if raw_cap is not None else 0
+    if cap <= 0:
+        # Default: leave at least one attempt for a different provider once more than one is in
+        # play, and never constrain a single-provider pool.
+        cap = max(1, max_attempt_count - 1)
+    selected: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    used: dict[str, int] = {}
+    for candidate in candidates:
+        if len(selected) >= max_attempt_count:
+            break
+        source = str(candidate.get("source") or "")
+        if used.get(source, 0) >= cap:
+            deferred.append(candidate)
+            continue
+        selected.append(candidate)
+        used[source] = used.get(source, 0) + 1
+    # A pool that is entirely one provider must still fill its window rather than answer with
+    # fewer attempts than the operator configured.
+    for candidate in deferred:
+        if len(selected) >= max_attempt_count:
+            break
+        selected.append(candidate)
+    return selected
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -717,7 +788,12 @@ def evaluate_upstream_failure_response(
             "source": model.get("source"),
             "status": status_code,
             "reason": reason,
-            "detail": text[:250],
+            # Wider than the cooldown detail below on purpose: this one is what the caller reads.
+            # Relays nest their wrappers ahead of the real message, so the sentence that names the
+            # problem sits at the end — a 250 cut on the OpenCode Zen rejection landed five
+            # characters short of "...passed back to the API.". The cooldown detail stays bounded
+            # because it is written to state, once per cooled model, and only ever read for triage.
+            "detail": text[:UPSTREAM_DETAIL_LIMIT],
         },
         cooldown_reason=reason,
         cooldown_detail=f"HTTP {status_code}: {text[:250]}",
@@ -1059,7 +1135,7 @@ class ChatCompletionRouter:
     ) -> ChatCompletionAttemptPlan:
         candidate_count = len(candidates)
         max_attempt_count = self.max_attempts_for_request(request.requested_model, self.config, candidate_count)
-        attempt_candidates = candidates[:max_attempt_count]
+        attempt_candidates = attempts_with_source_diversity(candidates, max_attempt_count, self.config)
         compression_plan = self.prepare_compression_route_body(body, self.config)
         return ChatCompletionAttemptPlan(
             candidates=attempt_candidates,
@@ -1081,7 +1157,19 @@ class ChatCompletionRouter:
     ) -> ChatCompletionAttemptRunResult:
         errors: list[dict[str, Any]] = []
         attempts: list[dict[str, Any]] = []
-        for model in plan.candidates:
+        deadline = request_deadline(self.config, request_started)
+        for index, model in enumerate(plan.candidates):
+            # Checked between attempts, never mid-attempt: an answer already being produced is
+            # never abandoned. The first candidate always runs, so a deadline can shorten a
+            # failing request but can never turn a request into zero attempts.
+            if index and deadline is not None and self.now() >= deadline:
+                errors.append({
+                    "model": model.get("id"),
+                    "upstream": model.get("upstream_id"),
+                    "source": model.get("source"),
+                    "reason": "request_deadline_exceeded",
+                })
+                break
             started = self.now()
             attempt = {
                 "model": model.get("id"),
@@ -1143,7 +1231,6 @@ class ChatCompletionRouter:
                         if success_decision.outcome == "terminal_failure":
                             break
                         continue
-                    ports.record_success(model, latency)
                     record_attempt_result(
                         AttemptResultRecordInput(
                             attempt=attempt,
@@ -1151,8 +1238,13 @@ class ChatCompletionRouter:
                             attempts=attempts,
                         )
                     )
+                    # Competence is derived from verified_capabilities, never from the `successes`
+                    # this is about to write, so resolving it first costs nothing and lets the
+                    # success and its telemetry share a single state write instead of two.
                     competence = ports.resolve_competence(request.requested_model, model)
-                    ports.record_telemetry(
+                    ports.record_success_with_telemetry(
+                        model,
+                        latency,
                         build_success_route_telemetry(
                             SuccessRouteLogInput(
                                 request_id=request_id,
@@ -1203,9 +1295,10 @@ class ChatCompletionRouter:
                     )
                 )
                 if stream_decision.outcome == "success":
-                    ports.record_success(model, latency)
                     competence = ports.resolve_competence(request.requested_model, model)
-                    ports.record_telemetry(
+                    ports.record_success_with_telemetry(
+                        model,
+                        latency,
                         build_success_route_telemetry(
                             SuccessRouteLogInput(
                                 request_id=request_id,

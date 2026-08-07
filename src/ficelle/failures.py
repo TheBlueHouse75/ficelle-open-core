@@ -325,6 +325,12 @@ CALLER_CAUSED_FAILURE_REASONS = frozenset(
         # payload — so no retry (see NON_RETRYABLE_FAILURE_REASONS), no cooldown, and the caller
         # gets the upstream's own 400.
         "bad_upstream_request",
+        # The upstream wants a field of its own that the OpenAI schema has no room for. Neither
+        # the caller nor the model is at fault, but the consequences the caller-caused set carries
+        # are exactly the right ones: no cooldown, no scoring streak. Cooling here would bench a
+        # model for the one turn it took `reasoning_replay` to learn its trace, and the next turn
+        # is the one that works.
+        "bad_upstream_contract",
         # Writing to the caller's socket failed: the client hung up mid-stream. The upstream was
         # answering fine; cooling it would punish a healthy model for a client-side abort.
         "client_disconnected",
@@ -335,7 +341,61 @@ CALLER_CAUSED_FAILURE_REASONS = frozenset(
 # the next one replays the same rejection and burns a healthy model's turn. Distinct from
 # CALLER_CAUSED_FAILURE_REASONS, which is about *state writes*: a truncated response is the caller's
 # fault too, yet a model with a larger budget may well answer, so it keeps its failover.
+#
+# `bad_upstream_contract` is deliberately absent: a rejection naming a field OpenAI never defined is
+# this upstream's private requirement, not a verdict on the body. The evidence was a router that
+# handed the caller a hard 400 with 163 healthy candidates left, seconds after another of them had
+# answered the very same body.
 NON_RETRYABLE_FAILURE_REASONS = frozenset({"bad_upstream_request"})
+
+# Fields a provider may demand that the OpenAI chat-completions schema does not define. A 400 naming
+# one cannot be the fault of a client that speaks the standard — it has no way to send the field, and
+# `reasoning_replay` exists because of exactly that gap. Matched on the provider's own wording, so
+# the list stays a list of field names rather than of error phrasings.
+NON_STANDARD_REQUEST_FIELDS = ("reasoning_content", "reasoning_details", "thinking_blocks")
+
+# ...but naming the field is not enough: `reasoning_content must be a string` is a verdict on a value
+# that WAS sent, and the next candidate would reject it just the same. The retryable reading needs
+# the upstream to be asking for something it did not get, so a requirement marker has to appear too.
+# Fails closed, like the upstream-rate-limit narrowing: an unrecognised phrasing keeps the terminal
+# `bad_upstream_request` reading rather than earning a failover it may not deserve.
+MISSING_FIELD_MARKERS = (
+    "passed back",
+    "must be provided",
+    "is required",
+    "are required",
+    "required field",
+    "missing",
+    "not provided",
+    "must be present",
+    "must be included",
+)
+
+# ...in the same breath. A body can be wrong in two ways at once — `reasoning_content must be a
+# string; required field: messages` names our field and demands a different one — and proximity
+# cannot tell the two apart, because the decoy sits *closer* to the field name than the real
+# message's own marker does. What separates them is the sentence: the genuine rejection makes one
+# statement, the decoy makes two. Splitting on ordinary clause punctuation (which JSON field
+# separators also fall under) keeps each statement's field and demand together.
+_CLAUSE_SPLIT_PATTERN = re.compile(r"[;.,\n]")
+
+
+def _demands_missing_field(lower: str) -> bool:
+    """True when one clause both names a non-standard field and asks for it."""
+    for clause in _CLAUSE_SPLIT_PATTERN.split(lower):
+        if any(field in clause for field in NON_STANDARD_REQUEST_FIELDS) and any(
+            marker in clause for marker in MISSING_FIELD_MARKERS
+        ):
+            return True
+    return False
+
+
+# How much of an upstream's own error text survives into the failure we hand back. The default 180
+# cut the sentence that named the problem — "The `reasoning_content` in the thinking mode must be
+# passed back to the API" arrived as "... [invalid_request_error] The " — which cost a live
+# reproduction to recover something the provider had already said. Relays nest their messages
+# (gateway wrapper, then the real upstream's), so the useful half is at the end.
+UPSTREAM_DETAIL_LIMIT = 400
 
 PROVIDER_SCOPED_COOLDOWN_REASONS = {"rate_limited", "auth_or_credit"}
 PROVIDER_ERROR_REASONS = PROVIDER_SCOPED_COOLDOWN_REASONS | {"quota_exhausted", "no_free_quota"}
@@ -508,6 +568,13 @@ def classify_failure(
     # above: what is left is the upstream rejecting the request body. Retrying it on another
     # candidate replays the same rejection, and cooling the model blames it for the caller's payload.
     if status_code in REQUEST_REJECTION_STATUSES:
+        # Unless the rejection asks for a field the OpenAI schema does not have. Then it is this
+        # upstream's own contract talking, the body was standard, and the next candidate — which
+        # very likely has no such requirement — deserves its turn. The field name alone is not
+        # enough: a complaint about a value that WAS sent is a real body defect, and stays
+        # terminal like any other.
+        if _demands_missing_field(lower):
+            return "bad_upstream_contract"
         return "bad_upstream_request"
     return "unavailable"
 
@@ -556,6 +623,8 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
         actions.append("Ficelle timed out a slow upstream and tried the next candidate; reduce this virtual model's timeout or quarantine repeat offenders.")
     if reason_counts.get("bad_upstream_request"):
         actions.append("The upstream rejected the request body itself (HTTP 400/422) — inspect the payload the client sent, typically a malformed tool_call or an unsupported field. No model was cooled and no other candidate was tried: every one of them would reject the same body.")
+    if reason_counts.get("bad_upstream_contract"):
+        actions.append("The upstream rejected the request over a field the OpenAI schema does not define, so a standard client cannot send it. Ficelle replays a thinking model's own reasoning trace for exactly this case (see reasoning_replay); the first turn of a conversation started before the service restarted has no trace on file yet and falls through to the next candidate. No model was cooled.")
     if reason_counts.get("client_disconnected"):
         actions.append("The client closed the connection while the answer was streaming; the upstream was healthy and was not cooled. Look at the client's timeout or cancel behaviour, not at the model.")
     if reason_counts.get("truncated_before_content"):
@@ -609,7 +678,7 @@ def build_upstream_failure_error(
             "status": row.get("status"),
             "reason": reason,
         }
-        detail = sanitize_error_detail(row.get("detail") or row.get("error"))
+        detail = sanitize_error_detail(row.get("detail") or row.get("error"), UPSTREAM_DETAIL_LIMIT)
         if detail:
             safe_row["detail"] = detail
         if "stream_started" in row:

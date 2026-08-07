@@ -18,7 +18,7 @@ export let selectedProvider = null;
 export const expandedModels = new Set();
 // Available-models filter/sort state. Object-property mutation only (Sets/scalars),
 // so importers always read the live value without a setter. Session-only, not persisted.
-export const modelFilters = { providers: new Set(), caps: new Set(), minContext: 0, sortKey: "score", sortDir: "desc" };
+export const modelFilters = { providers: new Set(), caps: new Set(), minContext: 0, sortKey: "score", sortDir: "desc", newOnly: false };
 // Requests view — derived request-log payloads + session-only filters (not persisted).
 export let requestsPayload = { entries: [] };
 export let requestsSummary = {};

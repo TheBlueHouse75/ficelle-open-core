@@ -16,6 +16,7 @@ class ModelSelectionPorts:
         list[str],
     ]
     run_due_quota_probes: Callable[..., dict[str, Any]]
+    schedule_quota_probes: Callable[..., None]
     safe_int: Callable[[Any, int], int]
     apply_verified_capability_ttl: Callable[[dict[str, Any]], None]
     apply_route_on_capability_reference: Callable[[dict[str, Any]], None]
@@ -41,9 +42,19 @@ class ModelSelectionRunner:
         state = self.ports.fresh_runtime_state()
         due_probe_keys = self.ports.due_quota_probe_keys_for_request(requested_model, models, config, state)
         if due_probe_keys:
+            # The inline probe is load-bearing, not just eager: clearing the cooldown here is
+            # what puts the model back in *this* request's candidate list. Moving it wholesale
+            # to the background was tried and reverted — it turns "recovered, answered" into
+            # `no_available_model` whenever a profile's only candidates are quota-cooled.
+            # So the first key still runs inline, and only the keys the limit already dropped —
+            # which used to be skipped entirely, waiting for some later request to re-trigger
+            # them — now get probed in the background instead of being forgotten.
             inline_limit = max(0, self.ports.safe_int(config.get("quota_inline_probe_limit"), 1))
             if inline_limit:
                 self.ports.run_due_quota_probes(config, catalog, keys=set(due_probe_keys[:inline_limit]))
+            deferred = set(due_probe_keys[inline_limit:])
+            if deferred:
+                self.ports.schedule_quota_probes(config, catalog, keys=deferred)
             state = self.ports.fresh_runtime_state()
         return self.select_models_result_from_state(
             requested_model,

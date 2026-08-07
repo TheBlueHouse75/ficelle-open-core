@@ -60,6 +60,32 @@ class ProviderAccess:
     base_url: str | None
     reason: str
     auth_status_invokable: bool = False
+    # The resolver's own redacted source for ``key`` (``env:NVIDIA_API_KEY``,
+    # ``keychain:...``), kept when ``reason`` had to be replaced by a diagnostic that says
+    # why the key cannot be used. Without it "no key" and "a key that cannot be used" reach
+    # every reader as the same answer, and the second one gets advice for the first. Never
+    # the key itself: it is the same coarse string ``credential_source_label`` already maps
+    # to a store name. ``None`` means ``reason`` is still the resolution source.
+    key_reason: str | None = None
+
+    @property
+    def can_invoke(self) -> bool:
+        """Whether a request to this provider would be sent — the one verdict, held once.
+
+        Both readers ask the record instead of composing their own predicate over it: the
+        status row (`use_cases/provider_auth.py`, hence the dashboard, `doctor` and
+        `selection.py`, which drops models whose provider is not invokable) and the gate
+        `invoke_model` applies before sending. They each used to spell it out, and each time
+        the two spellings drifted the answer was a lie in one direction or the other
+        (2026-08-06: a working provider silently dropped from routing, then a broken one
+        advertised green).
+
+        The keyless exemption is read from ``auth_status_invokable``, the flag the adapter
+        sets, not from ``reason == "keyless_local"``: a second keyless scheme (mTLS, IAM, a
+        local socket) sets that one flag and both readers follow it. A base URL is required
+        unconditionally — nothing can be sent without one, whoever is asking.
+        """
+        return bool(self.base_url) and (bool(self.key) or self.auth_status_invokable)
 
 
 @dataclass(frozen=True)

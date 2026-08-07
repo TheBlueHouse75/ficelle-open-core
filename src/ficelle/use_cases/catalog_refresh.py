@@ -439,13 +439,77 @@ def load_or_refresh_catalog(
     return catalog
 
 
+def catalog_listing_sizes(catalog: Any) -> dict[str, Any]:
+    """How many models each provider listed, tagged with the catalog it came from.
+
+    Only the counts are kept. The catalog itself is hundreds of KB and is overwritten on
+    every publish, and a completeness check reads nothing else off it. A provider that
+    errored or listed nothing is left out: it is a hole in the record, not a count of
+    zero, and treating it as a baseline would make the next listing look like a recovery.
+    """
+    if not isinstance(catalog, dict) or not catalog.get("generated_at"):
+        return {}
+    counts: dict[str, int] = {}
+    for source, summary in (catalog.get("providers") or {}).items():
+        if not isinstance(summary, dict) or summary.get("error"):
+            continue
+        raw_count = summary.get("raw_count")
+        if isinstance(raw_count, int) and raw_count > 0:
+            counts[str(source)] = raw_count
+    return {"generated_at": catalog["generated_at"], "counts": counts}
+
+
+def previous_catalog_baseline(state: dict[str, Any], catalog: dict[str, Any]) -> dict[str, Any]:
+    """The counts recorded one publish ago, shaped like the catalog they came from.
+
+    `prunable_catalog_sources` reads only `providers[source].raw_count` off its
+    `previous` argument, so this stands in for a catalog nobody keeps a copy of — which
+    is what lets a read-only view run the same truncation check the prune runs.
+
+    The baseline is returned only when state says it is describing *this* catalog
+    generation. A publish writes the catalog file first and the state second, and a
+    reader takes no catalog lock, so the two can be seen one generation apart: land in
+    that window with a stale baseline and a truncated listing looks complete, which is
+    the false "retired" this whole path exists to avoid. Comparing `generated_at` costs
+    nothing and closes the window from both sides.
+
+    An empty result means "no baseline", never "the provider listed nothing": callers
+    must not read an absent count as evidence about a provider.
+    """
+    recorded = state.get("catalog_provider_raw_counts")
+    if not isinstance(recorded, dict) or not catalog.get("generated_at"):
+        return {}
+    if recorded.get("generated_at") != catalog.get("generated_at"):
+        return {}
+    previous = state.get("previous_catalog_provider_raw_counts")
+    counts = previous.get("counts") if isinstance(previous, dict) else None
+    if not isinstance(counts, dict):
+        return {}
+    providers = {
+        str(source): {"raw_count": count}
+        for source, count in counts.items()
+        if isinstance(count, int) and count > 0
+    }
+    return {"providers": providers} if providers else {}
+
+
 def publish_catalog(
     catalog: dict[str, Any],
     *,
     catalog_path: Path,
+    load_json: LoadJson,
     atomic_write_json: AtomicWriteJson,
     update_state: UpdateState,
 ) -> None:
+    # Read the listing sizes off the catalog being replaced, before overwriting it. Keeping
+    # them is what lets anything running BETWEEN two refreshes tell a provider that dropped a
+    # model from one that answered with a truncated list — the file itself is about to be
+    # gone. They are taken from the outgoing file rather than carried forward from the last
+    # publish's own state entry: state and catalog drift apart whenever state is reset or a
+    # state write fails after the file was written, and a baseline that is silently one
+    # generation too old is exactly how a truncated listing passes for a complete one.
+    # Callers hold the catalog lock across both writes, so nothing publishes in between.
+    replaced = catalog_listing_sizes(load_json(catalog_path, {}))
     atomic_write_json(catalog_path, catalog)
 
     def mutate(state: dict[str, Any]) -> None:
@@ -454,6 +518,10 @@ def publish_catalog(
         state.setdefault("quota_probe_results", {})
         state.setdefault("quarantine", {})
         state["last_catalog_refresh_at"] = catalog["generated_at"]
+        # Each record names the catalog generation it describes, so a reader can check that
+        # the pair it holds lines up before concluding anything from it.
+        state["previous_catalog_provider_raw_counts"] = replaced
+        state["catalog_provider_raw_counts"] = catalog_listing_sizes(catalog)
 
     update_state(mutate, "refresh_catalog")
 
@@ -464,6 +532,7 @@ def refresh_catalog(
     ports: CatalogRefreshPorts,
     virtual_models: set[str],
     catalog_path: Path,
+    load_json: LoadJson,
     atomic_write_json: AtomicWriteJson,
     update_state: UpdateState,
 ) -> dict[str, Any]:
@@ -474,6 +543,7 @@ def refresh_catalog(
     publish_catalog(
         catalog,
         catalog_path=catalog_path,
+        load_json=load_json,
         atomic_write_json=atomic_write_json,
         update_state=update_state,
     )

@@ -6,7 +6,7 @@ import os
 import plistlib
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -245,14 +245,67 @@ class LaunchAgentServiceBackend:
         self.run_command(["launchctl", "enable", f"gui/{self.uid_provider()}/{self.paths.label}"])
         self.run_command(["launchctl", "kickstart", "-k", f"gui/{self.uid_provider()}/{self.paths.label}"])
         if not self.wait_for_ready():
+            # Left as-is, a port already held by something else looks like a mystery: launchd
+            # relaunches forever (KeepAlive on non-zero exit), appending a traceback each time,
+            # while the CLI says only "did not become ready". Name the holder and stop the loop.
             sys.stderr.write("Ficelle LaunchAgent started but /admin/status.json did not become ready.\n")
+            holder = self.port_holder_description()
+            if holder:
+                sys.stderr.write(f"The configured port looks busy: {holder}\n")
+            self.bootout()
+            sys.stderr.write("Booted the agent out so it does not relaunch in a loop.\n")
             return 1
         if not persist_service_context(self.paths):
             return 1
         print(f"installed {self.paths.plist}")
         return 0
 
+    def port_holder_description(self) -> str | None:
+        """Who is listening on the configured port, when anyone is."""
+        try:
+            config = json.loads((self.paths.runtime_dir / "config.json").read_text(encoding="utf-8"))
+            port = int(config.get("port") or 8646)
+        except (OSError, ValueError, TypeError):
+            port = 8646
+        probe = self.run_command(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"])
+        if probe.returncode != 0 or not (probe.stdout or "").strip():
+            return None
+        lines = [line for line in probe.stdout.splitlines() if line.strip()]
+        detail = lines[1] if len(lines) > 1 else lines[0]
+        return f"port {port} is held by: {detail.strip()}"
+
+    def recorded_interpreter(self) -> Path | None:
+        """The interpreter the installed plist already points at, when it still works.
+
+        AGENTS.md warns that the LaunchAgent must run under the Python that setup used. The CLI
+        honoured that at setup and then re-decided it on every restart, because `restart()`
+        rewrites the plist from `sys.executable`: running `ficelle restart` from a second
+        install, a `uvx` environment, or system Python silently repointed the service, and an
+        interpreter that cannot import `ficelle` leaves launchd in a crash loop.
+        """
+        try:
+            with self.paths.plist.open("rb") as handle:
+                payload = plistlib.load(handle)
+        except (OSError, ValueError):
+            return None
+        arguments = payload.get("ProgramArguments")
+        if not isinstance(arguments, list) or not arguments:
+            return None
+        candidate = Path(str(arguments[0]))
+        if not candidate.exists():
+            return None
+        probe = self.run_command([str(candidate), "-c", "import ficelle"])
+        if probe.returncode != 0:
+            return None
+        return candidate
+
     def restart(self) -> int:
+        recorded = self.recorded_interpreter()
+        if recorded is not None and recorded != self.paths.install_python:
+            print(f"reusing the interpreter the service was installed with: {recorded}")
+            self.paths = replace(self.paths, install_python=recorded)
+        elif recorded is None and self.paths.plist.exists():
+            print(f"installed interpreter unusable; repointing the service at {self.paths.install_python}")
         return self.install()
 
     def stop(self) -> int:

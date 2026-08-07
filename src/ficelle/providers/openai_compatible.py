@@ -190,14 +190,24 @@ class OpenAICompatibleCatalogAdapter:
         require_base_url: bool,
     ) -> ProviderAccess:
         if self.source == "nous":
-            return self._nous_access(provider_cfg, context, require_base_url=require_base_url)
+            return self._nous_access(provider_cfg, context)
         key, reason = context.resolve_credentials(self.source, provider_cfg)
         base_url = self._base_url(provider_cfg)
         if not base_url:
-            if key and not require_base_url and self._auth_allows_key_without_base_url():
-                return ProviderAccess(key, None, reason, auth_status_invokable=True)
+            # No base URL means nothing can be sent, whoever is asking. openrouter and mistral
+            # used to be exempted here so a key alone read as "configured" — harmless back when
+            # their base_url was guaranteed by config, but it let the status row advertise a
+            # provider `invoke_model` refuses with this very message, and `selection.py` keeps
+            # its models in the routing pool on the strength of that row.
+            # `key_reason` carries the store the key came from past this replaced `reason`,
+            # so a reader can tell "no key" from "a key nothing can send yet".
             if key or require_base_url:
-                return ProviderAccess(key, None, f"missing base_url for provider {self.source}")
+                return ProviderAccess(
+                    key,
+                    None,
+                    f"missing base_url for provider {self.source}",
+                    key_reason=reason,
+                )
             return ProviderAccess(None, None, reason)
         if not key and self._allows_keyless_local(provider_cfg):
             return ProviderAccess(None, base_url, "keyless_local", auth_status_invokable=True)
@@ -207,9 +217,8 @@ class OpenAICompatibleCatalogAdapter:
         self,
         provider_cfg: dict[str, Any],
         context: ProviderAccessContext,
-        *,
-        require_base_url: bool,
     ) -> ProviderAccess:
+        """Nous always has a base URL, so its answer does not depend on ``require_base_url``."""
         generic_key, generic_reason = context.resolve_credentials(self.source, provider_cfg)
         base_url = self._base_url(provider_cfg) or NOUS_DEFAULT_BASE_URL
         if generic_key:
@@ -218,17 +227,16 @@ class OpenAICompatibleCatalogAdapter:
             self.source,
             "missing NOUS_API_KEY",
         )
-        if external_key:
-            runtime_base_url = (external_base_url or base_url) if require_base_url else external_base_url
-            return ProviderAccess(external_key, runtime_base_url, external_reason)
-        return ProviderAccess(None, external_base_url or base_url, external_reason)
+        # The configured Nous URL backs an external key exactly as it backs no key at all. It
+        # used to be withheld when require_base_url was False, so the status row called a key
+        # "not invokable" that invocation — resolving with True — used without trouble, and
+        # `selection.py`, which drops models whose provider is not invokable, kept a working
+        # provider out of routing.
+        return ProviderAccess(external_key or None, external_base_url or base_url, external_reason)
 
     def _allows_keyless_local(self, provider_cfg: dict[str, Any]) -> bool:
         provider_class = str(provider_cfg.get("provider_class") or provider_cfg.get("source_type") or "")
         return provider_class == "local" and str(provider_cfg.get("free_mode") or "") == "local_free"
-
-    def _auth_allows_key_without_base_url(self) -> bool:
-        return self.source in {"openrouter", "mistral"}
 
     def _base_url(self, provider_cfg: dict[str, Any]) -> str:
         return str(provider_cfg.get("base_url") or "").strip().rstrip("/")

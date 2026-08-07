@@ -25,6 +25,7 @@ if importlib.util.find_spec("ficelle_pro") is None:
         "test_compression.py",
         "test_fusion_use_case.py",
         "test_router_settings_use_case.py",
+        "test_prepare_public_mirror.py",  # imports the mirror assembler, which imports the pack
     ]
 
 # Command-line front-ends for the host's secret store. Credential resolution reads

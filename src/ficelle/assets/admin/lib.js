@@ -181,11 +181,76 @@ export function reasonWithCode(reason) {
   return label === code ? label : label + " (" + code + ")";
 }
 
-export function showToast(msg) {
+// `level` is "ok" | "warn" | "error" (empty for neutral). `action` is an optional
+// {label, onClick}: a message that asks the user to do something needs a way to do it, and
+// needs to outlive the 2.8s a plain acknowledgement gets.
+export function showToast(msg, level = "", action = null) {
+  const toast = $("toast");
   $("toastMsg").textContent = msg;
-  $("toast").classList.add("show");
+  toast.classList.remove("is-ok", "is-warn", "is-error");
+  if (level) toast.classList.add("is-" + level);
+  const button = $("toastAction");
+  button.hidden = !action;
+  button.textContent = action?.label || "";
+  // `onclick` holds one handler by construction, so the previous toast's action cannot
+  // still be attached here.
+  button.onclick = action
+    ? () => { toast.classList.remove("show"); clearTimeout(showToast.t); action.onClick(); }
+    : null;
+  toast.classList.add("show");
   clearTimeout(showToast.t);
-  showToast.t = setTimeout(() => $("toast").classList.remove("show"), 2800);
+  const ms = action ? 14000 : (level === "warn" || level === "error" ? 6000 : 2800);
+  showToast.t = setTimeout(() => toast.classList.remove("show"), ms);
+}
+
+// The `auth.key_source` families a removal cannot reach, mapped to the next move — same shape
+// as REASON_LABELS/reasonLabel above, so a family added later falls back to its own name and is
+// still stated rather than silently dropped. `env` and `external` are the two nothing inside
+// Ficelle can clear, and the two `remaining_legacy_sources` never enumerated.
+const KEY_SOURCE_REMEDIES = {
+  env: "a process environment variable — unset it where the service starts, then restart",
+  external: "an external credential resolver — clear the key in that integration",
+};
+export function keySourceRemedy(keySource) {
+  const family = String(keySource || "");
+  return KEY_SOURCE_REMEDIES[family] || family;
+}
+
+// Keep the removal verdict pure so it can be tested without a DOM, and so the destructive
+// legacy purge is offered exactly once: after a normal removal reveals a source the purge
+// can reach, never after an explicit purge and never on a locked keychain it must skip.
+//
+// `keySource` is `auth.key_source` recomputed after the removal — the store the resolver
+// would read a key from *now*, or null when none does. It is what makes the verdict honest
+// for every family: `legacySources` enumerates legacy `.env` files and keychains only, so a
+// key held in a process environment variable or served by an external resolver (R4) used to
+// come back as a green "key removed" with the provider still configured.
+export function providerKeyRemovalNotice(label, removed, legacySources, purgeLegacy, keySource = null) {
+  const cleared = removed.length
+    ? (label + " key removed from " + removed.length + " location" + (removed.length > 1 ? "s" : "") + ".")
+    : ("No " + label + " key was stored by Ficelle.");
+  const stillConfigured = keySource
+    ? (" " + label + " is still configured: a key still resolves from " + keySourceRemedy(keySource) + ".")
+    : "";
+  // Each case below states its own message, level and button in one place. Only the rule that
+  // cuts across them lives here: a key that still resolves makes the toast red, unless a button
+  // is still offered that could finish the job.
+  const notice = (tail, level, offerLegacyPurge) => ({
+    message: cleared + stillConfigured + tail,
+    level: (keySource && !offerLegacyPurge) ? "error" : level,
+    offerLegacyPurge,
+  });
+  if (!legacySources.length) return notice("", removed.length ? "ok" : "warn", false);
+  if (purgeLegacy) {
+    return notice(" Could not clear " + legacySources.join(", ") + " — remove it manually.", "error", false);
+  }
+  // A locked keychain is reported but cannot be purged — the purge skips it so it never
+  // opens the GUI prompt that would hang the daemon. Offering the button there would spend
+  // a "other tools may lose access" confirmation on a guaranteed no-op.
+  if (!legacySources.some((source) => !source.endsWith(":locked"))) {
+    return notice(" " + legacySources.join(", ") + " is locked, so it cannot be read or cleared — unlock it, or remove the key manually.", "warn", false);
+  }
+  return notice(" Legacy credential sources remain at " + legacySources.join(", ") + ".", "warn", true);
 }
 
 // The clipboard rejects for reasons the user can act on (permission denied, document not

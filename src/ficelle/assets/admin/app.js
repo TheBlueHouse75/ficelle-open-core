@@ -1,7 +1,7 @@
 import { profileOrder, fusionModelId, profileLabels, profilePresets, CAP_PROFILE, CAP_STATE_META, $, esc, cloneJson, sleep,
   providerLabel, setProviderLabels, formatContext, formatTokenLimit, formatSeconds, formatDuration, pct, timeAgo, timeChip,
   hasIn, hasOut, hasParam, runtimeKey, freeAccess, freeModeLabel,
-  providerFreeModeLabel, reasonDescription, reasonLabel, reasonWithCode, showToast, copyToClipboard } from "./lib.js";
+  providerFreeModeLabel, reasonDescription, reasonLabel, reasonWithCode, showToast, providerKeyRemovalNotice, copyToClipboard } from "./lib.js";
 import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeProfile, dragged, modelFilters, currentView, expandedModels,
   compressionPayload, setState, setAuditEntries, setDraftProfiles, setDraftFusion, setDraftSettings, setCompressionPayload, setActiveProfile, setDragged, setCurrentView,
   selectedProvider, setSelectedProvider,
@@ -345,6 +345,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     function capChips(m) {
       const out = [];
+      // First, and on every list: an arrival is the reason the user came looking, and it is
+      // just as useful on a card already sitting in a lane ("this is the one I just added").
+      if (newModelIds().has(m.id)) out.push('<span class="badge ok" title="Newly offered for free by ' + esc(providerLabel(m.source)) + ' in the last week.">New</span>');
       if (isExcludedFromProfile(m.id)) out.push('<span class="badge warn">Excluded here</span>');
       const orch = profileVerdictBadge(m, "ficelle/auto-orchestrator", "Orchestration");
       if (orch) out.push(orch);
@@ -533,15 +536,26 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 
     /* ---------- renderers ---------- */
 
-    // A card for an id the catalog no longer lists. Two very different things used to wear the
-    // same "Missing" badge: a provider that failed its last refresh (the id returns with it) and
-    // a model its provider stopped offering for free (it never returns, and the next refresh
-    // drops it from the order). The server already made that call in `stale_profile_models`;
-    // this only phrases it. Matched on the id alone — the answer is a property of the model and
-    // its provider, not of the virtual model it happens to sit in.
+    // A card for an id the catalog no longer lists. Three very different things used to wear the
+    // same "Missing" badge: a provider that failed its last refresh (the id returns with it), a
+    // model its provider stopped offering for free (it never returns, and the next refresh drops
+    // it from the order), and a listing too incomplete to tell either way. The server already made
+    // that call in `stale_profile_models`; this only phrases it. Matched on the id alone — the
+    // answer is a property of the model and its provider, not of the virtual model it sits in.
+    // Only `retired` claims the model is gone, and it is the one branch that has to be named
+    // explicitly: an unknown disposition from a newer server must fall through to a card that
+    // asserts nothing, never to one that sends the user to the Remove button.
     function staleModelNotice(id) {
       const row = (state.stale_profile_models || []).find((r) => r.model_id === id);
       if (!row) return { name: "Unknown model", badge: "danger", label: "Missing", title: "This id is not in the catalog. Remove it, or wait for the next refresh to decide." };
+      if (row.disposition === "retired") {
+        return {
+          name: "Retired model",
+          badge: "danger",
+          label: "Retiring",
+          title: providerLabel(row.source) + " no longer offers this model for free. Ficelle drops it from your order at the next catalog refresh — remove it now to drop it immediately.",
+        };
+      }
       if (row.disposition === "held") {
         return {
           name: "Waiting on " + providerLabel(row.source),
@@ -551,10 +565,40 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         };
       }
       return {
-        name: "Retired model",
-        badge: "danger",
-        label: "Retiring",
-        title: providerLabel(row.source) + " no longer offers this model for free. Ficelle drops it from your order at the next catalog refresh — remove it now to drop it immediately.",
+        name: "Unconfirmed model",
+        badge: "warn",
+        label: "Unconfirmed",
+        title: providerLabel(row.source) + " answered the last catalog refresh, but the listing could not be confirmed complete — so Ficelle cannot tell whether this model is gone or was simply left out. It stays in your order until a refresh settles it.",
+      };
+    }
+
+    // The same three dispositions, phrased for the Health tab's guard list rather than for a
+    // card in a virtual model: shorter, and it names the virtual model instead of the id. Kept
+    // next to staleModelNotice so a fourth disposition cannot be added to one and missed in the
+    // other, and reading the row it was handed rather than looking one up by id.
+    function staleGuardNotice(row) {
+      const provider = providerLabel(row.source);
+      if (row.disposition === "retired") {
+        return {
+          meta: "no longer offered free by " + provider,
+          detail: "Ficelle removes it from this virtual model at the next catalog refresh, and tells you when it does.",
+          kind: "danger",
+          badge: "Retiring",
+        };
+      }
+      if (row.disposition === "held") {
+        return {
+          meta: provider + " unreachable at the last refresh",
+          detail: "Kept in place on purpose: a provider that fails a refresh drops its whole listing, so a missing id proves nothing about the model.",
+          kind: "warn",
+          badge: "Kept",
+        };
+      }
+      return {
+        meta: provider + " listing could not be confirmed complete",
+        detail: "Kept in place: with no trustworthy listing to compare against, Ficelle cannot tell whether this model is gone or was left out of a partial answer. Nothing is removed until a refresh settles it.",
+        kind: "warn",
+        badge: "Unconfirmed",
       };
     }
 
@@ -603,13 +647,22 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         ? preview.map((m, i) => { const sc = m.auto_scores?.[activeProfile]; const v = modelVerified(m); return '<div class="hp"><span class="n">' + (i + 1) + ".</span><span>" + esc(m.name || m.upstream_id) + " &middot; " + esc(candidateOrigin(p, m)) + (sc ? ' &middot; <span title="' + scoreTitle(scoreDetails(m)) + '">score ' + Number(sc).toFixed(0) + "</span>" : "") + (v ? " &middot; " + esc(v.status) : "") + "</span></div>"; }).join("")
           + (more > 0 ? '<div class="hp" style="color:var(--text-muted)"><span class="n">+</span><span>' + more + " more usable model" + (more > 1 ? "s" : "") + (manual ? ", further down this list" : ", ranked by score") + "</span></div>" : "")
         : '<div class="hp"><span>No usable models match this virtual model yet.</span></div>';
+      // This list is built from the DRAFT, so before it is saved it shows an intention while the
+      // router is still executing the last saved order. Said in the present tense either way, it
+      // reads as a statement of fact about live routing — which cost a real debugging session:
+      // the order on screen had a model one rank above where the router actually had it, and the
+      // logs were read as a routing bug for it.
+      const unsaved = unsavedProfileIds().includes(activeProfile);
       const heading = !full.length
         ? "Routing preview:"
-        : manual
-          ? "Your order decides, not the score — Ficelle tries these " + full.length + " usable models top-first until one responds (paused models are already skipped):"
-          : "Ficelle ranks all " + full.length + " usable models by score and tries them best-first until one responds:";
+        : unsaved
+          ? "Unsaved draft. Ficelle is still routing on the last saved order — save to make this the list it uses:"
+          : manual
+            ? "Your order decides, not the score — Ficelle tries these " + full.length + " usable models top-first until one responds (paused models are already skipped):"
+            : "Ficelle ranks all " + full.length + " usable models by score and tries them best-first until one responds:";
+      const headingColor = unsaved ? "var(--warn)" : "var(--text-soft)";
       $("profileHint").innerHTML = "<b>" + esc(lab[0]) + ".</b> " + esc(profilePresets[activeProfile] || "") +
-        '<div class="hint-preview"><span style="color:var(--text-soft);font-weight:600">' + esc(heading) + "</span>" + previewHtml + "</div>";
+        '<div class="hint-preview"><span style="color:' + headingColor + ';font-weight:600">' + esc(heading) + "</span>" + previewHtml + "</div>";
       $("autoModeBtn").classList.toggle("active", p.mode !== "manual_order");
       $("manualModeBtn").classList.toggle("active", p.mode === "manual_order");
       $("autoTailToggle").checked = Boolean(p.auto_tail);
@@ -657,8 +710,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     function renderAvailable() {
       const q = $("searchInput").value.trim().toLowerCase();
       const f = modelFilters;
+      const fresh = newModelIds();
       let models = [...(state.catalog?.models || [])];
       if (f.providers.size) models = models.filter((m) => f.providers.has(m.source));
+      if (f.newOnly) models = models.filter((m) => fresh.has(m.id));
       models = models.filter((m) => matchesReq(m, currentProfile().requirements || {}));
       if (f.caps.size) models = models.filter((m) => [...f.caps].every((c) => modelHasCap(m, c)));
       if (f.minContext) models = models.filter((m) => Number(m.context_length || 0) >= f.minContext);
@@ -667,8 +722,22 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (q) models = models.filter((m) => [m.name, m.id, m.source, m.upstream_id, m.modality, ...(m.input_modalities || []), ...(m.supported_parameters || [])].join(" ").toLowerCase().includes(q));
       $("modelCountBadge").textContent = models.length + " models";
       const list = $("availableList");
-      list.innerHTML = models.length ? models.map((m, i) => modelCard(m, "available", i)).join("") : '<div class="empty">No models match these filters.</div>';
+      list.innerHTML = models.length ? models.map((m, i) => modelCard(m, "available", i)).join("") : '<div class="empty">' + emptyAvailableNotice() + "</div>";
       bindModelCard(list); bindDrag(list, "available");
+    }
+    // This list always applies the active virtual model's requirements on top of the filter
+    // bar, so "See them" on the new-models banner can land on nothing at all — the arrivals
+    // may simply not suit the lane that happened to be open. Naming that case turns a dead
+    // end into one click on another lane. Only claimed when it is actually true: with the
+    // requirements out of the way the arrivals would still be filtered by everything else.
+    function emptyAvailableNotice() {
+      const generic = "No models match these filters.";
+      if (!modelFilters.newOnly) return generic;
+      const arrivals = catalogArrivals();
+      if (!arrivals.length || arrivals.some((m) => matchesReq(m, currentProfile().requirements || {}))) return generic;
+      const lane = profileLabels[activeProfile]?.[0] || activeProfile;
+      const count = arrivals.length;
+      return "None of the " + count + " new model" + (count === 1 ? "" : "s") + " meet " + esc(lane) + "&rsquo;s requirements. Try another virtual model, or clear the New filter.";
     }
 
     /* ---------- available-models capability filter + sort helpers ---------- */
@@ -746,8 +815,17 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       return false;
     }
     const dirTitle = () => modelFilters.sortDir === "asc" ? "Ascending — click for descending" : "Descending — click for ascending";
-    const fltAnyActive = () => { const f = modelFilters; return !!(f.providers.size || f.caps.size || f.minContext || f.sortKey !== "score" || f.sortDir !== "desc"); };
+    const fltAnyActive = () => { const f = modelFilters; return !!(f.providers.size || f.caps.size || f.minContext || f.newOnly || f.sortKey !== "score" || f.sortDir !== "desc"); };
     const dirSvg = () => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + (modelFilters.sortDir === "asc" ? DIR_ASC : DIR_DESC) + "</svg>";
+    // A plain toggle rather than a menu: it has one state, and it only exists while there is
+    // something recent to show. .flt-toggle rather than .flt-trigger — it looks the same, but
+    // every .flt-trigger opens a popover and carries aria-haspopup, which this does not.
+    const newFilterHtml = () => {
+      const count = catalogArrivals().length;
+      if (!count) return "";
+      return '<button type="button" class="flt-toggle' + (modelFilters.newOnly ? " on" : "") + '" id="fltNew" aria-pressed="' + (modelFilters.newOnly ? "true" : "false") +
+        '" title="Show only models a provider started offering for free in the last week.">New<span class="flt-count">' + count + "</span></button>";
+    };
 
     function renderFilterBar() {
       openFilter = null;
@@ -756,6 +834,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       for (const p of [...f.providers]) if (!provs.includes(p)) f.providers.delete(p);
       const tiers = contextTiers();
       if (f.minContext && !tiers.some(([v]) => v === f.minContext)) f.minContext = 0;
+      // The arrivals age out of runtime state on their own; a filter left on a set the
+      // catalog can no longer match would silently hide every model with no way back.
+      if (f.newOnly && !catalogArrivals().length) f.newOnly = false;
 
       const checkbox = (checked, attr, label) => '<label class="flt-opt"><input type="checkbox" ' + (checked ? "checked " : "") + attr + "><span>" + esc(label) + "</span></label>";
       const radio = (checked, name, attr, label) => '<label class="flt-opt"><input type="radio" name="' + name + '" ' + (checked ? "checked " : "") + attr + "><span>" + esc(label) + "</span></label>";
@@ -769,7 +850,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 
       $("filterBar").innerHTML =
         '<div class="flt-row">' + trig("prov", "", provPop) + trig("cap", "", capPop) + trig("ctx", "align-right", ctxPop) + "</div>" +
-        '<div class="flt-row">' + trig("sort", "", sortPop) +
+        '<div class="flt-row">' + trig("sort", "", sortPop) + newFilterHtml() +
         '<button type="button" class="flt-dir" id="fltDir" title="' + dirTitle() + '" aria-label="' + dirTitle() + '">' + dirSvg() + "</button>" +
         '<button type="button" class="flt-reset" id="fltReset" title="Reset filters and sort" aria-label="Reset filters and sort"' + (fltAnyActive() ? "" : ' style="display:none"') + '><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg></button></div>';
       bindFilterBar($("filterBar"));
@@ -781,6 +862,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         t.classList.toggle("on", fltTriggerOn(id));
         t.innerHTML = fltTriggerLabel(id) + CHEV;
       });
+      const fresh = bar.querySelector("#fltNew");
+      if (fresh) { fresh.classList.toggle("on", modelFilters.newOnly); fresh.setAttribute("aria-pressed", modelFilters.newOnly ? "true" : "false"); }
       const dir = bar.querySelector("#fltDir"); if (dir) { dir.innerHTML = dirSvg(); dir.title = dirTitle(); dir.setAttribute("aria-label", dirTitle()); }
       const reset = bar.querySelector("#fltReset"); if (reset) reset.style.display = fltAnyActive() ? "" : "none";
     }
@@ -804,8 +887,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       bar.querySelectorAll("[data-cap]").forEach((cb) => cb.addEventListener("change", () => { cb.checked ? f.caps.add(cb.dataset.cap) : f.caps.delete(cb.dataset.cap); refresh(); }));
       bar.querySelectorAll("[data-ctx]").forEach((rb) => rb.addEventListener("change", () => { f.minContext = Number(rb.dataset.ctx); refresh(); }));
       bar.querySelectorAll("[data-sort]").forEach((rb) => rb.addEventListener("change", () => { f.sortKey = rb.dataset.sort; f.sortDir = (f.sortKey === "latency" || f.sortKey === "name") ? "asc" : "desc"; refresh(); }));
+      const fresh = bar.querySelector("#fltNew"); if (fresh) fresh.addEventListener("click", () => { f.newOnly = !f.newOnly; refresh(); });
       const dir = bar.querySelector("#fltDir"); if (dir) dir.addEventListener("click", () => { f.sortDir = f.sortDir === "asc" ? "desc" : "asc"; refresh(); });
-      const reset = bar.querySelector("#fltReset"); if (reset) reset.addEventListener("click", () => { f.providers.clear(); f.caps.clear(); f.minContext = 0; f.sortKey = "score"; f.sortDir = "desc"; renderFilterBar(); renderAvailable(); });
+      const reset = bar.querySelector("#fltReset"); if (reset) reset.addEventListener("click", () => { f.providers.clear(); f.caps.clear(); f.minContext = 0; f.newOnly = false; f.sortKey = "score"; f.sortDir = "desc"; renderFilterBar(); renderAvailable(); });
     }
 
     // Map each provider source to its bundled logo file. Several sources may share one
@@ -1286,7 +1370,6 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      ["setCdQuota", "quota_exhausted", "Free quota exhausted", "Bench time after a provider reports its free quota is used up. Default 3600s (1 hour)."],
 	      ["setCdAuth", "auth_or_credit", "Auth or credit error", "Bench time after an authentication or credit failure. Default 3600s (1 hour). Usually a key needs fixing."],
 	      ["setCdBilling", "billing_or_paid", "Flagged as paid/billed", "Bench time after the anti-false-free guard flags a model as billed. Long by design (default 86400s = 24h) so paid models stop being proposed."],
-	      ["setCdBenchmark", "benchmark_failed", "Benchmark failed", "Bench time after a model fails its capability benchmark. Default 3600s (1 hour)."],
 	      ["setCdServer", "server_error", "Upstream server error (5xx)", "Bench time after an upstream 5xx. Short by design (default 180s) since these are often transient."],
 	      ["setCdTimeout", "timeout", "Timeout", "Bench time after a model times out. Default 300s (5 min)."],
 	      ["setCdUnavailable", "unavailable", "Unavailable / unusable reply", "Bench time after a connection error or an unusable success (empty or invalid reply). Default 600s (10 min). Also the fallback when a failure has no specific value."],
@@ -1436,6 +1519,15 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const q = Object.keys(rt.quarantine || {}).length;
       const stale = state.stale_profile_models || [];
       const retiring = stale.filter((r) => r.disposition === "retired").length;
+      const heldBack = stale.filter((r) => r.disposition === "held").length;
+      // Everything else, including a disposition this build does not know, counts as
+      // undecided rather than as a loss.
+      const unconfirmed = stale.length - retiring - heldBack;
+      const staleNote = [
+        retiring ? retiring + " no longer offered free" : "",
+        unconfirmed ? unconfirmed + " not confirmed gone" : "",
+        heldBack ? heldBack + " kept while their provider is unreachable" : "",
+      ].filter(Boolean).join(" &middot; ");
       const healthy = canary.status === "pass" && !cdM && !cdP && !cdQ && !q;
       const compressionMode = compression.configured_mode || "off";
       const compressionStatus = compression.last_status || (compressionMode === "off" ? "off" : "waiting");
@@ -1445,10 +1537,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         { k: "Canary check", ic: ICONS.canary, v: (canary.status === "pass" ? "Passing" : (canary.status || "Not run")), note: (sum.passed ?? 0) + " of " + (sum.total ?? 0) + " virtual models ok &middot; last run " + timeAgo(canary.last_run_at).label, cls: canary.status === "pass" ? "ok" : "warn" },
         { k: "Paused", ic: ICONS.paused, v: (cdM + cdP + cdQ), note: cdM + " models &middot; " + cdP + " providers &middot; " + cdQ + " free quotas", cls: (cdM + cdP + cdQ) ? "warn" : "ok" },
         { k: "Disabled", ic: ICONS.disable, v: q, note: q ? "manually held out of routing" : "nothing quarantined", cls: q ? "warn" : "ok" },
-        // Entries in a virtual model whose id left the catalog. Split, because the two halves
-        // end differently: retiring ones are removed by the next refresh, held ones return
-        // with their provider and must not be presented as a loss.
-        { k: "Missing models", ic: ICONS.exclude, v: stale.length, note: stale.length ? (retiring + " no longer offered free &middot; " + (stale.length - retiring) + " kept while their provider is unreachable") : "every model in your orders is still in the catalog", cls: retiring ? "warn" : "ok" },
+        // Entries in a virtual model whose id left the catalog. Split, because the parts end
+        // differently: retiring ones are removed by the next refresh, held ones return with
+        // their provider, unconfirmed ones are undecided — and neither of the last two may be
+        // presented as a loss. Only a real removal colours the card.
+        { k: "Missing models", ic: ICONS.exclude, v: stale.length, note: staleNote || "every model in your orders is still in the catalog", cls: retiring ? "warn" : "ok" },
         // blocked means a probe cooled/stopped its model; skipped counts still-due probes held
         // behind a cooldown; budget_capped means the pool's probing share of the budget was spent.
         { k: "Capability discovery", ic: ICONS.benchmark, v: (ab.last_run_at ? "Last run " + timeAgo(ab.last_run_at).label : "Not run yet"), note: ab.last_run_at ? ((ab.models ?? 0) + " models &middot; " + (ab.verified ?? 0) + " verified &middot; " + (ab.failed ?? 0) + " failed &middot; " + (ab.skipped ?? 0) + " paused &middot; " + (ab.blocked ?? 0) + " blocked &middot; " + (ab.budget_capped ?? 0) + " budget-capped") : "background discovery &middot; configure in Settings", cls: ((ab.skipped ?? 0) + (ab.blocked ?? 0) + (ab.budget_capped ?? 0)) ? "warn" : "ok" },
@@ -1479,15 +1572,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       });
       stale.forEach((row) => {
         const label = profileLabels[row.profile_id]?.[0] || row.profile_id;
-        const retired = row.disposition === "retired";
+        const notice = staleGuardNotice(row);
         guards.push({
           title: row.model_id,
-          meta: label + " - " + (retired ? "no longer offered free by " + providerLabel(row.source) : providerLabel(row.source) + " unreachable at the last refresh"),
-          detail: retired
-            ? "Ficelle removes it from this virtual model at the next catalog refresh, and tells you when it does."
-            : "Kept in place on purpose: a provider that fails a refresh drops its whole listing, so a missing id proves nothing about the model.",
-          kind: retired ? "danger" : "warn",
-          badge: retired ? "Retiring" : "Kept",
+          meta: label + " - " + notice.meta,
+          detail: notice.detail,
+          kind: notice.kind,
+          badge: notice.badge,
         });
       });
       $("guardList").innerHTML = guards.length ? guards.map((g) =>
@@ -1537,27 +1628,30 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       return ICONS.auditDefault;
 	    }
 	    function auditTitle(action) {
-	      return ({ "admin.profiles.save": "Saved virtual models", "admin.profiles.prune": "Removed models their provider dropped","admin.fusion.save": "Saved fusion settings", "admin.settings.save": "Saved routing settings", "admin.compression.clear": "Cleared compression store", "admin.canary": "Ran a canary health check", "admin.benchmark": "Ran a benchmark", "admin.quarantine.add": "Disabled a model", "admin.quarantine.remove": "Re-enabled a model", "admin.cooldowns.clear_model": "Resumed a model", "admin.cooldowns.clear_provider": "Resumed a provider", "admin.providers.probe": "Probed provider free quota", "admin.refresh": "Refreshed the model catalog" })[action] || action || "Admin action";
+	      return ({ "admin.profiles.save": "Saved virtual models", "admin.profiles.prune": "Removed models their provider dropped","admin.fusion.save": "Saved fusion settings", "admin.settings.save": "Saved routing settings", "admin.compression.clear": "Cleared compression store", "admin.canary": "Ran a canary health check", "admin.benchmark": "Ran a benchmark", "admin.quarantine.add": "Disabled a model", "admin.quarantine.remove": "Re-enabled a model", "admin.cooldowns.clear_model": "Resumed a model", "admin.cooldowns.clear_provider": "Resumed a provider", "admin.providers.probe": "Probed provider free quota", "admin.providers.toggle": "Enabled or disabled a provider", "admin.refresh": "Refreshed the model catalog" })[action] || action || "Admin action";
 	    }
 	    function auditMeta(e) {
+	      // renderAudit drops this return value straight into innerHTML, and `model_id` arrives from
+	      // the provider's own /models listing, so an escape missed here is script execution with the
+	      // admin token in scope, not a cosmetic bug.
 	      const m = e.metadata || {}, parts = [];
-	      if (m.profile_count !== undefined) parts.push(m.profile_count + " virtual models");
-	      if (m.max_attempts_per_request !== undefined) parts.push(m.max_attempts_per_request + " max attempts");
+	      if (m.profile_count !== undefined) parts.push(esc(m.profile_count) + " virtual models");
+	      if (m.max_attempts_per_request !== undefined) parts.push(esc(m.max_attempts_per_request) + " max attempts");
 	      if (m.enabled !== undefined) parts.push(m.enabled ? "enabled" : "disabled");
 	      if (m.visible_in_models !== undefined) parts.push(m.visible_in_models ? "visible in models" : "hidden from models");
-	      if (m.model_id) parts.push(m.model_id);
-	      if (m.source) parts.push(providerLabel(m.source));
-	      if (m.scope) parts.push("scope " + m.scope);
-	      if (m.resource) parts.push(m.resource);
-	      if (m.compression_mode) parts.push("compression " + m.compression_mode);
+	      if (m.model_id) parts.push(esc(m.model_id));
+	      if (m.source) parts.push(esc(providerLabel(m.source)));
+	      if (m.scope) parts.push("scope " + esc(m.scope));
+	      if (m.resource) parts.push(esc(m.resource));
+	      if (m.compression_mode) parts.push("compression " + esc(m.compression_mode));
 	      // A prune reports {virtualModelId: [modelIds]}; every other action reports a count.
 	      if (m.removed && typeof m.removed === "object") {
 	        const dropped = new Set(Object.values(m.removed).flat());
 	        const lanes = Object.keys(m.removed).map((x) => profileLabels[x]?.[0] || x);
 	        parts.push(esc(dropped.size + " model" + (dropped.size > 1 ? "s" : "") + " dropped from " + lanes.join(", ")));
-	      } else if (m.removed !== undefined) parts.push(m.removed + " removed");
-	      if ((m.profiles || []).length) parts.push((m.profiles || []).map((x) => (profileLabels[x]?.[0] || x)).join(", "));
-	      return parts.join(" &middot; ") || e.id;
+	      } else if (m.removed !== undefined) parts.push(esc(m.removed) + " removed");
+	      if ((m.profiles || []).length) parts.push(esc((m.profiles || []).map((x) => (profileLabels[x]?.[0] || x)).join(", ")));
+	      return parts.join(" &middot; ") || esc(e.id);
 	    }
     function renderAudit() {
       const list = $("auditList");
@@ -2011,7 +2105,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const errType = (!ok && e.error_type) ? ' <span class="req-errtype">' + esc(e.error_type) + "</span>" : "";
       const lat = e.latency_seconds == null ? "—" : Number(e.latency_seconds).toFixed(2) + "s";
       const t = timeAgo(e.logged_at);
-      const fallback = e.fallback ? '<span class="badge warn" title="' + Number(e.attempt_count || 0) + ' attempts">fallback</span>' : "";
+      // A row shows the candidate that ANSWERED, so a request that got there by failing over
+      // read as a clean single call — the 529 that pushed it off NVIDIA was one click away, and
+      // nothing on the row said there was anything to click. The count is the tell; the chain is
+      // on hover for whoever wants it without expanding.
+      const tries = Number(e.attempt_count || 0) > 1
+        ? '<span class="badge warn" title="' + esc(attemptChainSummary(e)) + '">' + (e.fallback ? "fallback " : "") + Number(e.attempt_count) + "×</span>"
+        : (e.fallback ? '<span class="badge warn">fallback</span>' : "");
       const stream = e.stream ? '<span class="req-stream" title="streamed response">≋</span>' : "";
       const head = '<div class="req-row' + (open ? " is-open" : "") + '" data-req-id="' + esc(e.request_id) + '" role="button" tabindex="0">' +
         '<span class="req-time" title="' + esc(t.title) + '">' + esc(t.label) + "</span>" +
@@ -2021,9 +2121,16 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         statusBadge +
         '<span class="req-reason">' + esc(reasonText) + errType + "</span>" +
         '<span class="req-lat">' + esc(lat) + "</span>" +
-        '<span class="req-flags">' + fallback + stream + "</span>" +
+        '<span class="req-flags">' + tries + stream + "</span>" +
         "</div>";
       return '<div class="req-item' + (isNew ? " is-new" : "") + '">' + head + (open ? reqDetailHTML(e) : "") + "</div>";
+    }
+    function attemptChainSummary(e) {
+      const attempts = e.attempts || [];
+      if (!attempts.length) return Number(e.attempt_count || 0) + " attempts";
+      return attempts
+        .map((a) => (a.source ? providerLabel(a.source) : "?") + " " + String(a.status ?? a.reason ?? "—"))
+        .join(" → ");
     }
     function reqDetailHTML(e) {
       const attempts = e.attempts || [];
@@ -2072,40 +2179,107 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      setProviderLabels(state.provider_labels);
 	      renderUpdateBanner();
 	      renderPruneBanner();
+	      renderNewModelsBanner();
 	      renderProfileList(); renderActiveProfile(); renderFilterBar(); renderSelected(); renderExcluded(); renderAvailable();
 	      renderProviders(); renderFusion(); renderSettings(); renderCompression(); renderLicense(); renderHealth(); renderPerformance(); renderAudit(); renderNavCounts();
       syncLongRunningActions();
       syncSaveButton();
 	    }
 
-    // Keyed by audit id, not a boolean: dismissing one prune must not silence the next one.
+    // Both banners remember what has been seen by value, not by a boolean: dismissing one
+    // prune must not silence the next one, and today's arrivals must not silence next week's.
     const PRUNE_NOTICE_KEY = "ficelle.dismissedPruneAudit";
-    const readDismissedPrune = () => { try { return localStorage.getItem(PRUNE_NOTICE_KEY); } catch { return null; } };
-    const writeDismissedPrune = (id) => { try { localStorage.setItem(PRUNE_NOTICE_KEY, id); } catch { /* private mode: the banner simply comes back */ } };
+    const ADDITIONS_NOTICE_KEY = "ficelle.dismissedCatalogAdditions";
+    const readDismissed = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+    const writeDismissed = (key, value) => { try { localStorage.setItem(key, value); } catch { /* private mode: the banner simply comes back */ } };
     function renderPruneBanner() {
       const banner = $("pruneBanner");
       if (!banner) return;
       banner.hidden = true;
       // Everything else in this dashboard shows what the user did. This is the one change
       // Ficelle made on its own, so it has to announce itself rather than wait to be found
-      // in the Activity tab — with the Undo that puts the order back if the call was wrong.
+      // in the Activity tab.
       const prune = state?.state?.last_profile_prune || {};
       const models = prune.models || [];
-      if (!prune.audit_id || !models.length || readDismissedPrune() === prune.audit_id) return;
+      if (!prune.audit_id || !models.length || readDismissed(PRUNE_NOTICE_KEY) === prune.audit_id) return;
       const lanes = (prune.profiles || []).map((pid) => profileLabels[pid]?.[0] || pid);
       const providers = (prune.sources || []).map((src) => providerLabel(src));
       const what = models.length === 1 ? "1 model" : models.length + " models";
       const where = lanes.length ? " from " + esc(lanes.join(", ")) : "";
+      // The lane to open: the first pruned one the config still knows about. A profile that
+      // has since disappeared would leave the Routing view on an id nothing renders.
+      const target = (prune.profiles || []).find((pid) => profileOrder.includes(pid));
       banner.hidden = false;
       banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle removed ' + what + where + '</div>' +
         '<div class="update-detail">' + esc(models.join(", ")) + " &mdash; no longer offered for free by " + esc(providers.join(", ") || "their provider") +
         ", so " + (models.length === 1 ? "it was" : "they were") + " dropped from your order at the last catalog refresh." +
         (prune.at ? " " + esc(timeAgo(prune.at).label) + "." : "") + "</div></div>" +
-        '<div class="update-actions"><button class="btn sm" type="button" id="prunePutBackBtn">Put them back</button><button class="btn ghost sm" type="button" id="pruneDismissBtn">Got it</button></div>';
-      // No local dismissal on this path: a successful undo clears the marker server-side, and
-      // reloading is what tells the two apart. A failed undo leaves the banner up, as it should.
-      $("prunePutBackBtn").addEventListener("click", async () => { await rollbackProfiles(prune.audit_id); await loadState(); });
-      $("pruneDismissBtn").addEventListener("click", () => { writeDismissedPrune(prune.audit_id); banner.hidden = true; });
+        '<div class="update-actions">' +
+        (target ? '<button class="btn sm" type="button" id="pruneReviewBtn" title="Open this virtual model and top its order back up.">Review your order</button>' : "") +
+        '<button class="btn ghost sm" type="button" id="pruneDismissBtn">Got it</button></div>';
+      // Undo lives on the `admin.profiles.prune` row of the Audit tab, not here. Putting the
+      // ids back is only right when the provider merely hiccuped; the common case is that they
+      // are gone for good, and offering it as the primary action invites the user to re-add
+      // models that cannot answer. Recompleting the shortened lane is the useful move.
+      if (target) $("pruneReviewBtn").addEventListener("click", () => {
+        writeDismissed(PRUNE_NOTICE_KEY, prune.audit_id);
+        setActiveProfile(target);
+        setView("routing");
+        render();
+      });
+      $("pruneDismissBtn").addEventListener("click", () => { writeDismissed(PRUNE_NOTICE_KEY, prune.audit_id); banner.hidden = true; });
+    }
+
+    const catalogAdditions = () => state?.state?.catalog_additions || {};
+    // Read once per card in capChips, so it is memoised on the payload array itself — a new
+    // /admin/state response brings a new array and invalidates it on its own.
+    let newModelIdCache = { source: undefined, ids: new Set() };
+    function newModelIds() {
+      const models = catalogAdditions().models;
+      if (newModelIdCache.source !== models) newModelIdCache = { source: models, ids: new Set(models) };
+      return newModelIdCache.ids;
+    }
+    // The arrivals the catalog still lists. The recorded ids outlive the catalog by up to a
+    // week, so a model that arrived and left again is counted by the server but has no card
+    // to show — everything the filter bar states has to be measured against this, not the
+    // raw record, or the chip promises rows that cannot appear.
+    function catalogArrivals() {
+      const fresh = newModelIds();
+      return fresh.size ? (state.catalog?.models || []).filter((m) => fresh.has(m.id)) : [];
+    }
+    // How many ids the banner spells out before falling back to a count. Enough to recognise
+    // what arrived, short enough to stay one sentence.
+    const ADDITIONS_PREVIEW = 4;
+    function renderNewModelsBanner() {
+      const banner = $("newModelsBanner");
+      if (!banner) return;
+      banner.hidden = true;
+      // The mirror of the prune banner, and the reason the feature exists: providers open free
+      // models regularly, and without this the only way to find out is to go looking.
+      const additions = catalogAdditions();
+      const models = additions.models || [];
+      const count = additions.count || models.length;
+      if (!additions.at || !count || readDismissed(ADDITIONS_NOTICE_KEY) === additions.at) return;
+      const providers = (additions.sources || []).map((src) => providerLabel(src));
+      const what = count === 1 ? "1 new free model" : count + " new free models";
+      const where = providers.length ? " at " + esc(providers.join(", ")) : "";
+      // The payload is newest first, so a truncated preview still names what just arrived.
+      const shown = models.slice(0, ADDITIONS_PREVIEW);
+      const rest = count - shown.length;
+      banner.hidden = false;
+      banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle found ' + what + where + '</div>' +
+        '<div class="update-detail">' + esc(shown.join(", ")) + (rest > 0 ? " and " + rest + " more" : "") +
+        " &mdash; newly offered for free, so " + (count === 1 ? "it is" : "they are") + " available to add to a virtual model. " +
+        esc(timeAgo(additions.at).label) + ".</div></div>" +
+        '<div class="update-actions"><button class="btn sm" type="button" id="additionsSeeBtn" title="Show only these models in the available list.">See them</button>' +
+        '<button class="btn ghost sm" type="button" id="additionsDismissBtn">Got it</button></div>';
+      $("additionsSeeBtn").addEventListener("click", () => {
+        writeDismissed(ADDITIONS_NOTICE_KEY, additions.at);
+        modelFilters.newOnly = true;
+        setView("routing");
+        render();
+      });
+      $("additionsDismissBtn").addEventListener("click", () => { writeDismissed(ADDITIONS_NOTICE_KEY, additions.at); banner.hidden = true; });
     }
 
     let updateInstallInFlight = false;
@@ -2474,17 +2648,30 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed"); if (input) input.value = ""; showToast(providerLabel(src) + " key saved."); await loadState();
       } catch (e) { showToast(e.message || String(e)); }
     }
-    async function removeProviderKey(src) {
-      try { const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/key", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify({ remove: true }) });
+    // `purgeLegacy` is the opt-in second pass over the read-only legacy stores. It is never
+    // the first thing tried: the default remove stays scoped to Ficelle's own store, and the
+    // user is asked before anything owned by a previous install is touched.
+    async function removeProviderKey(src, { purgeLegacy = false } = {}) {
+      try { const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/key", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify(purgeLegacy ? { remove: true, purge_legacy: true } : { remove: true }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed");
+        const removed = Array.isArray(p.removed) ? p.removed : [];
         const legacySources = Array.isArray(p.remaining_legacy_sources) ? p.remaining_legacy_sources : [];
-        if (legacySources.length) {
-          showToast("Legacy credential fallback sources still apply. Remove them manually from: " + legacySources.join(", ") + ". The provider may remain configured until cleanup is complete.");
+        // Recomputed by the server after the removal: the store a key still resolves from,
+        // or null when none does. `remaining_legacy_sources` cannot see a process
+        // environment variable or an external resolver, so this is what keeps the toast
+        // from reporting a success that left the provider configured.
+        const stillResolvedFrom = p.auth?.key_source || null;
+        const notice = providerKeyRemovalNotice(providerLabel(src), removed, legacySources, purgeLegacy, stillResolvedFrom);
+        if (notice.offerLegacyPurge) {
+          showToast(notice.message, notice.level, {
+            label: "Remove these too",
+            onClick: () => { if (window.confirm("Delete this key from the legacy store as well?\n\n" + legacySources.join("\n") + "\n\nOther tools reading these may lose access.")) removeProviderKey(src, { purgeLegacy: true }); },
+          });
         } else {
-          showToast((p.removed && p.removed.length) ? (providerLabel(src) + " stored key removed.") : "No Ficelle-managed key found.");
+          showToast(notice.message, notice.level);
         }
         await loadState();
-      } catch (e) { showToast(e.message || String(e)); }
+      } catch (e) { showToast(e.message || String(e), "error"); }
     }
     async function updateQuarantine(id, action) {
       try { const r = await fetch("/admin/quarantine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: id, action, reason: "manual", note: "manual admin change" }) });

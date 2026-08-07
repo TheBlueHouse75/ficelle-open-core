@@ -22,9 +22,12 @@
 
       <section class="update-banner" id="updateBanner" hidden aria-live="polite"></section>
       <!-- A prune is the only edit Ficelle makes to a virtual model on its own, so it says so
-           here once, next to the Undo it enables. Dismissed per audit id, so the next prune
-           speaks up again. -->
+           here once and sends the user to the lane it shortened. Dismissed per audit id, so
+           the next prune speaks up again. -->
       <section class="update-banner is-prune" id="pruneBanner" hidden aria-live="polite"></section>
+      <!-- The other direction: models a provider started offering for free. Nothing changed
+           locally, so this only reports — and hands over the filtered list to pick from. -->
+      <section class="update-banner is-fresh" id="newModelsBanner" hidden aria-live="polite"></section>
       <!-- Shown only if the first state load is slow or fails; aria-live so the wait is
            announced, not just drawn. -->
       <div class="empty boot-notice" id="bootNotice" hidden aria-live="polite"></div>
@@ -307,7 +310,7 @@
     </aside>
   </div>
 
-  <div class="toast" id="toast" role="status" aria-live="polite"><span class="t-dot"></span><span id="toastMsg"></span></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"><span class="t-dot"></span><span class="t-body"><span id="toastMsg"></span><button type="button" class="btn sm t-action" id="toastAction" hidden></button></span></div>
 
   <script type="module" src="/admin/static/app.js"></script>
 </body>

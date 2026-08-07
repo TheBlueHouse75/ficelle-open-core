@@ -304,6 +304,46 @@ def test_an_empty_pool_is_explained_by_the_missing_key_when_there_is_one():
     assert "ficelle set-key openrouter  # create a key at https://openrouter.example/keys" in message
 
 
+def test_an_empty_pool_names_the_key_that_is_stored_and_still_unusable():
+    """Selection drops these models too, so the demo has to account for them — but not
+    under "no API key is configured", and not behind a `set-key` line for a key it has."""
+    message = unroutable_pool_message(
+        "ficelle/auto-tools",
+        {
+            "openrouter": {"invokable": False, "reason": "missing OPENROUTER_API_KEY", "key_source": None},
+            "mistral": {
+                "invokable": False,
+                "reason": "missing base_url for provider mistral",
+                "key_source": "keychain",
+            },
+        },
+        {"openrouter": "https://openrouter.example/keys", "mistral": "https://mistral.example/keys"},
+    )
+
+    assert "Nothing is routable for ficelle/auto-tools: no configured provider is usable." in message
+    assert "ficelle set-key openrouter  # create a key at https://openrouter.example/keys" in message
+    assert "ficelle set-key mistral" not in message
+    assert "  mistral  # missing base_url for provider mistral" in message
+    assert "Then run `ficelle refresh` and try again." in message
+
+
+def test_an_empty_pool_drops_the_set_key_block_when_there_is_nothing_to_store():
+    message = unroutable_pool_message(
+        "ficelle/auto-tools",
+        {
+            "mistral": {
+                "invokable": False,
+                "reason": "missing base_url for provider mistral",
+                "key_source": "keychain",
+            }
+        },
+        {"mistral": "https://mistral.example/keys"},
+    )
+
+    assert "until at least one key is stored" not in message
+    assert "  mistral  # missing base_url for provider mistral" in message
+
+
 def test_an_empty_pool_stays_a_routing_problem_once_a_provider_is_configured():
     message = unroutable_pool_message(
         "ficelle/auto-tools",
@@ -386,6 +426,7 @@ def test_the_production_router_really_fails_over_off_the_simulated_outage():
             record_success=lambda _model, _latency: None,
             resolve_competence=lambda _profile, _model: "verified",
             record_telemetry=telemetry.append,
+            record_success_with_telemetry=lambda _model, _latency, row: telemetry.append(row),
             stream_response=lambda *_args: pytest.fail("the demo never streams"),
             detect_success_error=lambda *_args: None,
             has_deliverable=lambda _payload: True,
@@ -458,6 +499,7 @@ def test_a_missing_key_reaches_the_demo_as_a_recognisable_attempt():
             record_success=lambda _model, _latency: None,
             resolve_competence=lambda _profile, _model: "verified",
             record_telemetry=telemetry.append,
+            record_success_with_telemetry=lambda _model, _latency, row: telemetry.append(row),
             stream_response=lambda *_args: pytest.fail("the demo never streams"),
             detect_success_error=lambda *_args: None,
             has_deliverable=lambda _payload: True,

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
+from ficelle.redaction import sanitize_error_detail
+
 from ficelle.targets.base import (
     SmokeCheck,
     TargetExport,
@@ -64,7 +66,7 @@ def hermes_runtime_resolver(
             "nous credentials resolved without usable api_key/base_url",
         )
     except Exception as exc:
-        return None, None, f"{type(exc).__name__}: {exc}"
+        return None, None, sanitize_error_detail(f"{type(exc).__name__}: {exc}")
 
 
 def build_hermes_runtime_resolver(hermes_agent_dir: Path) -> HermesCredentialResolver:

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from ficelle.runtime_paths import RuntimePaths
+from ficelle.url_security import connectable_host
 from ficelle.service import (
     LaunchAgentServiceBackend,
     ServiceBackend,
@@ -28,6 +29,8 @@ from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
     provider_key_setup_commands,
     unconfigured_provider_sources,
+    unusable_key_provider_lines,
+    unusable_key_provider_reasons,
 )
 
 LABEL = "com.ficelle.router"
@@ -205,7 +208,9 @@ def report_terminated_stale_servers(stale_pids: list[int]) -> None:
 
 def router_url(path: str) -> str:
     config = router.load_config()
-    host = config.get("host") or "127.0.0.1"
+    # A wildcard bind is not a destination, and the router's Host allowlist refuses the literal,
+    # so echoing it back here would make every CLI status read fail against our own server.
+    host = connectable_host(config.get("host"))
     port = int(config.get("port") or 8646)
     return f"http://{host}:{port}{path}"
 
@@ -332,14 +337,25 @@ def doctor_provider_key_lines(auth: dict[str, Any]) -> list[str]:
     reads `status: ok` while every completion fails with `credentials unavailable`.
     A diagnostic that stays silent about the commonest reason nothing works is the
     bug, so the text report always states which providers can actually be called.
+
+    A provider holding a key that still cannot be used is reported on its own line, with
+    the reason and no `set-key` command: the key is not the missing piece, and offering to
+    store it again is advice that cannot work. It is stated even when another provider
+    does serve — a resolvable key that reaches nothing is exactly what a doctor is for.
     """
     configured = invokable_provider_sources(auth)
+    unusable = unusable_key_provider_reasons(auth)
+    unusable_lines = [f"  {line}" for line in unusable_key_provider_lines(unusable)]
     if configured:
-        return [f"provider_keys: {', '.join(configured)}"]
+        return [f"provider_keys: {', '.join(configured)}", *unusable_lines]
     missing = unconfigured_provider_sources(auth)
+    # "none configured" would itself be the lie this line exists to avoid when a key is
+    # sitting in a store and only the provider entry is incomplete.
+    headline = "none usable" if unusable else "none configured"
     return [
-        "provider_keys: none configured — no completion can be served.",
+        f"provider_keys: {headline} — no completion can be served.",
         *(f"  {line}" for line in provider_key_setup_commands(missing, router.PROVIDER_KEY_URLS)),
+        *unusable_lines,
     ]
 
 
@@ -354,7 +370,10 @@ def doctor(*, json_output: bool = True) -> int:
         print(f"state_exists: {status['state_exists']}")
         for line in doctor_provider_key_lines(status.get("auth") or {}):
             print(line)
-    return 0
+    # Exit code follows the reported status so a script or a CI step can gate on `ficelle doctor`
+    # instead of parsing its output. `status` here describes the *service*, so a keyless install
+    # still reads ok — the provider-key lines above are what surface that.
+    return 0 if status.get("status") == "ok" else 1
 
 
 def set_key(provider: str) -> int:
@@ -377,12 +396,25 @@ def set_key(provider: str) -> int:
     return 0
 
 
-def remove_key(provider: str) -> int:
+# The `auth.key_source` families a removal cannot reach, mapped to the next move. Mirrors
+# ``KEY_SOURCE_REMEDIES`` in ``assets/admin/lib.js``: ``env`` and ``external`` are the two
+# nothing inside Ficelle can clear and the two ``remaining_legacy_sources`` never reported, so
+# they carry their own instruction. Any other family is named as-is — the legacy line already
+# says what to do about a legacy store, and a family added later is still stated.
+RESIDUAL_KEY_SOURCE_HINTS = {
+    "env": "a process environment variable; unset it where the service starts, then restart",
+    "external": "an external credential resolver; clear the key in that integration",
+}
+
+
+def remove_key(provider: str, *, purge_legacy: bool = False) -> int:
     config = router.load_config()
     if provider not in (config.get("providers") or {}):
         print(f"Unknown provider: {provider}", file=sys.stderr)
         return 2
     cleared = router.remove_provider_key(provider, config)
+    if purge_legacy:
+        cleared = [*cleared, *router.purge_legacy_provider_credentials(provider, config)]
     remaining_legacy_sources = router.legacy_provider_credential_sources(
         provider,
         config,
@@ -391,12 +423,30 @@ def remove_key(provider: str) -> int:
         print(f"Removed {provider} key from: {', '.join(cleared)}.")
     else:
         print(f"No stored {provider} key found in the OS store or .env.")
+    # Resolution re-run after the removal: `key_source` names the store a key would still
+    # be read from, or None when none would. It is the verdict for every family, including
+    # the two `remaining_legacy_sources` cannot enumerate — a process environment variable
+    # and an external resolver (R4) — which used to leave a provider configured behind a
+    # clean "removed" line. Computed after the line above, not before: on a cold CLI process
+    # this resolution shells out to `security` once per alias and would hold that line back.
+    key_source = router.provider_auth_row(provider, config).get("key_source")
+    if key_source:
+        hint = RESIDUAL_KEY_SOURCE_HINTS.get(key_source, key_source)
+        print(f"A {provider} key still resolves from {hint}, so {provider} stays configured.")
+    elif not remaining_legacy_sources:
+        # Only claimed when nothing is left to qualify it: a locked legacy keychain reads as
+        # empty while it stays locked, so "no key resolves" would be a promise for today only.
+        print(f"No {provider} key resolves any more.")
     if remaining_legacy_sources:
-        print(
-            "Legacy credential fallback sources still apply; remove them manually from: "
-            f"{', '.join(remaining_legacy_sources)}. "
-            f"{provider} may remain configured until cleanup is complete."
+        sources = ", ".join(remaining_legacy_sources)
+        # After an explicit purge these are the ones it could not reach — a locked keychain,
+        # or a store another install owns — so the only remaining move is a manual one.
+        next_step = (
+            "remove them manually"
+            if purge_legacy
+            else "re-run with --purge-legacy to clear them"
         )
+        print(f"Legacy credential fallback sources still apply: {sources}. Please {next_step}.")
     router.main_args(["--refresh"])
     return 0
 
@@ -650,6 +700,12 @@ def main(argv: list[str] | None = None) -> int:
     set_key_parser.add_argument("provider")
     remove_key_parser = sub.add_parser("remove-key", help="Remove a stored provider API key")
     remove_key_parser.add_argument("provider")
+    remove_key_parser.add_argument(
+        "--purge-legacy",
+        action="store_true",
+        dest="purge_legacy",
+        help="Also delete the key from read-only legacy stores (previous Hermes/Ficelle keychains and .env files), which the router still resolves. Other tools reading them lose access.",
+    )
     license_parser = sub.add_parser("license", help="Manage the Ficelle Pro license (Pro only)")
     license_parser.add_argument("action", choices=["activate", "status", "refresh", "deactivate"])
     license_parser.add_argument("key", nargs="?", help="License key (for activate)")
@@ -696,7 +752,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "set-key":
         return set_key(args.provider)
     if args.command == "remove-key":
-        return remove_key(args.provider)
+        return remove_key(args.provider, purge_legacy=bool(getattr(args, "purge_legacy", False)))
     if args.command == "license":
         return cmd_license(args)
     if args.command == "install-pro":

@@ -264,6 +264,8 @@
     .update-banner.is-progress { border-color: color-mix(in srgb, var(--info) 42%, transparent); background: color-mix(in srgb, var(--info) 9%, var(--surface-1)); }
     .update-banner.is-error { border-color: color-mix(in srgb, var(--danger) 42%, transparent); background: color-mix(in srgb, var(--danger) 8%, var(--surface-1)); }
     .update-banner.is-prune { border-color: color-mix(in srgb, var(--warn) 42%, transparent); background: color-mix(in srgb, var(--warn) 9%, var(--surface-1)); }
+    /* Models leaving the free pool read as a warning; models arriving should not. */
+    .update-banner.is-fresh { border-color: color-mix(in srgb, var(--ok) 42%, transparent); background: color-mix(in srgb, var(--ok) 9%, var(--surface-1)); }
 
     /* ============ Buttons ============
        Pill shape + the website's "solid drop" primary: the shadow is a flat
@@ -416,14 +418,15 @@
     .filter-bar { display: flex; flex-direction: column; gap: 8px; margin: 11px 0 13px; }
     .flt-row { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
     .flt { position: relative; }
-    .flt-trigger {
+    /* A one-state toggle that sits in the same row: same shape as a trigger, no popover. */
+    .flt-trigger, .flt-toggle {
       display: inline-flex; align-items: center; gap: 6px;
       padding: 6px 11px; border-radius: 999px; border: 1px solid var(--border);
       background: var(--surface-1); color: var(--text-muted); font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;
       transition: background 0.15s var(--ease), color 0.15s var(--ease), border-color 0.15s var(--ease);
     }
-    .flt-trigger:hover { background: var(--surface-2); color: var(--text); }
-    .flt-trigger.on { background: color-mix(in srgb, var(--brand) 14%, transparent); border-color: color-mix(in srgb, var(--brand) 38%, transparent); color: var(--brand); }
+    .flt-trigger:hover, .flt-toggle:hover { background: var(--surface-2); color: var(--text); }
+    .flt-trigger.on, .flt-toggle.on { background: color-mix(in srgb, var(--brand) 14%, transparent); border-color: color-mix(in srgb, var(--brand) 38%, transparent); color: var(--brand); }
     .flt-trigger svg { width: 14px; height: 14px; flex: none; }
     .flt-trigger .chev { opacity: 0.75; transition: transform 0.18s var(--ease); }
     .flt.open .flt-trigger .chev { transform: rotate(180deg); }
@@ -727,8 +730,19 @@
       transform: translateY(14px); opacity: 0; pointer-events: none;
       transition: transform 0.22s var(--ease), opacity 0.22s var(--ease);
     }
-    .toast.show { transform: translateY(0); opacity: 1; }
+    /* pointer-events must come back on while shown, otherwise the action button below
+       is unclickable. */
+    .toast.show { transform: translateY(0); opacity: 1; pointer-events: auto; }
     .toast .t-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--brand); box-shadow: var(--glow); flex: none; }
+    /* A partial success and an outright failure used to look identical here, which is how a
+       remove that cleared nothing read as "it worked". The dot carries the level. */
+    .toast.is-ok .t-dot { background: var(--ok); }
+    .toast.is-warn .t-dot { background: var(--warn); }
+    .toast.is-error .t-dot { background: var(--danger); }
+    .toast .t-body { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+    /* Styling comes from .btn.sm; this only keeps the button from stretching in the
+       column flex above. */
+    .toast .t-action { align-self: flex-start; }
 
     /* ============ Views ============ */
     .view { display: none; animation: viewin 0.3s var(--ease); }

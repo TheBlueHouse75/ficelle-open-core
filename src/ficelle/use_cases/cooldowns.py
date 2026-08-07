@@ -63,6 +63,7 @@ class CooldownStatsPorts:
     safe_int: SafeInt
     safe_detail: SafeDetail
     now_iso: NowIso
+    now_epoch: Callable[[], float]
     cooldown_key: Callable[[dict[str, Any]], str]
     canonical_virtual_model_id: CanonicalProfileId
 
@@ -89,7 +90,7 @@ class CooldownSuccessPorts:
     quota_cooldown_matches_model: Callable[[str, dict[str, Any]], bool]
     clear_provider_error_in_state: Callable[[dict[str, Any], str], None]
     clear_model_error_in_state: Callable[[dict[str, Any], dict[str, Any]], None]
-    update_success_stats: Callable[[dict[str, Any], dict[str, Any], float], None]
+    update_success_stats: Callable[..., None]
     update_provider_success_stats: Callable[[dict[str, Any], str, float], None]
 
 
@@ -259,9 +260,56 @@ def set_model_not_found_quarantine_in_state(
     )
 
 
+
+# Half-life for the counters that feed scoring. Sized against 52 days of this install's own
+# traffic: 240 models carry stats, half of them last active 48 days ago, yet those cumulative
+# counters still fully decided their score. At 7 days a 48-day-old record keeps 0.9% of its
+# weight (effectively neutral) while a model used weekly keeps 50% of its history — and 7 days
+# is already the project's "evidence stays meaningful" horizon (verified_capability_ttl_seconds),
+# so this is consistency with an existing constant rather than a fresh guess.
+SCORE_DECAY_HALF_LIFE_SECONDS = 7 * 86_400
+
+
+def _decay_scored_counters(record: dict[str, Any], now_epoch: float) -> None:
+    """Age the scoring counters before folding in a new observation.
+
+    `successes`/`failures` stay as lifetime totals for the admin card; scoring reads the decayed
+    pair instead, so a model that degraded stops coasting on old wins and one that recovered
+    stops being punished for them.
+    """
+    previous = record.get("scored_at")
+    scored_successes = _safe_number(record.get("scored_successes"))
+    scored_failures = _safe_number(record.get("scored_failures"))
+    if previous is not None and (scored_successes or scored_failures):
+        try:
+            elapsed = max(0.0, now_epoch - float(previous))
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        if elapsed > 0:
+            factor = 0.5 ** (elapsed / SCORE_DECAY_HALF_LIFE_SECONDS)
+            scored_successes *= factor
+            scored_failures *= factor
+    record["scored_successes"] = round(scored_successes, 6)
+    record["scored_failures"] = round(scored_failures, 6)
+    record["scored_at"] = now_epoch
+
+
+def _safe_number(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if number > 0 else 0.0
+
+
 def _record_failure(record: dict[str, Any], reason: str, *, ports: CooldownStatsPorts) -> None:
     record["requests"] = ports.safe_int(record.get("requests"), 0) + 1
     record["failures"] = ports.safe_int(record.get("failures"), 0) + 1
+    _decay_scored_counters(record, ports.now_epoch())
+    if reason not in CALLER_CAUSED_FAILURE_REASONS:
+        # A caller's own bad request is visible in the lifetime totals but must not drag the
+        # score, the same exemption the consecutive-failure streak already makes.
+        record["scored_failures"] = round(_safe_number(record.get("scored_failures")) + 1.0, 6)
     # The streak drives a cumulative score penalty and the selection tie-break, so it stays reserved
     # for failures the model is answerable for. See CALLER_CAUSED_FAILURE_REASONS.
     if reason not in CALLER_CAUSED_FAILURE_REASONS:
@@ -280,11 +328,26 @@ def _latency_ewma(previous_latency: Any, latency_seconds: float) -> float:
         return latency_seconds
 
 
-def _record_success(record: dict[str, Any], latency_seconds: float, *, ports: CooldownStatsPorts) -> None:
+def _record_success(
+    record: dict[str, Any],
+    latency_seconds: float,
+    *,
+    ports: CooldownStatsPorts,
+    representative_latency: bool = True,
+) -> None:
     record["requests"] = ports.safe_int(record.get("requests"), 0) + 1
     record["successes"] = ports.safe_int(record.get("successes"), 0) + 1
     record["consecutive_failures"] = 0
-    record["latency_ewma"] = _latency_ewma(record.get("latency_ewma"), latency_seconds)
+    _decay_scored_counters(record, ports.now_epoch())
+    record["scored_successes"] = round(_safe_number(record.get("scored_successes")) + 1.0, 6)
+    if representative_latency:
+        record["latency_ewma"] = _latency_ewma(record.get("latency_ewma"), latency_seconds)
+    else:
+        # A capability probe asks for a handful of tokens, so its latency says nothing about how
+        # long this model takes on a real request — but it fed the same EWMA the latency score
+        # reads, making a model that has only ever been probed look the fastest in the pool. The
+        # success itself still counts: answering a probe is evidence the model works.
+        record["probe_latency_ewma"] = _latency_ewma(record.get("probe_latency_ewma"), latency_seconds)
     record["last_success_at"] = ports.now_iso()
 
 
@@ -301,11 +364,12 @@ def update_success_stats(
     latency_seconds: float,
     *,
     ports: CooldownStatsPorts,
+    representative_latency: bool = True,
 ) -> None:
     stats = state.setdefault("stats", {})
     key = ports.cooldown_key(model)
     record = stats.setdefault(key, {})
-    _record_success(record, latency_seconds, ports=ports)
+    _record_success(record, latency_seconds, ports=ports, representative_latency=representative_latency)
 
 
 def record_model_error_in_state(
@@ -522,6 +586,7 @@ def record_success_in_state(
     latency_seconds: float,
     *,
     ports: CooldownSuccessPorts,
+    representative_latency: bool = True,
 ) -> None:
     key = ports.cooldown_key(model)
     successes = state.setdefault("successes", {})
@@ -544,7 +609,7 @@ def record_success_in_state(
     if not source_has_active_quota_cooldown(state, source, ports=ports):
         ports.clear_provider_error_in_state(state, source)
     ports.clear_model_error_in_state(state, model)
-    ports.update_success_stats(state, model, latency_seconds)
+    ports.update_success_stats(state, model, latency_seconds, representative_latency=representative_latency)
     if source:
         ports.update_provider_success_stats(state, source, latency_seconds)
 

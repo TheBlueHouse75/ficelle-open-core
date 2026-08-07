@@ -17,10 +17,13 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 
 from ficelle.runtime_paths import FICELLE_CREDENTIAL_FILENAMES, RuntimePaths
 from ficelle.service import active_home_pointer_path, persist_active_service_context
+from ficelle.url_security import connectable_host
 from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
     provider_key_setup_commands,
     unconfigured_provider_sources,
+    unusable_key_provider_block,
+    unusable_key_provider_reasons,
 )
 
 MANAGED_CONFIG_BEGIN = "# BEGIN FICELLE MANAGED CONFIG"
@@ -331,11 +334,7 @@ def legacy_service_listener_status(
     except (OSError, ValueError):
         return "unknown"
     config = raw_config if isinstance(raw_config, dict) else {}
-    host = str(config.get("host") or "127.0.0.1")
-    if host == "0.0.0.0":
-        host = "127.0.0.1"
-    elif host == "::":
-        host = "::1"
+    host = connectable_host(config.get("host"))
     try:
         port = int(config.get("port") or 8646)
     except (TypeError, ValueError):
@@ -1038,6 +1037,11 @@ def first_run_provider_key_notice(auth: dict[str, Any] | None) -> list[str]:
     Empty when a provider is configured — a working install must not be nagged — and
     empty when credentials could not be read at all, since a false alarm here would
     send a configured user hunting a problem they do not have.
+
+    "Not invokable" has two halves with two different fixes, and they are addressed
+    separately: a provider with no key needs one stored, a provider already holding one
+    needs its entry completed. Answering the second with `ficelle set-key` would send the
+    user to re-paste a key that resolves perfectly well.
     """
     if auth is None or invokable_provider_sources(auth):
         return []
@@ -1048,21 +1052,35 @@ def first_run_provider_key_notice(auth: dict[str, Any] | None) -> list[str]:
         from ficelle.router import PROVIDER_KEY_URLS
     except Exception:  # noqa: BLE001 - the advice is worth printing without its links
         PROVIDER_KEY_URLS = {}
-    return [
-        "",
-        "No provider API key is configured, so Ficelle cannot serve a completion yet.",
-        "Ficelle routes through your own provider accounts and ships no keys of its own.",
-        "Create a key, then store it (input is hidden and never reaches shell history):",
-        "",
-        *(
-            f"  {line}"
-            for line in provider_key_setup_commands(unconfigured_provider_sources(auth), PROVIDER_KEY_URLS)
-        ),
+    keyless = unconfigured_provider_sources(auth)
+    unusable = unusable_key_provider_reasons(auth)
+    headline = (
+        "No provider is usable yet, so Ficelle cannot serve a completion."
+        if unusable
+        else "No provider API key is configured, so Ficelle cannot serve a completion yet."
+    )
+    lines = ["", headline]
+    if keyless:
+        lines += [
+            "Ficelle routes through your own provider accounts and ships no keys of its own.",
+            "Create a key, then store it (input is hidden and never reaches shell history):",
+            "",
+            *(f"  {line}" for line in provider_key_setup_commands(keyless, PROVIDER_KEY_URLS)),
+        ]
+    if unusable:
+        lines += [
+            "",
+            *unusable_key_provider_block(unusable),
+            "Storing that key again will not change it: fix what the reason names in the",
+            "provider's `config.json` entry (`ficelle doctor --text` prints its path).",
+        ]
+    lines += [
         "",
         "`ficelle models` lists the providers' public catalogs, which they serve without",
         "credentials — a populated model list does NOT mean a request can be served.",
         "`ficelle doctor --text` reports which providers are actually configured.",
     ]
+    return lines
 
 
 def run_install(options: InstallOptions) -> int:

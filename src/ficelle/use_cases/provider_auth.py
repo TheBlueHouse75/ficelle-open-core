@@ -17,16 +17,17 @@ def provider_auth_row(source: str, config: dict[str, Any], *, ports: ProviderAut
     providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
     provider_cfg = providers.get(source) if isinstance(providers.get(source), dict) else {}
     access = ports.provider_access(source, provider_cfg, False)
-    configured = bool(access.key and access.base_url)
-    invokable = configured or access.auth_status_invokable
-    key_for_row = access.key if invokable else None
+    # The record's own verdict, not a second copy of it: this row and `invoke_model` must
+    # answer the same question, and every time each composed its own predicate they drifted.
+    invokable = access.can_invoke
     base_url_for_row = access.base_url or provider_cfg.get("base_url")
     return auth_row(
         invokable,
-        key_for_row,
+        access.key,
         access.reason,
         base_url_for_row,
         credential_source_label=ports.credential_source_label,
+        key_reason=access.key_reason,
     )
 
 
@@ -42,11 +43,24 @@ def auth_row(
     base_url: Any,
     *,
     credential_source_label: Callable[[str | None], str | None],
+    key_reason: str | None = None,
 ) -> dict[str, Any]:
+    """The public shape of one provider's credential state. Never carries key material.
+
+    ``key_source`` answers "does a key resolve, and from where" and ``invokable`` answers
+    "would a request be sent" — two questions, because they have two different fixes. A key
+    that resolves and still cannot be used keeps ``reason`` (``missing base_url for provider
+    <source>``) rather than reading ``configured``, so no caller can mistake it for one that
+    works; and it keeps its ``key_source``, so no caller can mistake it for one with no key
+    and answer it with `ficelle set-key`.
+
+    ``key_reason`` is the resolution source when ``reason`` had to be spent on that
+    diagnostic; both are coarse redacted strings owned by the resolver, never the value.
+    """
     return {
         "invokable": invokable,
-        "reason": "configured" if key else reason,
-        "key_source": credential_source_label(reason) if key else None,
+        "reason": "configured" if key and invokable else reason,
+        "key_source": credential_source_label(key_reason or reason) if key else None,
         "base_url": base_url,
     }
 
@@ -63,10 +77,30 @@ def invokable_provider_sources(auth: Mapping[str, Any]) -> list[str]:
     return [str(source) for source, row in auth.items() if isinstance(row, dict) and row.get("invokable")]
 
 
+def unusable_key_provider_reasons(auth: Mapping[str, Any]) -> dict[str, str]:
+    """Providers whose key resolves and still cannot be called, mapped to why, in configured order.
+
+    These are the ones `ficelle set-key` cannot help: the key is already there and something
+    else is missing — today only a `base_url`, which is the one way to hold a key and stay
+    non-invokable. The value is the row's own ``reason`` verbatim, so the advice names what
+    is actually missing instead of repeating the question.
+    """
+    return {
+        str(source): str(row.get("reason") or "the stored key cannot be used")
+        for source, row in auth.items()
+        if isinstance(row, dict) and not row.get("invokable") and row.get("key_source")
+    }
+
+
 def unconfigured_provider_sources(auth: Mapping[str, Any]) -> list[str]:
-    """The providers a user would have to give a key to, in configured order."""
-    invokable = set(invokable_provider_sources(auth))
-    return [str(source) for source in auth if str(source) not in invokable]
+    """The providers a user would have to give a key to, in configured order.
+
+    Narrower than "not invokable", which is what it used to be: a provider already holding
+    a key is in ``unusable_key_provider_reasons`` instead, because storing that same key
+    again is not what fixes it.
+    """
+    accounted = set(invokable_provider_sources(auth)) | set(unusable_key_provider_reasons(auth))
+    return [str(source) for source in auth if str(source) not in accounted]
 
 
 def provider_key_setup_commands(sources: Sequence[str], key_urls: Mapping[str, str]) -> list[str]:
@@ -85,3 +119,32 @@ def provider_key_setup_commands(sources: Sequence[str], key_urls: Mapping[str, s
         url = str(key_urls.get(source) or "").strip()
         lines.append(f"{command.ljust(width)}  # create a key at {url}" if url else command)
     return lines
+
+
+def unusable_key_provider_lines(reasons: Mapping[str, str]) -> list[str]:
+    """One ``<provider>  # <reason>`` line per stored-but-unusable key, unindented.
+
+    Aligned like ``provider_key_setup_commands`` because the two blocks are printed
+    together: one lists what to store, the other what to fix. No command, because there
+    is none — the reason is the whole actionable content.
+    """
+    width = max((len(source) for source in reasons), default=0)
+    return [f"{source.ljust(width)}  # {reason}" for source, reason in reasons.items()]
+
+
+def unusable_key_provider_block(reasons: Mapping[str, str]) -> list[str]:
+    """The whole block — heading, indented lines, trailing blank — or nothing at all.
+
+    Unlike the keyless half, whose framing is deliberately worded per surface, this
+    sentence is the same everywhere it is printed, so it is owned here rather than copied:
+    a reword must reach every surface at once. Callers add their own follow-up if they
+    have one. Empty for an empty mapping, so no surface prints a heading over no lines.
+    """
+    if not reasons:
+        return []
+    return [
+        "These providers already hold a key, and something else is missing:",
+        "",
+        *(f"  {line}" for line in unusable_key_provider_lines(reasons)),
+        "",
+    ]

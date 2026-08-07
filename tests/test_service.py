@@ -309,3 +309,69 @@ def test_select_service_backend_rejects_windows_platform(tmp_path, capsys):
     assert isinstance(backend, UnsupportedServiceBackend)
     assert backend.install() == 1
     assert "macOS LaunchAgent and Linux systemd --user" in capsys.readouterr().err
+
+
+def _launchagent(paths, run_command):
+    return select_service_backend(
+        platform_name="darwin",
+        paths=paths,
+        run_command=run_command,
+        uid_provider=lambda: "501",
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+
+
+def test_restart_reuses_the_interpreter_the_plist_already_records(tmp_path, capsys):
+    # AGENTS.md warns the agent must run under the Python setup used, and the CLI honoured that
+    # at setup then re-decided it on every restart from sys.executable. Running `ficelle restart`
+    # from a second install or an ephemeral uvx environment silently repointed the service.
+    import plistlib
+
+    installed_python = tmp_path / "venv" / "bin" / "python"
+    installed_python.parent.mkdir(parents=True)
+    installed_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    paths = make_paths(tmp_path)
+    paths.plist.parent.mkdir(parents=True, exist_ok=True)
+    with paths.plist.open("wb") as handle:
+        plistlib.dump({"ProgramArguments": [str(installed_python), "-m", "ficelle.router", "--serve"]}, handle)
+
+    backend = _launchagent(paths, lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
+    assert backend.paths.install_python != installed_python, "precondition: a different interpreter is running"
+
+    assert backend.restart() == 0
+
+    with paths.plist.open("rb") as handle:
+        rewritten = plistlib.load(handle)
+    assert rewritten["ProgramArguments"][0] == str(installed_python), "the recorded interpreter must survive a restart"
+    assert "reusing the interpreter" in capsys.readouterr().out
+
+
+def test_restart_repoints_when_the_recorded_interpreter_cannot_import_ficelle(tmp_path, capsys):
+    import plistlib
+
+    broken_python = tmp_path / "broken" / "python"
+    broken_python.parent.mkdir(parents=True)
+    broken_python.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    paths = make_paths(tmp_path)
+    paths.plist.parent.mkdir(parents=True, exist_ok=True)
+    with paths.plist.open("wb") as handle:
+        plistlib.dump({"ProgramArguments": [str(broken_python), "-m", "ficelle.router", "--serve"]}, handle)
+
+    def run_command(cmd):
+        # The import probe fails for the recorded interpreter; launchctl calls succeed.
+        if cmd[:2] == [str(broken_python), "-c"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="ModuleNotFoundError")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    backend = _launchagent(paths, run_command)
+
+    assert backend.restart() == 0
+
+    with paths.plist.open("rb") as handle:
+        rewritten = plistlib.load(handle)
+    assert rewritten["ProgramArguments"][0] == str(paths.install_python), "a dead interpreter must be replaced"
+    assert "unusable" in capsys.readouterr().out

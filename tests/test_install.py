@@ -311,6 +311,53 @@ def test_run_install_tells_an_unkeyed_install_it_cannot_serve_anything(monkeypat
     assert "Verify: `ficelle health` and `ficelle models`." not in output
 
 
+def test_run_install_does_not_ask_for_a_key_the_install_already_holds(monkeypatch, tmp_path, capsys):
+    """First run is where a `base_url` cleared in `config.json` is met, and it used to be
+    answered with `ficelle set-key` for a key sitting in the keychain."""
+    install_with_doctor_auth(
+        monkeypatch,
+        tmp_path,
+        {
+            "openrouter": {"invokable": False, "reason": "missing OPENROUTER_API_KEY", "key_source": None},
+            "mistral": {
+                "invokable": False,
+                "reason": "missing base_url for provider mistral",
+                "key_source": "keychain",
+            },
+        },
+    )
+    output = capsys.readouterr().out
+
+    assert "No provider is usable yet, so Ficelle cannot serve a completion." in output
+    assert "ficelle set-key openrouter" in output
+    assert "ficelle set-key mistral" not in output
+    assert "These providers already hold a key, and something else is missing:" in output
+    assert "  mistral  # missing base_url for provider mistral" in output
+    assert "Storing that key again will not change it" in output
+
+
+def test_run_install_skips_the_set_key_block_when_every_provider_already_has_a_key(monkeypatch, tmp_path, capsys):
+    """The block would otherwise print its "store a key" preamble over an empty command list."""
+    install_with_doctor_auth(
+        monkeypatch,
+        tmp_path,
+        {
+            "mistral": {
+                "invokable": False,
+                "reason": "missing base_url for provider mistral",
+                "key_source": "keychain",
+            }
+        },
+    )
+    output = capsys.readouterr().out
+
+    assert "No provider is usable yet, so Ficelle cannot serve a completion." in output
+    assert "ficelle set-key" not in output
+    assert "Create a key, then store it" not in output
+    assert "  mistral  # missing base_url for provider mistral" in output
+    assert "does NOT mean a request can be served" in output
+
+
 def test_run_install_leaves_a_configured_install_alone(monkeypatch, tmp_path, capsys):
     install_with_doctor_auth(
         monkeypatch,
