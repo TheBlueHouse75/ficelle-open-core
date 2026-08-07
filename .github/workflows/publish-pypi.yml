@@ -54,26 +54,36 @@ jobs:
           test -n "$TAG" || { echo "::error::no release tag to publish"; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the released tag
+      # The default branch, not the tag: the audit script is release *tooling* and a tag can
+      # predate it. v0.1.7 does — it was cut before this workflow existed — so checking out the
+      # tag would fail on a missing script rather than audit anything. `fetch-depth: 0` brings
+      # the tags along so the pin can still be read from the release itself, below.
+      - name: Checkout the release tooling
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Read the pinned Core version
+      - name: Read the pin recorded at the released tag
         id: pin
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          VERSION=$(sed -n 's/^CORE_VERSION = "\(.*\)"$/\1/p' scripts/bootstrap-ficelle.py)
-          test -n "$VERSION" || { echo "::error::no CORE_VERSION in scripts/bootstrap-ficelle.py"; exit 1; }
-          # A tag that disagrees with the pin means the bump script was not run before tagging,
-          # and the digest recorded in the installer belongs to another build.
+          # The pin is a property of the release, so read it out of the tag rather than the
+          # branch. They agree today; assuming that would publish a wheel verified against
+          # whatever digest the branch happens to carry.
+          PIN="$RUNNER_TEMP/bootstrap-at-tag.py"
+          git show "$TAG:scripts/bootstrap-ficelle.py" > "$PIN"
+          VERSION=$(sed -n 's/^CORE_VERSION = "\(.*\)"$/\1/p' "$PIN")
+          test -n "$VERSION" || { echo "::error::no CORE_VERSION at $TAG"; exit 1; }
+          # A tag that disagrees with its own pin means the bump script was not run before
+          # tagging, and the digest recorded in the installer belongs to another build.
           if [ "$TAG" != "v$VERSION" ]; then
             echo "::error::tag $TAG does not match CORE_VERSION $VERSION"
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "pin=$PIN" >> "$GITHUB_OUTPUT"
 
       - name: Download every asset attached to the release
         env:
@@ -87,7 +97,7 @@ jobs:
           ls -l staging
 
       - name: Audit the artifacts
-        run: python scripts/audit-release-artifacts.py staging
+        run: python scripts/audit-release-artifacts.py staging --bootstrap "${{ steps.pin.outputs.pin }}"
 
       - name: Stage only the audited artifacts
         env:

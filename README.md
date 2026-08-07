@@ -72,6 +72,19 @@ key in shell history, enter it silently before running the same command:
 )
 ```
 
+### Or install from PyPI
+
+If you already manage Python environments, the same open Core is on PyPI:
+
+```bash
+uv tool install ficelle-router      # or: pip install ficelle-router
+ficelle-setup --skip-package --target generic
+```
+
+PyPI serves the exact wheel attached to the GitHub Release, so the two paths install identical
+bytes. The bootstrap above stays the recommended one because it is the only path that *verifies*
+that for you: it checks the wheel against a SHA-256 pinned in the script you downloaded.
+
 ### Add a provider key — nothing routes without one
 
 Ficelle routes with **your** provider accounts and ships no keys of its own, so a
