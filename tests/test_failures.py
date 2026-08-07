@@ -174,6 +174,13 @@ def test_a_403_naming_a_model_that_must_be_switched_on_does_not_cool_the_provide
         "Your organization must be enabled to use gpt-4o-mini",
         "Your account is not enabled for gpt-4o-mini",
         "You are not authorized to use gpt-4o-mini",
+        # Account-wide gates phrased per-model. These carry the entitlement marker in the ACTIVE
+        # voice — "must enable" — exactly as Mistral's real message does, so only naming the gate
+        # itself tells them apart. Worth the extra markers because this branch quarantines, and a
+        # quarantine waits for a human where the old provider cooldown expired by itself.
+        "Your organization must enable SSO to use gpt-4o-mini",
+        "An admin must enable two-factor auth before you can use gpt-4o-mini",
+        "Your workspace must enable this integration to use gpt-4o-mini",
     ):
         assert classify_failure(403, body, upstream_model_id="gpt-4o-mini") == "auth_or_credit", body
     # 401 is never a per-model verdict: nothing about a key is model-scoped.

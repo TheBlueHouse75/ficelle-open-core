@@ -255,7 +255,7 @@ def set_model_not_found_quarantine_in_state(
         "model_not_found",
         detail,
         source,
-        fallback_note or f"provider reported that {MODEL_NOT_SERVEABLE_NOTE}",
+        fallback_note or MODEL_NOT_SERVEABLE_NOTE,
         ports=ports,
     )
 

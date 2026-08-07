@@ -193,6 +193,18 @@ ACCOUNT_SCOPE_403_MARKERS = (
     "revoked",
     "suspended",
     "api key",
+    # Account-wide gates that a provider may phrase per-model — "an admin must enable SSO before
+    # you can use <model>" carries the entitlement marker and names the model, so only naming the
+    # gate itself separates it from "an admin must enable them" about a model tier. Worth closing
+    # even though it looks narrow: this branch leads to a QUARANTINE, which a human has to clear,
+    # where the old provider cooldown expired on its own. Misreading an account gate would
+    # therefore quarantine the provider's whole catalogue, one model per probe, permanently.
+    "sso",
+    "two-factor",
+    "2fa",
+    "mfa",
+    "workspace",
+    "integration",
 )
 
 MODEL_NOT_ENTITLED_TEXT_MARKERS = (
