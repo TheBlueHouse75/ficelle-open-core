@@ -70,6 +70,15 @@ export function providerLabel(s) { return _runtimeProviderLabels[s] || ({ openro
 export function formatContext(v) { const n = Number(v || 0); if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 ? 1 : 0) + "M"; if (n >= 1e3) return Math.round(n / 1e3) + "k"; return String(n); }
 export function formatTokenLimit(v) { const n = Number(v || 0); if (!n) return null; if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 ? 1 : 0) + "M"; if (n >= 1e3) return Math.round(n / 1e3) + "k"; return String(n); }
 export function formatSeconds(v) { const n = Number(v || 0); if (!n) return "0s"; if (n >= 3600) return Math.round(n / 3600) + "h"; if (n >= 60) return Math.round(n / 60) + " min"; return Math.round(n) + "s"; }
+// Floored at every magnitude: an inflated savings claim is the one direction this
+// figure must not err in.
+export function formatUsd(v) {
+  const n = Math.max(0, Number(v || 0));
+  if (!n) return "$0.00";
+  if (n >= 100) return "$" + Math.floor(n);
+  if (n >= 0.01) return "$" + (Math.floor(n * 100) / 100).toFixed(2);
+  return "<$0.01";
+}
 export function formatDuration(v) {
   const n = Math.max(0, Number(v || 0));
   if (!n) return "0.00s";
@@ -122,6 +131,7 @@ export const REASON_LABELS = {
   empty_assistant_message: "Empty model response",
   truncated_before_content: "Token budget too small",
   bad_upstream_request: "Invalid request body",
+  bad_upstream_contract: "Provider/model request contract",
   malformed_tool_call: "Tool call without a name",
   client_disconnected: "Client hung up",
   invalid_success_json: "Invalid provider response",
@@ -151,6 +161,7 @@ export const REASON_DESCRIPTIONS = {
   empty_assistant_message: "The provider returned success, but no usable assistant text was found.",
   truncated_before_content: "The request's max_tokens ran out before the model emitted any content, typically because a reasoning model spent the budget on reasoning tokens. Request-side limit: the model is not cooled.",
   bad_upstream_request: "The provider rejected the request body itself (HTTP 400/422), typically a malformed tool_call or an unsupported field. Request-side problem: no other candidate is tried and the model is not cooled.",
+  bad_upstream_contract: "One model rejected an otherwise valid request option or required a private provider field. Ficelle keeps the request unchanged, tries the next candidate, and cools neither the model nor the provider.",
   malformed_tool_call: "Ficelle refused the request before calling any provider: a tool call replayed in the conversation history carries no function name, which every provider rejects. The error names the offending message index — fix the client that built the history, or start a new conversation. No model was picked, called, or cooled.",
   client_disconnected: "The client closed the connection while the answer was streaming. Client-side abort: the model is not cooled.",
   invalid_success_json: "The provider returned success, but the JSON response could not be parsed.",

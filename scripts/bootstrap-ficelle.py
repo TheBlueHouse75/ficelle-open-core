@@ -6,9 +6,10 @@ This script is intentionally stdlib-only so it can be served as:
     curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.1.8/scripts/bootstrap-ficelle.py | python3
 
 Without a license key it installs the versioned open Core from the public GitHub
-release. With ``--license-key`` it also downloads the licensed Pro wheel, installs it
-without consulting PyPI, activates the entitlement, and verifies both packages. It
-never prints license keys or provider secrets.
+release. With ``FICELLE_LICENSE_KEY`` (or the legacy ``FICELLE_INSTALL_TOKEN``)
+it also downloads the licensed Pro wheel, installs it without consulting PyPI,
+activates the entitlement, and verifies both packages. It never prints license keys
+or provider secrets.
 """
 from __future__ import annotations
 
@@ -599,6 +600,8 @@ def setup_command(
     python: Path,
     wheel: Path,
     target: ResolvedInstallTarget,
+    *,
+    expose_cli: bool = False,
 ) -> list[str]:
     command = [
         str(python),
@@ -625,6 +628,8 @@ def setup_command(
         command.append("--skip-smoke")
     if options.dry_run:
         command.append("--dry-run")
+    if expose_cli:
+        command.append("--expose-cli")
     return command
 
 
@@ -633,9 +638,11 @@ def run_packaged_setup(
     python: Path,
     wheel: Path,
     target: ResolvedInstallTarget,
+    *,
+    expose_cli: bool = False,
 ) -> None:
     result = run_command(
-        setup_command(options, python, wheel, target),
+        setup_command(options, python, wheel, target, expose_cli=expose_cli),
         dry_run=options.dry_run,
         env=command_env(options, target),
     )
@@ -691,36 +698,16 @@ def run_license_activation(
     else:
         print(
             "Note: packages installed, but license activation did not complete. "
-            "Run `ficelle license activate <license-key>` once your key and network are ready."
+            "Set FICELLE_LICENSE_KEY or run `ficelle license activate` interactively "
+            "once your key and network are ready."
         )
 
 
-def expose_cli(python: Path, *, isolated: bool, dry_run: bool) -> None:
-    if not isolated or os.name == "nt":
-        return
-    destination_dir = Path.home() / ".local" / "bin"
-    for name in ("ficelle", "ficelle-setup"):
-        source = python.parent / name
-        destination = destination_dir / name
-        if dry_run:
-            print(f"DRY RUN: link {destination} -> {source}")
-            continue
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        if destination.is_symlink() and destination.resolve() == source.resolve():
-            continue
-        if destination.exists() or destination.is_symlink():
-            print(
-                f"WARN: keeping existing command at {destination}; "
-                f"the Ficelle command is {source}",
-                file=sys.stderr,
-            )
-            continue
-        destination.symlink_to(source)
-    if str(destination_dir) not in os.getenv("PATH", "").split(os.pathsep):
-        print(
-            f"Add {destination_dir} to PATH to run `ficelle` directly. "
-            f"Until then use {python.parent / 'ficelle'}."
-        )
+# Exposing the CLI lives in `ficelle.install` (`--expose-cli`), not here: it is one rule about
+# writing outside the install's footprint, and a second copy in this script could drift from the
+# one the packaged `ficelle-setup` applies. The isolation verdict stays here, because it is the
+# thing only the bootstrap knows — it exposes the commands when it made the environment itself,
+# and keeps its hands off an interpreter the user named or a host application owns.
 
 
 def run_bootstrap(options: BootstrapOptions) -> int:
@@ -754,8 +741,7 @@ def run_bootstrap(options: BootstrapOptions) -> int:
                 PRO_RUNTIME_REQUIREMENTS,
             )
             install_wheel(options, python, pro_wheel, target, no_deps=True)
-        run_packaged_setup(options, python, core_wheel, target)
-        expose_cli(python, isolated=isolated, dry_run=True)
+        run_packaged_setup(options, python, core_wheel, target, expose_cli=isolated)
         return 0
 
     with tempfile.TemporaryDirectory(prefix="ficelle-bootstrap-") as tmp:
@@ -776,8 +762,7 @@ def run_bootstrap(options: BootstrapOptions) -> int:
             )
             install_wheel(options, python, pro_wheel, target, no_deps=True)
             wheels.append(pro_wheel)
-        run_packaged_setup(options, python, core_wheel, target)
-        expose_cli(python, isolated=isolated, dry_run=False)
+        run_packaged_setup(options, python, core_wheel, target, expose_cli=isolated)
         verify_install(
             options,
             python,
@@ -811,7 +796,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Expected Core wheel SHA256.",
     )
     parser.add_argument("--wheel-url", default=os.getenv("FICELLE_WHEEL_URL", DEFAULT_WHEEL_URL), help="Private wheel URL or local wheel path. Default: Ficelle install service endpoint.")
-    parser.add_argument("--license-key", default=os.getenv("FICELLE_LICENSE_KEY") or os.getenv("FICELLE_INSTALL_TOKEN"), help="Ficelle license/install token. Also read from FICELLE_LICENSE_KEY or FICELLE_INSTALL_TOKEN.")
     parser.add_argument("--sha256", default=os.getenv("FICELLE_WHEEL_SHA256"), help="Expected wheel SHA256. Strongly recommended for release validation.")
     parser.add_argument("--target", choices=INSTALL_TARGETS, default="auto", help="Integration target. Auto detects Hermes, otherwise installs standalone Core.")
     parser.add_argument(
@@ -844,7 +828,7 @@ def options_from_args(args: argparse.Namespace) -> BootstrapOptions:
         core_wheel_url=args.core_wheel_url,
         core_sha256=args.core_sha256,
         wheel_url=args.wheel_url,
-        license_key=args.license_key,
+        license_key=os.getenv("FICELLE_LICENSE_KEY") or os.getenv("FICELLE_INSTALL_TOKEN"),
         sha256=args.sha256,
         python=args.python,
         venv=Path(args.venv).expanduser().resolve(),

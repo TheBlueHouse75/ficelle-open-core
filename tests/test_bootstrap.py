@@ -8,6 +8,8 @@ import zipfile
 from email.message import Message
 from pathlib import Path
 
+import pytest
+
 
 BOOTSTRAP_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bootstrap-ficelle.py"
 spec = importlib.util.spec_from_file_location("ficelle_bootstrap", BOOTSTRAP_PATH)
@@ -107,6 +109,25 @@ def test_setup_command_can_disable_config_and_backups(tmp_path):
     assert "--skip-service" in command
     assert "--skip-smoke" in command
     assert "--dry-run" in command
+
+
+def test_setup_command_exposes_cli_only_when_requested(tmp_path):
+    wheel = tmp_path / "ficelle_router-0.1.2-py3-none-any.whl"
+    options = make_options(tmp_path, dry_run=True)
+    python = Path("/tmp/isolated/bin/python")
+
+    command = bootstrap.setup_command(options, python, wheel, "generic")
+    exposed_command = bootstrap.setup_command(
+        options,
+        python,
+        wheel,
+        "generic",
+        expose_cli=True,
+    )
+
+    assert "--expose-cli" not in command
+    assert "--dry-run" in exposed_command
+    assert "--expose-cli" in exposed_command
 
 
 def test_implicit_home_is_omitted_from_setup_command_and_environment(
@@ -722,6 +743,18 @@ def test_run_license_activation_passes_key_via_env_not_argv(monkeypatch, tmp_pat
     assert "FICELLE_RUNTIME_DIR" not in captured["env"]
 
 
+def test_bootstrap_accepts_license_key_only_from_protected_environment(monkeypatch):
+    monkeypatch.setenv("FICELLE_LICENSE_KEY", "SK-FROM-ENV")
+    parser = bootstrap.build_parser()
+    options = bootstrap.options_from_args(parser.parse_args([]))
+
+    assert options.license_key == "SK-FROM-ENV"
+    assert "--license-key" not in parser.format_help()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--license-key", "SK-IN-ARGV"])
+
+
 def test_run_license_activation_skips_without_key(monkeypatch, tmp_path):
     options = make_options(tmp_path, license_key=None)
     calls = []
@@ -813,7 +846,7 @@ def test_keep_wheel_uses_ficelle_home_artifacts(monkeypatch, tmp_path):
         keep_wheel=True,
     )
     monkeypatch.setattr(bootstrap, "install_wheel", lambda *args: None)
-    monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "verify_install", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "run_license_activation", lambda *args: None)
     monkeypatch.setattr(
@@ -857,7 +890,7 @@ def test_core_only_bootstrap_never_downloads_or_installs_pro(
             (wheel, kwargs)
         ),
     )
-    monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "verify_install", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "run_license_activation", lambda *args: None)
     monkeypatch.setattr(
@@ -913,7 +946,7 @@ def test_pro_bootstrap_installs_core_then_pro_without_dependencies(
             (wheel, kwargs)
         ),
     )
-    monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "verify_install", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "run_license_activation", lambda *args: None)
     monkeypatch.setattr(

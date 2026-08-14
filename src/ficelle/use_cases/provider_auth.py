@@ -103,7 +103,12 @@ def unconfigured_provider_sources(auth: Mapping[str, Any]) -> list[str]:
     return [str(source) for source in auth if str(source) not in accounted]
 
 
-def provider_key_setup_commands(sources: Sequence[str], key_urls: Mapping[str, str]) -> list[str]:
+def provider_key_setup_commands(
+    sources: Sequence[str],
+    key_urls: Mapping[str, str],
+    *,
+    command: str = "ficelle",
+) -> list[str]:
     """One ready-to-paste ``ficelle set-key`` line per provider, unindented.
 
     The key-creation URLs come from the caller's registry (``PROVIDER_KEY_URLS``)
@@ -111,8 +116,14 @@ def provider_key_setup_commands(sources: Sequence[str], key_urls: Mapping[str, s
     unnamed in the open core and no second copy of a URL can drift. A provider the
     registry does not know still gets its command — the command is the actionable
     half, the link is the convenience.
+
+    ``command`` exists for the one surface that can be read before the CLI is runnable:
+    setup prints this block having just installed the console script, and a shell that
+    cannot resolve ``ficelle`` yet would meet "ready-to-paste" with `command not found`.
+    Every other caller is reached *through* the CLI, which is proof enough that the bare
+    name works, so they keep it.
     """
-    commands = [f"ficelle set-key {source}" for source in sources]
+    commands = [f"{command} set-key {source}" for source in sources]
     width = max((len(command) for command in commands), default=0)
     lines: list[str] = []
     for source, command in zip(sources, commands):

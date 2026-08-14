@@ -310,3 +310,62 @@ def test_candidates_for_profile_uses_auto_sort_for_non_manual_profiles():
     )
 
     assert [model["id"] for model in candidates] == ["ficelle/openrouter/a", "ficelle/openrouter/b"]
+
+
+# --- Lot 1 (synthetic-health remediation): stale grace and scoped exclusions ----------------
+
+
+def test_stale_rows_block_past_grace_and_route_within_it():
+    import dataclasses
+
+    def stale_block(model, _config, _state):
+        return "stale_catalog" if model.get("id") == "ficelle/openrouter/expired" else None
+
+    policy = dataclasses.replace(simple_policy(), stale_model_block_reason=stale_block)
+    catalog = {
+        "models": [
+            model_row("ficelle/openrouter/fresh"),
+            model_row("ficelle/openrouter/expired", catalog_stale=True, stale_since="2026-08-08T09:00:00+00:00"),
+            model_row("ficelle/openrouter/graced", catalog_stale=True, stale_since="2026-08-08T10:00:00+00:00"),
+        ]
+    }
+
+    result = select_models_result_from_typed_rows(
+        "ficelle/auto-tools", typed_catalog_rows(catalog), {}, {}, policy
+    )
+
+    selected = {candidate.id for candidate in result.candidates}
+    assert "ficelle/openrouter/expired" not in selected
+    assert {"ficelle/openrouter/fresh", "ficelle/openrouter/graced"} <= selected
+    assert result.excluded_reasons["ficelle/openrouter/expired"] == "stale_catalog"
+
+
+def test_cooldown_exclusions_carry_their_scope():
+    import dataclasses
+
+    def on_cooldown(model, _state):
+        reasons = {
+            "ficelle/openrouter/provider-cooled": (True, "provider:rate_limited"),
+            "ficelle/openrouter/quota-cooled": (True, "quota:quota_exhausted"),
+            "ficelle/openrouter/model-cooled": (True, "timeout"),
+        }
+        return reasons.get(str(model.get("id")), (False, None))
+
+    policy = dataclasses.replace(simple_policy(), model_on_cooldown=on_cooldown)
+    catalog = {
+        "models": [
+            model_row("ficelle/openrouter/provider-cooled"),
+            model_row("ficelle/openrouter/quota-cooled"),
+            model_row("ficelle/openrouter/model-cooled"),
+            model_row("ficelle/openrouter/free"),
+        ]
+    }
+
+    result = select_models_result_from_typed_rows(
+        "ficelle/auto-tools", typed_catalog_rows(catalog), {}, {}, policy
+    )
+
+    assert result.excluded_reasons["ficelle/openrouter/provider-cooled"] == "provider_cooldown"
+    assert result.excluded_reasons["ficelle/openrouter/quota-cooled"] == "quota_cooldown"
+    assert result.excluded_reasons["ficelle/openrouter/model-cooled"] == "cooldown"
+    assert {candidate.id for candidate in result.candidates} == {"ficelle/openrouter/free"}

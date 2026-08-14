@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import filecmp
+import getpass
 import json
 import os
 import shutil
@@ -56,6 +57,8 @@ class InstallOptions:
     target: InstallTarget = "auto"
     rollback: bool = False
     ficelle_home_explicit: bool = True
+    expose_cli: bool = False
+    non_interactive: bool = False
 
 
 @dataclass(frozen=True)
@@ -392,7 +395,13 @@ def command_env(
     return env
 
 
-def run_command(command: Sequence[str], *, dry_run: bool, env: Mapping[str, str] | None = None) -> CommandResult:
+def run_command(
+    command: Sequence[str],
+    *,
+    dry_run: bool,
+    env: Mapping[str, str] | None = None,
+    input_text: str | None = None,
+) -> CommandResult:
     printable = " ".join(command)
     env_hint = ""
     if env:
@@ -407,7 +416,13 @@ def run_command(command: Sequence[str], *, dry_run: bool, env: Mapping[str, str]
         print(f"DRY RUN:{env_hint} {printable}")
         return CommandResult(list(command), 0)
     print(f"RUN:{env_hint} {printable}")
-    completed = subprocess.run(list(command), text=True, capture_output=True, env=dict(env) if env else None)
+    completed = subprocess.run(
+        list(command),
+        text=True,
+        capture_output=True,
+        env=dict(env) if env else None,
+        input=input_text,
+    )
     if completed.stdout:
         print(completed.stdout, end="")
     if completed.stderr:
@@ -720,8 +735,13 @@ def collect_preflight_checks(
             checks.append(PreflightCheck("service", "ok", "Linux systemd user backend available"))
         else:
             checks.append(PreflightCheck("service", "fail", "systemctl not found", "Install systemd tools or use --skip-service for developer mode."))
+    elif sys.platform == "win32":
+        if shutil.which("schtasks"):
+            checks.append(PreflightCheck("service", "ok", "Windows Scheduled Task backend available"))
+        else:
+            checks.append(PreflightCheck("service", "fail", "schtasks not found", "Use --skip-service for developer mode."))
     else:
-        checks.append(PreflightCheck("service", "fail", f"unsupported managed service platform: {sys.platform}", "Use --skip-service for developer mode or wait for a Windows backend."))
+        checks.append(PreflightCheck("service", "fail", f"unsupported managed service platform: {sys.platform}", "Use --skip-service for developer mode."))
 
     if sys.platform == "darwin":
         keychain = dedicated_keychain_path(options)
@@ -1031,7 +1051,146 @@ def doctor_auth_report(stdout: str) -> dict[str, Any] | None:
     return auth if isinstance(auth, dict) else None
 
 
-def first_run_provider_key_notice(auth: dict[str, Any] | None) -> list[str]:
+def installed_cli_command(
+    name: str = "ficelle",
+    *,
+    interpreter: Path | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+) -> str:
+    """How this install's ``name`` has to be typed for the user's shell to actually run it.
+
+    Setup runs *inside* the target interpreter, so the console script it installs sits beside
+    ``sys.executable`` — no guessing, no registry. The bare name is returned only when the shell
+    resolves it to that exact file; a venv the user never activated, a bootstrap that could not
+    expose the CLI, or an older Ficelle earlier on `PATH` all mean the closing advice would name
+    a command that does not run, or runs something else. Setup is the one surface with that
+    problem: it is the only one reachable without the CLI being reachable.
+
+    Falls back to the bare name when no such script exists — a source-checkout run that reaches
+    here before the package install has nothing to point at, and inventing a path to a file that
+    is not there would be worse advice than none.
+    """
+    installed = (interpreter or Path(sys.executable)).parent / name
+    if os.name == "nt" and not installed.exists():
+        installed = installed.with_suffix(".exe")
+    if not installed.exists():
+        return name
+    resolved = which(name)
+    if resolved and Path(resolved).resolve() == installed.resolve():
+        return name
+    return str(installed)
+
+
+def cli_reachability_notice(
+    command: str,
+    *,
+    name: str = "ficelle",
+    expose_command: str | None = None,
+) -> list[str]:
+    """The lines that turn "command not found" into a next step, or nothing at all.
+
+    Printed before any instruction, because it is what makes the instructions runnable.
+    Deliberately says *reachable* rather than "on your PATH": both a missing directory and
+    a different Ficelle earlier on `PATH` land here, and "put it first" is the honest advice
+    for both.
+
+    `expose_command` adds the permanent fix. It is offered rather than done, and only when
+    the caller has not just done it: this notice is read once, at install time, while the
+    problem it describes outlives the message — three weeks later nobody remembers a path
+    setup printed.
+    """
+    if command == name:
+        return []
+    lines = [
+        f"`{name}` is not reachable by name from this shell, so the commands below use its full path.",
+        f"Put {Path(command).parent} first on your PATH to type `{name}` directly.",
+    ]
+    if expose_command:
+        lines.append(f"Or link the commands into {default_cli_exposure_dir()}: `{expose_command} --expose-cli`.")
+    return lines
+
+
+CLI_CONSOLE_SCRIPTS = ("ficelle", "ficelle-setup")
+
+
+def default_cli_exposure_dir() -> Path:
+    """Where `--expose-cli` links to: the user-level bin `pipx` and `uv` already use."""
+    return Path.home() / ".local" / "bin"
+
+
+def expose_cli_scripts(
+    *,
+    interpreter: Path | None = None,
+    destination_dir: Path | None = None,
+    dry_run: bool = False,
+    names: Sequence[str] = CLI_CONSOLE_SCRIPTS,
+) -> list[str]:
+    """Link this install's console scripts into a user-level bin. Returns what to print.
+
+    Opt-in, and deliberately so: this is the one install step that writes *outside* the
+    install's own footprint. `~/.local/bin` is a user-global namespace; nothing in Ficelle
+    ever removes an entry from it (`ficelle uninstall` is the **service** backend, not the
+    package); and the interpreter setup runs in is not always one Ficelle owns — a project
+    virtualenv, the system Python, or a host application's virtualenv all reach here. A link
+    written from an environment the user later rebuilds resolves to nothing while still
+    looking installed, which reads as a broken Ficelle rather than a stale link. So it
+    happens when asked for, never as a side effect of installing.
+
+    Never overwrites. An existing command at the destination is reported and kept, whoever
+    owns it — including another Ficelle install, whose exposure is not this one's to reclaim.
+    A link that already points here is left alone; only a still-required PATH hint is repeated.
+    """
+    if os.name == "nt":
+        return [
+            "--expose-cli is not supported on Windows: there is no user-level bin convention "
+            "to link into, and symlinks need privileges. Add the Scripts directory to PATH instead."
+        ]
+    source_dir = (interpreter or Path(sys.executable)).expanduser().absolute().parent
+    destination_dir = destination_dir or default_cli_exposure_dir()
+    lines: list[str] = []
+    exposed = False
+    for name in names:
+        source = source_dir / name
+        destination = destination_dir / name
+        if dry_run:
+            lines.append(f"DRY RUN: link {destination} -> {source}")
+            continue
+        if not source.exists():
+            lines.append(f"WARN: no `{name}` command beside {source_dir}; nothing to link.")
+            continue
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        # `exists()` is False for a broken link, so the `is_symlink()` half is what keeps this
+        # from silently replacing one.
+        if destination.is_symlink() and destination.resolve() == source.resolve():
+            exposed = True
+            continue
+        if destination.exists() or destination.is_symlink():
+            lines.append(f"WARN: keeping the existing command at {destination}; this install's is {source}")
+            continue
+        destination.symlink_to(source)
+        exposed = True
+        lines.append(f"linked {destination} -> {source}")
+    if exposed and str(destination_dir) not in os.getenv("PATH", "").split(os.pathsep):
+        lines.append(f"Put {destination_dir} on your PATH to use them.")
+    return lines
+
+
+def provider_key_urls() -> dict[str, str]:
+    """The key-creation URL registry, or empty when the router cannot import yet.
+
+    Imported lazily, not at module scope: the registry lives in router.py beside the
+    provider definitions, and router pulls in the HTTP stack that a source-checkout
+    bootstrap has not necessarily installed at the time this module is imported. The
+    advice that uses it is worth printing without its links.
+    """
+    try:
+        from ficelle.router import PROVIDER_KEY_URLS
+    except Exception:  # noqa: BLE001
+        return {}
+    return PROVIDER_KEY_URLS
+
+
+def first_run_provider_key_notice(auth: dict[str, Any] | None, *, command: str = "ficelle") -> list[str]:
     """The closing block for an install that cannot serve a request yet.
 
     Empty when a provider is configured — a working install must not be nagged — and
@@ -1045,13 +1204,7 @@ def first_run_provider_key_notice(auth: dict[str, Any] | None) -> list[str]:
     """
     if auth is None or invokable_provider_sources(auth):
         return []
-    # Imported here, not at module scope: the registry lives in router.py beside the
-    # provider definitions, and router pulls in the HTTP stack that a source-checkout
-    # bootstrap has not necessarily installed at the time this module is imported.
-    try:
-        from ficelle.router import PROVIDER_KEY_URLS
-    except Exception:  # noqa: BLE001 - the advice is worth printing without its links
-        PROVIDER_KEY_URLS = {}
+    PROVIDER_KEY_URLS = provider_key_urls()
     keyless = unconfigured_provider_sources(auth)
     unusable = unusable_key_provider_reasons(auth)
     headline = (
@@ -1065,22 +1218,78 @@ def first_run_provider_key_notice(auth: dict[str, Any] | None) -> list[str]:
             "Ficelle routes through your own provider accounts and ships no keys of its own.",
             "Create a key, then store it (input is hidden and never reaches shell history):",
             "",
-            *(f"  {line}" for line in provider_key_setup_commands(keyless, PROVIDER_KEY_URLS)),
+            *(f"  {line}" for line in provider_key_setup_commands(keyless, PROVIDER_KEY_URLS, command=command)),
         ]
     if unusable:
         lines += [
             "",
             *unusable_key_provider_block(unusable),
             "Storing that key again will not change it: fix what the reason names in the",
-            "provider's `config.json` entry (`ficelle doctor --text` prints its path).",
+            f"provider's `config.json` entry (`{command} doctor --text` prints its path).",
         ]
     lines += [
         "",
-        "`ficelle models` lists the providers' public catalogs, which they serve without",
+        f"`{command} models` lists the providers' public catalogs, which they serve without",
         "credentials — a populated model list does NOT mean a request can be served.",
-        "`ficelle doctor --text` reports which providers are actually configured.",
+        f"`{command} doctor --text` reports which providers are actually configured.",
     ]
     return lines
+
+
+def offer_first_key_capture(
+    options: InstallOptions,
+    env: Mapping[str, str],
+    keyless: Sequence[str],
+    *,
+    cli_command: str,
+) -> bool:
+    """Collapse install → key → first routed completion into one sitting.
+
+    Setup used to close on a URL and a `set-key` command to type later, which is where
+    a first run stalls: the install works, but the user has still never seen it serve.
+    When a human is present and no provider key resolves, offer to paste one now
+    (hidden input, stored through the installed CLI's own `set-key --stdin` so the key
+    never touches argv), then run `ficelle demo` so the first routed completion happens
+    inside the install session itself.
+
+    ``keyless`` is the caller's verdict, computed from the same auth report as the
+    set-key advice block — this function decides only whether and how to prompt.
+    The first entry is offered: configured order is the codebase's one expression
+    of provider preference. Returns True when a key was stored — the caller then
+    drops the advice block, which would re-instruct what just happened. Every gate
+    failing is silent: scripted (`--non-interactive`, implied by a piped stdin),
+    dry-run, and keys-present-but-unusable installs keep the advice block behavior.
+    """
+    if options.dry_run or options.non_interactive or not keyless:
+        return False
+    provider = keyless[0]
+    url = str(provider_key_urls().get(provider) or "").strip()
+    print()
+    print("Ficelle routes with your own provider key; nothing serves without one.")
+    if url:
+        print(f"Create a free {provider} key at {url}")
+    try:
+        secret = getpass.getpass(f"Paste the {provider} API key to finish now (Enter to skip): ").strip()
+    except EOFError:
+        # Ctrl-D is a natural "no input" gesture at an Enter-to-skip prompt.
+        print()
+        return False
+    if not secret:
+        return False
+    stored = run_command(
+        [options.python, "-m", "ficelle.cli", "set-key", provider, "--stdin"],
+        dry_run=False,
+        env=env,
+        input_text=secret + "\n",
+    )
+    if stored.returncode != 0:
+        print(f"The key was not stored; run `{cli_command} set-key {provider}` to retry.")
+        return False
+    print("Serving a first routed completion (a few seconds)...")
+    demo = run_command([options.python, "-m", "ficelle.cli", "demo"], dry_run=False, env=env)
+    if demo.returncode != 0:
+        print(f"The first-request demo did not answer; `{cli_command} doctor --text` says why.")
+    return True
 
 
 def run_install(options: InstallOptions) -> int:
@@ -1146,15 +1355,38 @@ def run_install(options: InstallOptions) -> int:
         ):
             raise SystemExit("Ficelle setup could not persist the selected --ficelle-home.")
 
-    key_notice = first_run_provider_key_notice(provider_auth)
+    # Keep the venv path itself (rather than resolving its Python symlink to a base runtime):
+    # console scripts are installed beside the selected interpreter. The source-checkout
+    # wrapper can run under a different Python when `--python` is explicit.
+    target_interpreter = Path(shutil.which(options.python) or options.python).expanduser().absolute()
+
+    # Before resolving how the commands have to be typed, since exposing them changes the
+    # answer: a link into a directory already on PATH makes the bare name work.
+    exposure_lines = (
+        expose_cli_scripts(interpreter=target_interpreter, dry_run=options.dry_run)
+        if options.expose_cli
+        else []
+    )
+
+    # Resolved once, here, because every instruction below is one the user is about to type:
+    # setup is the only surface that can be read before its own CLI is runnable.
+    cli = installed_cli_command(interpreter=target_interpreter)
+    setup_cli = installed_cli_command("ficelle-setup", interpreter=target_interpreter)
+    key_notice = first_run_provider_key_notice(provider_auth, command=cli)
 
     print("Ficelle setup complete.")
+    for line in exposure_lines:
+        print(line)
+    # Offered only when it has not just been done — repeating it over a link that was written
+    # a second ago would read as the step having failed.
+    for line in cli_reachability_notice(cli, expose_command=None if options.expose_cli else setup_cli):
+        print(line)
     if target == "hermes":
         if options.configure_hermes:
             print("Hermes config step complete or snippet written. Restart Hermes gateway after merging config changes.")
         else:
-            print("Next: run `ficelle export --target hermes` or rerun setup with `--configure-hermes` for a safe config snippet/apply step.")
-        print("Rollback: `ficelle-setup --target hermes --rollback` restores the latest available integration backups.")
+            print(f"Next: run `{cli} export --target hermes` or rerun setup with `--configure-hermes` for a safe config snippet/apply step.")
+        print(f"Rollback: `{setup_cli} --target hermes --rollback` restores the latest available integration backups.")
         print("Do not make Ficelle the main Hermes model until dogfood/canaries stay green.")
     else:
         print("Local OpenAI-compatible base URL: http://127.0.0.1:8646/v1")
@@ -1162,13 +1394,21 @@ def run_install(options: InstallOptions) -> int:
         # serve without credentials — so pointing an unconfigured install at it as its
         # verification step is what teaches the user that setup worked when it did not.
         if not key_notice:
-            print("Verify: `ficelle health` and `ficelle models`.")
+            print(f"Verify: `{cli} health` and `{cli} models`.")
         print(
             "OpenAI client: `OpenAI(base_url=\"http://127.0.0.1:8646/v1\", "
             "api_key=\"ficelle-local\")`."
         )
         if target == "openclaw":
             print("OpenClaw target is experimental; merge `/admin/export/openclaw` into OpenClaw manually.")
+    # `key_notice` non-empty is the one "this install cannot serve yet" verdict; the
+    # keyless list reuses the same helper the notice itself derives its advice from.
+    if key_notice and offer_first_key_capture(
+        options, env, unconfigured_provider_sources(provider_auth), cli_command=cli
+    ):
+        # The demo just served (or diagnosed) the first request; re-printing the
+        # set-key instructions would describe a state that no longer exists.
+        key_notice = []
     for line in key_notice:
         print(line)
     return 0
@@ -1191,6 +1431,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-plugin", action="store_true", help="Skip Hermes provider plugin copy.")
     parser.add_argument("--skip-service", action="store_true", help="Skip managed service install/start step.")
     parser.add_argument("--skip-smoke", action="store_true", help="Skip doctor/health/models smoke checks.")
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Never prompt (no inline provider-key capture). Implied when stdin or stdout is not a terminal.",
+    )
+    parser.add_argument(
+        "--expose-cli",
+        action="store_true",
+        help=(
+            "Link the `ficelle` and `ficelle-setup` commands into ~/.local/bin so they can be "
+            "typed by name. Opt-in: it writes outside this install, and never overwrites an "
+            "existing command."
+        ),
+    )
     return parser
 
 
@@ -1213,6 +1467,16 @@ def options_from_args(args: argparse.Namespace) -> InstallOptions:
         backup_existing=not args.no_backup,
         rollback=args.rollback,
         ficelle_home_explicit=configured_ficelle_home is not None,
+        expose_cli=args.expose_cli,
+        # The flag's "implied without a terminal" promise is implemented here, at the one
+        # place the option is decided, so every prompt gates on the option alone. Both
+        # streams matter: the prompt's context lines travel on stdout, so a captured
+        # stdout (the bootstrap runs setup that way) would leave the user a bare
+        # hidden-input prompt with no explanation. The `and` guards fd-0/fd-1-closed
+        # starts (e.g. pythonw), where the stream objects are None.
+        non_interactive=args.non_interactive
+        or not (sys.stdin and sys.stdin.isatty())
+        or not (sys.stdout and sys.stdout.isatty()),
     )
 
 

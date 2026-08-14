@@ -4,7 +4,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ficelle.failures import CALLER_CAUSED_FAILURE_REASONS, MODEL_NOT_SERVEABLE_NOTE, CooldownPolicy
+from ficelle.failures import (
+    CALLER_CAUSED_FAILURE_REASONS,
+    MODEL_NOT_SERVEABLE_NOTE,
+    PROVIDER_SCOPED_COOLDOWN_REASONS,
+    CooldownPolicy,
+)
 
 
 StateMutator = Callable[[dict[str, Any]], dict[str, Any] | None]
@@ -31,8 +36,10 @@ class CooldownWritePorts:
         [dict[str, Any], dict[str, Any], str, str | None, int | str | None, str | None],
         None,
     ]
-    set_quota_cooldown_in_state: Callable[[dict[str, Any], dict[str, Any], dict[str, Any], str | None], None]
-    set_provider_cooldown_in_state: Callable[[dict[str, Any], str, str, dict[str, Any], str | None], None]
+    # Both return the key they blocked — the quota pool's, at its declared scope, and the
+    # provider's `source` — so `set_cooldown` can report it rather than re-derive it.
+    set_quota_cooldown_in_state: Callable[[dict[str, Any], dict[str, Any], dict[str, Any], str | None], str]
+    set_provider_cooldown_in_state: Callable[[dict[str, Any], str, str, dict[str, Any], str | None], str]
     set_billing_quarantine_in_state: Callable[[dict[str, Any], dict[str, Any], str | None, str, str], None]
     set_no_free_quota_quarantine_in_state: Callable[[dict[str, Any], dict[str, Any], str | None, str, str], None]
     set_model_not_found_quarantine_in_state: Callable[[dict[str, Any], dict[str, Any], str | None, str, str], None]
@@ -40,6 +47,21 @@ class CooldownWritePorts:
     now_seconds: Callable[[], float]
     now_iso: Callable[[], str]
     safe_detail: Callable[[Any], str]
+
+
+@dataclass(frozen=True)
+class AppliedCooldown:
+    """The keys one cooldown write blocked BEYOND the candidate that earned it.
+
+    A model cooldown and a quarantine are deliberately absent: they block the one model that just
+    failed, which its caller is not going to try again anyway. What is here is what also rules out
+    *other* candidates — a whole provider, or whichever slice of a quota pool the provider declares
+    — and it is reported by the write instead of re-derived from the reason, so a caller acting on
+    it cannot drift from what the state actually says.
+    """
+
+    provider_source: str = ""
+    quota_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -138,6 +160,23 @@ def provider_on_cooldown(source: str, state: dict[str, Any], *, ports: CooldownR
     if until > ports.now_seconds():
         return True, str(cd.get("reason") or "provider_cooldown")
     return False, None
+
+
+def cooldown_block_scope(reason: str | None) -> str:
+    """The blocking scope encoded in a `model_on_cooldown` reason string.
+
+    `model_on_cooldown` prefixes provider-wide blocks with `provider:` and quota-pool
+    blocks with `quota:`; everything else is a model-scoped cooldown. This is the single
+    place that convention is decoded — selection exclusions and the synthetic-health
+    eligibility records both read it from here, so the API refusal and the harness can
+    never disagree about a block's scope.
+    """
+    reason_text = str(reason or "")
+    if reason_text.startswith("provider:"):
+        return "provider"
+    if reason_text.startswith("quota:"):
+        return "quota"
+    return "model"
 
 
 def model_on_cooldown(model: dict[str, Any], state: dict[str, Any], *, ports: CooldownReadPorts) -> tuple[bool, str | None]:
@@ -466,10 +505,15 @@ def set_provider_cooldown_in_state(
     detail: str | None = None,
     *,
     ports: CooldownMutationPorts,
-) -> None:
+) -> str:
+    """Cool a whole provider, and return the key that now blocks it (its `source`), or `""`.
+
+    Reported rather than inferred so a caller can act on what was *written*: the attempt loop
+    diverts the rest of its window off exactly the scopes its own failures blocked.
+    """
     source = str(source or "").strip()
     if not source:
-        return
+        return ""
     ports.update_provider_failure_stats(state, source, reason)
     cooldowns = state.setdefault("provider_cooldowns", {})
     seconds_map = config.get("cooldown_seconds") or {}
@@ -480,6 +524,7 @@ def set_provider_cooldown_in_state(
         "detail": ports.safe_detail(detail),
         "set_at": ports.now_iso(),
     }
+    return source
 
 
 def quota_probe_backoff_seconds(config: dict[str, Any], consecutive_failures: int, *, ports: CooldownMutationPorts) -> int:
@@ -501,7 +546,15 @@ def set_quota_cooldown_in_state(
     ports: CooldownMutationPorts,
     probe_failed: bool = False,
     cooldown_key_override: str | None = None,
-) -> None:
+) -> str:
+    """Cool a quota pool, and return the key that now blocks it.
+
+    That key is NOT the source: it is whichever of the four scopes the provider declares
+    (`quota_cooldown_key_for_scope`) — `model:`, `account:`, `shared_account:` or `provider:` — so
+    it can block one model, or span several sources sharing one account. Reported for the same
+    reason the provider cooldown reports its own: what blocks is what the caller must act on, and
+    only the write knows it (`cooldown_key_override` included).
+    """
     source = str(model.get("source") or "").strip()
     if source:
         ports.update_provider_failure_stats(state, source, "quota_exhausted")
@@ -529,6 +582,7 @@ def set_quota_cooldown_in_state(
         "consecutive_probe_failures": consecutive_probe_failures,
         "detail": ports.safe_detail(detail),
     }
+    return key
 
 
 def clear_model_cooldown_in_state(state: dict[str, Any], cooldown_key: str) -> bool:
@@ -608,6 +662,14 @@ def record_success_in_state(
                 quota_cooldowns.pop(quota_key, None)
     if not source_has_active_quota_cooldown(state, source, ports=ports):
         ports.clear_provider_error_in_state(state, source)
+    quarantine = state.get("quarantine")
+    if isinstance(quarantine, dict):
+        row = quarantine.get(key)
+        # A model that just answered is demonstrably serveable again: the catalog-drift
+        # quarantine self-heals on its own success (L4-R3). Billing and manual quarantines
+        # require explicit resolution and stay untouched.
+        if isinstance(row, dict) and str(row.get("reason") or "") == "model_not_found":
+            quarantine.pop(key, None)
     ports.clear_model_error_in_state(state, model)
     ports.update_success_stats(state, model, latency_seconds, representative_latency=representative_latency)
     if source:
@@ -645,6 +707,21 @@ def clear_quota_cooldown_in_state(
     ports.clear_model_error_in_state(state, model)
 
 
+def prune_provider_scoped_model_cooldowns_in_state(state: dict[str, Any]) -> None:
+    """Remove legacy model cooldowns whose reason is provider-scoped (L2-R4 migration).
+
+    Under the one-blocking-scope contract these reasons never write a model cooldown:
+    while the provider cooldown is active the row is redundant, and after it expires the
+    row wrongly keeps one model blocked past provider recovery. Independent model-scoped
+    reasons (`rate_limited_upstream`, `request_too_large`, timeouts, server errors) and
+    quarantines are untouched."""
+    cooldowns = state.get("cooldowns") if isinstance(state.get("cooldowns"), dict) else {}
+    for key in list(cooldowns):
+        row = cooldowns.get(key)
+        if isinstance(row, dict) and str(row.get("reason") or "") in PROVIDER_SCOPED_COOLDOWN_REASONS:
+            del cooldowns[key]
+
+
 def set_cooldown(
     model: dict[str, Any],
     reason: str,
@@ -655,8 +732,16 @@ def set_cooldown(
     status: int | str | None = None,
     request_id: str | None = None,
     profile_id: str | None = None,
-) -> None:
+) -> AppliedCooldown:
+    """Write the cooldown policy for this failure, and report what it blocked beyond this model."""
+    provider_source = ""
+    quota_key = ""
+
     def mutate(state: dict[str, Any]) -> None:
+        nonlocal provider_source, quota_key
+        # Every write converges the state toward the one-blocking-scope contract, so a
+        # legacy row cannot outlive the first cooldown written after an upgrade.
+        prune_provider_scoped_model_cooldowns_in_state(state)
         ports.update_failure_stats(state, model, reason)
         ports.record_model_error_in_state(state, model, reason, detail, status, request_id, profile_id)
         source = str(model.get("source") or "").strip()
@@ -664,9 +749,11 @@ def set_cooldown(
         if policy.record_provider_error:
             ports.record_provider_error_in_state(state, model, reason, detail, status, request_id)
         if policy.quota_cooldown:
-            ports.set_quota_cooldown_in_state(state, model, config, detail)
+            quota_key = ports.set_quota_cooldown_in_state(state, model, config, detail) or ""
         if policy.provider_cooldown:
-            ports.set_provider_cooldown_in_state(state, policy.provider_cooldown_source, reason, config, detail)
+            provider_source = ports.set_provider_cooldown_in_state(
+                state, policy.provider_cooldown_source, reason, config, detail
+            ) or ""
         quarantine = policy.quarantine
         if quarantine and quarantine.reason == "billing_or_paid":
             ports.set_billing_quarantine_in_state(
@@ -705,3 +792,4 @@ def set_cooldown(
         }
 
     ports.update_state(mutate, f"set_cooldown:{reason}")
+    return AppliedCooldown(provider_source=provider_source, quota_key=quota_key)

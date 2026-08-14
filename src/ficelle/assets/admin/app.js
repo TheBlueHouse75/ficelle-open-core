@@ -1,10 +1,10 @@
 import { profileOrder, fusionModelId, profileLabels, profilePresets, CAP_PROFILE, CAP_STATE_META, $, esc, cloneJson, sleep,
-  providerLabel, setProviderLabels, formatContext, formatTokenLimit, formatSeconds, formatDuration, pct, timeAgo, timeChip,
+  providerLabel, setProviderLabels, formatContext, formatTokenLimit, formatSeconds, formatDuration, formatUsd, pct, timeAgo, timeChip,
   hasIn, hasOut, hasParam, runtimeKey, freeAccess, freeModeLabel,
   providerFreeModeLabel, reasonDescription, reasonLabel, reasonWithCode, showToast, providerKeyRemovalNotice, copyToClipboard } from "./lib.js";
 import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeProfile, dragged, modelFilters, currentView, expandedModels,
   compressionPayload, setState, setAuditEntries, setDraftProfiles, setDraftFusion, setDraftSettings, setCompressionPayload, setActiveProfile, setDragged, setCurrentView,
-  selectedProvider, setSelectedProvider,
+  selectedProvider, setSelectedProvider, providerModelFilter,
   requestsPayload, requestsSummary, requestsLive, expandedRequests, requestFilters,
   setRequestsPayload, setRequestsSummary, setRequestsLive } from "./store.js";
 
@@ -111,9 +111,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     const modelMap = () => new Map((state?.catalog?.models || []).map((m) => [m.id, m]));
     const incAll = (items, req) => { const s = new Set((items || []).map(String)); return (req || []).every((x) => s.has(String(x))); };
     const incAny = (items, req) => { if (!(req || []).length) return true; const s = new Set((items || []).map(String)); return req.some((x) => s.has(String(x))); };
+    // The context floor a requirement set actually enforces: its own value, else the router's
+    // configured minimum. Shared so the gate and the note that explains it cannot disagree.
+    const minContextFloor = (req) => Number(req?.min_context || state?.config?.min_context_length || 131072);
     function matchesReq(m, req) {
       req = req || {};
-      if (Number(m.context_length || 0) < Number(req.min_context || state?.config?.min_context_length || 131072)) return false;
+      if (Number(m.context_length || 0) < minContextFloor(req)) return false;
       if (req.free !== false && !freeAccess(m).eligible) return false;
       if (req.tools !== false && !m.supports_tools) return false;
       if (req.structured === true && !m.supports_structured_outputs) return false;
@@ -439,6 +442,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       profiles: '<path d="M5 3h14v18l-7-4-7 4Z"/>',
       settings: '<circle cx="12" cy="12" r="3"/><path d="M3 12h3M18 12h3M12 3v3M12 18v3"/>',
       cooldownClock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+      dollar: '<circle cx="12" cy="12" r="9"/><path d="M12 6.5v11"/><path d="M14.8 8.8c-.5-.9-1.5-1.4-2.8-1.4-1.7 0-2.8.8-2.8 2s1 1.7 2.8 2.1c1.8.4 2.8 1 2.8 2.2s-1.1 2-2.8 2c-1.3 0-2.3-.5-2.8-1.4"/>',
       auditDefault: '<circle cx="12" cy="12" r="9"/>',
       providers: '<rect x="4" y="4" width="16" height="6" rx="1"/><rect x="4" y="14" width="16" height="6" rx="1"/><path d="M8 7h.01M8 17h.01"/>',
       models: '<path d="M12 3l8 4-8 4-8-4 8-4z"/><path d="M4 12l8 4 8-4M4 17l8 4 8-4"/>',
@@ -724,6 +728,69 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const list = $("availableList");
       list.innerHTML = models.length ? models.map((m, i) => modelCard(m, "available", i)).join("") : '<div class="empty">' + emptyAvailableNotice() + "</div>";
       bindModelCard(list); bindDrag(list, "available");
+      renderAvailableNote(models.length);
+    }
+    // The New chip counts every arrival in the catalog, but this list also applies the active
+    // virtual model's requirements, so the two numbers disagree with nothing on screen saying
+    // why: 10 arrived, 6 listed, 4 short of `structured` and invisible. emptyAvailableNotice
+    // already words the all-hidden case; this is the partial one, which was silent.
+    function renderAvailableNote(shown) {
+      const note = $("availableNote");
+      if (!note) return;
+      note.hidden = true;
+      if (!modelFilters.newOnly || !shown) return;
+      const req = currentProfile().requirements || {};
+      const blocked = catalogArrivals().filter((m) => !matchesReq(m, req));
+      if (!blocked.length) return;
+      const lane = profileLabels[activeProfile]?.[0] || activeProfile;
+      const why = blockingRequirementNames(blocked, req);
+      const one = blocked.length === 1;
+      note.hidden = false;
+      note.innerHTML = blocked.length + " more new model" + (one ? "" : "s") + (one ? " doesn&rsquo;t" : " don&rsquo;t") +
+        " meet " + lanePossessive(lane) + " requirements" + (why ? " (" + esc(why) + ")" : "") +
+        " &mdash; " + ARRIVALS_WAY_OUT;
+    }
+    // Shared by the two messages about arrivals the open lane hides — this one and the
+    // all-hidden empty state — so the guidance cannot drift into two wordings.
+    const ARRIVALS_WAY_OUT = "try another virtual model, or clear the New filter.";
+    // Possessive form of a lane label. A label already ending in "s" takes a bare apostrophe
+    // ("Fast side tasks&rsquo; requirements"), which is the plural rule and the only case the
+    // lane list has today. Shared by both messages so the same lane cannot read two ways.
+    const lanePossessive = (label) => esc(label) + (/s$/i.test(label) ? "&rsquo;" : "&rsquo;s");
+    // Names what the blocked arrivals are missing, so the note can say it instead of leaving
+    // two capability lists to diff. Checks run in matchesReq's own order and stop at the first
+    // failure, so each model is attributed to the requirement that actually rejected it, and a
+    // requirement added there has to be added here too or the note goes quiet about it.
+    function blockingRequirementNames(models, req) {
+      const names = new Set();
+      models.forEach((m) => {
+        if (Number(m.context_length || 0) < minContextFloor(req)) names.add("context length");
+        else if (req.free !== false && !freeAccess(m).eligible) names.add("free access");
+        else if (req.tools !== false && !m.supports_tools) names.add("tool calling");
+        else if (req.structured === true && !m.supports_structured_outputs) names.add("JSON output");
+        else if (req.structured === false && m.supports_structured_outputs) names.add("no JSON output");
+        else listRequirementGaps(m, req).forEach((n) => names.add(n));
+      });
+      return [...names].join(", ");
+    }
+    // The list-shaped requirements name themselves: they carry the exact identifiers the model
+    // failed to offer (`reasoning`, `image`), so echoing those beats inventing a label for each
+    // one. Without this the lanes that select on parameters or modalities — Reasoning is the
+    // common case — got a note that counted the hidden models but named nothing.
+    function listRequirementGaps(m, req) {
+      for (const [have, all, any] of [
+        [m.input_modalities, req.input_modalities, req.input_modalities_any],
+        [m.output_modalities, req.output_modalities, req.output_modalities_any],
+        [m.supported_parameters, req.supported_parameters, req.supported_parameters_any],
+      ]) {
+        const owned = new Set((have || []).map(String));
+        const missing = (all || []).filter((x) => !owned.has(String(x))).map(String);
+        if (missing.length) return missing;
+        // An `any` group is satisfied by one of its entries, so it is named as one alternative
+        // ("reasoning or include_reasoning") rather than as several separate missing things.
+        if ((any || []).length && !incAny(have, any)) return [any.map(String).join(" or ")];
+      }
+      return [];
     }
     // This list always applies the active virtual model's requirements on top of the filter
     // bar, so "See them" on the new-models banner can land on nothing at all — the arrivals
@@ -737,7 +804,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (!arrivals.length || arrivals.some((m) => matchesReq(m, currentProfile().requirements || {}))) return generic;
       const lane = profileLabels[activeProfile]?.[0] || activeProfile;
       const count = arrivals.length;
-      return "None of the " + count + " new model" + (count === 1 ? "" : "s") + " meet " + esc(lane) + "&rsquo;s requirements. Try another virtual model, or clear the New filter.";
+      return "None of the " + count + " new model" + (count === 1 ? "" : "s") + " meet " + lanePossessive(lane) + " requirements. " +
+        ARRIVALS_WAY_OUT.charAt(0).toUpperCase() + ARRIVALS_WAY_OUT.slice(1);
     }
 
     /* ---------- available-models capability filter + sort helpers ---------- */
@@ -908,6 +976,20 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       }
       return '<span class="provider-logo"><span class="letter">' + esc((providerLabel(src) || "?").charAt(0).toUpperCase()) + "</span></span>";
     }
+    // One vocabulary for catalog reject reasons, shared by the composition-legend buckets and
+    // the per-row badges: naming the same reason differently in two adjacent elements would
+    // make "read the legend, type its word into the model filter" silently miss rows.
+    // not_eligible (free-quota variant, `not_free` its legacy alias) and unsafe_pricing
+    // (free-model variant) share "not free", matching the legend's merged bucket.
+    const CATALOG_REJECT_LABELS = {
+      not_eligible: "not free",
+      not_free: "not free",
+      unsafe_pricing: "not free",
+      not_chat: "not chat",
+      no_tools: "no tools",
+      small_context: "too small",
+      invalid: "invalid",
+    };
     // Catalogue composition for the provider bar: ordered buckets over raw_count, so the dominant
     // rejection reason (usually "not free" or "not chat" — neither was surfaced by the old reject
     // chips) is visible. Each bucket's color is shared by its bar segment and its legend swatch.
@@ -923,11 +1005,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const raw = Number(p.raw_count || 0);
       const buckets = [
         { label: "usable", count: Number(p.accepted_count || 0), color: "var(--accent)" },
-        { label: "not free", count: n("not_eligible") + n("unsafe_pricing"), color: "var(--text-muted)" },
-        { label: "not chat", count: n("not_chat"), color: "var(--violet)" },
-        { label: "no tools", count: n("no_tools"), color: "var(--info)" },
-        { label: "too small", count: n("small_context"), color: "var(--warn)" },
-        { label: "invalid", count: n("invalid"), color: "var(--danger)" },
+        { label: CATALOG_REJECT_LABELS.not_eligible, count: n("not_eligible") + n("unsafe_pricing"), color: "var(--text-muted)" },
+        { label: CATALOG_REJECT_LABELS.not_chat, count: n("not_chat"), color: "var(--violet)" },
+        { label: CATALOG_REJECT_LABELS.no_tools, count: n("no_tools"), color: "var(--info)" },
+        { label: CATALOG_REJECT_LABELS.small_context, count: n("small_context"), color: "var(--warn)" },
+        { label: CATALOG_REJECT_LABELS.invalid, count: n("invalid"), color: "var(--danger)" },
       ];
       const known = buckets.reduce((sum, b) => sum + b.count, 0);
       const other = Math.max(0, raw - known);
@@ -935,14 +1017,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       return { raw, buckets };
     }
     function providerModelReasonLabel(reason) {
-      return ({
-        accepted: "accepted",
-        not_eligible: "not eligible",
-        not_free: "not eligible",
-        no_tools: "no tools",
-        small_context: "too small",
-        invalid: "invalid",
-      })[reason] || reason || "unknown";
+      if (reason === "accepted") return "accepted";
+      return CATALOG_REJECT_LABELS[reason] || reason || "unknown";
     }
     function compactNumber(value) {
       const n = Number(value || 0);
@@ -950,16 +1026,23 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       return n >= 1000 ? Math.round(n / 1000) + "k" : String(n);
     }
     function providerModelList(p, openByDefault) {
-      const rows = Array.isArray(p.models) ? p.models : [];
+      const rows = Array.isArray(p.models) ? [...p.models] : [];
       if (!rows.length) return "";
+      // Provider APIs return their catalog in arbitrary order, which buried the usable rows
+      // mid-list on long catalogs: accepted first, then alphabetical on id.
+      const rowId = (m) => String(m.id || m.model_id || "");
+      rows.sort((a, b) => (a.status === "accepted" ? 0 : 1) - (b.status === "accepted" ? 0 : 1) || rowId(a).localeCompare(rowId(b)));
       return '<details class="provider-models"' + (openByDefault ? " open" : "") + '><summary>' + rows.length + " models</summary>" +
+        '<div class="provider-model-filter"><input type="search" class="key-input" data-model-filter placeholder="Filter by id, name, or reason" value="' + esc(providerModelFilter.q) + '" autocomplete="off" spellcheck="false" /></div>' +
         '<div class="provider-model-list">' +
         rows.map((m) => {
+          const id = rowId(m);
           const ok = m.status === "accepted";
           const reason = providerModelReasonLabel(m.reason);
           const context = Number(m.context_length || 0);
-          return '<div class="provider-model-row ' + (ok ? "ok" : "muted") + '">' +
-            '<div class="provider-model-main"><span class="provider-model-id">' + esc(m.id || m.model_id || "unknown") + "</span>" +
+          const haystack = [id, m.name, reason, m.reason].filter(Boolean).join(" ").toLowerCase();
+          return '<div class="provider-model-row ' + (ok ? "ok" : "muted") + '" data-search="' + esc(haystack) + '">' +
+            '<div class="provider-model-main"><span class="provider-model-id">' + esc(id || "unknown") + "</span>" +
             (m.name && m.name !== m.id ? '<span class="provider-model-name">' + esc(m.name) + "</span>" : "") + "</div>" +
             '<div class="provider-model-meta">' +
               '<span class="badge ' + (ok ? "ok" : "warn") + '">' + esc(reason) + "</span>" +
@@ -968,7 +1051,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
             "</div>" +
           "</div>";
         }).join("") +
-        "</div></details>";
+        "</div>" +
+        '<div class="empty provider-model-empty is-hidden">No models match this filter.</div>' +
+        "</details>";
     }
     // Providers view — master/detail split. The left list (#providerList) is a navigation
     // index; the right panel (#providerDetail) carries the full per-provider surface (config
@@ -986,6 +1071,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         return;
       }
       if (!selectedProvider || !keys.includes(selectedProvider)) setSelectedProvider(keys[0]);
+      if (selectedProvider !== providerModelFilter.src) { providerModelFilter.q = ""; providerModelFilter.src = selectedProvider; }
       listEl.innerHTML = keys.map((src) => providerListItemHTML(src, provs[src] || {})).join("");
       listEl.querySelectorAll("[data-prov]").forEach((b) => b.addEventListener("click", () => {
         if (b.dataset.prov === selectedProvider) return;
@@ -1217,6 +1303,27 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const input = form.querySelector(".key-input");
         if (input) input.focus();
       }));
+      // Client-side filter over the model rows (id / name / reason), mirroring the Routing
+      // search: rows are hidden in place rather than re-rendered so the input keeps focus.
+      const filterInput = root.querySelector("[data-model-filter]");
+      if (filterInput) {
+        const summary = root.querySelector(".provider-models summary");
+        const emptyEl = root.querySelector(".provider-model-empty");
+        const rows = root.querySelectorAll(".provider-model-row");
+        const applyModelFilter = () => {
+          const q = providerModelFilter.q.trim().toLowerCase();
+          let shown = 0;
+          rows.forEach((row) => {
+            const hit = !q || (row.dataset.search || "").includes(q);
+            row.classList.toggle("is-hidden", !hit);
+            if (hit) shown += 1;
+          });
+          if (emptyEl) emptyEl.classList.toggle("is-hidden", shown > 0);
+          if (summary) summary.textContent = (q ? shown + " / " + rows.length : rows.length) + " models";
+        };
+        filterInput.addEventListener("input", () => { providerModelFilter.q = filterInput.value; applyModelFilter(); });
+        if (providerModelFilter.q) applyModelFilter();
+      }
     }
 
 	    // knownProfileIds, fusionProfileOptions, fusionCallMultiplierDraft, and fusionMetric moved to
@@ -1847,9 +1954,31 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const top = (s.by_reason || []).find((r) => r.reason !== "ok");
       const windowLabel = formatSeconds(s.window_seconds || 86400);
       const rateCls = s.success_rate == null ? "ok" : (Number(s.success_rate) >= 0.95 ? "ok" : (Number(s.success_rate) >= 0.8 ? "warn" : "danger"));
+      const usage = s.usage || {};
+      const savings = s.savings || {};
+      const usageRequests = Number(usage.requests || 0);
+      const tokensTotal = Number(usage.prompt_tokens || 0) + Number(usage.completion_tokens || 0);
+      const tokensNote = usageRequests
+        ? formatContext(usage.prompt_tokens) + " in &middot; " + formatContext(usage.completion_tokens) + " out &middot; " + usageRequests + " requests reporting usage"
+        : "no requests reported token usage";
+      // Tri-state: the server stamps strict_zero from config on success and degraded
+      // payloads alike; only an explicit value earns a claim about spend.
+      const spendTile = s.strict_zero === true
+        ? { v: "$0.00", note: "strict-zero &middot; no paid fallback", cls: "ok" }
+        : (s.strict_zero === false
+          ? { v: "n/a", note: "paid fallback enabled", cls: "warn" }
+          : { v: "—", note: "config state unknown", cls: "info" });
+      const saved = Number(savings.estimated_saved_usd || 0);
+      const priced = Number(savings.priced_requests || 0);
+      const savedNote = priced
+        ? "at these models&#39; paid rates &middot; " + priced + " of " + usageRequests + " usage-reporting requests priced"
+        : "no reference-priced requests in window";
       const cards = [
         { k: "Requests", ic: ICONS.models, v: total, note: "in the last " + windowLabel, cls: "info" },
         { k: "Success rate", ic: ICONS.canary, v: rate, note: Number(s.ok || 0) + " ok &middot; " + errs + " errors", cls: rateCls },
+        { k: "Tokens routed", ic: ICONS.compression, v: formatContext(tokensTotal), note: tokensNote, cls: "info" },
+        { k: "Spent", ic: ICONS.dollar, v: spendTile.v, note: spendTile.note, cls: spendTile.cls },
+        { k: "Est. saved", ic: ICONS.dollar, v: priced ? "~" + formatUsd(saved) : "n/a", note: savedNote, cls: "info" },
         { k: "Latency p95", ic: ICONS.latency, v: p95, note: "median " + p50, cls: "info" },
         { k: "Fallbacks", ic: ICONS.retest, v: fb, note: fb ? "needed a backup model" : "no fallback needed", cls: fb ? "warn" : "ok" },
         { k: "Top error", ic: ICONS.disable, v: top ? reasonLabel(top.reason) : "none", note: top ? (top.total + " in window") : "no errors in window", cls: top ? "danger" : "ok" },
@@ -2178,6 +2307,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      if (!state) return;
 	      setProviderLabels(state.provider_labels);
 	      renderUpdateBanner();
+	      renderPaidModelBanner();
 	      renderPruneBanner();
 	      renderNewModelsBanner();
 	      renderProfileList(); renderActiveProfile(); renderFilterBar(); renderSelected(); renderExcluded(); renderAvailable();
@@ -2190,8 +2320,46 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     // prune must not silence the next one, and today's arrivals must not silence next week's.
     const PRUNE_NOTICE_KEY = "ficelle.dismissedPruneAudit";
     const ADDITIONS_NOTICE_KEY = "ficelle.dismissedCatalogAdditions";
+    const PAID_MODEL_NOTICE_KEY = "ficelle.dismissedPaidModelNotice";
+    const PAID_MODEL_TOAST_KEY = "ficelle.seenPaidModelToast";
     const readDismissed = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
     const writeDismissed = (key, value) => { try { localStorage.setItem(key, value); } catch { /* private mode: the banner simply comes back */ } };
+    let shownPaidModelToast = null;
+    function latestPaidModelNotice() {
+      return (state?.notices?.paid_models || [])[0] || null;
+    }
+    function reviewPaidModelNotice(notice, options = {}) {
+      if (options.dismiss) writeDismissed(PAID_MODEL_NOTICE_KEY, notice.id);
+      setView("health");
+      render();
+    }
+    function renderPaidModelBanner() {
+      const banner = $("paidModelBanner");
+      if (!banner) return;
+      banner.hidden = true;
+      const notice = latestPaidModelNotice();
+      if (!notice || readDismissed(PAID_MODEL_NOTICE_KEY) === notice.id) return;
+      const provider = providerLabel(notice.provider);
+      banner.hidden = false;
+      banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle blocked a paid model</div>' +
+        '<div class="update-detail"><span class="mono">' + esc(notice.upstream_id) + "</span> &mdash; " + esc(provider) +
+        " reported that this model now requires paid access. Ficelle removed it from routing and did not pause the rest of " + esc(provider) +
+        "." + (notice.set_at ? " " + esc(timeAgo(notice.set_at).label) + "." : "") + "</div></div>" +
+        '<div class="update-actions"><button class="btn sm" type="button" id="paidModelReviewBtn">Review guard</button>' +
+        '<button class="btn ghost sm" type="button" id="paidModelDismissBtn">Got it</button></div>';
+      $("paidModelReviewBtn").addEventListener("click", () => reviewPaidModelNotice(notice, { dismiss: true }));
+      $("paidModelDismissBtn").addEventListener("click", () => { writeDismissed(PAID_MODEL_NOTICE_KEY, notice.id); banner.hidden = true; });
+    }
+    function maybeShowPaidModelToast() {
+      const notice = latestPaidModelNotice();
+      if (!notice || shownPaidModelToast === notice.id || readDismissed(PAID_MODEL_TOAST_KEY) === notice.id) return;
+      shownPaidModelToast = notice.id;
+      writeDismissed(PAID_MODEL_TOAST_KEY, notice.id);
+      showToast("Ficelle removed " + notice.upstream_id + " from routing because " + providerLabel(notice.provider) + " now requires paid access for it.", "error", {
+        label: "Review",
+        onClick: () => reviewPaidModelNotice(notice),
+      });
+    }
     function renderPruneBanner() {
       const banner = $("pruneBanner");
       if (!banner) return;
@@ -2285,6 +2453,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     let updateInstallInFlight = false;
     let updateStatusTimer = null;
     let updateStatusRefreshInFlight = false;
+    let noticeRefreshInFlight = false;
     function renderUpdateBanner() {
       const banner = $("updateBanner");
       if (!banner) return;
@@ -2336,10 +2505,148 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       }
     }
 
+    async function refreshNotices({ resyncCatalog = true } = {}) {
+      if (!state || noticeRefreshInFlight) return;
+      noticeRefreshInFlight = true;
+      try {
+        const r = await fetch("/admin/notices", { cache: "no-store" });
+        if (!r.ok) return;
+        state.notices = await r.json();
+        renderPaidModelBanner();
+        maybeShowPaidModelToast();
+        if (resyncCatalog) void resyncIfCatalogRepublished(state.notices.catalog);
+      } catch (_) {
+        // Notification polling is observational; routing is already protected server-side.
+      } finally {
+        noticeRefreshInFlight = false;
+      }
+    }
+
     function startUpdateStatusPolling() {
       void refreshUpdateStatus();
       if (updateStatusTimer) return;
-      updateStatusTimer = setInterval(() => { void refreshUpdateStatus(); }, 15000);
+      updateStatusTimer = setInterval(() => { void refreshUpdateStatus(); void refreshNotices(); }, 15000);
+    }
+
+    /* ---------- background state resync ----------
+       State was fetched once at load and then only after an action, so a tab left open
+       overnight kept rendering the catalog it booted with: a provider that opened two models
+       at 00:21 still showed the previous count, with nothing on screen admitting it was out
+       of date. Only /admin/update and /admin/notices were polled, and neither carried the
+       catalog — so /admin/notices now also reports when the catalog was last published, and
+       this reloads the full state only once that marker actually moves.
+
+       The heavy endpoint is deliberately not the thing being polled. /admin/state is ~3 MB,
+       rebuilds the catalog and admin projections, and runs due quota probes on the request
+       thread — admin_notices_payload's own docstring calls it "intentionally not polled", and
+       /admin/status.json was already hardened so a timer could not spend free quota by being
+       read. Putting it on an interval would have reopened exactly that hole, for a catalog
+       that is republished at most hourly. */
+    let resyncInFlight = false;
+    // The catalog identity currently on screen. A full-state payload carries the same published
+    // catalog document as /admin/notices, but with the models rather than a precomputed count, so
+    // this accepts both shapes. Left untouched whenever a reload is skipped or fails, so a change
+    // seen while the operator was busy stays pending instead of being silently swallowed.
+    // `undefined` means no state has rendered yet; `null` means it rendered without a usable
+    // marker, in which case a valid notice must reload instead of silently becoming the baseline.
+    let renderedCatalogMarker;
+    function catalogMarker(c) {
+      if (!c || typeof c !== "object") return null;
+      const generatedAt = typeof c.generated_at === "string" ? c.generated_at : "";
+      const modelCount = Number.isInteger(c.model_count) ? c.model_count : (Array.isArray(c.models) ? c.models.length : null);
+      return generatedAt && modelCount !== null ? generatedAt + "|" + modelCount : null;
+    }
+
+    // Called on every notices poll (15s), plus when the tab comes back. A marker that has not
+    // moved costs one comparison; only a genuine republish pays for the full state.
+    async function resyncIfCatalogRepublished(catalog) {
+      const marker = catalogMarker(catalog);
+      // A daemon older than this asset sends no marker. Rather than guess, the resync simply
+      // stays off — the page then behaves exactly as it did before, which is what an install
+      // caught mid-upgrade (new page, not-yet-restarted service) should get.
+      if (!marker) return;
+      // loadState anchors this only after its full payload rendered. A notice that races the
+      // initial state response is compared immediately afterwards, rather than adopted here.
+      if (renderedCatalogMarker === undefined) return;
+      if (marker === renderedCatalogMarker) return;
+      await resyncState(marker);
+    }
+
+    // A resync rebuilds nearly the whole page, so it must never land mid-edit: it would drop
+    // the caret out of the focused field, close an open filter popover, and — when it reseeds
+    // the drafts — discard unsaved virtual-model edits, the very loss beforeunload warns about.
+    // Stale numbers are a much smaller harm than lost work, so every doubt defers the resync;
+    // the next poll picks it up once the operator is idle again.
+    //
+    // The focus test asks the question that actually matters — "will render() replace the node
+    // the operator is typing into?" — rather than "is this a field?". Fields that live in the
+    // static markup (the routing search box) or in the one view render() never touches (the
+    // Requests filters) are therefore not disturbances, and parking the caret in one of them
+    // cannot wedge the resync off for the life of the tab.
+    const RESYNC_REBUILT_CONTAINERS = "#profileList,#filterBar,#selectedList,#excludedList,#availableList,#providerList,#providerDetail,#settingsControls,#view-fusion,#view-compression,#view-license,#view-health,#view-performance,#view-audit";
+    function resyncWouldDisturb() {
+      const el = document.activeElement;
+      if (el && typeof el.closest === "function" && el.closest(RESYNC_REBUILT_CONTAINERS)) return true;
+      if (openFilter) return true;
+      if (benchmarkRunInFlight || serverBenchmarkRunning()) return true;
+      if ($("saveBtn")?.classList.contains("is-loading")) return true;
+      return false;
+    }
+
+    // render() rebuilds the list containers, which resets the scroll offset of every scroller
+    // inside them — the browser cannot restore what innerHTML wiped. A background refresh must
+    // not scroll the operator away from what they were reading, so the offsets are captured and
+    // reapplied. The nodes themselves survive (only their contents are replaced), so they are
+    // held directly rather than re-queried, which would have to guess which match is which.
+    // The window offset is restored too because the momentarily empty containers let the browser
+    // clamp it; native scroll anchoring may still adjust it afterwards to keep the visible
+    // content, rather than the number, steady.
+    const RESYNC_SCROLL_KEEP = "#providerList, .scroll";
+    function captureScroll() {
+      const els = [...document.querySelectorAll(RESYNC_SCROLL_KEEP)].map((el) => [el, el.scrollTop]).filter(([, top]) => top);
+      return { y: window.scrollY, els };
+    }
+    function restoreScroll(snapshot) {
+      snapshot.els.forEach(([el, top]) => { if (el.isConnected) el.scrollTop = top; });
+      if (snapshot.y) window.scrollTo(0, snapshot.y);
+    }
+
+    async function resyncState(marker) {
+      if (!state || resyncInFlight || document.hidden || resyncWouldDisturb()) return;
+      resyncInFlight = true;
+      try {
+        const r = await fetch("/admin/state", { cache: "no-store" });
+        if (!r.ok) return;
+        const next = await r.json();
+        // The fetch is asynchronous: the tab may have become hidden or the operator may have
+        // started typing while it was in flight, so the decision is re-taken against the current
+        // page before any state or marker moves.
+        if (document.hidden || resyncWouldDisturb()) return;
+        // Which drafts are unsaved has to be read against the state they were seeded from,
+        // before the new one replaces it. Read afterwards it would compare the drafts to a
+        // baseline they never came from — and the catalog refresh that triggers this resync
+        // is also what prunes dead ids out of the saved profiles, so a clean tab would look
+        // edited, keep the pruned id, and offer to save it back.
+        const dirty = new Set(unsavedProfileIds());
+        setState(next);
+        // Preserve only the profiles the operator actually edited. Save posts every profile, so
+        // keeping a clean old draft could otherwise put back a model the new catalog just pruned
+        // while an unrelated profile was dirty. Fusion and settings have no equivalent dirty
+        // test, so their drafts stay untouched until the next explicit loadState().
+        seedProfileDrafts(dirty);
+        const scroll = captureScroll();
+        render();
+        restoreScroll(scroll);
+        // Anchor to what actually rendered. Falling back to the notice that triggered this
+        // reload matters: a state payload we cannot derive a marker from would otherwise anchor
+        // `null`, and every later notice would differ from it — turning the poll into a reload
+        // loop, which is the one outcome worse than the stale data this all exists to fix.
+        renderedCatalogMarker = catalogMarker(next.catalog) || marker;
+      } catch (_) {
+        // Transient local failure — the marker is left pending, so the next poll retries.
+      } finally {
+        resyncInFlight = false;
+      }
     }
 
     async function checkUpdate() {
@@ -2483,16 +2790,40 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        throw err;
 	      }
 	      setState(await r.json());
-	      setDraftProfiles(cloneJson(state.virtual_profiles || {}));
+	      seedProfileDrafts();
 	      setDraftFusion(cloneJson(state.fusion?.config || {}));
-		      setDraftSettings(cloneJson(state.settings?.config || {}));
-	      for (const pid of profileOrder) { draftProfiles[pid] ||= { mode: "auto", models: [], excluded_models: [], auto_tail: true, requirements: defaultReq() }; draftProfiles[pid].excluded_models ||= []; draftProfiles[pid].requirements = { ...defaultReq(), ...(draftProfiles[pid].requirements || {}) }; }
-      await Promise.all([loadAudit(false), loadOptionalCompression()]); render();
+	      setDraftSettings(cloneJson(state.settings?.config || {}));
+      // Do not let the concurrent notices read compare against the previous render. Once this
+      // payload has rendered, anchor the marker to it and then compare the notice we just read:
+      // a publish between the two responses triggers one resync, while an explicit state reload
+      // that already contains the publish does not launch a redundant second /admin/state.
+      await Promise.all([loadAudit(false), loadOptionalCompression(), refreshNotices({ resyncCatalog: false })]);
+      render();
+      renderedCatalogMarker = catalogMarker(state.catalog);
+      void resyncIfCatalogRepublished(state.notices?.catalog);
 	      // Refresh the action toolbar now that state (incl. pro_installed) is loaded — it was first
 	      // built by setView() at bootstrap when state was null, so Pro-gated Fusion/Compression
 	      // buttons would otherwise never appear on a direct page load.
       setView(currentView);
       startUpdateStatusPolling();
+    }
+    // Reseeds the editable copy of the virtual models from what the server last returned, in the
+    // canonical shape the rest of the view expects (every known profile present, requirements
+    // filled in from defaultReq). Shared with the background resync, which must produce exactly
+    // the same drafts a fresh load would — a half-normalised profile silently changes what
+    // matchesReq accepts, and the available-models list with it.
+    function seedProfileDrafts(preserveIds = new Set()) {
+      const previous = draftProfiles;
+      const next = cloneJson(state.virtual_profiles || {});
+      preserveIds.forEach((pid) => {
+        if (Object.prototype.hasOwnProperty.call(previous, pid)) next[pid] = previous[pid];
+      });
+      setDraftProfiles(next);
+      for (const pid of profileOrder) {
+        draftProfiles[pid] ||= { mode: "auto", models: [], excluded_models: [], auto_tail: true, requirements: defaultReq() };
+        draftProfiles[pid].excluded_models ||= [];
+        draftProfiles[pid].requirements = { ...defaultReq(), ...(draftProfiles[pid].requirements || {}) };
+      }
     }
     async function loadAudit(after = true) {
       const r = await fetch("/admin/audit?limit=12", { cache: "no-store" }); const p = await r.json();
@@ -2749,10 +3080,17 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       // A hidden tab holds no live tail: drop it on the way out, and resync on the way back
       // rather than replaying whatever piled up while nobody was looking.
       document.addEventListener("visibilitychange", () => {
+        // A tab that was hidden held off its resync, so coming back is when it is most likely
+        // to be showing yesterday's numbers. This only re-reads the small notices payload; the
+        // full state follows from it, and only if the catalog really moved.
+        if (!document.hidden) void refreshNotices();
         if (currentView !== "requests" || !requestsLive) return;
         if (document.hidden) { stopRequestsLive(); return; }
         loadRequests().then(() => startRequestsLive()).catch(() => startRequestsLive());
       });
+      // Returning to the browser from another application does not reliably toggle page
+      // visibility. refreshNotices' own in-flight flag keeps the pair from doubling up.
+      window.addEventListener("focus", () => { void refreshNotices(); });
     }
     // Bridge for the optional closed-pack views (pro-views.js). The moved Fusion/Compression render
     // and save/load functions read every helper, state accessor, and core callback they need from this

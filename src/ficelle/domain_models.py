@@ -178,6 +178,11 @@ class RouterModel:
     context_length_source: str = "catalog"
     context_length_estimate: int | None = None
     burn_weight: float | None = None
+    # Observational only: the paid sibling's USD-per-token prices recorded at catalog
+    # refresh ({"prompt": float, "completion": float, "basis": str}). Feeds the admin
+    # "estimated saved" figure; never read by admission or routing — strict-zero keeps
+    # gating on the model's own pricing.
+    reference_pricing: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

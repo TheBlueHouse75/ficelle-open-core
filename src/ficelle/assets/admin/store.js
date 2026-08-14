@@ -15,6 +15,10 @@ export let activeProfile = "ficelle/auto-orchestrator";
 export let dragged = null;
 export let currentView = "routing";
 export let selectedProvider = null;
+// Provider detail model-list filter. `q` survives the detail re-render loadState() triggers
+// after a key save / cooldown action; `src` records which provider the query belongs to so
+// renderProviders can reset it when the selection moves. Session-only, not persisted.
+export const providerModelFilter = { src: null, q: "" };
 export const expandedModels = new Set();
 // Available-models filter/sort state. Object-property mutation only (Sets/scalars),
 // so importers always read the live value without a setter. Session-only, not persisted.

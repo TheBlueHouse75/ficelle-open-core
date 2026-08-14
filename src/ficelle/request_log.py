@@ -23,6 +23,7 @@ it) so it can be unit-tested in isolation, mirroring ``compression.py``.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from contextlib import closing
@@ -32,7 +33,7 @@ from typing import Any
 
 from ficelle.runtime_paths import RuntimePaths
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Retention bounds for the derived index (the JSONL source keeps everything).
 MAX_ROWS = 100_000
@@ -81,6 +82,10 @@ _COLUMNS = (
     "fallback",
     "competence",
     "compression_status",
+    "prompt_tokens",
+    "completion_tokens",
+    "prompt_price",
+    "completion_price",
     "attempts_json",
 )
 
@@ -252,7 +257,13 @@ def summary(
     window_seconds: int = WINDOW_SECONDS[DEFAULT_WINDOW],
     now: float | None = None,
 ) -> dict[str, Any]:
-    """Return aggregate request-health metrics over the given window."""
+    """Return aggregate request-health metrics over the given window.
+
+    The savings figure is a pure aggregation of what each success row recorded at
+    route time (token counts × the USD-per-token reference stamped on the row), so
+    the estimate is immutable history: a later catalog price change cannot inflate
+    it, and rebuilding the index from ``routes.jsonl`` reproduces the same numbers.
+    """
     window = max(60, _safe_int(window_seconds, WINDOW_SECONDS[DEFAULT_WINDOW]) or WINDOW_SECONDS[DEFAULT_WINDOW])
     reference = float(now) if now is not None else time.time()
     cutoff = reference - window
@@ -303,6 +314,23 @@ def summary(
             "WHERE ts >= ? AND ts <= ? AND latency_seconds IS NOT NULL",
             (cutoff, reference),
         ).fetchone()["c"] or 0)
+        usage_totals = conn.execute(
+            """
+            SELECT COUNT(*) AS c,
+                   SUM(COALESCE(prompt_tokens, 0)) AS p,
+                   SUM(COALESCE(completion_tokens, 0)) AS o,
+                   SUM(CASE WHEN prompt_price IS NOT NULL OR completion_price IS NOT NULL
+                       THEN 1 ELSE 0 END) AS priced,
+                   SUM(COALESCE(prompt_tokens, 0) * COALESCE(prompt_price, 0)
+                       + COALESCE(completion_tokens, 0) * COALESCE(completion_price, 0)) AS saved
+            FROM requests
+            WHERE ts >= ? AND ts <= ?
+              AND (prompt_tokens IS NOT NULL OR completion_tokens IS NOT NULL)
+            """,
+            (cutoff, reference),
+        ).fetchone()
+        usage_requests = int(usage_totals["c"] or 0)
+        priced_requests = int(usage_totals["priced"] or 0)
         return {
             "generated_at": _now_iso(),
             "window_seconds": window,
@@ -319,6 +347,18 @@ def summary(
             "by_reason": by_reason,
             "by_status": by_status,
             "timeline": timeline,
+            "usage": {
+                "requests": usage_requests,
+                "prompt_tokens": int(usage_totals["p"] or 0),
+                "completion_tokens": int(usage_totals["o"] or 0),
+            },
+            "savings": {
+                # Floored at micro-dollar precision, never rounded: half-up rounding
+                # could overstate, the one direction the estimate must not err in.
+                "estimated_saved_usd": math.floor(float(usage_totals["saved"] or 0.0) * 1e6) / 1e6,
+                "priced_requests": priced_requests,
+                "unpriced_requests": usage_requests - priced_requests,
+            },
         }
 
 
@@ -476,6 +516,11 @@ def _row_from_log_line(raw: Any) -> dict[str, Any] | None:
     compression = raw.get("compression")
     compression_status = compression.get("status") if isinstance(compression, dict) else None
 
+    # Token counts and the USD-per-token reference recorded at route time — the only
+    # usage facts the success writer emits.
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+    reference = raw.get("reference_pricing") if isinstance(raw.get("reference_pricing"), dict) else {}
+
     attempt_count = _safe_int(raw.get("attempt_count"), 0) or 0
     logged_at = raw.get("logged_at") if isinstance(raw.get("logged_at"), str) else None
 
@@ -497,8 +542,33 @@ def _row_from_log_line(raw: Any) -> dict[str, Any] | None:
         "fallback": 1 if attempt_count > 1 else 0,
         "competence": _str_or_none(raw.get("competence")),
         "compression_status": _str_or_none(compression_status),
+        "prompt_tokens": _token_count(usage.get("prompt_tokens")),
+        "completion_tokens": _token_count(usage.get("completion_tokens")),
+        "prompt_price": _price_per_token(reference.get("prompt")),
+        "completion_price": _price_per_token(reference.get("completion")),
         "attempts_json": json.dumps(attempts, ensure_ascii=False, sort_keys=True),
     }
+
+
+def _token_count(value: Any) -> int | None:
+    """A non-negative token count, or None. The success writer clamps at the source,
+    but the ingest defends on its own: a foreign or hand-edited log line must not
+    subtract from the window totals."""
+    if isinstance(value, bool):
+        return None
+    count = _safe_int(value, None)
+    return count if count is not None and count >= 0 else None
+
+
+def _price_per_token(value: Any) -> float | None:
+    """A finite, non-negative USD-per-token rate, or None. Bools coerce to 1.0 and
+    "Infinity" parses to inf — either would poison the window's savings SUM and can
+    make the summary payload unserializable, so values earn the same whitelist
+    discipline as field names."""
+    if isinstance(value, bool):
+        return None
+    price = _safe_float(value)
+    return price if price is not None and price >= 0 and math.isfinite(price) else None
 
 
 def _insert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> int:
@@ -620,6 +690,10 @@ def _create_requests_table(conn: sqlite3.Connection) -> None:
           fallback INTEGER,
           competence TEXT,
           compression_status TEXT,
+          prompt_tokens INTEGER,
+          completion_tokens INTEGER,
+          prompt_price REAL,
+          completion_price REAL,
           attempts_json TEXT
         )
         """
@@ -690,6 +764,8 @@ def _public_row(row: sqlite3.Row) -> dict[str, Any]:
         "fallback": bool(row["fallback"]),
         "competence": row["competence"],
         "compression_status": row["compression_status"],
+        "prompt_tokens": row["prompt_tokens"],
+        "completion_tokens": row["completion_tokens"],
         "attempts": attempts,
     }
 

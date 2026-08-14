@@ -21,6 +21,9 @@
       </header>
 
       <section class="update-banner" id="updateBanner" hidden aria-live="polite"></section>
+      <!-- Runtime strict-zero guard: a provider declared one catalog model paid. The model is
+           already quarantined; this notice explains the automatic routing change. -->
+      <section class="update-banner is-error" id="paidModelBanner" hidden aria-live="assertive"></section>
       <!-- A prune is the only edit Ficelle makes to a virtual model on its own, so it says so
            here once and sends the user to the lane it shortened. Dismissed per audit id, so
            the next prune speaks up again. -->
@@ -102,6 +105,7 @@
                 </label>
                 <div class="filter-bar" id="filterBar" role="group" aria-label="Model filters and sort"></div>
                 <div class="scroll"><div class="dropzone" id="availableList"></div></div>
+                <div class="avail-note" id="availableNote" hidden></div>
               </div>
             </div>
           </section>
@@ -231,7 +235,7 @@
       <button class="endpoint" id="endpointCopy" type="button" title="Copy the base URL">
         <span class="ep-key">OpenAI-compatible endpoint</span>
         <span class="ep-val" id="endpointUrl">&nbsp;</span>
-        <span class="ep-hint">Click to copy &middot; api key <code>ficelle-local</code></span>
+        <span class="ep-hint">Loopback key <code>ficelle-local</code> &middot; remote key: <code>ficelle access-token api</code></span>
       </button>
       <button class="endpoint endpoint-alt" id="endpointChatCopy" type="button" title="Copy the full chat completions URL">
         <span class="ep-key">Full chat URL</span>

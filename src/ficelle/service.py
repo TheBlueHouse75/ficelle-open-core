@@ -1,6 +1,7 @@
 """Local service backends for Ficelle."""
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import plistlib
@@ -9,6 +10,21 @@ import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Protocol
+from xml.sax.saxutils import escape as xml_escape
+
+
+LOG_FILE_NAME = "ficelle.log"
+ERROR_LOG_FILE_NAME = "ficelle.error.log"
+
+# Substrings that identify a Ficelle server process command line. Defined here, next to
+# the backends that construct those command lines, and consumed by the CLI's
+# stale-server cleanup so the two halves of the contract cannot drift apart.
+SERVER_COMMAND_SIGNATURES = ("-m ficelle.router --serve", "-m ficelle.windows_entry")
+
+
+def service_log_dir(ficelle_home: Path) -> Path:
+    """The service log directory for a Ficelle home, shared with ficelle.windows_entry."""
+    return ficelle_home / "logs"
 
 
 RunCommand = Callable[[list[str]], subprocess.CompletedProcess[str]]
@@ -153,7 +169,7 @@ class ServicePaths:
 
     @property
     def log_dir(self) -> Path:
-        return self.ficelle_home / "logs"
+        return service_log_dir(self.ficelle_home)
 
 
 def service_environment(paths: ServicePaths) -> dict[str, str]:
@@ -171,9 +187,9 @@ def _systemd_environment_line(name: str, value: str) -> str:
     return f"Environment={assignment}"
 
 
-def write_text_file(path: Path, content: str) -> None:
+def write_text_file(path: Path, content: str, *, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    path.write_text(content, encoding=encoding)
 
 
 def persist_service_context(paths: ServicePaths) -> bool:
@@ -221,8 +237,8 @@ class LaunchAgentServiceBackend:
             "ProgramArguments": [str(self.paths.install_python), "-m", "ficelle.router", "--serve"],
             "RunAtLoad": True,
             "KeepAlive": {"SuccessfulExit": False},
-            "StandardOutPath": str(self.paths.log_dir / "ficelle.log"),
-            "StandardErrorPath": str(self.paths.log_dir / "ficelle.error.log"),
+            "StandardOutPath": str(self.paths.log_dir / LOG_FILE_NAME),
+            "StandardErrorPath": str(self.paths.log_dir / ERROR_LOG_FILE_NAME),
             "WorkingDirectory": str(self.paths.ficelle_home),
             "EnvironmentVariables": service_environment(self.paths),
         }
@@ -449,6 +465,176 @@ class SystemdUserServiceBackend:
         return result.returncode
 
 
+def windows_headless_python(install_python: Path) -> Path:
+    """Prefer the console-less ``pythonw.exe`` beside the install interpreter.
+
+    A logon-triggered task with an InteractiveToken principal runs in the user's desktop
+    session, so ``python.exe`` would keep a console window open for the lifetime of the
+    service. ``pythonw.exe`` ships beside ``python.exe`` in CPython installs and
+    virtualenvs; fall back to the recorded interpreter when it is absent.
+    """
+    headless = install_python.with_name("pythonw.exe")
+    return headless if headless.exists() else install_python
+
+
+def windows_task_account() -> str:
+    """The ``DOMAIN\\user`` principal for the per-user task.
+
+    ``USERNAME`` must win: ``getpass.getuser()`` prefers ``LOGNAME``/``USER``, which
+    MSYS2/Git Bash shells set to names ``schtasks`` cannot map to a Windows account.
+    """
+    domain = os.environ.get("USERDOMAIN")
+    user = os.environ.get("USERNAME") or getpass.getuser()
+    return f"{domain}\\{user}" if domain else user
+
+
+class WindowsScheduledTaskBackend:
+    """Windows per-user Scheduled Task backend (logon trigger, no elevation)."""
+
+    name = "scheduled-task"
+
+    def __init__(
+        self,
+        *,
+        paths: ServicePaths,
+        run_command: RunCommand,
+        wait_for_ready: ReadyCheck,
+        terminate_stale_servers: StaleServerTerminator,
+        report_stale_servers: StaleServerReporter,
+        account_provider: UidProvider = windows_task_account,
+    ) -> None:
+        self.paths = paths
+        self.run_command = run_command
+        self.wait_for_ready = wait_for_ready
+        self.terminate_stale_servers = terminate_stale_servers
+        self.report_stale_servers = report_stale_servers
+        self.account_provider = account_provider
+
+    @property
+    def task_name(self) -> str:
+        return self.paths.label
+
+    @property
+    def task_xml(self) -> Path:
+        return self.paths.ficelle_home / f"{self.paths.label}.task.xml"
+
+    def entry_arguments(self) -> list[str]:
+        # Task Scheduler cannot set per-task environment variables, so the service context
+        # travels as NAME=VALUE assignments (systemd's Environment= shape) that
+        # ficelle.windows_entry republishes; service_environment() is the one definition.
+        return ["-m", "ficelle.windows_entry"] + [
+            f"{name}={value}" for name, value in service_environment(self.paths).items()
+        ]
+
+    def task_payload(self) -> str:
+        account = xml_escape(self.account_provider())
+        command = xml_escape(str(windows_headless_python(self.paths.install_python)))
+        arguments = xml_escape(subprocess.list2cmdline(self.entry_arguments()))
+        working_directory = xml_escape(str(self.paths.ficelle_home))
+        # ExecutionTimeLimit PT0S disables the schema default, which kills the process
+        # after 72 hours.
+        return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Ficelle local OpenAI-compatible model router</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{account}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{account}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>10</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
+      <WorkingDirectory>{working_directory}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+    def write_task_definition(self) -> None:
+        self.paths.ficelle_home.mkdir(parents=True, exist_ok=True)
+        self.paths.log_dir.mkdir(parents=True, exist_ok=True)
+        # schtasks expects the exported-task encoding: UTF-16 with a BOM.
+        write_text_file(self.task_xml, self.task_payload(), encoding="utf-16")
+
+    def install(self) -> int:
+        self.write_task_definition()
+        self.run_command(["schtasks", "/End", "/TN", self.task_name])
+        self.report_stale_servers(self.terminate_stale_servers())
+        register = self.run_command(
+            ["schtasks", "/Create", "/TN", self.task_name, "/XML", str(self.task_xml), "/F"]
+        )
+        if register.returncode != 0:
+            sys.stderr.write(register.stderr or register.stdout)
+            return register.returncode
+        start = self.run_command(["schtasks", "/Run", "/TN", self.task_name])
+        if start.returncode != 0:
+            sys.stderr.write(start.stderr or start.stdout)
+            return start.returncode
+        if not self.wait_for_ready():
+            sys.stderr.write("Ficelle scheduled task started but /admin/status.json did not become ready.\n")
+            self.run_command(["schtasks", "/End", "/TN", self.task_name])
+            sys.stderr.write(
+                "Ended the task so it does not restart-loop; check the logs under FICELLE_HOME and the configured port.\n"
+            )
+            return 1
+        if not persist_service_context(self.paths):
+            return 1
+        print(f"installed {self.task_xml}")
+        return 0
+
+    def restart(self) -> int:
+        # Unlike the LaunchAgent's recorded_interpreter(), this re-decides the interpreter
+        # from the current process on every restart — the systemd backend shares that
+        # trade-off. Revisit if the second-install repointing incident recurs on Windows.
+        return self.install()
+
+    def stop(self) -> int:
+        result = self.run_command(["schtasks", "/End", "/TN", self.task_name])
+        self.report_stale_servers(self.terminate_stale_servers())
+        return result.returncode
+
+    def uninstall(self) -> int:
+        self.stop()
+        self.run_command(["schtasks", "/Delete", "/TN", self.task_name, "/F"])
+        if self.task_xml.exists():
+            self.task_xml.unlink()
+        print(f"removed {self.task_xml}")
+        return 0
+
+    def status(self) -> int:
+        # No /V and no label filtering: schtasks localizes its labels, so the compact
+        # default listing printed verbatim is the portable answer.
+        result = self.run_command(["schtasks", "/Query", "/TN", self.task_name, "/FO", "LIST"])
+        print(result.stdout.strip() or result.stderr.strip() or "not registered")
+        return result.returncode
+
+
 class UnsupportedServiceBackend:
     """Explicit backend for platforms that do not have a user-proof service installer yet."""
 
@@ -459,7 +645,8 @@ class UnsupportedServiceBackend:
 
     def _fail(self) -> int:
         sys.stderr.write(
-            "Ficelle managed service install is supported on macOS LaunchAgent and Linux systemd --user. "
+            "Ficelle managed service install is supported on macOS LaunchAgent, Linux systemd --user, "
+            "and Windows per-user Scheduled Tasks. "
             f"Detected platform: {self.platform_name}. "
             "Run `python -m ficelle.router --serve` for developer foreground mode, or add a platform service backend first.\n"
         )
@@ -503,6 +690,14 @@ def select_service_backend(
         )
     if platform_name.startswith("linux"):
         return SystemdUserServiceBackend(
+            paths=paths,
+            run_command=run_command,
+            wait_for_ready=wait_for_ready,
+            terminate_stale_servers=terminate_stale_servers,
+            report_stale_servers=report_stale_servers,
+        )
+    if platform_name == "win32":
+        return WindowsScheduledTaskBackend(
             paths=paths,
             run_command=run_command,
             wait_for_ready=wait_for_ready,

@@ -28,6 +28,7 @@ class RuntimePaths:
     state_lock_path: Path
     state_backup_dir: Path
     capability_discrepancy_log_path: Path
+    catalog_refresh_attempts_path: Path
     compression_store_path: Path
     hermes_agent_dir: Path
     hermes_config_path: Path
@@ -87,6 +88,7 @@ class RuntimePaths:
             state_lock_path=router_dir / "state.lock",
             state_backup_dir=router_dir / "state-backups",
             capability_discrepancy_log_path=router_dir / "logs" / "capability-discrepancies.jsonl",
+            catalog_refresh_attempts_path=router_dir / "catalog-refresh-attempts.json",
             compression_store_path=router_dir / "compression.sqlite",
             hermes_agent_dir=hermes_home / "hermes-agent",
             hermes_config_path=hermes_home / "config.yaml",

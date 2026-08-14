@@ -213,7 +213,9 @@ def refresh() -> Any:
     licensing = _licensing()
     cached = licensing.load_cached_entitlement(_entitlement_read_path())
     if cached is None:
-        raise LicenseOperationError("no active license to refresh; run: ficelle license activate <license-key>")
+        raise LicenseOperationError(
+            "no active license to refresh; run `ficelle license activate` and use the hidden prompt"
+        )
     try:
         token, entitlement = licensing.refresh_with_service(
             validated_service_url(), load_or_create_machine_fingerprint(), cached.machine_activation_id

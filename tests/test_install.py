@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -15,6 +16,7 @@ from ficelle.install import (
     InstallOptions,
     backup_existing_path,
     build_parser,
+    cli_reachability_notice,
     collect_preflight_checks,
     configure_hermes,
     copy_plugin_tree,
@@ -24,10 +26,13 @@ from ficelle.install import (
     ensure_hermes_compression_plugin_enabled,
     ensure_hermes_toolset_enabled,
     ensure_hermes_plugin_enabled,
+    expose_cli_scripts,
     install_plugins,
+    installed_cli_command,
     legacy_service_listener_status,
     managed_service_status,
     migrate_legacy_ficelle_home,
+    offer_first_key_capture,
     options_from_args,
     package_is_local_reference,
     package_install_command,
@@ -57,6 +62,9 @@ def make_options(tmp_path, **overrides):
         "backup_existing": True,
         "rollback": False,
         "ficelle_home_explicit": False,
+        # The CLI implies this for a piped stdin; the test harness is exactly that, so
+        # capture tests opt in to interactivity explicitly.
+        "non_interactive": True,
     }
     values.update(overrides)
     return InstallOptions(**values)
@@ -267,13 +275,18 @@ def test_run_install_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_path)
     ]
 
 
-def install_with_doctor_auth(monkeypatch, tmp_path, auth, **option_overrides):
+def install_with_doctor_auth(monkeypatch, tmp_path, auth, *, pin_cli=True, **option_overrides):
     """Run a generic install whose `doctor --json` smoke check reports `auth`."""
+    # Most of these tests are about *what* setup advises, not how the command is spelled — and
+    # how it is spelled depends on whether the test runner's venv happens to be on PATH. Pinned
+    # to the bare name by default; the spelling has its own tests, which opt out.
+    if pin_cli:
+        monkeypatch.setattr("ficelle.install.installed_cli_command", lambda name="ficelle", **_kwargs: name)
     monkeypatch.setattr("ficelle.install.run_preflight", lambda options, target=None: None)
     monkeypatch.setattr("ficelle.install.install_package", lambda options, target=None, runtime_dir=None: None)
     monkeypatch.setattr("ficelle.install.ensure_dedicated_keychain", lambda options: None)
 
-    def fake_run(command, *, dry_run, env=None):
+    def fake_run(command, *, dry_run, env=None, input_text=None):
         if command[-2:] == ["doctor", "--json"] and auth is not None:
             return CommandResult(command, 0, stdout=json.dumps({"status": "ok", "auth": auth}))
         return CommandResult(command, 0)
@@ -356,6 +369,327 @@ def test_run_install_skips_the_set_key_block_when_every_provider_already_has_a_k
     assert "Create a key, then store it" not in output
     assert "  mistral  # missing base_url for provider mistral" in output
     assert "does NOT mean a request can be served" in output
+
+
+def _keyless_auth():
+    return {"openrouter": {"invokable": False, "reason": "missing OPENROUTER_API_KEY"}}
+
+
+def _interactive_capture(monkeypatch, *, pasted=None, run=None):
+    """Record run_command calls; patch getpass only when a paste is given."""
+    run = run or (lambda command: CommandResult(command, 0))
+    calls = []
+
+    def fake_run(command, *, dry_run, env=None, input_text=None):
+        calls.append((command, input_text))
+        return run(command)
+
+    monkeypatch.setattr("ficelle.install.run_command", fake_run)
+    if pasted is not None:
+        monkeypatch.setattr("ficelle.install.getpass.getpass", lambda _prompt: pasted)
+    return calls
+
+
+def test_first_key_capture_stores_via_stdin_and_runs_the_demo(monkeypatch, tmp_path, capsys):
+    pasted = "sk-or-v1-" + "a" * 40
+    calls = _interactive_capture(monkeypatch, pasted=pasted)
+    options = make_options(tmp_path, dry_run=False, non_interactive=False)
+
+    assert offer_first_key_capture(options, {}, ["openrouter", "nous"], cli_command="ficelle") is True
+    assert calls[0][0] == ["/usr/bin/python3", "-m", "ficelle.cli", "set-key", "openrouter", "--stdin"]
+    assert calls[0][1] == pasted + "\n"  # the key travels on stdin, never argv
+    assert calls[1] == (["/usr/bin/python3", "-m", "ficelle.cli", "demo"], None)
+    out = capsys.readouterr().out
+    assert "https://openrouter.ai/keys" in out
+    assert pasted not in out  # the secret is never echoed
+
+
+def test_first_key_capture_offers_the_first_provider_in_configured_order(monkeypatch, tmp_path):
+    # Configured order is the codebase's one expression of provider preference; a user
+    # who deliberately ordered another provider first gets that provider offered.
+    calls = _interactive_capture(monkeypatch)
+    prompts = []
+    monkeypatch.setattr("ficelle.install.getpass.getpass", lambda prompt: prompts.append(prompt) or "")
+    options = make_options(tmp_path, dry_run=False, non_interactive=False)
+
+    assert offer_first_key_capture(options, {}, ["nous", "openrouter"], cli_command="ficelle") is False
+    assert prompts == ["Paste the nous API key to finish now (Enter to skip): "]
+    assert calls == []
+
+
+def test_first_key_capture_treats_eof_as_skip(monkeypatch, tmp_path):
+    # Ctrl-D at an Enter-to-skip prompt must decline, not crash a finished install.
+    calls = _interactive_capture(monkeypatch)
+
+    def raise_eof(_prompt):
+        raise EOFError
+
+    monkeypatch.setattr("ficelle.install.getpass.getpass", raise_eof)
+    options = make_options(tmp_path, dry_run=False, non_interactive=False)
+
+    assert offer_first_key_capture(options, {}, ["openrouter"], cli_command="ficelle") is False
+    assert calls == []
+
+
+def test_first_key_capture_declines_silently_on_empty_paste(monkeypatch, tmp_path):
+    calls = _interactive_capture(monkeypatch, pasted="")
+    options = make_options(tmp_path, dry_run=False, non_interactive=False)
+
+    assert offer_first_key_capture(options, {}, ["openrouter"], cli_command="ficelle") is False
+    assert calls == []
+
+
+def test_first_key_capture_respects_the_non_interactive_option(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "ficelle.install.getpass.getpass",
+        lambda _prompt: pytest.fail("--non-interactive must suppress the prompt"),
+    )
+    options = make_options(tmp_path, dry_run=False, non_interactive=True)
+
+    assert offer_first_key_capture(options, {}, ["openrouter"], cli_command="ficelle") is False
+
+
+def test_first_key_capture_does_not_prompt_with_no_keyless_provider(monkeypatch, tmp_path):
+    # Keys exist but cannot be used: the caller passes an empty keyless list, and
+    # pasting another key is not the fix — the advice block explains what is.
+    monkeypatch.setattr(
+        "ficelle.install.getpass.getpass",
+        lambda _prompt: pytest.fail("an unusable key must route to the advice block, not a prompt"),
+    )
+    options = make_options(tmp_path, dry_run=False, non_interactive=False)
+
+    assert offer_first_key_capture(options, {}, [], cli_command="ficelle") is False
+
+
+def test_non_interactive_is_implied_without_an_interactive_terminal(monkeypatch):
+    args = build_parser().parse_args(["--target", "generic"])
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("ficelle.install.sys.stdin", Tty())
+    monkeypatch.setattr("ficelle.install.sys.stdout", Tty())
+    assert options_from_args(args).non_interactive is False
+    assert options_from_args(build_parser().parse_args(["--non-interactive"])).non_interactive is True
+
+    # A piped or captured stream on either side suppresses the prompt: the context
+    # lines travel on stdout (the bootstrap captures it), the paste arrives on stdin.
+    monkeypatch.setattr("ficelle.install.sys.stdin", io.StringIO())
+    assert options_from_args(args).non_interactive is True
+    monkeypatch.setattr("ficelle.install.sys.stdin", Tty())
+    monkeypatch.setattr("ficelle.install.sys.stdout", io.StringIO())
+    assert options_from_args(args).non_interactive is True
+
+    # fd 0 closed at interpreter start (pythonw, provisioning managers): stdin is None.
+    monkeypatch.setattr("ficelle.install.sys.stdin", None)
+    assert options_from_args(args).non_interactive is True
+
+
+def test_first_key_capture_reports_a_failed_store_and_keeps_the_advice(monkeypatch, tmp_path, capsys):
+    def failing_set_key(command):
+        return CommandResult(command, 1 if "set-key" in command else 0)
+
+    calls = _interactive_capture(monkeypatch, pasted="not-a-key", run=failing_set_key)
+    options = make_options(tmp_path, dry_run=False, non_interactive=False)
+
+    assert offer_first_key_capture(options, {}, ["openrouter"], cli_command="ficelle") is False
+    assert len(calls) == 1  # no demo after a failed store
+    assert "run `ficelle set-key openrouter` to retry" in capsys.readouterr().out
+
+
+def test_run_install_drops_the_advice_block_after_an_inline_key_capture(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr("ficelle.install.getpass.getpass", lambda _prompt: "sk-or-v1-" + "b" * 40)
+    install_with_doctor_auth(monkeypatch, tmp_path, _keyless_auth(), non_interactive=False)
+    output = capsys.readouterr().out
+
+    assert "Paste the openrouter API key" not in output  # getpass prompts off-stream
+    assert "Create a free openrouter key at https://openrouter.ai/keys" in output
+    # The advice block would re-instruct what the capture just did.
+    assert "ficelle set-key openrouter" not in output
+    assert "does NOT mean a request can be served" not in output
+
+
+def test_installed_cli_command_names_the_script_a_shell_cannot_reach(tmp_path):
+    """Setup closes on `ficelle set-key ...`. A venv the user never activated answers that
+    with `command not found`, on the very first instruction the install gives."""
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    interpreter = venv_bin / "python"
+    interpreter.touch()
+    (venv_bin / "ficelle").touch()
+
+    # Not on PATH at all.
+    assert installed_cli_command(interpreter=interpreter, which=lambda _name: None) == str(venv_bin / "ficelle")
+    # On PATH, and it is this install: the bare name is the better advice.
+    assert installed_cli_command(interpreter=interpreter, which=lambda _name: str(venv_bin / "ficelle")) == "ficelle"
+    # Composes with the bootstrap, which exposes the CLI by symlinking it into ~/.local/bin:
+    # resolved through the link it is the same file, so setup stays quiet.
+    exposed = tmp_path / "local-bin" / "ficelle"
+    exposed.parent.mkdir(parents=True)
+    exposed.symlink_to(venv_bin / "ficelle")
+    assert installed_cli_command(interpreter=interpreter, which=lambda _name: str(exposed)) == "ficelle"
+    # On PATH, but it is a different Ficelle — the full path is what runs the one just installed.
+    other = tmp_path / "other" / "ficelle"
+    other.parent.mkdir(parents=True)
+    other.touch()
+    assert installed_cli_command(interpreter=interpreter, which=lambda _name: str(other)) == str(venv_bin / "ficelle")
+    # Nothing installed beside this interpreter: a path to a file that is not there would be
+    # worse advice than none.
+    bare = tmp_path / "empty" / "python"
+    bare.parent.mkdir(parents=True)
+    assert installed_cli_command(interpreter=bare, which=lambda _name: None) == "ficelle"
+
+
+def test_cli_reachability_notice_is_silent_when_the_bare_name_works():
+    assert cli_reachability_notice("ficelle") == []
+    assert cli_reachability_notice("ficelle", expose_command="/opt/venv/bin/ficelle-setup") == []
+
+    lines = cli_reachability_notice("/opt/venv/bin/ficelle")
+
+    assert "not reachable by name" in lines[0]
+    # "Put it first", not "add it": a different Ficelle earlier on PATH lands here too.
+    assert "Put /opt/venv/bin first on your PATH" in lines[1]
+    # The permanent fix is offered, never implied: no `--expose-cli` line unless a caller
+    # passes the command, because setup does not write outside itself unasked.
+    assert len(lines) == 2
+
+    offered = cli_reachability_notice("/opt/venv/bin/ficelle", expose_command="/opt/venv/bin/ficelle-setup")
+
+    assert "`/opt/venv/bin/ficelle-setup --expose-cli`" in offered[2]
+
+
+def test_expose_cli_scripts_links_both_commands_and_never_overwrites(tmp_path, monkeypatch):
+    """The one install step that writes outside the install. It has to be careful twice:
+    it must not claim a name someone else owns, and it must not report work it did not do."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    interpreter = venv_bin / "python"
+    for name in ("python", "ficelle", "ficelle-setup"):
+        (venv_bin / name).touch()
+    destination = tmp_path / "local-bin"
+
+    lines = expose_cli_scripts(interpreter=interpreter, destination_dir=destination)
+
+    assert (destination / "ficelle").resolve() == (venv_bin / "ficelle").resolve()
+    assert (destination / "ficelle-setup").is_symlink()
+    assert any("linked" in line for line in lines)
+    assert any(f"Put {destination} on your PATH" in line for line in lines)
+
+    # Idempotent: the links are left alone, but the still-required PATH step is not lost.
+    assert expose_cli_scripts(interpreter=interpreter, destination_dir=destination) == [
+        f"Put {destination} on your PATH to use them."
+    ]
+    monkeypatch.setenv("PATH", str(destination))
+    assert expose_cli_scripts(interpreter=interpreter, destination_dir=destination) == []
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    # A command someone else owns is kept, whoever they are — including another Ficelle.
+    (destination / "ficelle").unlink()
+    (destination / "ficelle").write_text("a different install's script")
+    kept = expose_cli_scripts(interpreter=interpreter, destination_dir=destination)
+
+    assert (destination / "ficelle").read_text() == "a different install's script"
+    assert any("keeping the existing command" in line for line in kept)
+
+    # A broken symlink is still an owned entry: do not silently reclaim its name.
+    broken_target = tmp_path / "removed-install" / "ficelle-setup"
+    (destination / "ficelle-setup").unlink()
+    (destination / "ficelle-setup").symlink_to(broken_target)
+    kept = expose_cli_scripts(interpreter=interpreter, destination_dir=destination)
+
+    assert (destination / "ficelle-setup").is_symlink()
+    assert (destination / "ficelle-setup").readlink() == broken_target
+    assert any("keeping the existing command" in line for line in kept)
+
+
+def test_expose_cli_scripts_reports_a_console_script_that_is_not_there(tmp_path):
+    """A source-checkout run that reaches this before the package install has nothing to link;
+    a symlink to a missing file would look installed and resolve to nothing."""
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").touch()
+    destination = tmp_path / "local-bin"
+
+    lines = expose_cli_scripts(interpreter=venv_bin / "python", destination_dir=destination)
+
+    assert not destination.exists()
+    assert all(line.startswith("WARN: no `") for line in lines)
+
+
+def test_expose_cli_scripts_says_what_a_dry_run_would_do(tmp_path):
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").touch()
+    destination = tmp_path / "local-bin"
+
+    lines = expose_cli_scripts(interpreter=venv_bin / "python", destination_dir=destination, dry_run=True)
+
+    assert not destination.exists()
+    assert len(lines) == 2 and all(line.startswith("DRY RUN: link ") for line in lines)
+
+
+def test_run_install_only_exposes_the_cli_when_asked(monkeypatch, tmp_path, capsys):
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "ficelle.install.expose_cli_scripts",
+        lambda **kwargs: (calls.append(kwargs), ["linked /home/u/.local/bin/ficelle -> /opt/venv/bin/ficelle"])[1],
+    )
+    monkeypatch.setattr(
+        "ficelle.install.installed_cli_command",
+        lambda name="ficelle", **_kwargs: f"/opt/venv/bin/{name}",
+    )
+
+    install_with_doctor_auth(monkeypatch, tmp_path, None, pin_cli=False)
+    assert calls == []
+    assert "linked /home/u/.local/bin/ficelle" not in capsys.readouterr().out
+
+    install_with_doctor_auth(monkeypatch, tmp_path, None, pin_cli=False, expose_cli=True)
+    output = capsys.readouterr().out
+
+    assert calls == [{"interpreter": Path("/usr/bin/python3"), "dry_run": False}]
+    assert "linked /home/u/.local/bin/ficelle" in output
+    # Having just written the link, offering it again would read as the step having failed.
+    assert "--expose-cli" not in output
+
+
+def test_run_install_resolves_closing_commands_from_the_selected_python(monkeypatch, tmp_path):
+    calls: list[tuple[str, Path | None]] = []
+
+    def fake_installed_cli_command(name="ficelle", *, interpreter=None, **_kwargs):
+        calls.append((name, interpreter))
+        return name
+
+    monkeypatch.setattr("ficelle.install.installed_cli_command", fake_installed_cli_command)
+
+    install_with_doctor_auth(monkeypatch, tmp_path, None, pin_cli=False)
+
+    assert calls == [
+        ("ficelle", Path("/usr/bin/python3")),
+        ("ficelle-setup", Path("/usr/bin/python3")),
+    ]
+
+
+def test_run_install_spells_out_the_commands_a_fresh_shell_cannot_run(monkeypatch, tmp_path, capsys):
+    """The whole point of (a): every command setup prints is one the reader is about to type."""
+    monkeypatch.setattr(
+        "ficelle.install.installed_cli_command",
+        lambda name="ficelle", **_kwargs: f"/opt/venv/bin/{name}",
+    )
+    install_with_doctor_auth(
+        monkeypatch,
+        tmp_path,
+        {"openrouter": {"invokable": False, "reason": "missing OPENROUTER_API_KEY"}},
+        pin_cli=False,
+    )
+    output = capsys.readouterr().out
+
+    assert "`ficelle` is not reachable by name from this shell" in output
+    assert "/opt/venv/bin/ficelle set-key openrouter" in output
+    assert "`/opt/venv/bin/ficelle doctor --text` reports which providers are actually configured." in output
+    # The bare form is what a fresh shell answers with `command not found`.
+    assert "  ficelle set-key openrouter" not in output
 
 
 def test_run_install_leaves_a_configured_install_alone(monkeypatch, tmp_path, capsys):

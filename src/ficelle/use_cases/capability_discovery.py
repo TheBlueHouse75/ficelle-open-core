@@ -276,7 +276,7 @@ class CapabilityDiscoveryJob:
     benchmark_body: Callable[[str, dict[str, Any] | None], tuple[dict[str, Any], str, str]]
     invoke_model: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], Any]
     classify_failure: Callable[[int, str, dict[str, Any]], str]
-    set_cooldown: Callable[..., None]
+    set_cooldown: Callable[..., Any]
     record_benchmark_result: Callable[[str, dict[str, Any], dict[str, Any]], None]
     record_verified_capability: Callable[[str, dict[str, Any], dict[str, Any]], None]
     record_success: Callable[[dict[str, Any], float], None]

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from ficelle.failures import DEFAULT_FAILURE_MARKERS
 from ficelle.providers.base import (
     CatalogFetchContext,
@@ -130,3 +132,84 @@ def test_provider_catalog_use_case_delegates_headers_access_and_fetch_context() 
     assert http_calls == [("https://fake.test/models", {"timeout": 7.0, "key": "generic-key"})]
     assert adapter.access_context is not None
     assert adapter.fetch_context is not None
+
+
+# --- Per-family catalog overrides -----------------------------------------------------------
+
+
+def _adapter_for(provider_cfg):
+    from ficelle.providers.openai_compatible import OpenAICompatibleCatalogAdapter
+
+    adapter = OpenAICompatibleCatalogAdapter("groq")
+    return adapter, adapter.catalog_policy(provider_cfg)
+
+
+def test_family_override_narrows_only_the_rows_it_names():
+    # Groq publishes no per-model supported_parameters, so the provider-wide default would
+    # claim tools for every row — including compound, which documents that it accepts no
+    # user-provided tools.
+    provider_cfg = {
+        "catalog_model_defaults": {
+            "context_length": 128_000,
+            "supported_parameters": ["tools", "tool_choice", "response_format"],
+        },
+        "catalog_model_overrides": {"groq/compound": {"supported_parameters": []}},
+    }
+    adapter, policy = _adapter_for(provider_cfg)
+
+    compound = adapter.normalize_catalog_model({"id": "groq/compound"}, policy).trusted_model
+    compound_mini = adapter.normalize_catalog_model({"id": "groq/compound-mini"}, policy).trusted_model
+    ordinary = adapter.normalize_catalog_model({"id": "llama-3.3-70b-versatile"}, policy).trusted_model
+
+    # The corrected family loses the claim entirely, and keeps the rest of the defaults.
+    assert compound["supported_parameters"] == []
+    assert compound_mini["supported_parameters"] == []
+    assert compound["context_length"] == 128_000
+    # Every other model keeps the provider-wide default untouched.
+    assert ordinary["supported_parameters"] == ["tools", "tool_choice", "response_format"]
+
+
+def test_a_models_own_declaration_still_wins_over_an_override():
+    provider_cfg = {
+        "catalog_model_defaults": {"supported_parameters": ["tools"]},
+        "catalog_model_overrides": {"groq/compound": {"supported_parameters": []}},
+    }
+    adapter, policy = _adapter_for(provider_cfg)
+
+    declared = adapter.normalize_catalog_model(
+        {"id": "groq/compound", "supported_parameters": ["tools", "tool_choice"]}, policy
+    ).trusted_model
+
+    # A provider that starts publishing real per-model metadata is believed over our guess.
+    assert declared["supported_parameters"] == ["tools", "tool_choice"]
+
+
+def test_the_most_specific_override_wins_and_unknown_fields_are_dropped():
+    provider_cfg = {
+        "catalog_model_defaults": {"supported_parameters": ["tools"], "context_length": 8_000},
+        "catalog_model_overrides": {
+            "groq/compound": {"context_length": 32_000},
+            "groq/compound-mini": {"context_length": 16_000, "api_key": "leak", "unknown_field": 1},
+        },
+    }
+    adapter, policy = _adapter_for(provider_cfg)
+
+    mini = adapter.normalize_catalog_model({"id": "groq/compound-mini"}, policy).trusted_model
+    full = adapter.normalize_catalog_model({"id": "groq/compound"}, policy).trusted_model
+
+    assert mini["context_length"] == 16_000, "the longer, more specific pattern wins"
+    assert full["context_length"] == 32_000
+    # Same whitelist as the provider-wide defaults: nothing outside trusted fields survives.
+    assert "api_key" not in mini and "unknown_field" not in mini
+
+
+def test_shipped_groq_pack_declares_compound_without_tools():
+    # This file ships to the core-only mirror, where the closed pack is absent by
+    # construction — the one pack-coupled assertion skips there instead of failing.
+    provider_pack = pytest.importorskip(
+        "ficelle_pro.provider_pack", reason="ficelle-pro not installed (core-only environment)"
+    )
+
+    groq = provider_pack.PROVIDER_PACK["groq"]
+
+    assert groq["catalog_model_overrides"]["groq/compound"]["supported_parameters"] == []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +22,18 @@ from ficelle.providers.base import (
 from ficelle.redaction import redact_sensitive_json, sanitize_error_detail
 
 
+def _price_per_token(value: Any) -> float | None:
+    # Bools coerce to 1.0 and "Infinity" parses to inf — both would inflate the
+    # savings estimate, the one direction it must never err in. Finite and >= 0 only.
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 and math.isfinite(parsed) else None
+
+
 OPENCODE_ZEN_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -31,6 +44,18 @@ CONTEXT_LENGTH_CATALOG_ALIASES = ("context_window", "max_context_length")
 
 @dataclass(frozen=True)
 class OpenAICompatibleCatalogAdapter:
+    def adapt_chat_request(
+        self,
+        payload: dict[str, Any],
+        model: dict[str, Any],
+        provider_cfg: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """The provider request-adaptation seam (L3-R4). Identity by default: a dialect
+        transform may only be installed here once a live compatibility probe proved the
+        exact target model accepts it losslessly — never a silent rewrite of the client's
+        tool schemas, required fields, or nullability."""
+        return payload
+
     source: str
 
     def request_headers(self) -> dict[str, str]:
@@ -49,7 +74,54 @@ class OpenAICompatibleCatalogAdapter:
         return headers
 
     def failure_markers(self) -> FailureMarkers:
+        if self.source == "ollama":
+            # Ollama's cloud catalog can list a model that later requires a subscription. Its live
+            # 403 uses account-like status semantics, so these provider-specific words must win
+            # before the generic 403 auth classification: quarantine only that model, not Ollama.
+            return DEFAULT_FAILURE_MARKERS.with_extra(
+                false_free=(
+                    "requires a subscription",
+                    "subscription required",
+                    "upgrade for access",
+                )
+            )
         return DEFAULT_FAILURE_MARKERS
+
+    def reference_prices_for_free_models(self, raw_models: list[Any]) -> dict[str, dict[str, Any]]:
+        """Free-model upstream id -> the paid sibling's USD-per-token prices, with provenance.
+
+        OpenRouter dialect: a strict-zero ``<id>:free`` listing shadows a paid ``<id>``
+        in the same payload, quoted in USD per token. Both halves of that convention —
+        the id suffix and the pricing unit — are this provider's, so they live here;
+        other sources return {} until they declare a pairing of their own.
+        """
+        if self.source != "openrouter":
+            return {}
+        paid: dict[str, dict[str, float]] = {}
+        for model in raw_models:
+            if not isinstance(model, dict):
+                continue
+            upstream_id = str(model.get("id") or "").strip()
+            pricing = model.get("pricing")
+            if not upstream_id or upstream_id.endswith(":free") or not isinstance(pricing, dict):
+                continue
+            prompt = _price_per_token(pricing.get("prompt"))
+            completion = _price_per_token(pricing.get("completion"))
+            if prompt is None or completion is None or (prompt <= 0 and completion <= 0):
+                continue
+            paid[upstream_id] = {"prompt": prompt, "completion": completion}
+        references: dict[str, dict[str, Any]] = {}
+        for model in raw_models:
+            if not isinstance(model, dict):
+                continue
+            upstream_id = str(model.get("id") or "").strip()
+            if not upstream_id.endswith(":free"):
+                continue
+            sibling = upstream_id.removesuffix(":free")
+            price = paid.get(sibling)
+            if price is not None:
+                references[upstream_id] = {**price, "basis": f"{self.source}:{sibling}"}
+        return references
 
     def resolve_budget(self, context: CatalogFetchContext, provider_cfg: dict[str, Any]) -> ProviderBudget | None:
         """This ACCOUNT's budget, read from the provider, or None if it cannot say.
@@ -111,6 +183,7 @@ class OpenAICompatibleCatalogAdapter:
             model_id_allowlist=self._safe_model_id_patterns(provider_cfg, "model_id_allowlist"),
             requires_exact_model_allowlist=self._requires_exact_model_allowlist(provider_cfg),
             rejection_counters=rejection_counters,
+            model_overrides=self._safe_model_overrides(provider_cfg),
         )
 
     def normalize_catalog_model(
@@ -119,8 +192,11 @@ class OpenAICompatibleCatalogAdapter:
         policy: ProviderCatalogPolicy,
     ) -> ProviderNormalizedCatalogModel:
         normalized_model = self._catalog_row_with_normalized_context(model)
-        trusted_model = deep_merge(policy.model_defaults, normalized_model)
-        default_params = self._safe_string_list(policy.model_defaults.get("supported_parameters"))
+        # A matching family override replaces the provider-wide guess for this row only, so
+        # a correction never widens beyond the ids it names.
+        defaults = self._model_defaults_for_row(policy, normalized_model)
+        trusted_model = deep_merge(defaults, normalized_model)
+        default_params = self._safe_string_list(defaults.get("supported_parameters"))
         model_params = self._safe_string_list(normalized_model.get("supported_parameters"))
         if "supported_parameters" in normalized_model and not model_params:
             trusted_model["supported_parameters"] = []
@@ -253,6 +329,41 @@ class OpenAICompatibleCatalogAdapter:
         safe_defaults = {key: raw_defaults[key] for key in TRUSTED_PROVIDER_MODEL_FIELDS if key in raw_defaults}
         redacted = redact_sensitive_json(safe_defaults)
         return redacted if isinstance(redacted, dict) else {}
+
+    def _safe_model_overrides(self, provider_cfg: dict[str, Any]) -> tuple[tuple[str, dict[str, Any]], ...]:
+        """Per-family corrections, sanitized exactly like the provider-wide defaults.
+
+        Same trusted-field whitelist and redaction: an override can only narrow or correct
+        metadata the provider itself is allowed to state, never introduce new keys."""
+        raw = provider_cfg.get("catalog_model_overrides")
+        if not isinstance(raw, dict):
+            return ()
+        overrides: list[tuple[str, dict[str, Any]]] = []
+        for pattern, values in raw.items():
+            key = str(pattern).strip().lower()
+            if not key or not isinstance(values, dict):
+                continue
+            safe = {field: values[field] for field in TRUSTED_PROVIDER_MODEL_FIELDS if field in values}
+            redacted = redact_sensitive_json(safe)
+            if isinstance(redacted, dict) and redacted:
+                overrides.append((key, redacted))
+        # Longest pattern first: a specific id wins over the family prefix it belongs to.
+        return tuple(sorted(overrides, key=lambda item: (-len(item[0]), item[0])))
+
+    def _model_defaults_for_row(
+        self,
+        policy: ProviderCatalogPolicy,
+        normalized_model: dict[str, Any],
+    ) -> dict[str, Any]:
+        model_id = str(normalized_model.get("id") or "").strip().lower()
+        if not model_id or not policy.model_overrides:
+            return policy.model_defaults
+        for pattern, values in policy.model_overrides:
+            if pattern in model_id:
+                # Replace, not merge, for the fields the override names: a corrected
+                # `supported_parameters` must be able to REMOVE what the default claimed.
+                return {**policy.model_defaults, **values}
+        return policy.model_defaults
 
     def _safe_model_id_patterns(self, provider_cfg: dict[str, Any], key: str) -> list[str]:
         raw = provider_cfg.get(key)

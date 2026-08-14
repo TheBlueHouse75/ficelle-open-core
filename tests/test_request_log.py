@@ -557,6 +557,54 @@ def test_source_signature_moves_only_when_the_log_grows(paths):
     assert rl.source_signature(log) != first
 
 
+def test_ingest_records_token_usage_and_summary_sums_the_recorded_savings(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [
+        # The reference price is a fact recorded at route time, so the summary is
+        # immutable history: no read-time catalog join can change it.
+        _line("u1", now=now, offset=10, usage={"prompt_tokens": 1000, "completion_tokens": 500},
+              reference_pricing={"prompt": 1e-06, "completion": 2e-06}),
+        _line("u2", now=now, offset=20, usage={"prompt_tokens": 200, "completion_tokens": 100},
+              selected_model="ficelle/openrouter/unpriced:free"),
+        _line("u3", now=now, offset=30),  # no usage reported
+    ])
+
+    payload = rl.summary(store_path=db, source_path=log, window_seconds=3600, now=now)
+
+    assert payload["usage"] == {"requests": 2, "prompt_tokens": 1200, "completion_tokens": 600}
+    assert payload["savings"]["priced_requests"] == 1
+    assert payload["savings"]["unpriced_requests"] == 1
+    assert payload["savings"]["estimated_saved_usd"] == pytest.approx(1000 * 1e-06 + 500 * 2e-06, abs=2e-06)
+    by_id = {row["request_id"]: row for row in rl.query(store_path=db, source_path=log, limit=10)}
+    assert by_id["u1"]["prompt_tokens"] == 1000
+    assert by_id["u1"]["completion_tokens"] == 500
+    assert by_id["u3"]["prompt_tokens"] is None
+
+
+def test_ingest_defends_against_poisoned_usage_and_price_values(paths):
+    # The success writer clamps at the source, but the ingest must hold on its own:
+    # a foreign or hand-edited log line with inf prices or negative counts would
+    # otherwise poison the window SUM (and inf makes the payload unserializable).
+    log, db = paths
+    now = time.time()
+    _write(log, [
+        _line("p1", now=now, offset=10,
+              usage={"prompt_tokens": -50, "completion_tokens": True},
+              reference_pricing={"prompt": "Infinity", "completion": True}),
+        _line("p2", now=now, offset=20, usage={"prompt_tokens": 10, "completion_tokens": 5},
+              reference_pricing={"prompt": 1e-06, "completion": 1e-06}),
+    ])
+
+    payload = rl.summary(store_path=db, source_path=log, window_seconds=3600, now=now)
+
+    assert payload["usage"] == {"requests": 1, "prompt_tokens": 10, "completion_tokens": 5}
+    assert payload["savings"]["priced_requests"] == 1
+    # The micro-dollar floor may understate by up to 1e-06 (here: 14.9999… → 14 µ$) —
+    # understating is the direction the estimate is allowed to err in.
+    assert payload["savings"]["estimated_saved_usd"] == pytest.approx(1.4e-05)
+
+
 def test_window_seconds_from_label():
     assert rl.window_seconds_from_label("1h") == 3600
     assert rl.window_seconds_from_label("7d") == 604800

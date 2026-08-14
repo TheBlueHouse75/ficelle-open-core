@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from ficelle import license_ops, request_log, update as update_service
+from ficelle.build_identity import package_build_identity
 from ficelle.config_store import ConfigStore
 try:
     from ficelle_pro.compression import (
@@ -70,6 +71,7 @@ from ficelle.domain_models import (
     SelectionResult,
 )
 from ficelle.failures import (
+    DROPPABLE_SAMPLING_PARAMETERS,
     BENCHMARK_ROUTE_BLOCKING_REASONS,
     PROVIDER_ERROR_REASONS,
     PROVIDER_SCOPED_COOLDOWN_REASONS,
@@ -100,6 +102,14 @@ from ficelle.provider_credentials import (
     remove_provider_key as remove_provider_key_use_case,
     resolve_provider_access,
     store_provider_key as store_provider_key_use_case,
+)
+from ficelle.probe_lock import (
+    SYNTHETIC_CASE_ID_HEADER as PROBE_SYNTHETIC_CASE_ID_HEADER,
+    SYNTHETIC_CASE_ID_PATTERN as PROBE_SYNTHETIC_CASE_ID_PATTERN,
+    file_lock,
+    probe_lock_path,
+    synthetic_health_lock_held,
+    synthetic_health_lock_path,
 )
 from ficelle.selection import (
     SelectionPolicy,
@@ -178,8 +188,10 @@ from ficelle.use_cases.capability_discovery import (
     record_background_job_error_in_state,
 )
 from ficelle.use_cases.catalog_refresh import (
+    CatalogPublishDecision,
     CatalogRefreshRunner,
     CatalogRefreshPorts,
+    decide_catalog_publish,
     load_or_refresh_catalog as load_or_refresh_catalog_use_case,
     previous_catalog_baseline,
     publish_catalog as publish_catalog_use_case,
@@ -240,12 +252,17 @@ from ficelle.use_cases.admin_status import (
 from ficelle.use_cases.admin_security import (
     ADMIN_HTML_SECURITY_HEADERS,
     LOOPBACK_BIND_HOSTS,
-    admin_origin_allowed,
     admin_token_matches,
+    basic_token_matches,
+    bearer_token_matches,
+    bind_host_is_loopback,
+    inference_origin_allowed,
     is_loopback_origin as is_loopback_origin_use_case,
     request_host_allowed,
+    same_origin_allowed,
 )
 from ficelle.use_cases.cooldowns import (
+    AppliedCooldown,
     CooldownMutationPorts,
     CooldownReadPorts,
     CooldownStatsPorts,
@@ -516,6 +533,19 @@ CONNECT_TIMEOUT_SECONDS = 5.0
 MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 # A provider is untrusted output: a multi-GB answer must fail this attempt, not the daemon.
 MAX_UPSTREAM_RESPONSE_BYTES = 256 * 1024 * 1024
+# Enough to identify any real Origin/Host in the error log; a longer value is an attack, not a client.
+GUARD_REJECT_LOG_MAX_CHARS = 200
+# The RouterHandler.log_message override bypasses BaseHTTPRequestHandler's own control-character
+# scrubbing, so it re-applies the same table itself: attacker-influenced bytes (URL path, Origin,
+# Host) reach the terminal-viewed error log as \xNN escapes, never as raw control codes. Built
+# here rather than borrowed because the stdlib's table is private and only a security backport
+# on the oldest supported 3.11 releases.
+LOG_CONTROL_CHAR_TABLE = {c: rf"\x{c:02x}" for c in (*range(0x20), *range(0x7F, 0xA0))}
+LOG_CONTROL_CHAR_TABLE[ord("\\")] = r"\\"
+# Bound the product of request size and concurrency while retaining normal agent fan-out.
+MAX_ACTIVE_CHAT_REQUESTS = 32
+MAX_AGGREGATE_CHAT_REQUEST_BYTES = 128 * 1024 * 1024
+MAX_ACTIVE_HTTP_HANDLERS = 64
 
 
 class RequestBodyTooLarge(ValueError):
@@ -524,6 +554,60 @@ class RequestBodyTooLarge(ValueError):
 
 class UpstreamResponseTooLarge(Exception):
     """Raised when a provider's response passes ``MAX_UPSTREAM_RESPONSE_BYTES``."""
+
+
+class ChatRequestLease:
+    def __init__(self, admission: "ChatRequestAdmission", reserved_bytes: int) -> None:
+        self._admission = admission
+        self._reserved_bytes = reserved_bytes
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._admission.release(self._reserved_bytes)
+
+
+class ChatRequestAdmission:
+    """Non-blocking per-server budget for active chat work and retained request bodies."""
+
+    def __init__(self, *, max_active: int, max_reserved_bytes: int) -> None:
+        self.max_active = max(1, int(max_active))
+        self.max_reserved_bytes = max(1, int(max_reserved_bytes))
+        self._active = 0
+        self._reserved_bytes = 0
+        self._lock = threading.Lock()
+
+    @property
+    def active(self) -> int:
+        with self._lock:
+            return self._active
+
+    @property
+    def reserved_bytes(self) -> int:
+        with self._lock:
+            return self._reserved_bytes
+
+    def try_acquire(self, declared_bytes: int) -> ChatRequestLease | None:
+        reserved_bytes = max(0, int(declared_bytes))
+        with self._lock:
+            if self._active >= self.max_active:
+                return None
+            if self._reserved_bytes + reserved_bytes > self.max_reserved_bytes:
+                return None
+            self._active += 1
+            self._reserved_bytes += reserved_bytes
+        return ChatRequestLease(self, reserved_bytes)
+
+    def release(self, reserved_bytes: int) -> None:
+        with self._lock:
+            if self._active <= 0 or reserved_bytes > self._reserved_bytes:
+                raise RuntimeError("chat request admission released without a matching lease")
+            self._active -= 1
+            self._reserved_bytes -= reserved_bytes
+
+
 RUNTIME_STATE_HISTORY_KEYS = state_store_module.RUNTIME_STATE_HISTORY_KEYS
 
 # Static admin assets shipped inside the package (not under HERMES_HOME).
@@ -531,7 +615,7 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 RUNTIME_PATHS = RuntimePaths.from_env(package_dir=PACKAGE_DIR)
 HERMES_HOME = RUNTIME_PATHS.hermes_home
 ROUTER_DIR = RUNTIME_PATHS.router_dir
-_ADMIN_TOKEN: str | None = None
+_ACCESS_TOKEN_CACHE: dict[str, str] = {}
 CATALOG_PATH = RUNTIME_PATHS.catalog_path
 CATALOG_LOCK_PATH = CATALOG_PATH.with_suffix(".lock")
 STATE_PATH = RUNTIME_PATHS.state_path
@@ -552,6 +636,7 @@ COMPRESSION_PENDING_MARKER = CHAT_COMPLETION_COMPRESSION_PENDING_MARKER
 # setup migrates it. Credential WRITES are different: all new writes go to the
 # Ficelle-owned home, while resolution below keeps read-only legacy fallbacks.
 FICELLE_HOME = RUNTIME_PATHS.ficelle_home
+PROVIDER_PROBE_LOCK_PATH = probe_lock_path(FICELLE_HOME)
 CREDENTIAL_ENV_FILE = RUNTIME_PATHS.credential_env_file
 LEGACY_CREDENTIAL_ENV_FILE = RUNTIME_PATHS.legacy_credential_env_file
 FICELLE_SECRETS_KEYCHAIN = RUNTIME_PATHS.ficelle_secrets_keychain
@@ -1476,6 +1561,7 @@ def ficelle_response_headers(
     selected_model: dict[str, Any] | None = None,
     attempt_count: int = 0,
     compression: dict[str, Any] | None = None,
+    dropped_parameters: tuple[str, ...] | list[str] = (),
 ) -> dict[str, str]:
     headers = {
         "X-Ficelle-Request-Id": request_id,
@@ -1490,6 +1576,11 @@ def ficelle_response_headers(
     if compression:
         status = safe_detail(compression.get("status")) or "none"
         headers["X-Ficelle-Compression"] = status if status in {"dry_run", "compressed"} else "none"
+    # A sampling knob the serving model refused was removed from the request. Saying so is
+    # what separates this from a silent rewrite: the caller can see exactly what changed.
+    announced = sorted({str(name) for name in dropped_parameters if str(name) in DROPPABLE_SAMPLING_PARAMETERS})
+    if announced:
+        headers["X-Ficelle-Dropped-Params"] = ",".join(announced)
     return headers
 
 
@@ -1556,8 +1647,8 @@ def apply_chat_attempt_cooldown(
     *,
     request_id: str,
     profile_id: str,
-) -> None:
-    set_cooldown(
+) -> AppliedCooldown:
+    return set_cooldown(
         cooldown.model,
         cooldown.reason,
         config,
@@ -4626,6 +4717,64 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
     }
 
 
+ADMIN_NOTICE_LIMIT = 20
+
+
+def admin_notices_payload(state: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return lightweight automatic guard notices for dashboard polling.
+
+    The full ``/admin/state`` endpoint rebuilds catalog/admin projections and is intentionally not
+    polled. Paid-model notices need only the quarantine map, and expose no provider error detail:
+    model ids, provider source, and the guard timestamp are sufficient for the UI.
+
+    It also carries a ``catalog`` freshness marker, which is what lets the dashboard notice that a
+    tab left open has gone stale without polling the heavy endpoint to find out. The marker is read
+    with ``load_catalog_document`` — the published file, through its mtime-keyed cache — so this
+    stays a plain read: no refresh, no provider fan-out, and none of the quota probes that
+    ``/admin/state`` runs on the request thread.
+    """
+    runtime_state = load_runtime_state() if state is None else state
+    raw_quarantine = runtime_state.get("quarantine") if isinstance(runtime_state, dict) else {}
+    quarantine = raw_quarantine if isinstance(raw_quarantine, dict) else {}
+    rows: list[tuple[float, dict[str, str]]] = []
+    for raw_key, raw_value in quarantine.items():
+        if not isinstance(raw_value, dict):
+            continue
+        if raw_value.get("reason") != "billing_or_paid" or bool(raw_value.get("manual", False)):
+            continue
+        set_at = safe_detail(raw_value.get("set_at"), 80)
+        timestamp = state_store_module.parse_iso_timestamp(set_at)
+        key = safe_state_key(raw_key)
+        provider = safe_detail(key.partition("::")[0], 80)
+        model_id = safe_detail(raw_value.get("model_id"), 250)
+        upstream_id = safe_detail(raw_value.get("upstream_id"), 250)
+        if timestamp is None or not provider or not model_id or not upstream_id:
+            continue
+        rows.append(
+            (
+                timestamp,
+                {
+                    "id": f"{key}@{set_at}",
+                    "provider": provider,
+                    "model_id": model_id,
+                    "upstream_id": upstream_id,
+                    "set_at": set_at,
+                },
+            )
+        )
+    rows.sort(key=lambda item: item[0], reverse=True)
+    raw_catalog = load_catalog_document()
+    catalog = raw_catalog if isinstance(raw_catalog, dict) else {}
+    models = catalog.get("models")
+    return {
+        "paid_models": [row for _timestamp, row in rows[:ADMIN_NOTICE_LIMIT]],
+        "catalog": {
+            "generated_at": safe_detail(catalog.get("generated_at"), 80),
+            "model_count": len(models) if isinstance(models, list) else 0,
+        },
+    }
+
+
 def last_profile_prune_row(raw_value: Any) -> dict[str, Any]:
     if not isinstance(raw_value, dict):
         return {}
@@ -5194,20 +5343,37 @@ def request_log_tail_payload(cursor: int | None, filters: dict[str, str | None])
         return {"generated_at": now_iso(), "cursor": cursor, "entries": [], "resync": False, "error_type": type(exc).__name__}
 
 
+def strict_zero_active(config: dict[str, Any]) -> bool:
+    """The one spelling of "default routing cannot spend": paid fallback is off."""
+    return not bool(config.get("allow_paid_fallback"))
+
+
 def request_log_summary_payload(path: str) -> dict[str, Any]:
     """Aggregate request-health metrics over a window from the derived index."""
     params = parse_qs(urlparse(path).query, keep_blank_values=True)
     window_values = params.get("window")
     window = request_log.window_seconds_from_label(window_values[0] if window_values else None)
+    # "Spent $0.00" is a config-backed claim, not decoration: the dashboard reads the
+    # guarantee from the config, on the degraded payload too — an index hiccup must not
+    # let the client guess at a config state the server never reported.
+    strict_zero = strict_zero_active(load_config())
     try:
         with _REQUEST_LOG_LOCK:
-            return request_log.summary(
+            payload = request_log.summary(
                 store_path=REQUEST_LOG_STORE_PATH,
                 source_path=runtime_read_path(ROUTE_LOG_PATH),
                 window_seconds=window,
             )
+        payload["strict_zero"] = strict_zero
+        return payload
     except Exception as exc:
-        return {"generated_at": now_iso(), "window_seconds": window, "total": 0, "error_type": type(exc).__name__}
+        return {
+            "generated_at": now_iso(),
+            "window_seconds": window,
+            "total": 0,
+            "error_type": type(exc).__name__,
+            "strict_zero": strict_zero,
+        }
 
 
 def admin_status_ports() -> AdminStatusBuildPorts:
@@ -5285,6 +5451,16 @@ def license_variant_structural_fingerprints(config: dict[str, Any]) -> set[str]:
     }
 
 
+def service_build_identity() -> dict[str, Any]:
+    """The build identity of THIS process, snapshotted once (cached in build_identity).
+
+    ``serve()`` warms it at startup: an editable checkout edited while the service stays
+    up must keep reporting the code this process actually imported, not whatever now sits
+    on disk — a stale process claiming the fresh hash is precisely the state the
+    synthetic-health preflight and ``ficelle doctor`` exist to expose."""
+    return package_build_identity()
+
+
 def admin_status(config: dict[str, Any], *, run_quota_probes: bool = True) -> dict[str, Any]:
     effective_config = effective_runtime_config(config)
     catalog = load_cached_catalog_for_admin_status(effective_config)
@@ -5309,14 +5485,18 @@ def admin_status(config: dict[str, Any], *, run_quota_probes: bool = True) -> di
             catalog["models"] = []
             catalog["providers"] = {}
     state = load_runtime_state()
-    return build_admin_status(
+    status = build_admin_status(
         catalog,
         effective_config,
         state if isinstance(state, dict) else {},
     )
+    # The identity of the code answering, not of the state: lets `ficelle doctor` and the
+    # synthetic-health preflight prove they talk to the build they are validating.
+    status["build"] = service_build_identity()
+    return status
 
 
-def admin_page_html() -> str:
+def admin_page_html(*, embed_token: bool = True) -> str:
     """Return the admin dashboard shell.
 
     The dashboard HTML/CSS/JS live as static files under ``assets/admin`` and are
@@ -5326,7 +5506,9 @@ def admin_page_html() -> str:
     if asset is None:
         return "<!doctype html><meta charset=utf-8><title>Ficelle</title><body>admin assets missing</body>"
     html = asset[0].decode("utf-8")
-    token_meta = f'<meta name="ficelle-admin-token" content="{admin_token()}">'
+    token_meta = (
+        f'<meta name="ficelle-admin-token" content="{admin_token()}">' if embed_token else ""
+    )
     html = (
         html
         .replace('/admin/static/admin.css"', f'/admin/static/admin.css?v={admin_asset_version("admin.css")}"')
@@ -5342,16 +5524,11 @@ def admin_page_html() -> str:
     return html
 
 
-def admin_token() -> str:
-    """Return the local admin auth token, creating it (0600) on first use.
-
-    The token guards the admin credential-write endpoint against cross-site browser
-    requests: it is embedded in the same-origin admin page (see ``admin_page_html``),
-    so a page from another origin cannot read it and cannot forge the write."""
-    global _ADMIN_TOKEN
-    if _ADMIN_TOKEN:
-        return _ADMIN_TOKEN
-    path = ROUTER_DIR / "admin-token"
+def _runtime_access_token(filename: str) -> str:
+    cached = _ACCESS_TOKEN_CACHE.get(filename)
+    if cached:
+        return cached
+    path = ROUTER_DIR / filename
     try:
         existing = path.read_text().strip()
         if existing:
@@ -5361,7 +5538,7 @@ def admin_token() -> str:
                 write_private_text(path, existing)
             except OSError:
                 pass
-            _ADMIN_TOKEN = existing
+            _ACCESS_TOKEN_CACHE[filename] = existing
             return existing
     except OSError:
         pass
@@ -5373,8 +5550,33 @@ def admin_token() -> str:
         # stays usable for this process. What changed is that when the write does land, it is
         # never briefly world-readable.
         pass
-    _ADMIN_TOKEN = token
+    _ACCESS_TOKEN_CACHE[filename] = token
     return token
+
+
+def admin_token() -> str:
+    """Return the owner-only credential for control-plane access."""
+    return _runtime_access_token("admin-token")
+
+
+def api_token() -> str:
+    """Return the distinct owner-only credential for exposed OpenAI-compatible clients."""
+    return _runtime_access_token("api-token")
+
+
+def ensure_exposed_access_tokens() -> None:
+    """Fail closed when an exposed listener cannot persist two independently scoped tokens."""
+    tokens = {"admin-token": admin_token(), "api-token": api_token()}
+    if tokens["admin-token"] == tokens["api-token"]:
+        raise RuntimeError("admin-token and api-token must be distinct for a non-loopback bind")
+    for filename, expected in tokens.items():
+        path = ROUTER_DIR / filename
+        try:
+            persisted = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError(f"non-loopback bind requires a persistent owner-only {filename}") from exc
+        if persisted != expected or path.stat().st_mode & 0o077:
+            raise RuntimeError(f"non-loopback bind requires a persistent owner-only {filename}")
 
 
 def is_loopback_origin(origin: str) -> bool:
@@ -5469,6 +5671,65 @@ def upstream_post(url: str, **kwargs: Any) -> Any:
     return upstream_session().post(url, **kwargs)
 
 
+def buffer_bounded_upstream_response(response: Any, *, deadline_monotonic: float | None = None) -> Any:
+    """Buffer a logical non-streaming response without trusting its size metadata.
+
+    ``deadline_monotonic`` bounds a drip-feeding body to the request budget (L2-R2): a
+    provider emitting one byte before every read-idle timeout would otherwise keep the
+    buffering alive past the configured request deadline."""
+    raw_length = str((getattr(response, "headers", {}) or {}).get("Content-Length") or "").strip()
+    if raw_length:
+        try:
+            declared_length = int(raw_length)
+        except ValueError:
+            declared_length = None
+        if declared_length is not None and declared_length > MAX_UPSTREAM_RESPONSE_BYTES:
+            response.close()
+            raise UpstreamResponseTooLarge(
+                f"upstream declared {declared_length} bytes, above the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
+            )
+
+    iter_content = getattr(response, "iter_content", None)
+    if not callable(iter_content):
+        content = bytes(getattr(response, "content", b""))
+        if len(content) > MAX_UPSTREAM_RESPONSE_BYTES:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            raise UpstreamResponseTooLarge(
+                f"upstream response passed the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
+            )
+        return response
+
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        # Same deadline guard as the streaming path: one definition of "the budget ended
+        # this body" for both buffered and streamed responses.
+        for chunk in deadline_guarded_chunks(iter_content(chunk_size=64 * 1024), deadline_monotonic):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_UPSTREAM_RESPONSE_BYTES:
+                raise UpstreamResponseTooLarge(
+                    f"upstream response passed the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
+                )
+            chunks.append(chunk)
+    except Exception:
+        response.close()
+        raise
+    content = b"".join(chunks)
+    # `requests.Response.content` reads these private transport fields. Test doubles generally use
+    # a plain attribute, so update it as well when writable.
+    response._content = content
+    response._content_consumed = True
+    try:
+        response.content = content
+    except (AttributeError, TypeError):
+        pass
+    return response
+
+
 def _publish_catalog_unlocked(catalog: dict[str, Any]) -> None:
     publish_catalog_use_case(
         catalog,
@@ -5487,6 +5748,81 @@ def _publish_catalog(catalog: dict[str, Any]) -> None:
         _publish_catalog_unlocked(catalog)
 
 
+class CatalogRefreshRejectedError(RuntimeError):
+    """A rebuilt catalog was refused publication because it would destroy a working one.
+
+    Carries the previous (still-active) catalog so callers on the request path can keep
+    serving it instead of failing the request.
+    """
+
+    def __init__(self, detail: str, previous_catalog: dict[str, Any]) -> None:
+        super().__init__(detail)
+        self.previous_catalog = previous_catalog
+
+
+CATALOG_REFRESH_ATTEMPTS_PATH = RUNTIME_PATHS.catalog_refresh_attempts_path
+CATALOG_REFRESH_ATTEMPTS_KEEP = 200
+
+
+def _record_catalog_refresh_attempt(decision: CatalogPublishDecision) -> None:
+    """Keep redacted per-provider diagnostics for every refresh attempt (L1-R1/L1-R2).
+
+    A rejected refresh publishes nothing, so without this file its evidence would vanish.
+    Successful attempts are retained too so a catalog transition can be tied to the exact
+    observed generation and promotion decision. Only safe fields are kept: no model rows,
+    no request bodies, no key material — provider errors go through safe_detail.
+    """
+    providers = decision.catalog.get("providers") if isinstance(decision.catalog.get("providers"), dict) else {}
+    entry = {
+        "at": now_iso(),
+        "catalog_generation": decision.catalog.get("generated_at"),
+        "decision": decision.decision,
+        "rejected_reason": safe_detail(decision.rejected_reason) or None,
+        "accepted_count": len([m for m in decision.catalog.get("models", []) if isinstance(m, dict)]),
+        "preserved_by_source": decision.preserved_by_source,
+        "confirmed_empty_sources": decision.confirmed_empty_sources,
+        "providers": {
+            str(source): {
+                "result_class": summary.get("result_class"),
+                "raw_count": summary.get("raw_count"),
+                "accepted_count": summary.get("accepted_count"),
+                "error": safe_detail(summary.get("error")) or None,
+                "enabled": summary.get("enabled"),
+            }
+            for source, summary in providers.items()
+            if isinstance(summary, dict)
+        },
+    }
+    try:
+        existing = load_runtime_json(CATALOG_REFRESH_ATTEMPTS_PATH, [])
+        attempts = existing if isinstance(existing, list) else []
+        # Fields above are already whitelisted; the shared redaction is a second net in
+        # case a provider error string ever carries something it should not.
+        attempts.append(redact_sensitive_json(entry))
+        atomic_write_json(CATALOG_REFRESH_ATTEMPTS_PATH, attempts[-CATALOG_REFRESH_ATTEMPTS_KEEP:])
+    except Exception:
+        # Evidence retention must never break the refresh itself.
+        pass
+
+
+def _catalog_pending_empty_listings(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    row = state.get("catalog_pending_empty_listings")
+    return {str(k): dict(v) for k, v in row.items() if isinstance(v, dict)} if isinstance(row, dict) else {}
+
+
+def _store_catalog_pending_empty_listings(pending: dict[str, dict[str, Any]], previous: dict[str, dict[str, Any]]) -> None:
+    if pending == previous:
+        return
+
+    def mutate(state: dict[str, Any]) -> None:
+        if pending:
+            state["catalog_pending_empty_listings"] = pending
+        else:
+            state.pop("catalog_pending_empty_listings", None)
+
+    _STATE_STORE.update(mutate, reason="catalog_pending_empty_listings")
+
+
 def _refresh_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, Any]:
     # The arrivals notice compares this catalog against the one it is about to overwrite, so
     # it has to sit where the overwrite happens — not in `refresh_catalog`. The prune can
@@ -5499,10 +5835,41 @@ def _refresh_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, A
     #
     # Safe on that path in a way the prune is not: this writes runtime state, never config.
     previous = load_runtime_json(CATALOG_PATH, {})
+    previous_catalog = previous if isinstance(previous, dict) else {}
     catalog = _build_catalog_for_effective_config(config)
-    _publish_catalog(catalog)
-    record_catalog_additions(catalog, previous if isinstance(previous, dict) else {})
-    return catalog
+    pending_before = _catalog_pending_empty_listings(load_runtime_state())
+    decision = decide_catalog_publish(
+        catalog,
+        previous_catalog,
+        config,
+        pending_empty_listings=pending_before,
+        now_iso=now_iso,
+    )
+    _record_catalog_refresh_attempt(decision)
+    if decision.decision == "rejected_empty":
+        detail = f"refresh rejected: {safe_detail(decision.rejected_reason)}"
+        # Empty-listing observations remain valid even though this generation is not
+        # promoted; otherwise one unrelated transient provider could prevent another
+        # provider's confirmed removal forever.
+        _store_catalog_pending_empty_listings(decision.pending_empty_listings, pending_before)
+        record_catalog_refresh_error(
+            detail,
+            decision=decision.decision,
+            catalog_generation=str(catalog.get("generated_at") or "") or None,
+            catalog_stale_since=str(previous_catalog.get("generated_at") or "") or None,
+        )
+        raise CatalogRefreshRejectedError(
+            detail,
+            decision.fallback_catalog or previous_catalog,
+        )
+    _publish_catalog(decision.catalog)
+    _store_catalog_pending_empty_listings(decision.pending_empty_listings, pending_before)
+    # No `record_catalog_refresh_error(None, ...)` here: `_publish_catalog` already left
+    # `last_update_reason` as `"refresh_catalog"`, and a promoted/merged decision is exactly
+    # `_record_catalog_refresh_attempt`'s job above — a second state write would only
+    # relabel the reason as `"catalog_refresh_error"` on a refresh that had none.
+    record_catalog_additions(decision.catalog, previous_catalog)
+    return decision.catalog
 
 
 def refresh_catalog(config: dict[str, Any]) -> dict[str, Any]:
@@ -5516,6 +5883,9 @@ def refresh_catalog(config: dict[str, Any]) -> dict[str, Any]:
     effective = effective_runtime_config(config)
     # Publishes, and records the arrivals against the catalog it replaced — every rebuild
     # does, not only this one.
+    # A rejected refresh raises CatalogRefreshRejectedError before this point publishes,
+    # prunes, or touches budgets: pruning profiles off an empty rebuild would act on
+    # evidence the reject just declared untrustworthy. Callers decide how to surface it.
     catalog = _refresh_catalog_for_effective_config(effective)
     prune_stale_profile_models(config, catalog, previous if isinstance(previous, dict) else {})
     refresh_provider_budgets(effective)
@@ -5570,12 +5940,21 @@ def refresh_provider_budgets(effective_config: dict[str, Any]) -> dict[str, Prov
     return budgets
 
 
+def _refresh_catalog_for_effective_config_or_previous(config: dict[str, Any]) -> dict[str, Any]:
+    """The TTL reload behind a routing request must never fail the request on a rejected
+    refresh: keep serving the previous generation and let the periodic loop retry."""
+    try:
+        return _refresh_catalog_for_effective_config(config)
+    except CatalogRefreshRejectedError as exc:
+        return exc.previous_catalog
+
+
 def _load_or_refresh_catalog_for_effective_config(config: dict[str, Any], force: bool = False) -> dict[str, Any]:
     catalog = load_or_refresh_catalog_use_case(
         config,
         catalog_path=CATALOG_PATH,
         load_json=_load_runtime_json_for_catalog_use_case,
-        refresh_catalog=_refresh_catalog_for_effective_config,
+        refresh_catalog=_refresh_catalog_for_effective_config_or_previous,
         catalog_config_fingerprint=catalog_config_fingerprint,
         now_seconds=time.time,
         force=force,
@@ -6053,6 +6432,13 @@ def safe_attempt_row(raw: dict[str, Any]) -> dict[str, Any]:
         row["error_type"] = safe_detail(raw.get("error_type"))
     if raw.get("stream_started") is not None:
         row["stream_started"] = bool(raw.get("stream_started"))
+    retried_without = raw.get("retried_without_parameters")
+    if isinstance(retried_without, list) and retried_without:
+        # Whitelisted like every other field here: only known sampling-knob names survive,
+        # so a provider echoing arbitrary text can never write it into state.
+        row["retried_without_parameters"] = sorted(
+            {str(name) for name in retried_without if str(name) in DROPPABLE_SAMPLING_PARAMETERS}
+        )
     return row
 
 
@@ -6109,6 +6495,7 @@ def chat_success_response_headers(
     selected_model: dict[str, Any],
     attempt_count: int,
     compression: dict[str, Any] | None,
+    dropped_parameters: tuple[str, ...] | list[str] = (),
 ) -> dict[str, str]:
     return ficelle_response_headers(
         request_id,
@@ -6116,6 +6503,7 @@ def chat_success_response_headers(
         selected_model,
         attempt_count,
         compression=compression,
+        dropped_parameters=dropped_parameters,
     )
 
 
@@ -6250,6 +6638,15 @@ def build_last_route_mutator(
     return mutate
 
 
+def _telemetry_with_synthetic_case(
+    telemetry: ChatCompletionRouteTelemetry,
+    synthetic_case_id: str | None,
+) -> ChatCompletionRouteTelemetry:
+    if synthetic_case_id is not None:
+        telemetry.route_log["synthetic_case_id"] = synthetic_case_id
+    return telemetry
+
+
 def record_success_with_telemetry(
     model: dict[str, Any],
     latency_seconds: float,
@@ -6305,8 +6702,8 @@ def cooldown_mutation_ports() -> CooldownMutationPorts:
     )
 
 
-def set_provider_cooldown_in_state(state: dict[str, Any], source: str, reason: str, config: dict[str, Any], detail: str | None = None) -> None:
-    set_provider_cooldown_in_state_use_case(state, source, reason, config, detail, ports=cooldown_mutation_ports())
+def set_provider_cooldown_in_state(state: dict[str, Any], source: str, reason: str, config: dict[str, Any], detail: str | None = None) -> str:
+    return set_provider_cooldown_in_state_use_case(state, source, reason, config, detail, ports=cooldown_mutation_ports())
 
 
 def quota_probe_backoff_seconds(config: dict[str, Any], consecutive_failures: int) -> int:
@@ -6321,8 +6718,8 @@ def set_quota_cooldown_in_state(
     *,
     probe_failed: bool = False,
     cooldown_key_override: str | None = None,
-) -> None:
-    set_quota_cooldown_in_state_use_case(
+) -> str:
+    return set_quota_cooldown_in_state_use_case(
         state,
         model,
         config,
@@ -6394,8 +6791,8 @@ def set_cooldown(
     status: int | str | None = None,
     request_id: str | None = None,
     profile_id: str | None = None,
-) -> None:
-    set_cooldown_use_case(
+) -> AppliedCooldown:
+    return set_cooldown_use_case(
         model,
         reason,
         config,
@@ -6707,13 +7104,21 @@ def run_due_quota_probes(
     source: str | None = None,
     keys: set[str] | None = None,
 ) -> dict[str, Any]:
-    return quota_probe_runner().run_due_quota_probes(
-        config,
-        catalog,
-        force=force,
-        source=source,
-        keys=keys,
-    )
+    with file_lock(PROVIDER_PROBE_LOCK_PATH, blocking=False) as acquired:
+        if not acquired:
+            return {
+                "status": "skipped",
+                "reason": "provider_probes_already_running",
+                "probed_count": 0,
+                "results": [],
+            }
+        return quota_probe_runner().run_due_quota_probes(
+            config,
+            catalog,
+            force=force,
+            source=source,
+            keys=keys,
+        )
 
 
 def due_quota_probe_keys_for_request(requested_model: str, models: list[dict[str, Any]], config: dict[str, Any], state: dict[str, Any]) -> list[str]:
@@ -6886,6 +7291,95 @@ def model_route_competence(profile_id: str, model: dict[str, Any], state: dict[s
     )
 
 
+# How long a row preserved from a failed provider fetch keeps routing (L1-R1). Within the
+# grace it serves with `catalog_stale: true` exposed; past it, its mutable pricing evidence
+# is too old to trust and the row is excluded until a refresh revalidates it. Half the
+# default catalog TTL: several bounded-backoff refresh retries fit inside one grace.
+DEFAULT_CATALOG_STALE_GRACE_SECONDS = 1800
+
+
+def stale_catalog_block_reason(
+    model: dict[str, Any],
+    config: dict[str, Any],
+    state: dict[str, Any],
+) -> str | None:
+    stale_since = model.get("stale_since") if model.get("catalog_stale") else None
+    if stale_since is None:
+        refresh = state.get("catalog_refresh") if isinstance(state.get("catalog_refresh"), dict) else {}
+        # A rejected all-transient refresh leaves the catalog file untouched. Carry its
+        # original proof epoch in state so a manual rejection cannot make those unmarked
+        # rows route indefinitely merely because the old document is still within its TTL.
+        stale_since = refresh.get("catalog_stale_since")
+    if stale_since is None:
+        return None
+    grace = safe_int(config.get("catalog_stale_grace_seconds"), DEFAULT_CATALOG_STALE_GRACE_SECONDS)
+    stale_epoch = parse_iso_timestamp(stale_since)
+    if stale_epoch is None:
+        # A stale row whose proof age cannot be established fails closed.
+        return "stale_catalog"
+    return "stale_catalog" if time.time() - stale_epoch > grace else None
+
+
+# How long a learned "this model rejects this sampling knob" verdict stands before it is
+# re-tested. Providers enable options over time, so the verdict self-heals on the same
+# horizon as verified capabilities rather than being permanent.
+DEFAULT_UNSUPPORTED_PARAMETER_TTL_SECONDS = 7 * 24 * 3600
+
+
+def unsupported_parameter_ttl_seconds(config: dict[str, Any] | None = None) -> float:
+    raw = (config or load_runtime_config()).get("unsupported_parameter_ttl_seconds")
+    seconds = safe_float(raw, DEFAULT_UNSUPPORTED_PARAMETER_TTL_SECONDS) if raw is not None else DEFAULT_UNSUPPORTED_PARAMETER_TTL_SECONDS
+    return max(3600.0, seconds)
+
+
+def unsupported_parameters_for_model(
+    model: dict[str, Any],
+    body: dict[str, Any] | None = None,
+    *,
+    config: dict[str, Any] | None = None,
+    state: dict[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Sampling knobs this model rejected recently, intersected with what the body carries.
+
+    The proactive half of the drop-and-retry contract: a knob already refused is removed
+    before the request is sent, so the wasted round trip happens once per TTL, not once per
+    request."""
+    runtime_state = state if state is not None else load_runtime_state()
+    learned = runtime_state.get("unsupported_parameters")
+    row = learned.get(cooldown_key(model)) if isinstance(learned, dict) else None
+    if not isinstance(row, dict):
+        return ()
+    ttl = unsupported_parameter_ttl_seconds(config)
+    now = time.time()
+    present = set(body or {})
+    return tuple(
+        parameter
+        for parameter, learned_at in sorted(row.items())
+        if isinstance(learned_at, (int, float))
+        and now - float(learned_at) < ttl
+        and (not body or parameter in present)
+    )
+
+
+def learn_unsupported_parameters(model: dict[str, Any], parameters: tuple[str, ...]) -> None:
+    """Record that this model rejected these sampling knobs, with the time it happened."""
+    if not parameters:
+        return
+
+    def mutate(state: dict[str, Any]) -> None:
+        learned = state.setdefault("unsupported_parameters", {})
+        row = learned.setdefault(cooldown_key(model), {})
+        now = time.time()
+        for parameter in parameters:
+            row[str(parameter)] = now
+
+    try:
+        _STATE_STORE.update(mutate, reason="learn_unsupported_parameters")
+    except Exception:
+        # Learning is an optimization: failing to persist it must never fail the request.
+        pass
+
+
 def selection_policy() -> SelectionPolicy:
     return SelectionPolicy(
         model_on_cooldown=model_on_cooldown,
@@ -6897,6 +7391,7 @@ def selection_policy() -> SelectionPolicy:
         sort_available_for_virtual_model=sort_available_for_virtual_model,
         route_competence_gate_result=route_competence_gate_result,
         virtual_models=set(VIRTUAL_MODELS),
+        stale_model_block_reason=stale_catalog_block_reason,
     )
 
 
@@ -7120,6 +7615,91 @@ def pick_vision_fixture(index: int | None = None) -> tuple[str, str]:
     return pick_vision_fixture_use_case(index, ports=benchmark_media_ports())
 
 
+# --- Synthetic-run correlation (L2-R3) ------------------------------------------------------
+#
+# A synthetic client that times out client-side gets no response headers, so its request used
+# to become unattributable. This header restores exact correlation without trusting
+# user-controlled route ids: it is accepted only from loopback while the synthetic-health
+# lock for this FICELLE_HOME is held, strictly validated, never forwarded upstream (upstream
+# headers are built explicitly in invoke_model), and never replaces Ficelle's own request id.
+# Header name and shape live in probe_lock (the shared synthetic contract module), so the
+# harness that sends the id and this gate that validates it can never drift apart.
+SYNTHETIC_CASE_ID_HEADER = PROBE_SYNTHETIC_CASE_ID_HEADER
+SYNTHETIC_CASE_ID_PATTERN = PROBE_SYNTHETIC_CASE_ID_PATTERN
+# Socket peer addresses, not bind hosts: deliberately distinct from the loopback sets in
+# use_cases/admin_security.py (bind hosts) and url_security.py (URL hostnames).
+LOOPBACK_CLIENT_ADDRESSES = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+_SYNTHETIC_CASE_IDS_SEEN: set[str] = set()
+_SYNTHETIC_RUN_WAS_ACTIVE = False
+_SYNTHETIC_CASE_IDS_THREAD_LOCK = threading.Lock()
+
+
+def synthetic_health_run_active() -> bool:
+    return synthetic_health_lock_held(FICELLE_HOME)
+
+
+def accept_synthetic_case_id(raw_value: str | None, client_address: str) -> str | None:
+    """The validated synthetic case id for this request, or None when any gate fails.
+
+    Gates (all required): loopback client, active synthetic-health lock, strict
+    `[A-Za-z0-9._-]{1,80}` shape, and no duplicate within the active run. Case ids are
+    deterministic across runs and this service is long-lived, so the seen-set is keyed to
+    the run itself: it is cleared on every observed inactive→active lock transition (a new
+    run started) and whenever the lock is observed released."""
+    if not raw_value:
+        return None
+    if client_address not in LOOPBACK_CLIENT_ADDRESSES:
+        return None
+    if not SYNTHETIC_CASE_ID_PATTERN.match(raw_value):
+        return None
+    global _SYNTHETIC_RUN_WAS_ACTIVE
+    run_active = synthetic_health_run_active()
+    with _SYNTHETIC_CASE_IDS_THREAD_LOCK:
+        if not run_active:
+            _SYNTHETIC_CASE_IDS_SEEN.clear()
+            _SYNTHETIC_RUN_WAS_ACTIVE = False
+            return None
+        if not _SYNTHETIC_RUN_WAS_ACTIVE:
+            # First headered request of a new run: previous run's ids must not shadow it.
+            _SYNTHETIC_CASE_IDS_SEEN.clear()
+        _SYNTHETIC_RUN_WAS_ACTIVE = True
+        if raw_value in _SYNTHETIC_CASE_IDS_SEEN:
+            return None
+        _SYNTHETIC_CASE_IDS_SEEN.add(raw_value)
+    return raw_value
+
+
+class RequestDeadlineExceeded(Exception):
+    """The configured request deadline expired while an attempt was in flight (L2-R2).
+
+    Distinct from a provider `timeout` (the profile read budget) and from a downstream
+    client timeout: this is Ficelle's own request budget ending the attempt."""
+
+
+# Kept from the remaining request budget for writing the response and its telemetry, so the
+# whole request still completes near the configured deadline instead of at deadline+margin.
+REQUEST_BUDGET_MARGIN_SECONDS = 2.0
+# An attempt is never given less read budget than this: a sub-second timeout only measures
+# the network, not the model.
+REQUEST_BUDGET_FLOOR_SECONDS = 1.0
+
+
+def deadline_guarded_chunks(chunks: Iterable[bytes], deadline_monotonic: float | None) -> Iterable[bytes]:
+    """Stop consuming an upstream stream at the absolute request deadline (L2-R2).
+
+    A drip-feeding provider that emits one byte before every read-idle timeout keeps
+    resetting the socket timeout forever; this guard is what bounds that stream to the
+    request budget. The raise surfaces through `stream_chunks_to_writer` as a mid-stream
+    failure once bytes were delivered."""
+    if deadline_monotonic is None:
+        yield from chunks
+        return
+    for chunk in chunks:
+        if time.monotonic() > deadline_monotonic:
+            raise RequestDeadlineExceeded("request deadline expired while streaming the response")
+        yield chunk
+
+
 def invoke_model(
     model: dict[str, Any],
     body: dict[str, Any],
@@ -7127,6 +7707,8 @@ def invoke_model(
     *,
     timeout_seconds: float | int | None = None,
     extra_headers: dict[str, str] | None = None,
+    remaining_budget_seconds: float | None = None,
+    deadline_monotonic: float | None = None,
 ) -> requests.Response:
     source = str(model.get("source"))
     access = provider_access_for(source, config)
@@ -7142,6 +7724,12 @@ def invoke_model(
     # that has not been seen emitting one, which is nearly all of them. See
     # `ficelle.reasoning_replay` for why this is the one body rewrite Ficelle performs.
     payload = REASONING_REPLAY_STORE.replay_into_body(str(model.get("id") or ""), payload, now=time.time())
+    # The typed provider request-adaptation seam (L3-R4): identity unless the provider
+    # adapter installed a live-proven lossless transform. Generic mechanism here, provider
+    # policy in the adapter — never a silent rewrite of the client's schemas.
+    payload = provider_catalog_adapter(source).adapt_chat_request(
+        payload, model, (config.get("providers") or {}).get(source)
+    )
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json" if not payload.get("stream") else "text/event-stream",
@@ -7155,22 +7743,45 @@ def invoke_model(
         timeout = float(timeout_seconds) if timeout_seconds is not None else request_timeout_seconds_for_profile(requested_model, config)
     except Exception:
         timeout = request_timeout_seconds_for_profile(requested_model, config)
+    # The profile read budget never exceeds what remains of the request deadline (L2-R2):
+    # an in-flight attempt is constrained by the smaller of the two, minus a bounded margin
+    # for writing the response. A timeout raised under that constraint is the request
+    # budget ending the attempt, not the provider being slow — report it as such.
+    budget_constrained = False
+    if remaining_budget_seconds is not None:
+        budgeted = max(REQUEST_BUDGET_FLOOR_SECONDS, remaining_budget_seconds - REQUEST_BUDGET_MARGIN_SECONDS)
+        if budgeted < timeout:
+            timeout = budgeted
+            budget_constrained = True
     record_upstream_spend(model)
     # `upstream_post` (pooled single exit for chat traffic) keeps main's connection reuse;
     # binding the result is what lets the trace be observed before the response is returned.
-    response = upstream_post(
-        f"{base_url.rstrip('/')}/chat/completions",
-        headers=headers,
-        json=payload,
-        # Separate, short connect timeout so a black-holed provider endpoint fails over in
-        # seconds instead of holding the whole profile timeout at connect — the same policy the
-        # catalog fetch already applies (providers/openai_compatible.py). A model that is simply
-        # slow to *answer* still gets the full read budget.
-        timeout=(min(CONNECT_TIMEOUT_SECONDS, timeout), timeout),
-        stream=bool(payload.get("stream")),
-    )
-    if not bool(payload.get("stream")):
-        observe_reasoning_trace(model, response)
+    try:
+        response = upstream_post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+            # Separate, short connect timeout so a black-holed provider endpoint fails over in
+            # seconds instead of holding the whole profile timeout at connect — the same policy the
+            # catalog fetch already applies (providers/openai_compatible.py). A model that is simply
+            # slow to *answer* still gets the full read budget.
+            timeout=(min(CONNECT_TIMEOUT_SECONDS, timeout), timeout),
+            # Always stream at the HTTP transport layer so provider-controlled bytes can be bounded
+            # before they enter memory. Logical downstream streaming remains controlled by the payload.
+            stream=True,
+        )
+        if not bool(payload.get("stream")):
+            response = buffer_bounded_upstream_response(response, deadline_monotonic=deadline_monotonic)
+            observe_reasoning_trace(model, response)
+    except requests.exceptions.Timeout as exc:
+        # A connect timeout is never the request budget's doing: the connect phase is
+        # capped at CONNECT_TIMEOUT_SECONDS regardless of the budget, and a black-holed
+        # endpoint must keep its fast-failover attribution (and its provider penalty).
+        if budget_constrained and not isinstance(exc, requests.exceptions.ConnectTimeout):
+            raise RequestDeadlineExceeded(
+                f"request deadline expired during the provider call ({safe_detail(exc)})"
+            ) from exc
+        raise
     return response
 
 
@@ -7882,6 +8493,29 @@ def sse_error_event(code: str, detail: str | None = None) -> bytes:
     return b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n"
 
 
+def sse_data_objects(text: str) -> Iterator[dict[str, Any]]:
+    """Yield the parsed JSON object of each complete `data:` line, in order.
+
+    The shared scan under both stream inspectors: a line that is not a `data:` line, is
+    the `[DONE]` terminator, or does not parse to a JSON object is skipped — which also
+    covers a buffer that begins or ends mid-line (the cut fragment fails one of those
+    tests). Bounded by the caller's buffer.
+    """
+    for line in text.splitlines():
+        payload = line.strip()
+        if not payload.startswith("data:"):
+            continue
+        payload = payload[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            yield parsed
+
+
 def upstream_stream_error_payload(chunk: bytes) -> dict[str, Any] | None:
     """The error object a provider put in its first streamed chunk, or None.
 
@@ -7899,29 +8533,71 @@ def upstream_stream_error_payload(chunk: bytes) -> dict[str, Any] | None:
         return None
     if not text:
         return None
-    candidates: list[str] = []
+    parsed_objects: Iterable[dict[str, Any]]
     if text.startswith("data:"):
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("data:"):
-                payload = line[len("data:"):].strip()
-                if payload and payload != "[DONE]":
-                    candidates.append(payload)
+        parsed_objects = sse_data_objects(text)
     elif text.startswith("{"):
         # Some providers drop the SSE framing entirely and answer with a bare JSON error.
-        candidates.append(text)
-    for payload in candidates:
         try:
-            parsed = json.loads(payload)
+            bare = json.loads(text)
         except ValueError:
-            continue
-        if isinstance(parsed, dict) and isinstance(parsed.get("error"), (dict, str)):
+            return None
+        parsed_objects = [bare] if isinstance(bare, dict) else []
+    else:
+        return None
+    for parsed in parsed_objects:
+        if isinstance(parsed.get("error"), (dict, str)):
             error = parsed["error"]
             return error if isinstance(error, dict) else {"message": error}
     return None
 
 
-def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: Any) -> dict[str, Any]:
+# How much of the stream's tail is kept to recognize the terminal frame. An SSE terminator is
+# tiny (`data: [DONE]` plus framing), so a bounded tail recognizes it across arbitrary chunk
+# boundaries without buffering the stream — parser carry-over cannot grow past this (L2-R1).
+SSE_TERMINAL_TAIL_BYTES = 4096
+
+
+def sse_stream_ended_with_done(tail: bytes) -> bool:
+    """True when the stream's final complete event is the `[DONE]` terminator.
+
+    Reads only the bounded tail: the last `data:` line must carry exactly `[DONE]` and only
+    framing whitespace may follow it. Content after a `[DONE]` therefore invalidates it —
+    a non-terminal `[DONE]` is not a clean end.
+    """
+    text = tail.decode("utf-8", errors="replace")
+    stripped = text.rstrip("\r\n \t")
+    marker = stripped.rfind("data:")
+    if marker == -1:
+        return False
+    return stripped[marker + len("data:"):].strip() == "[DONE]"
+
+
+def usage_from_sse_tail(tail: bytes) -> dict[str, Any] | None:
+    """The `usage` object of the stream's final chunks, when the provider emitted one.
+
+    OpenAI-style streams put usage in a late chunk right before `[DONE]`, and only when
+    the caller asked for it (`stream_options.include_usage`) — Ficelle never alters the
+    upstream request, so this is opportunistic: parse the already-buffered terminal tail
+    and take the last well-formed usage object found.
+    """
+    # The common case is a client that never asked for usage: skip all parsing for it.
+    if b'"usage"' not in tail:
+        return None
+    usage: dict[str, Any] | None = None
+    for parsed in sse_data_objects(tail.decode("utf-8", errors="replace")):
+        if isinstance(parsed.get("usage"), dict):
+            usage = parsed["usage"]
+    return usage
+
+
+def stream_chunks_to_writer(
+    chunks: Iterable[bytes],
+    write_chunk: Any,
+    flush: Any,
+    *,
+    expect_sse_done: bool = True,
+) -> dict[str, Any]:
     response_committed = False
     # True only while a call into `write_chunk`/`flush` is in flight — the delivery side. An
     # exception raised under this flag never came from the upstream, which is what matters here: a
@@ -7933,6 +8609,23 @@ def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: An
     chunk_count = 0
     bytes_sent = 0
     stream_tail = b""
+
+    def emit_terminal_error(reason: str, detail: str | None) -> None:
+        # Best-effort — the client may already be gone (broken pipe); the failure is still
+        # reported to the caller via the returned dict regardless. Never a synthetic [DONE]:
+        # a truncated or error-terminated stream must stay distinguishable from a complete one.
+        try:
+            if stream_tail.endswith(b"\n\n"):
+                boundary = b""
+            elif stream_tail.endswith(b"\n"):
+                boundary = b"\n"
+            else:
+                boundary = b"\n\n"
+            write_chunk(boundary + sse_error_event(reason, detail))
+            flush()
+        except Exception:
+            pass
+
     try:
         for chunk in chunks:
             if not chunk:
@@ -7967,7 +8660,7 @@ def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: An
             write_chunk(chunk)
             chunk_count += 1
             bytes_sent += len(chunk)
-            stream_tail = (stream_tail + chunk)[-2:]
+            stream_tail = (stream_tail + chunk)[-SSE_TERMINAL_TAIL_BYTES:]
             flush()
             writing_to_client = False
     except Exception as exc:
@@ -7982,19 +8675,7 @@ def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: An
             # The HTTP response may already be committed (headers sent, no retry possible):
             # emit an explicit terminal error frame so the client sees a failure instead of a
             # silently truncated stream.
-            # Best-effort — the client may already be gone (broken pipe); the failure is still
-            # reported to the caller via the returned dict regardless.
-            try:
-                if stream_tail.endswith(b"\n\n"):
-                    boundary = b""
-                elif stream_tail.endswith(b"\n"):
-                    boundary = b"\n"
-                else:
-                    boundary = b"\n\n"
-                write_chunk(boundary + sse_error_event(reason, detail))
-                flush()
-            except Exception:
-                pass
+            emit_terminal_error(reason, detail)
         return {
             "status": "fail",
             "reason": reason,
@@ -8012,12 +8693,28 @@ def stream_chunks_to_writer(chunks: Iterable[bytes], write_chunk: Any, flush: An
             "chunk_count": 0,
             "bytes_sent": 0,
         }
+    if expect_sse_done and not sse_stream_ended_with_done(stream_tail):
+        # HTTP 200 with bytes delivered but no terminal [DONE]: a clean-looking EOF that is
+        # actually a truncation (L2-R1). The response is committed, so no fallback — the
+        # client gets an explicit terminal error frame and telemetry records the failure.
+        detail = "stream ended without a terminal [DONE] event"
+        emit_terminal_error("mid_stream_failure", detail)
+        return {
+            "status": "fail",
+            "reason": "mid_stream_failure",
+            "stream_started": True,
+            "chunk_count": chunk_count,
+            "bytes_sent": bytes_sent,
+            "error_type": "missing_done",
+            "message": detail,
+        }
     return {
         "status": "ok",
         "reason": "ok",
         "stream_started": True,
         "chunk_count": chunk_count,
         "bytes_sent": bytes_sent,
+        "usage": usage_from_sse_tail(stream_tail),
     }
 
 
@@ -8230,7 +8927,10 @@ def benchmark_profile(profile_id: str, config: dict[str, Any], *, all_candidates
     if not _BENCHMARK_RUN_LOCK.acquire(blocking=False):
         return {"status": "skipped", "reason": "benchmark_already_running", "profile": profile_id, "results": []}
     try:
-        return _benchmark_profile_locked(profile_id, config, all_candidates=all_candidates, only_model_id=only_model_id)
+        with file_lock(PROVIDER_PROBE_LOCK_PATH, blocking=False) as acquired:
+            if not acquired:
+                return {"status": "skipped", "reason": "provider_probes_already_running", "profile": profile_id, "results": []}
+            return _benchmark_profile_locked(profile_id, config, all_candidates=all_candidates, only_model_id=only_model_id)
     finally:
         _BENCHMARK_RUN_LOCK.release()
 
@@ -8417,7 +9117,10 @@ def run_auto_benchmark_cycle(config: dict[str, Any]) -> dict[str, Any]:
     if not _BENCHMARK_RUN_LOCK.acquire(blocking=False):
         return {"status": "skipped", "reason": "benchmark_already_running", "models": 0}
     try:
-        return _run_auto_benchmark_cycle_locked(config)
+        with file_lock(PROVIDER_PROBE_LOCK_PATH, blocking=False) as acquired:
+            if not acquired:
+                return {"status": "skipped", "reason": "provider_probes_already_running", "models": 0}
+            return _run_auto_benchmark_cycle_locked(config)
     finally:
         _BENCHMARK_RUN_LOCK.release()
 
@@ -8668,7 +9371,7 @@ def run_failover_demo(
         all_candidates_free=all(
             model_is_strict_zero(model) for model in candidates if str(model.get("id") or "") in attempted_ids
         ),
-        paid_fallback_allowed=bool(effective_config.get("allow_paid_fallback")),
+        paid_fallback_allowed=not strict_zero_active(effective_config),
     )
 
 
@@ -8791,6 +9494,38 @@ class ThreadingHTTPServer(_StdThreadingHTTPServer):
     # waits out a retransmit before its request is even seen.
     request_queue_size = 128
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.chat_admission = ChatRequestAdmission(
+            max_active=MAX_ACTIVE_CHAT_REQUESTS,
+            max_reserved_bytes=MAX_AGGREGATE_CHAT_REQUEST_BYTES,
+        )
+        self._handler_slots = threading.BoundedSemaphore(MAX_ACTIVE_HTTP_HANDLERS)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._handler_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._handler_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._handler_slots.release()
+
 
 class RouterHandler(BaseHTTPRequestHandler):
     server_version = "Ficelle/0.1"
@@ -8879,7 +9614,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         # still open one and park a handler thread. The admin origin check closes that door;
         # an Origin-less client (curl) is allowed, as everywhere else on the admin surface.
         if not self._admin_origin_ok():
-            self._send_json(403, {"error": {"message": "cross-origin request stream rejected", "type": "forbidden"}})
+            message = "cross-origin request stream rejected"
+            self._log_rejected_header(message, "Origin")
+            self._send_json(403, {"error": {"message": message, "type": "forbidden"}})
             return
         if not _REQUEST_STREAM_SLOTS.acquire(blocking=False):
             self._send_json(503, {"error": {"message": "too many live request streams", "type": "busy"}})
@@ -8977,20 +9714,48 @@ class RouterHandler(BaseHTTPRequestHandler):
         return data
 
     def _bind_is_loopback(self) -> bool:
-        return str(self.config.get("host") or "127.0.0.1").strip().lower() in LOOPBACK_BIND_HOSTS
+        return bind_host_is_loopback(self.config.get("host"))
 
     def _admin_origin_ok(self) -> bool:
-        """CSRF guard for admin mutations. A browser always sends ``Origin`` on a POST;
-        accept it only when it is this exact loopback server (host AND port), which
-        blocks both cross-site pages and other local apps on a different port. A request
-        with no ``Origin`` (curl/CLI) is allowed — it cannot be driven cross-site.
-
-        That last allowance only holds while the socket itself is the boundary. On a
-        non-loopback bind anyone on the network can send an Origin-less POST, so there the
-        admin token becomes the gate instead (see ``_admin_write_authorized``)."""
-        return admin_origin_allowed(
+        """CSRF guard: browser mutations must name this exact request host and port."""
+        return same_origin_allowed(
             self.headers.get("Origin"),
+            self.headers.get("Host"),
             self.server.server_address[1],  # type: ignore[attr-defined]
+        )
+
+    def _remote_admin_authenticated(self) -> bool:
+        authorization = self.headers.get("Authorization")
+        expected = admin_token()
+        return (
+            basic_token_matches(authorization, expected)
+            or bearer_token_matches(authorization, expected)
+            or admin_token_matches(self.headers.get("X-Ficelle-Admin-Token"), expected)
+        )
+
+    def _remote_api_authenticated(self) -> bool:
+        return bearer_token_matches(self.headers.get("Authorization"), api_token())
+
+    def _remote_request_authorized(self, path: str) -> bool:
+        if self._bind_is_loopback():
+            return True
+        if path == "/admin" or path.startswith("/admin/"):
+            return self._remote_admin_authenticated()
+        return self._remote_api_authenticated()
+
+    def _reject_remote_authentication(self, path: str, *, unread_body: bool = False) -> None:
+        if path == "/admin" or path.startswith("/admin/"):
+            challenge = 'Basic realm="Ficelle Admin", charset="UTF-8"'
+        else:
+            challenge = 'Bearer realm="Ficelle API"'
+        headers = {"WWW-Authenticate": challenge}
+        if unread_body:
+            self.close_connection = True
+            headers["Connection"] = "close"
+        self._send_json(
+            401,
+            {"error": {"code": "authentication_required", "message": "authentication required"}},
+            headers=headers,
         )
 
     def _admin_mutation_authorized(self) -> bool:
@@ -8999,9 +9764,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             return False
         if self._bind_is_loopback():
             return True
-        # Exposed bind: an absent Origin no longer proves a local caller, so require the token
-        # that only the served admin page (and the operator) can hold.
-        return admin_token_matches(self.headers.get("X-Ficelle-Admin-Token") or "", admin_token())
+        return self._remote_admin_authenticated()
 
     def _host_header_ok(self) -> bool:
         """Anti-DNS-rebinding guard, applied to every method before routing.
@@ -9016,8 +9779,22 @@ class RouterHandler(BaseHTTPRequestHandler):
             str(self.config.get("host") or "127.0.0.1"),
         )
 
-    def _reject_foreign_host(self) -> None:
-        self._send_json(403, {"error": {"code": "forbidden", "message": "unexpected Host header"}})
+    def _log_rejected_header(self, message: str, name: str) -> None:
+        # The 403 body deliberately names no specifics, so this error-log line is the only
+        # after-the-fact trace of *which* Origin/Host a misconfigured client or proxy sent.
+        # log_message escapes control characters itself, so the raw value is safe to hand over.
+        value = self.headers.get(name) or "<missing>"
+        if len(value) > GUARD_REJECT_LOG_MAX_CHARS:
+            value = value[:GUARD_REJECT_LOG_MAX_CHARS] + "…"
+        self.log_message("%s (%s: %s)", message, name, value)
+
+    def _reject_foreign_host(self, *, unread_body: bool = False) -> None:
+        message = "unexpected Host header"
+        self._log_rejected_header(message, "Host")
+        if unread_body:
+            self._reject_unread_body(403, "forbidden", message)
+            return
+        self._send_json(403, {"error": {"code": "forbidden", "message": message}})
 
     def _reject_unread_body(self, status: int, code: str, message: str) -> None:
         # The declared (or chunked) body remains unread. HTTP/1.1 would otherwise interpret
@@ -9038,11 +9815,24 @@ class RouterHandler(BaseHTTPRequestHandler):
             411, "length_required", "chunked request bodies are not supported; send Content-Length"
         )
 
+    def _reject_unsupported_media_type(self) -> None:
+        self._reject_unread_body(
+            415,
+            "unsupported_media_type",
+            "chat completions require Content-Type: application/json",
+        )
+
+    def _json_content_type_ok(self) -> bool:
+        content_type = (self.headers.get("Content-Type") or "").partition(";")[0]
+        return content_type.strip().lower() == "application/json"
+
     def _admin_write_authorized(self) -> bool:
         """Guard secret-bearing admin writes: the CSRF origin check plus the local admin
         token (the token gates the credential-write endpoint specifically)."""
         if not self._admin_origin_ok():
             return False
+        if not self._bind_is_loopback():
+            return self._remote_admin_authenticated()
         presented = self.headers.get("X-Ficelle-Admin-Token") or ""
         # Constant-time compare to avoid a token-recovery timing side-channel.
         return admin_token_matches(presented, admin_token())
@@ -9052,7 +9842,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         return self.server.config  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
+        message = (fmt % args).translate(LOG_CONTROL_CHAR_TABLE)
+        sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), message))
 
     def do_GET(self) -> None:  # noqa: N802
         try:
@@ -9060,12 +9851,23 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._reject_foreign_host()
                 return
             path = urlparse(self.path).path.rstrip("/") or "/"
+            if not self._remote_request_authorized(path):
+                self._reject_remote_authentication(path)
+                return
             if path in {"/health", "/v1/health"}:
                 catalog = load_or_refresh_catalog(self.config)
-                self._send_json(200, {"status": "ok", "generated_at": catalog.get("generated_at"), "model_count": len(catalog.get("models") or [])})
+                self._send_json(
+                    200,
+                    {
+                        "status": "ok",
+                        "generated_at": catalog.get("generated_at"),
+                        "model_count": len(catalog.get("models") or []),
+                        "build": service_build_identity(),
+                    },
+                )
                 return
             if path == "/admin":
-                self._send_html(200, admin_page_html())
+                self._send_html(200, admin_page_html(embed_token=self._bind_is_loopback()))
                 return
             if path == "/admin/state":
                 self._send_json(200, admin_state(self.config))
@@ -9079,6 +9881,9 @@ class RouterHandler(BaseHTTPRequestHandler):
                 return
             if path == "/admin/update":
                 self._send_json(200, update_service.public_update_status())
+                return
+            if path == "/admin/notices":
+                self._send_json(200, admin_notices_payload())
                 return
             if path == "/admin/targets":
                 self._send_json(200, targets_contract_payload(self.config))
@@ -9213,7 +10018,11 @@ class RouterHandler(BaseHTTPRequestHandler):
         # nothing at all and drop the connection rather than surfacing an error.
         try:
             if not self._host_header_ok():
-                self._reject_foreign_host()
+                self._reject_foreign_host(unread_body=True)
+                return
+            path = urlparse(self.path).path.rstrip("/") or "/"
+            if not self._remote_request_authorized(path):
+                self._reject_remote_authentication(path, unread_body=True)
                 return
             # Checked once here rather than per route: every handler funnels through _read_body,
             # whose RequestBodyTooLarge subclasses ValueError and would otherwise be answered as
@@ -9224,23 +10033,34 @@ class RouterHandler(BaseHTTPRequestHandler):
             if self.headers.get("Transfer-Encoding"):
                 self._reject_chunked_body()
                 return
+            declared_length = 0
             declared = self.headers.get("Content-Length")
             if declared is not None:
                 try:
                     declared_length = int(declared)
                 except ValueError:
-                    declared_length = None
-                if declared_length is not None and declared_length > MAX_REQUEST_BODY_BYTES:
+                    self._reject_unread_body(400, "invalid_content_length", "invalid Content-Length")
+                    return
+                if declared_length < 0:
+                    self._reject_unread_body(400, "invalid_content_length", "invalid Content-Length")
+                    return
+                if declared_length > MAX_REQUEST_BODY_BYTES:
                     self._reject_payload_too_large()
                     return
         except Exception as exc:
-            self._send_json(500, safe_error_body(exc))
+            self.close_connection = True
+            self._send_json(
+                500,
+                safe_error_body(exc),
+                headers={"Connection": "close"},
+            )
             return
-        path = urlparse(self.path).path.rstrip("/") or "/"
-        # CSRF guard for the whole admin mutation surface: a cross-origin browser POST is
-        # rejected here. /v1/* (the inference API) is intentionally not gated.
+        # Browser mutations must be same-origin. Exposed binds additionally passed the independent
+        # authentication check above; loopback still uses the socket as its direct-client boundary.
         if path.startswith("/admin/") and not self._admin_mutation_authorized():
-            self._send_json(403, {"error": {"code": "forbidden", "message": "cross-origin admin request rejected"}})
+            message = "cross-origin admin request rejected"
+            self._log_rejected_header(message, "Origin")
+            self._reject_unread_body(403, "forbidden", message)
             return
         if path == "/admin/refresh":
             try:
@@ -9567,7 +10387,12 @@ class RouterHandler(BaseHTTPRequestHandler):
                         source,
                         self.config,
                     )
-                    refresh_catalog(self.config)
+                    try:
+                        refresh_catalog(self.config)
+                    except CatalogRefreshRejectedError:
+                        # The credential change itself succeeded; the reject kept the previous
+                        # catalog and the periodic loop will retry the rebuild.
+                        pass
                     # The post-removal verdict: resolution re-run after the delete and after
                     # refresh_catalog, so it names whatever store would still serve this
                     # provider — process env and external resolvers included, which
@@ -9603,7 +10428,11 @@ class RouterHandler(BaseHTTPRequestHandler):
                 if validator and not validator(key):
                     raise ValueError(f"invalid {source} API key format")
                 target = store_provider_key(source, self.config, key, store=server_secret_store())
-                refresh_catalog(self.config)
+                try:
+                    refresh_catalog(self.config)
+                except CatalogRefreshRejectedError:
+                    # Key stored; the rejected rebuild kept the previous catalog intact.
+                    pass
                 write_admin_audit("admin.providers.set_key", after={"stored": True}, metadata={"source": source, "target": target})
                 self._send_json(200, {"source": source, "stored": True, "target": target, "auth": provider_auth_row(source, self.config)})
             except ValueError as exc:
@@ -9790,9 +10619,46 @@ class RouterHandler(BaseHTTPRequestHandler):
         if path != CHAT_COMPLETIONS_PATH:
             self._send_json(404, not_found_body("POST", path, target_base_url(self.config)))
             return
+        origin_header = self.headers.get("Origin")
+        if not inference_origin_allowed(
+            origin_header,
+            self.headers.get("Host"),
+            self.server.server_address[1],  # type: ignore[attr-defined]
+        ):
+            message = "cross-origin inference request rejected"
+            self._log_rejected_header(message, "Origin")
+            self._reject_unread_body(403, "forbidden", message)
+            return
+        if not self._json_content_type_ok():
+            self._reject_unsupported_media_type()
+            return
+        admission = self.server.chat_admission.try_acquire(declared_length)  # type: ignore[attr-defined]
+        if admission is None:
+            self._reject_unread_body(
+                503,
+                "server_busy",
+                "chat request capacity is exhausted; retry later",
+            )
+            return
         request_id = uuid.uuid4().hex
         requested_model = DEFAULT_CHAT_COMPLETION_MODEL
         request_started = time.monotonic()
+        # Validated synthetic-run correlation id (L2-R3), or None on any failed gate. It
+        # supplements route telemetry only — Ficelle's random request id stays authoritative
+        # and upstream headers are built explicitly, so this can never travel to a provider.
+        synthetic_case_id = accept_synthetic_case_id(
+            self.headers.get(SYNTHETIC_CASE_ID_HEADER),
+            str(self.client_address[0]) if self.client_address else "",
+        )
+
+        def write_route_log_with_case(row: dict[str, Any]) -> None:
+            if synthetic_case_id is not None:
+                row = {**row, "synthetic_case_id": synthetic_case_id}
+            write_route_log(row)
+
+        def record_telemetry_with_case(telemetry: ChatCompletionRouteTelemetry) -> None:
+            apply_chat_route_telemetry(_telemetry_with_synthetic_case(telemetry, synthetic_case_id))
+
         try:
             body = self._read_body()
             chat_request = normalize_chat_completion_request(body)
@@ -9807,11 +10673,12 @@ class RouterHandler(BaseHTTPRequestHandler):
                     entitled=entitled,
                 ),
                 select_candidates=select_models,
+                select_result=select_models_result,
                 is_fusion_profile=lambda model: canonical_virtual_model_id(model) == FUSION_MODEL_ID,
                 is_virtual_model=lambda model: model in configured_virtual_model_ids(effective_config),
                 response_headers=ficelle_response_headers,
                 record_last_route=record_last_route,
-                write_route_log=write_route_log,
+                write_route_log=write_route_log_with_case,
                 max_attempts_for_request=max_attempts_for_request,
                 prepare_compression_route_body=lambda request_body, config: prepare_compression_route_body(
                     request_body,
@@ -9823,7 +10690,13 @@ class RouterHandler(BaseHTTPRequestHandler):
             def attempt_ports_factory(attempt_plan: ChatCompletionAttemptPlan) -> ChatCompletionAttemptPorts:
                 compression_metadata = attempt_plan.compression_metadata
 
-                def stream_response(response: Any, model: dict[str, Any], attempt_count: int) -> dict[str, Any]:
+                def stream_response(
+                    response: Any,
+                    model: dict[str, Any],
+                    attempt_count: int,
+                    *,
+                    deadline_monotonic: float | None = None,
+                ) -> dict[str, Any]:
                     headers_sent = False
 
                     def write_stream_chunk(chunk: bytes) -> None:
@@ -9855,13 +10728,27 @@ class RouterHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
 
                     # The chunks reach the writer untouched; the observer only reads them on
-                    # the way past, to learn a thinking model's trace for the next turn.
+                    # the way past, to learn a thinking model's trace for the next turn. The
+                    # deadline guard bounds a drip-feeding upstream to the request budget.
                     observed = observe_stream_chunks(
-                        response.iter_content(chunk_size=None),
+                        deadline_guarded_chunks(response.iter_content(chunk_size=None), deadline_monotonic),
                         ReasoningStreamObserver(REASONING_REPLAY_STORE, str(model.get("id") or "")),
                         now_fn=time.time,
                     )
-                    return stream_chunks_to_writer(observed, write_stream_chunk, self.wfile.flush)
+                    # The [DONE] contract applies to SSE bodies; a provider answering a stream
+                    # request with a plain JSON body (no SSE framing) has no terminator to demand.
+                    upstream_content_type = str(response.headers.get("Content-Type") or "text/event-stream")
+                    try:
+                        return stream_chunks_to_writer(
+                            observed,
+                            write_stream_chunk,
+                            self.wfile.flush,
+                            expect_sse_done="event-stream" in upstream_content_type.lower(),
+                        )
+                    finally:
+                        # The guard may have abandoned the upstream mid-body; close so the
+                        # pooled connection is not returned holding unread bytes.
+                        response.close()
 
                 return ChatCompletionAttemptPorts(
                     invoke_model=invoke_model,
@@ -9873,13 +10760,23 @@ class RouterHandler(BaseHTTPRequestHandler):
                     ),
                     record_success=record_success,
                     resolve_competence=lambda profile, model: model_route_competence(profile, model, fresh_runtime_state()),
-                    record_telemetry=apply_chat_route_telemetry,
-                    record_success_with_telemetry=record_success_with_telemetry,
+                    record_telemetry=record_telemetry_with_case,
+                    record_success_with_telemetry=lambda model, latency, telemetry: record_success_with_telemetry(
+                        model,
+                        latency,
+                        _telemetry_with_synthetic_case(telemetry, synthetic_case_id),
+                    ),
                     stream_response=stream_response,
                     detect_success_error=success_error_payload_failure,
                     has_deliverable=has_deliverable_message,
                     classify_failure=classify_failure,
                     is_timeout_exception=lambda exc: isinstance(exc, requests.exceptions.Timeout),
+                    is_deadline_exception=lambda exc: isinstance(exc, RequestDeadlineExceeded),
+                    quota_cooldown_matches_model=quota_cooldown_matches_model,
+                    unsupported_parameters_for=lambda model, request_body: unsupported_parameters_for_model(
+                        model, request_body, config=effective_config
+                    ),
+                    learn_unsupported_parameters=learn_unsupported_parameters,
                     build_success_headers=chat_success_response_headers,
                     build_failure_error=build_upstream_failure_error,
                     build_failure_headers=chat_failure_response_headers,
@@ -9944,6 +10841,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 safe_error_body(exc, request_id=request_id),
                 headers=ficelle_response_headers(request_id, requested_model),
             )
+        finally:
+            admission.release()
 
 
 def print_summary(catalog: dict[str, Any]) -> None:
@@ -9979,7 +10878,13 @@ def catalog_refresh_interval_seconds(config: dict[str, Any]) -> int:
 CATALOG_WARM_RETRY_MIN_SECONDS = 5.0
 
 
-def record_catalog_refresh_error(detail: str | None) -> None:
+def record_catalog_refresh_error(
+    detail: str | None,
+    *,
+    decision: str | None = None,
+    catalog_generation: str | None = None,
+    catalog_stale_since: str | None = None,
+) -> None:
     """Publish the refresh loop's last error into state, or clear it on success.
 
     `auto_benchmark_loop` already records `last_error` for the admin UI while this loop only
@@ -9992,10 +10897,17 @@ def record_catalog_refresh_error(detail: str | None) -> None:
         if detail is None:
             row.pop("last_error", None)
             row.pop("last_error_at", None)
+            row.pop("catalog_stale_since", None)
             row["last_success_at"] = now_iso()
         else:
             row["last_error"] = detail
             row["last_error_at"] = now_iso()
+            if catalog_stale_since is not None:
+                row["catalog_stale_since"] = catalog_stale_since
+        if decision is not None:
+            row["last_decision"] = decision
+            row["last_attempt_at"] = now_iso()
+            row["last_attempt_generation"] = catalog_generation
 
     try:
         _STATE_STORE.update(mutate, reason="catalog_refresh_error")
@@ -10027,8 +10939,10 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
             print(f"initial catalog warm failed: {exc}; retrying in {backoff:.0f}s", flush=True)
             time.sleep(backoff)
             backoff = min(backoff * 2, catalog_refresh_interval_seconds(config))
+    retry_backoff: float | None = None
     while True:
-        time.sleep(catalog_refresh_interval_seconds(config))
+        interval = catalog_refresh_interval_seconds(config)
+        time.sleep(min(retry_backoff, interval) if retry_backoff is not None else interval)
         try:
             refresh_capability_oracle_if_stale(config)
             # `refresh_catalog` rather than a forced `load_or_refresh_catalog`: at force=True
@@ -10042,10 +10956,21 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
             # Still not the TTL reload shared with routing (_load_or_refresh_catalog_for_
             # effective_config): a chat call must never rewrite the user's config.
             refresh_catalog(config)
+        except CatalogRefreshRejectedError as exc:
+            # Already recorded in state by the reject itself. The active catalog is intact,
+            # so retry sooner than a full interval — bounded backoff, like the initial warm.
+            retry_backoff = (
+                CATALOG_WARM_RETRY_MIN_SECONDS
+                if retry_backoff is None
+                else min(retry_backoff * 2, interval)
+            )
+            print(f"periodic catalog refresh rejected: {exc}; retrying in {retry_backoff:.0f}s", flush=True)
         except Exception as exc:
+            retry_backoff = None
             record_catalog_refresh_error(f"periodic catalog refresh failed: {safe_detail(exc)}")
             print(f"periodic catalog refresh failed: {exc}", flush=True)
         else:
+            retry_backoff = None
             record_catalog_refresh_error(None)
 
 
@@ -10111,6 +11036,8 @@ def serve(config: dict[str, Any]) -> None:
     # swallowed), so assert it synchronously here before binding — cheap, no network.
     if config.get("allow_paid_fallback") is not False:
         raise RuntimeError("allow_paid_fallback must stay false for the free router MVP")
+    if not bind_host_is_loopback(host):
+        ensure_exposed_access_tokens()
     # Bind and start serving BEFORE warming the catalog. A slow or hanging provider
     # catalog fetch must never keep the HTTP server from binding — otherwise the whole
     # service is unreachable at startup (`ficelle restart` reports "did not become
@@ -10118,6 +11045,12 @@ def serve(config: dict[str, Any]) -> None:
     # while the warm runs in the background; the live catalog populates when ready.
     server = ThreadingHTTPServer((host, port), RouterHandler)
     server.config = config  # type: ignore[attr-defined]
+
+    # Snapshot the build identity now that the socket is bound (never before — its two git
+    # subprocesses could otherwise spend the whole readiness budget pre-bind): it must
+    # describe what this process imported at startup, not whatever a later edit leaves on
+    # disk, and no request is served until serve_forever().
+    service_build_identity()
 
     # Keep the catalog fresh in the background — warm once, then refresh within the TTL so
     # an idle instance never lets it go stale (a stale catalog is reported as empty by
@@ -10168,7 +11101,11 @@ def main_args(argv: list[str] | None = None) -> int:
         return 0
     if args.refresh:
         refresh_capability_oracle_if_stale(config)
-        catalog = refresh_catalog(config)
+        try:
+            catalog = refresh_catalog(config)
+        except CatalogRefreshRejectedError as exc:
+            print(f"refresh rejected: {exc} — the previous catalog remains active", flush=True)
+            return 1
         print_summary(catalog)
         return 0
     if args.canary:

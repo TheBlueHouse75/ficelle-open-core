@@ -8,9 +8,12 @@ from ficelle.service import (
     ServicePaths,
     SystemdUserServiceBackend,
     UnsupportedServiceBackend,
+    WindowsScheduledTaskBackend,
     persist_active_service_context,
     read_active_service_context,
     select_service_backend,
+    windows_headless_python,
+    windows_task_account,
 )
 
 
@@ -295,7 +298,24 @@ def test_systemd_user_uninstall_removes_unit_and_reloads(tmp_path):
     ]
 
 
-def test_select_service_backend_rejects_windows_platform(tmp_path, capsys):
+def _windows_backend(paths, calls=None, *, account="EXAMPLE\\cyril"):
+    recorded = calls if calls is not None else []
+
+    def run(cmd):
+        recorded.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    return WindowsScheduledTaskBackend(
+        paths=paths,
+        run_command=run,
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+        account_provider=lambda: account,
+    )
+
+
+def test_select_service_backend_uses_scheduled_task_on_windows(tmp_path):
     backend = select_service_backend(
         platform_name="win32",
         paths=make_paths(tmp_path),
@@ -306,9 +326,116 @@ def test_select_service_backend_rejects_windows_platform(tmp_path, capsys):
         report_stale_servers=lambda _pids: None,
     )
 
+    assert isinstance(backend, WindowsScheduledTaskBackend)
+    assert backend.name == "scheduled-task"
+
+
+def test_scheduled_task_install_registers_and_runs_the_task(tmp_path):
+    calls = []
+    paths = make_paths(tmp_path)
+    backend = _windows_backend(paths, calls)
+
+    assert backend.install() == 0
+    assert backend.task_xml.exists()
+    assert ["schtasks", "/Create", "/TN", paths.label, "/XML", str(backend.task_xml), "/F"] in calls
+    assert ["schtasks", "/Run", "/TN", paths.label] in calls
+    payload = backend.task_xml.read_text(encoding="utf-16")
+    assert '<?xml version="1.0" encoding="UTF-16"?>' in payload
+    assert "<UserId>EXAMPLE\\cyril</UserId>" in payload
+    assert "-m ficelle.windows_entry" in payload
+    assert f"FICELLE_HOME={paths.ficelle_home}" in payload
+    assert f"<WorkingDirectory>{paths.ficelle_home}</WorkingDirectory>" in payload
+    assert "<LogonTrigger>" in payload
+    assert "<RunLevel>LeastPrivilege</RunLevel>" in payload
+    assert "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in payload
+    assert "FICELLE_RUNTIME_DIR=" not in payload
+    assert "HERMES_HOME=" not in payload
+
+
+def test_scheduled_task_passes_runtime_and_hermes_context_as_assignments(tmp_path):
+    hermes_home = tmp_path / "custom-hermes"
+    runtime_dir = tmp_path / ".hermes" / "ficelle"
+    runtime_dir.mkdir(parents=True)
+    paths = make_paths(tmp_path, runtime_dir=runtime_dir, hermes_home=hermes_home)
+    backend = _windows_backend(paths)
+
+    assert backend.entry_arguments() == [
+        "-m",
+        "ficelle.windows_entry",
+        f"FICELLE_HOME={paths.ficelle_home}",
+        f"FICELLE_RUNTIME_DIR={runtime_dir}",
+        f"HERMES_HOME={hermes_home}",
+    ]
+
+
+def test_scheduled_task_stop_and_uninstall_use_schtasks(tmp_path):
+    calls = []
+    paths = make_paths(tmp_path)
+    backend = _windows_backend(paths, calls)
+    assert backend.install() == 0
+    assert backend.task_xml.exists()
+
+    assert backend.stop() == 0
+    assert ["schtasks", "/End", "/TN", paths.label] in calls
+    assert backend.uninstall() == 0
+    assert ["schtasks", "/Delete", "/TN", paths.label, "/F"] in calls
+    assert not backend.task_xml.exists()
+
+
+def test_scheduled_task_install_persists_active_context(tmp_path):
+    paths = make_paths(tmp_path, persist_home=True)
+    backend = _windows_backend(paths)
+
+    assert backend.install() == 0
+    assert read_active_service_context(paths.active_home_pointer) == (
+        paths.ficelle_home,
+        paths.runtime_dir,
+        None,
+    )
+
+
+def test_windows_task_account_prefers_username_over_getpass_chain(monkeypatch):
+    # MSYS2/Git Bash export LOGNAME/USER, which getpass.getuser() would prefer even
+    # though schtasks cannot map those names to a Windows account.
+    monkeypatch.setenv("USERDOMAIN", "EXAMPLE")
+    monkeypatch.setenv("USERNAME", "cyril")
+    monkeypatch.setenv("LOGNAME", "msys-name")
+    monkeypatch.setenv("USER", "msys-name")
+
+    assert windows_task_account() == "EXAMPLE\\cyril"
+
+    monkeypatch.delenv("USERDOMAIN")
+
+    assert windows_task_account() == "cyril"
+
+
+def test_windows_headless_python_prefers_pythonw_sibling(tmp_path):
+    python = tmp_path / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+
+    assert windows_headless_python(python) == python
+
+    pythonw = python.with_name("pythonw.exe")
+    pythonw.write_text("", encoding="utf-8")
+
+    assert windows_headless_python(python) == pythonw
+
+
+def test_select_service_backend_rejects_unknown_platform(tmp_path, capsys):
+    backend = select_service_backend(
+        platform_name="sunos5",
+        paths=make_paths(tmp_path),
+        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        uid_provider=lambda: "1000",
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+
     assert isinstance(backend, UnsupportedServiceBackend)
     assert backend.install() == 1
-    assert "macOS LaunchAgent and Linux systemd --user" in capsys.readouterr().err
+    assert "Windows per-user Scheduled Tasks" in capsys.readouterr().err
 
 
 def _launchagent(paths, run_command):

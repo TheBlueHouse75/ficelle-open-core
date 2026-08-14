@@ -414,6 +414,9 @@
     .field input { border: 0; background: transparent; outline: none; width: 100%; }
     .field:focus-within { border-color: color-mix(in srgb, var(--brand) 50%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 14%, transparent); }
 
+    /* Footnote under the available-models list: why the New chip counts more than the list shows. */
+    .avail-note { margin-top: 10px; padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius-xs); background: var(--surface-1); color: var(--text-muted); font-size: 12px; line-height: 1.45; }
+
     /* Available-models filter + sort bar (providers, capabilities, context, sort) */
     .filter-bar { display: flex; flex-direction: column; gap: 8px; margin: 11px 0 13px; }
     .flt-row { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
@@ -559,7 +562,9 @@
     .key-input { font: inherit; font-size: 12px; color: var(--text); }
     .key-input:focus { outline: none; border-color: var(--brand); }
     .key-mask { letter-spacing: 3px; color: var(--text-muted); user-select: none; }
-    .key-form .is-hidden { display: none; }
+    /* Generic hide utility, toggled from JS (key form reveal, provider model filter).
+       !important so it wins over component display rules (.provider-model-row is a grid). */
+    .is-hidden { display: none !important; }
     .provider-note { color: var(--text-muted); font-size: 12px; line-height: 1.45; margin-top: 11px; }
     /* "Get a key" external link — sits where the provider notes used to be. */
     .provider-keyurl { margin-top: 13px; }
@@ -568,6 +573,9 @@
     .provider-keyurl a svg { width: 14px; height: 14px; }
     .provider-models { margin-top: 13px; border: 1px solid var(--border); border-radius: var(--radius-xs); background: var(--surface-1); overflow: hidden; }
     .provider-models summary { cursor: pointer; padding: 9px 11px; color: var(--text-soft); font-size: 12px; font-weight: 650; border-bottom: 1px solid var(--border); }
+    .provider-model-filter { padding: 8px 11px; border-bottom: 1px solid var(--border); }
+    .provider-model-filter .key-input { width: 100%; }
+    .provider-model-empty { margin: 10px 11px; }
     .provider-model-list { max-height: 320px; overflow: auto; display: flex; flex-direction: column; }
     .provider-model-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 7px; align-items: start; padding: 9px 11px; border-bottom: 1px solid var(--border); }
     .provider-model-row:last-child { border-bottom: 0; }

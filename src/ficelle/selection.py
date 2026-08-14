@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ficelle.domain_models import CatalogModel, SelectionPurpose, SelectionRequest, SelectionResult
+from ficelle.use_cases.cooldowns import cooldown_block_scope
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,10 @@ class SelectionPolicy:
     sort_available_for_virtual_model: Callable[[str, list[dict[str, Any]], dict[str, Any]], list[dict[str, Any]]]
     route_competence_gate_result: Callable[[str, list[dict[str, Any]], dict[str, Any]], tuple[list[dict[str, Any]], bool]]
     virtual_models: set[str]
+    # Returns a block reason for a catalog row preserved past its stale grace (L1-R1), or
+    # None when the row is fresh or still within grace. Optional so pre-existing callers
+    # and tests keep their behavior unchanged.
+    stale_model_block_reason: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], str | None] | None = None
 
 
 def typed_catalog_rows(catalog: dict[str, Any]) -> list[tuple[CatalogModel, dict[str, Any]]]:
@@ -111,11 +116,24 @@ def select_models_result_from_typed_rows(
     invokable_rows = [raw for _model, raw in typed_rows if raw.get("invokable")]
     available: list[dict[str, Any]] = []
     for raw_model in invokable_rows:
-        on_cd, _ = policy.model_on_cooldown(raw_model, state)
         model_id = str(raw_model.get("id") or "")
+        if policy.stale_model_block_reason is not None:
+            stale_reason = policy.stale_model_block_reason(raw_model, config, state)
+            if stale_reason:
+                if model_id:
+                    excluded_reasons[model_id] = stale_reason
+                continue
+        on_cd, cooldown_reason = policy.model_on_cooldown(raw_model, state)
         if on_cd:
             if model_id:
-                excluded_reasons[model_id] = "cooldown"
+                # Keep the block's scope so refusals and telemetry can name it (L1-R4);
+                # the prefix convention is decoded in one place, cooldown_block_scope.
+                scope = cooldown_block_scope(cooldown_reason)
+                excluded_reasons[model_id] = (
+                    "provider_cooldown" if scope == "provider"
+                    else "quota_cooldown" if scope == "quota"
+                    else "cooldown"
+                )
             continue
         if policy.model_is_quarantined(raw_model, state):
             if model_id:

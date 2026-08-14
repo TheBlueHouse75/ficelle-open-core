@@ -23,6 +23,7 @@ _URL_PATTERN = re.compile(r"""https?://[^\s"'<>)\]},;]+""")
 
 FailureReason = Literal[
     "auth_or_credit",
+    "bad_upstream_contract",
     "bad_upstream_request",
     "billing_or_paid",
     "model_not_found",
@@ -376,11 +377,10 @@ CALLER_CAUSED_FAILURE_REASONS = frozenset(
         # payload — so no retry (see NON_RETRYABLE_FAILURE_REASONS), no cooldown, and the caller
         # gets the upstream's own 400.
         "bad_upstream_request",
-        # The upstream wants a field of its own that the OpenAI schema has no room for. Neither
-        # the caller nor the model is at fault, but the consequences the caller-caused set carries
-        # are exactly the right ones: no cooldown, no scoring streak. Cooling here would bench a
-        # model for the one turn it took `reasoning_replay` to learn its trace, and the next turn
-        # is the one that works.
+        # This model's request contract differs from another candidate's: it either wants a private
+        # field the OpenAI schema has no room for, or disables an otherwise valid option. Neither
+        # case says the model is unhealthy, so the caller-caused set carries the right consequences:
+        # no cooldown and no scoring streak.
         "bad_upstream_contract",
         # Writing to the caller's socket failed: the client hung up mid-stream. The upstream was
         # answering fine; cooling it would punish a healthy model for a client-side abort.
@@ -393,16 +393,33 @@ CALLER_CAUSED_FAILURE_REASONS = frozenset(
 # CALLER_CAUSED_FAILURE_REASONS, which is about *state writes*: a truncated response is the caller's
 # fault too, yet a model with a larger budget may well answer, so it keeps its failover.
 #
-# `bad_upstream_contract` is deliberately absent: a rejection naming a field OpenAI never defined is
-# this upstream's private requirement, not a verdict on the body. The evidence was a router that
-# handed the caller a hard 400 with 163 healthy candidates left, seconds after another of them had
-# answered the very same body.
+# `bad_upstream_contract` is deliberately absent: a candidate-specific rejection is not a verdict
+# on the body across the pool. The evidence includes a private reasoning field being required or
+# forbidden, and Mistral disabling `top_k` on selected models while another candidate can accept
+# the same request.
 NON_RETRYABLE_FAILURE_REASONS = frozenset({"bad_upstream_request"})
 
-# Fields a provider may demand that the OpenAI chat-completions schema does not define. A 400 naming
-# one cannot be the fault of a client that speaks the standard — it has no way to send the field, and
-# `reasoning_replay` exists because of exactly that gap. Matched on the provider's own wording, so
-# the list stays a list of field names rather than of error phrasings.
+# ...but staying retryable does not make the *next* candidate a free choice. A contract rejection is
+# the provider's request validation answering, not the model: its siblings sit behind the same
+# endpoint and the same checks, so the attempt after one of these buys far more from another source.
+# Live evidence, run 20260810T221353Z: `top_k sampling is not enabled for this model` cost six
+# Mistral models in a row on one request before any other provider was tried, and the caller got a
+# 502 with 56 candidates in the pool. Read only by the attempt loop, and only for *this* request:
+# nothing is cooled, nothing is scored, and a pool with no other source left still spends its window
+# here — some providers do disable an option on selected models only.
+#
+# One member, and the only reason that has to be *listed* at all. Every other fact that takes the
+# window off part of the pool writes state saying so — a provider cooldown naming its source, a quota
+# cooldown naming its pool at the scope that provider declares — and the attempt loop diverts on what
+# the write reports (`AppliedCooldown`), so it needs no list to stay in step with the cooldown policy.
+# A contract rejection writes nothing at all: no cooldown, no scoring streak, nothing for a later
+# request to read. It is a verdict on the source held for the length of one request, which is exactly
+# why it lives here as a reason rather than as a key.
+SOURCE_DIVERTING_FAILURE_REASONS = frozenset({"bad_upstream_contract"})
+
+# Fields providers disagree on because the OpenAI chat-completions schema does not define them. One
+# upstream may demand a field while another rejects the same field as extra; neither verdict applies
+# to every candidate in a heterogeneous pool. `reasoning_replay` exists because of exactly that gap.
 NON_STANDARD_REQUEST_FIELDS = ("reasoning_content", "reasoning_details", "thinking_blocks")
 
 # ...but naming the field is not enough: `reasoning_content must be a string` is a verdict on a value
@@ -441,6 +458,93 @@ def _demands_missing_field(lower: str) -> bool:
     return False
 
 
+def _forbids_nonstandard_assistant_field(text: str) -> bool:
+    """True for a structured schema rejection of known provider-private assistant metadata.
+
+    Pydantic/FastAPI identifies an unknown field with ``type: extra_forbidden`` and a typed
+    ``loc`` path. Both are required: matching prose would let a caller merely mention these words
+    and turn a genuinely malformed body into a failover. A wrong value type stays terminal too.
+    """
+    if len(text) > ERROR_BODY_PARSE_LIMIT:
+        return False
+    try:
+        payload = json.loads(text)
+    except (ValueError, RecursionError):
+        return False
+    details = payload.get("detail") if isinstance(payload, dict) else None
+    if not isinstance(details, list):
+        return False
+    for detail in details:
+        if not isinstance(detail, dict) or detail.get("type") != "extra_forbidden":
+            continue
+        location = detail.get("loc")
+        if not isinstance(location, list) or len(location) < 4:
+            continue
+        if location[-2] != "assistant" or location[-1] not in NON_STANDARD_REQUEST_FIELDS:
+            continue
+        try:
+            messages_index = location.index("messages")
+        except ValueError:
+            continue
+        if any(type(part) is int for part in location[messages_index + 1 : -2]):
+            return True
+    return False
+
+
+# A request option can be valid in the provider's OpenAI-compatible API while one particular model
+# disables it. That is a model contract mismatch, not a malformed body: a sibling candidate may
+# support the same option and should get its turn. Keep this evidence deliberately narrow to the
+# exact option and wording observed from Mistral; an unfamiliar 400 remains terminal rather than
+# spending quota by replaying a genuinely invalid body.
+MODEL_SPECIFIC_OPTION_REJECTION_MARKERS = (
+    "not enabled for this model",
+    "not supported by this model",
+    "not supported for this model",
+)
+MODEL_SPECIFIC_REQUEST_OPTIONS = ("top_k",)
+
+# Sampling knobs that shape *how* a model draws tokens, never *what* is asked of it. Only these
+# may be dropped and retried when a provider rejects them by name: removing one changes the
+# sampling distribution, not the request's meaning. Messages, tools, tool_choice, schemas,
+# response_format, max tokens and every field carrying caller intent are deliberately absent —
+# dropping any of those would silently answer a different question.
+DROPPABLE_SAMPLING_PARAMETERS = (
+    "top_k",
+    "top_p",
+    "min_p",
+    "top_a",
+    "repetition_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "seed",
+)
+
+
+def _rejects_model_specific_request_option(lower: str) -> bool:
+    return any(option in lower for option in MODEL_SPECIFIC_REQUEST_OPTIONS) and any(
+        marker in lower for marker in MODEL_SPECIFIC_OPTION_REJECTION_MARKERS
+    )
+
+
+def rejected_sampling_parameters(text: str, body: dict[str, Any] | None = None) -> tuple[str, ...]:
+    """Sampling parameters this rejection names, and that the request actually carries.
+
+    The provider must name the parameter AND reject it as unsupported — a message merely
+    echoing a value is not a verdict. Intersecting with the request body keeps a rejection
+    quoting an unrelated field from dropping something the caller never sent (L3-R4's rule:
+    never silently weaken a request; here, never drop what was not refused)."""
+    lower = str(text or "")[:PROSE_SCAN_LIMIT].lower()
+    if not any(marker in lower for marker in MODEL_SPECIFIC_OPTION_REJECTION_MARKERS):
+        return ()
+    present = set(body or {})
+    return tuple(
+        parameter
+        for parameter in DROPPABLE_SAMPLING_PARAMETERS
+        if parameter in lower and (not body or parameter in present)
+    )
+
+
 # How much of an upstream's own error text survives into the failure we hand back. The default 180
 # cut the sentence that named the problem — "The `reasoning_content` in the thinking mode must be
 # passed back to the API" arrived as "... [invalid_request_error] The " — which cost a live
@@ -450,6 +554,7 @@ UPSTREAM_DETAIL_LIMIT = 400
 
 PROVIDER_SCOPED_COOLDOWN_REASONS = {"rate_limited", "auth_or_credit"}
 PROVIDER_ERROR_REASONS = PROVIDER_SCOPED_COOLDOWN_REASONS | {"quota_exhausted", "no_free_quota"}
+
 BENCHMARK_ROUTE_BLOCKING_REASONS = {
     "billing_or_paid",
     "no_free_quota",
@@ -506,6 +611,11 @@ def cooldown_policy_for_reason(reason: str, *, source: str = "") -> CooldownPoli
         # max_tokens=20 or a malformed tool_call would otherwise empty a whole profile's pool for
         # the cooldown window, which is exactly how a bad client takes the router down.
         return CooldownPolicy(record_provider_error=False, model_cooldown=False)
+    if reason == "request_deadline_exceeded":
+        # Ficelle's own request budget ended the attempt (L2-R2). The model proved nothing
+        # wrong — earlier attempts may have consumed most of the budget — so no cooldown;
+        # the attempt stays recorded for scoring and diagnosis.
+        return CooldownPolicy(record_provider_error=False, model_cooldown=False)
     if reason == "quota_exhausted":
         return CooldownPolicy(
             record_provider_error=True,
@@ -513,10 +623,16 @@ def cooldown_policy_for_reason(reason: str, *, source: str = "") -> CooldownPoli
             model_cooldown=False,
         )
     if reason in PROVIDER_SCOPED_COOLDOWN_REASONS:
+        # Provider-wide failures use the provider cooldown as the SOLE selection-blocking
+        # cooldown (L2-R4): the model attempt, error, and stats stay recorded for diagnosis,
+        # but no model cooldown is written — a redundant one outlives provider recovery and
+        # then reports two independent guards for one incident. A model-named upstream-pool
+        # 429 classifies as `rate_limited_upstream` and stays model-scoped.
         return CooldownPolicy(
             record_provider_error=True,
             provider_cooldown=True,
             provider_cooldown_source=provider_source,
+            model_cooldown=False,
         )
     if reason == "billing_or_paid":
         return CooldownPolicy(
@@ -569,6 +685,17 @@ def classify_failure(
     unknown_status = status_code is None
     if status_code is None:
         status_code = 200
+    # This structural verdict has to precede every prose scan below: ``detail[].input`` repeats the
+    # rejected reasoning trace, whose ordinary content may itself say "payment required" or "quota
+    # exceeded". Those are caller/model words, not the provider's diagnosis. A contradictory named
+    # status remains stronger; only an absent or request-rejection code lets the typed location win.
+    named_status = status_for_error_codes(*(error_codes or provider_error_codes(text)))
+    if (
+        status_code in REQUEST_REJECTION_STATUSES
+        and (named_status is None or named_status in REQUEST_REJECTION_STATUSES)
+        and _forbids_nonstandard_assistant_field(text)
+    ):
+        return "bad_upstream_contract"
     lower = text[:PROSE_SCAN_LIMIT].lower()
     lower_without_urls = _URL_PATTERN.sub(" ", lower)
     has_quota_marker = any(marker in lower for marker in marker_set.quota_exhausted)
@@ -611,7 +738,6 @@ def classify_failure(
     # The provider's own code fields skip both marker rules: they carry its verdict, not the caller's
     # vocabulary, so `status_for_error_codes` reads them directly — and its own precedence keeps a
     # canonical name (`type: invalid_request_error`) ahead of a payment word in a sibling field.
-    named_status = status_for_error_codes(*(error_codes or provider_error_codes(text)))
     # A provider that NAMES the error a request rejection is saying the message is about the body we
     # sent, whatever status it wrapped that in — a gateway relaying an upstream 400 under its own 502
     # is the common case. That is the same evidence as the status itself, so it narrows the markers
@@ -655,12 +781,11 @@ def classify_failure(
     # above: what is left is the upstream rejecting the request body. Retrying it on another
     # candidate replays the same rejection, and cooling the model blames it for the caller's payload.
     if status_code in REQUEST_REJECTION_STATUSES:
-        # Unless the rejection asks for a field the OpenAI schema does not have. Then it is this
-        # upstream's own contract talking, the body was standard, and the next candidate — which
-        # very likely has no such requirement — deserves its turn. The field name alone is not
-        # enough: a complaint about a value that WAS sent is a real body defect, and stays
-        # terminal like any other.
-        if _demands_missing_field(lower):
+        # Unless the rejection exposes this candidate's narrower contract: it requires private
+        # assistant metadata, or it disables an option other candidates accept. The structured
+        # mirror image — forbidding that metadata — returned before the prose scans above so the
+        # rejected field's echoed value could not masquerade as a billing or quota verdict.
+        if _demands_missing_field(lower) or _rejects_model_specific_request_option(lower):
             return "bad_upstream_contract"
         return "bad_upstream_request"
     return "unavailable"
@@ -693,9 +818,9 @@ def bad_request_body(exc: Exception, *, request_id: str | None = None) -> dict[s
 def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
     actions: list[str] = []
     if reason_counts.get("auth_or_credit"):
-        actions.append("Check provider credentials/credits, then clear the provider cooldown after fixing it.")
+        actions.append("Check provider credentials/credits, then clear the provider cooldown after fixing it. Ficelle cooled that provider and sent the rest of this request's attempts to another one when the pool had another to offer, so a single failed attempt here is expected rather than a truncated failover.")
     if reason_counts.get("rate_limited"):
-        actions.append("Wait for the provider cooldown or switch this virtual model to another healthy provider.")
+        actions.append("Wait for the provider cooldown or switch this virtual model to another healthy provider. Ficelle cooled that provider and sent the rest of this request's attempts to another one when the pool had another to offer, so a single failed attempt here is expected rather than a truncated failover.")
     if reason_counts.get("rate_limited_upstream"):
         actions.append("The shared upstream pool behind this model id is saturated, not your account: the model is cooled briefly and its provider keeps serving. Nothing to fix; add your own upstream key if you need dedicated limits.")
     if reason_counts.get("billing_or_paid"):
@@ -715,7 +840,7 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
     if reason_counts.get("bad_upstream_request"):
         actions.append("The upstream rejected the request body itself (HTTP 400/422) — inspect the payload the client sent, typically a malformed tool_call or an unsupported field. No model was cooled and no other candidate was tried: every one of them would reject the same body.")
     if reason_counts.get("bad_upstream_contract"):
-        actions.append("The upstream rejected the request over a field the OpenAI schema does not define, so a standard client cannot send it. Ficelle replays a thinking model's own reasoning trace for exactly this case (see reasoning_replay); the first turn of a conversation started before the service restarted has no trace on file yet and falls through to the next candidate. No model was cooled.")
+        actions.append("One upstream rejected a request option or provider-private field that another candidate may handle. Ficelle kept the request unchanged and preferred a different provider for the next attempt when one was available. No model was cooled.")
     if reason_counts.get("client_disconnected"):
         actions.append("The client closed the connection while the answer was streaming; the upstream was healthy and was not cooled. Look at the client's timeout or cancel behaviour, not at the model.")
     if reason_counts.get("truncated_before_content"):
@@ -727,6 +852,33 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
     return actions
 
 
+# Capacity dimensions a 413/429 body may name (L4-R1). Read for reporting only — they never
+# change the failure classification or its scope; unknown limits stay unknown.
+CAPACITY_DIMENSION_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("tpm", ("tokens per minute", "tpm")),
+    ("rpm", ("requests per minute", "rpm")),
+    ("tpd", ("tokens per day", "tpd")),
+    ("rpd", ("requests per day", "rpd", "daily request")),
+    ("concurrent", ("concurrent request", "concurrent session", "simultaneous request")),
+    ("free_quota", ("free quota", "free tier", "free-tier", "trial quota")),
+    ("context_or_body", ("context length", "maximum context", "request entity too large", "request too large", "body too large")),
+)
+
+
+def capacity_dimension(status_code: int | None, text: str) -> str | None:
+    """The real dimension of a provider capacity rejection, or None for non-capacity errors.
+
+    `capacity.unknown` covers a 413/429 whose body names no dimension (the seventh baseline
+    Groq case): capacity evidence without an invented unit."""
+    if status_code not in {413, 429}:
+        return None
+    lower = _URL_PATTERN.sub(" ", str(text or "")).lower()
+    for dimension, markers in CAPACITY_DIMENSION_MARKERS:
+        if any(marker in lower for marker in markers):
+            return f"capacity.{dimension}"
+    return "capacity.unknown"
+
+
 def caller_rejected_request(errors: list[dict[str, Any]]) -> bool:
     """True when every attempt failed because the upstream refused the request body itself.
 
@@ -736,12 +888,21 @@ def caller_rejected_request(errors: list[dict[str, Any]]) -> bool:
     return bool(errors) and all(row.get("reason") == "bad_upstream_request" for row in errors)
 
 
+def request_feature_incompatible(errors: list[dict[str, Any]]) -> bool:
+    """True when every candidate was excluded for an unsupported tool-schema feature
+    (L3-R4): nothing was sent upstream, and the precise 422 tells the caller which request
+    feature to change instead of a 502 that reads as an outage."""
+    return bool(errors) and all(row.get("reason") == "unsupported_tool_schema" for row in errors)
+
+
 def upstream_failure_status(errors: list[dict[str, Any]]) -> int:
     """HTTP status for a run where no candidate delivered.
 
     Paired with `build_upstream_failure_error`, which reads the same verdict off the same list:
     every caller of one must use the other, or the status and the payload's `type` disagree.
     """
+    if request_feature_incompatible(errors):
+        return 422
     return 400 if caller_rejected_request(errors) else 502
 
 
@@ -777,7 +938,13 @@ def build_upstream_failure_error(
         safe_details.append({key: value for key, value in safe_row.items() if value is not None})
     reason_summary = ", ".join(f"{reason}={count}" for reason, count in sorted(reason_counts.items())) or "unknown"
     safe_requested_model = sanitize_error_detail(requested_model, 250) or "[redacted]"
-    if list(reason_counts) == ["bad_upstream_request"]:  # `caller_rejected_request`, already counted
+    if list(reason_counts) == ["unsupported_tool_schema"]:  # `request_feature_incompatible`
+        feature_detail = safe_details[-1].get("detail") if safe_details else ""
+        message = "the requested model does not support a tool-schema feature in this request" + (
+            f": {feature_detail}" if feature_detail else ""
+        )
+        error_type = "invalid_request_error"
+    elif list(reason_counts) == ["bad_upstream_request"]:  # `caller_rejected_request`, already counted
         upstream_detail = safe_details[-1].get("detail") if safe_details else ""
         message = "upstream rejected this request as invalid" + (f": {upstream_detail}" if upstream_detail else "")
         error_type = "invalid_request_error"

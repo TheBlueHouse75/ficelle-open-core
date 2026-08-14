@@ -15,9 +15,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from ficelle.build_identity import package_build_identity
 from ficelle.runtime_paths import RuntimePaths
 from ficelle.url_security import connectable_host
 from ficelle.service import (
+    SERVER_COMMAND_SIGNATURES,
     LaunchAgentServiceBackend,
     ServiceBackend,
     ServicePaths,
@@ -32,6 +34,7 @@ from ficelle.use_cases.provider_auth import (
     unusable_key_provider_lines,
     unusable_key_provider_reasons,
 )
+from ficelle.use_cases.synthetic_health import build_identity_match, describe_build, unverified_build_verdict
 
 LABEL = "com.ficelle.router"
 PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
@@ -121,7 +124,20 @@ def service_paths() -> ServicePaths:
 
 def ficelle_server_pids() -> list[int]:
     """Return live Ficelle server PIDs using a narrow command signature."""
-    result = _run(["ps", "-axo", "pid=,command="])
+    if sys.platform == "win32":
+        # No `ps` on Windows; WQL pre-filters, the precise match below stays shared.
+        result = _run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%ficelle%'\" | "
+                'ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }',
+            ]
+        )
+    else:
+        result = _run(["ps", "-axo", "pid=,command="])
     if result.returncode != 0:
         return []
     current_pid = os.getpid()
@@ -137,32 +153,70 @@ def ficelle_server_pids() -> list[int]:
             continue
         if pid == current_pid:
             continue
-        if "-m ficelle.router --serve" in command:
+        if any(signature in command for signature in SERVER_COMMAND_SIGNATURES):
             pids.append(pid)
     return pids
 
 
+# Windows has no SIGKILL; os.kill there hard-terminates via TerminateProcess anyway.
+_FORCE_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Per-pid liveness probe, so the grace loop does not re-enumerate all processes."""
+    if sys.platform == "win32":
+        # os.kill(pid, 0) is not a probe on Windows (0 is CTRL_C_EVENT); ask the kernel.
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def terminate_stale_servers(*, grace_seconds: float = 2.0) -> list[int]:
-    """Terminate orphan Ficelle server processes left behind after launchctl bootout."""
+    """Terminate orphan Ficelle server processes left behind by the service manager."""
     pids = ficelle_server_pids()
     if not pids:
         return []
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except OSError:
+            # A dead pid raises ProcessLookupError on POSIX but a plain OSError on Windows.
             pass
     deadline = time.time() + grace_seconds
-    while time.time() < deadline:
-        remaining = [pid for pid in ficelle_server_pids() if pid in pids]
-        if not remaining:
-            return pids
+    remaining = pids
+    while remaining and time.time() < deadline:
         time.sleep(0.1)
-    for pid in [pid for pid in ficelle_server_pids() if pid in pids]:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        remaining = [pid for pid in remaining if _pid_alive(pid)]
+    if remaining:
+        # One final enumeration before SIGKILL: a pid the OS recycled to an unrelated
+        # process since the last liveness sample must not be force-killed.
+        still_ficelle = set(ficelle_server_pids())
+        for pid in remaining:
+            if pid not in still_ficelle:
+                continue
+            try:
+                os.kill(pid, _FORCE_KILL_SIGNAL)
+            except OSError:
+                pass
     return pids
 
 
@@ -215,10 +269,20 @@ def router_url(path: str) -> str:
     return f"http://{host}:{port}{path}"
 
 
+def router_request_headers(path: str) -> dict[str, str]:
+    """Authenticate owner CLI calls when the router listens beyond loopback."""
+    config = router.load_config()
+    if router.bind_host_is_loopback(config.get("host")):
+        return {}
+    token = router.admin_token() if path == "/admin" or path.startswith("/admin/") else router.api_token()
+    return {"Authorization": f"Bearer {token}"}
+
+
 def read_admin_status(*, timeout_seconds: float = 2.0) -> dict[str, Any]:
     """Read the live machine-readable admin status without exposing credentials."""
     url = router_url("/admin/status.json")
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    headers = {"Accept": "application/json", **router_request_headers("/admin/status.json")}
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
             body = response.read().decode("utf-8", errors="replace")
@@ -231,6 +295,7 @@ def read_admin_status(*, timeout_seconds: float = 2.0) -> dict[str, Any]:
         return {"ready": False, "url": url, "http_status": response.status, "error": "invalid_status_payload"}
     raw_catalog = payload.get("catalog")
     catalog = raw_catalog if isinstance(raw_catalog, dict) else {}
+    raw_build = payload.get("build")
     return {
         "ready": payload.get("status") in {"ok", "degraded", "fail"},
         "url": url,
@@ -240,6 +305,7 @@ def read_admin_status(*, timeout_seconds: float = 2.0) -> dict[str, Any]:
         "available_count": catalog.get("available_count"),
         "model_cooldowns": len(payload.get("model_cooldowns") or []),
         "provider_cooldowns": len(payload.get("provider_cooldowns") or []),
+        "build": raw_build if isinstance(raw_build, dict) else None,
     }
 
 
@@ -295,7 +361,12 @@ def managed_service_status() -> int:
 
 def http_json(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None, timeout: int = 240) -> int:
     data = json.dumps(payload or {}).encode("utf-8") if method != "GET" else None
-    req = urllib.request.Request(router_url(path), data=data, method=method, headers={"Content-Type": "application/json", "Accept": "application/json"})
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        **router_request_headers(path),
+    }
+    req = urllib.request.Request(router_url(path), data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="replace")
@@ -313,8 +384,16 @@ def doctor_status() -> dict[str, Any]:
     config_read_path = router.runtime_read_path(router.CONFIG_PATH)
     catalog_read_path = router.runtime_read_path(router.CATALOG_PATH)
     state_read_path = router.runtime_read_path(router.STATE_PATH)
+    cli_build = package_build_identity()
+    if service.get("ready"):
+        # Fail closed like the synthetic-health preflight: a reachable service that does
+        # not prove the CLI's runtime content hash is the stale-venv incident, not "ok".
+        build_verdict = build_identity_match(cli_build, service.get("build"))
+    else:
+        # No service answered; "mismatch" would be a guess and "match" a lie.
+        build_verdict = unverified_build_verdict("service unreachable — build identity not verified")
     return {
-        "status": "ok" if service.get("ready") else "degraded",
+        "status": "ok" if build_verdict["match"] is True else "degraded",
         "config": str(router.CONFIG_PATH),
         "catalog_exists": catalog_read_path.exists(),
         "state_exists": state_read_path.exists(),
@@ -325,6 +404,9 @@ def doctor_status() -> dict[str, Any]:
             "catalog_read_path": str(catalog_read_path),
             "state_read_path": str(state_read_path),
         },
+        # The service's raw identity already ships under service.build; repeating it here
+        # would be a second copy to keep in sync.
+        "build": {"cli": cli_build, **build_verdict},
         "service": service,
         "auth": router.auth_status(config),
     }
@@ -368,20 +450,31 @@ def doctor(*, json_output: bool = True) -> int:
         print(f"config: {status['config']}")
         print(f"catalog_exists: {status['catalog_exists']}")
         print(f"state_exists: {status['state_exists']}")
+        build = status.get("build") or {}
+        if build.get("match") is True:
+            print(f"build: service runs the CLI build — {describe_build(build.get('cli') or {})}")
+        else:
+            print(f"build: {build.get('diagnostic') or 'not verified'}")
         for line in doctor_provider_key_lines(status.get("auth") or {}):
             print(line)
     # Exit code follows the reported status so a script or a CI step can gate on `ficelle doctor`
-    # instead of parsing its output. `status` here describes the *service*, so a keyless install
-    # still reads ok — the provider-key lines above are what surface that.
+    # instead of parsing its output. `status` here describes the *service* — reachable and running
+    # the same build as this CLI — so a keyless install still reads ok; the provider-key lines
+    # above are what surface that.
     return 0 if status.get("status") == "ok" else 1
 
 
-def set_key(provider: str) -> int:
+def set_key(provider: str, *, from_stdin: bool = False) -> int:
     config = router.load_config()
     if provider not in (config.get("providers") or {}):
         print(f"Unknown provider: {provider}", file=sys.stderr)
         return 2
-    secret = getpass.getpass(f"Paste the {provider} API key (input hidden): ").strip()
+    if from_stdin:
+        # One line piped by a wrapper (ficelle-setup's inline key capture, scripts): the
+        # key stays off argv and out of the process environment.
+        secret = sys.stdin.readline().strip()
+    else:
+        secret = getpass.getpass(f"Paste the {provider} API key (input hidden): ").strip()
     if not secret:
         print("No key entered; aborted.", file=sys.stderr)
         return 1
@@ -456,7 +549,7 @@ def _print_license_status(entitlement: Any, *, json_output: bool) -> int:
         print(json.dumps(license_ops.status_dict(entitlement)))
         return 0
     if entitlement is None:
-        print("License: not activated. Run: ficelle license activate <license-key>")
+        print("License: not activated. Set FICELLE_LICENSE_KEY or run `ficelle license activate` interactively.")
         return 1
     serving = "yes" if entitlement.is_entitled() else "no (expired / past grace — refresh billing)"
     print(f"License: {entitlement.status} (plan {entitlement.plan or 'n/a'}) — Pro serving: {serving}")
@@ -484,11 +577,13 @@ def cmd_license(args: argparse.Namespace) -> int:
             license_ops.cached_entitlement(), json_output=json_output
         )
     if args.action == "activate":
-        # Env fallback lets automation (the bootstrap handoff) pass the key without putting it on
-        # the command line, where it would be echoed to logs (bootstrap's run_command prints argv).
-        key = args.key or os.getenv("FICELLE_LICENSE_KEY", "")
+        # Automation uses the environment; interactive terminals use a hidden prompt. License
+        # keys are never accepted on argv, where shell history and process listings expose them.
+        key = os.getenv("FICELLE_LICENSE_KEY", "").strip()
+        if not key and sys.stdin.isatty():
+            key = getpass.getpass("License key: ").strip()
         if not key:
-            print("usage: ficelle license activate <license-key>")
+            print("Set FICELLE_LICENSE_KEY or run `ficelle license activate` interactively.")
             return 2
         try:
             entitlement = license_ops.activate(key)
@@ -659,6 +754,85 @@ def cmd_update(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_access_token(scope: str) -> int:
+    """Print an explicitly requested owner token for an exposed listener."""
+    token = router.admin_token() if scope == "admin" else router.api_token()
+    print(token)
+    return 0
+
+
+def _print_synthetic_health_result(payload: dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    print(f"Synthetic health: {payload.get('status', 'unknown')}")
+    if payload.get("run_id"):
+        print(f"Run: {payload['run_id']}")
+    cases = payload.get("cases")
+    if isinstance(cases, dict):
+        print(f"Cases: {cases.get('completed', 0)}/{cases.get('planned', 0)}")
+    artifacts = payload.get("artifacts")
+    if isinstance(artifacts, dict) and artifacts.get("summary_markdown"):
+        print(f"Report: {artifacts['summary_markdown']}")
+
+
+def cmd_synthetic_health(args: argparse.Namespace) -> int:
+    from ficelle import synthetic_health
+
+    action = getattr(args, "synthetic_action", None)
+    json_output = bool(getattr(args, "json_output", False))
+    try:
+        if action == "run":
+            payload, exit_code = synthetic_health.run_synthetic_health(
+                FICELLE_HOME,
+                depth=args.depth,
+                max_duration_seconds=args.max_duration_seconds,
+            )
+        elif action == "status":
+            payload = synthetic_health.synthetic_health_status(FICELLE_HOME)
+            exit_code = 0
+        elif action == "report":
+            payload, exit_code = synthetic_health.load_run_report(FICELLE_HOME, args.run_id)
+        elif action == "resume":
+            payload, exit_code = synthetic_health.resume_synthetic_health(
+                FICELLE_HOME,
+                args.run_id,
+                max_duration_seconds=args.max_duration_seconds,
+            )
+        elif action == "rerun":
+            payload, exit_code = synthetic_health.rerun_failed_synthetic_health(
+                FICELLE_HOME,
+                args.run_id,
+                max_duration_seconds=args.max_duration_seconds,
+            )
+        elif action == "schedule":
+            schedule_action = getattr(args, "schedule_action", None)
+            if schedule_action == "install":
+                hour_text, separator, minute_text = args.time.partition(":")
+                if not separator:
+                    raise synthetic_health.SyntheticHealthError("schedule time must use HH:MM")
+                weekday = {"sun": 1, "mon": 2, "tue": 3, "wed": 4, "thu": 5, "fri": 6, "sat": 7}[args.weekday]
+                payload = synthetic_health.install_weekly_schedule(
+                    FICELLE_HOME,
+                    weekday=weekday,
+                    hour=int(hour_text),
+                    minute=int(minute_text),
+                    max_duration_seconds=args.max_duration_seconds,
+                )
+            elif schedule_action == "remove":
+                payload = synthetic_health.remove_weekly_schedule()
+            else:
+                payload = synthetic_health.schedule_status()
+            exit_code = 0
+        else:
+            raise synthetic_health.SyntheticHealthError("missing synthetic-health action")
+    except (synthetic_health.SyntheticHealthError, ValueError) as exc:
+        payload = {"status": "error", "error": str(exc)}
+        exit_code = 2
+    _print_synthetic_health_result(payload, json_output=json_output)
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ficelle", description="Ficelle local OpenAI-compatible model router")
     sub = parser.add_subparsers(dest="command")
@@ -698,6 +872,12 @@ def main(argv: list[str] | None = None) -> int:
     demo_parser.add_argument("--json", action="store_true", dest="json_output", help="Print machine-readable JSON")
     set_key_parser = sub.add_parser("set-key", help="Store a provider API key (prompted, hidden input)")
     set_key_parser.add_argument("provider")
+    set_key_parser.add_argument(
+        "--stdin",
+        action="store_true",
+        dest="from_stdin",
+        help="Read the key from standard input instead of prompting (for wrappers and scripts; keeps the key off argv).",
+    )
     remove_key_parser = sub.add_parser("remove-key", help="Remove a stored provider API key")
     remove_key_parser.add_argument("provider")
     remove_key_parser.add_argument(
@@ -708,8 +888,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     license_parser = sub.add_parser("license", help="Manage the Ficelle Pro license (Pro only)")
     license_parser.add_argument("action", choices=["activate", "status", "refresh", "deactivate"])
-    license_parser.add_argument("key", nargs="?", help="License key (for activate)")
     license_parser.add_argument("--json", action="store_true", dest="json_output", help="Machine-readable status (JSON)")
+    access_token_parser = sub.add_parser(
+        "access-token",
+        help="Print an owner-only token for a non-loopback listener",
+    )
+    access_token_parser.add_argument("scope", choices=["admin", "api"])
     sub.add_parser("install-pro", help="Install/upgrade to Ficelle Pro from a license key (detached helper; key via FICELLE_LICENSE_KEY)")
     update_parser = sub.add_parser("update", help="Check for or install a verified Ficelle update")
     update_group = update_parser.add_mutually_exclusive_group()
@@ -718,6 +902,39 @@ def main(argv: list[str] | None = None) -> int:
     update_group.add_argument("--recover", action="store_true", help=argparse.SUPPRESS)
     update_parser.add_argument("--json", action="store_true", dest="json_output", help="Print machine-readable status.")
     update_parser.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
+    synthetic_parser = sub.add_parser("synthetic-health", help="Run and inspect deep synthetic user health checks")
+    synthetic_sub = synthetic_parser.add_subparsers(dest="synthetic_action", required=True)
+    synthetic_run = synthetic_sub.add_parser("run", help="Run the synthetic user corpus")
+    synthetic_run.add_argument("--depth", choices=["deep"], default="deep")
+    synthetic_run.add_argument("--max-duration-seconds", type=float)
+    synthetic_run.add_argument("--json", action="store_true", dest="json_output")
+    synthetic_status = synthetic_sub.add_parser("status", help="Show active and latest run status")
+    synthetic_status.add_argument("--json", action="store_true", dest="json_output")
+    synthetic_report = synthetic_sub.add_parser("report", help="Show a completed run report")
+    report_selection = synthetic_report.add_mutually_exclusive_group()
+    report_selection.add_argument("--latest", action="store_true", help="Show the latest run (default)")
+    report_selection.add_argument("--run-id")
+    synthetic_report.add_argument("--json", action="store_true", dest="json_output")
+    synthetic_resume = synthetic_sub.add_parser("resume", help="Resume an identity-compatible interrupted run")
+    synthetic_resume.add_argument("--run-id", required=True)
+    synthetic_resume.add_argument("--max-duration-seconds", type=float)
+    synthetic_resume.add_argument("--json", action="store_true", dest="json_output")
+    synthetic_rerun = synthetic_sub.add_parser("rerun", help="Create a child run for failed cases")
+    synthetic_rerun.add_argument("--run-id", required=True)
+    synthetic_rerun.add_argument("--failed", action="store_true", required=True)
+    synthetic_rerun.add_argument("--max-duration-seconds", type=float)
+    synthetic_rerun.add_argument("--json", action="store_true", dest="json_output")
+    synthetic_schedule = synthetic_sub.add_parser("schedule", help="Manage the disabled-by-default macOS weekly launcher")
+    schedule_sub = synthetic_schedule.add_subparsers(dest="schedule_action", required=True)
+    schedule_status_parser = schedule_sub.add_parser("status")
+    schedule_status_parser.add_argument("--json", action="store_true", dest="json_output")
+    schedule_install = schedule_sub.add_parser("install")
+    schedule_install.add_argument("--weekday", choices=["mon", "tue", "wed", "thu", "fri", "sat", "sun"], required=True)
+    schedule_install.add_argument("--time", required=True, help="Local time in HH:MM format")
+    schedule_install.add_argument("--max-duration-seconds", type=float)
+    schedule_install.add_argument("--json", action="store_true", dest="json_output")
+    schedule_remove = schedule_sub.add_parser("remove")
+    schedule_remove.add_argument("--json", action="store_true", dest="json_output")
     args = parser.parse_args(argv)
     if args.command == "serve":
         return router.main_args(["--serve"])
@@ -750,15 +967,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "demo":
         return cmd_demo(args)
     if args.command == "set-key":
-        return set_key(args.provider)
+        return set_key(args.provider, from_stdin=bool(getattr(args, "from_stdin", False)))
     if args.command == "remove-key":
         return remove_key(args.provider, purge_legacy=bool(getattr(args, "purge_legacy", False)))
     if args.command == "license":
         return cmd_license(args)
+    if args.command == "access-token":
+        return cmd_access_token(args.scope)
     if args.command == "install-pro":
         return cmd_install_pro()
     if args.command == "update":
         return cmd_update(args)
+    if args.command == "synthetic-health":
+        return cmd_synthetic_health(args)
     parser.print_help()
     return 0
 

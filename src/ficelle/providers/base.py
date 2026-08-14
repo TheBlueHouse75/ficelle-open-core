@@ -109,6 +109,11 @@ class ProviderCatalogPolicy:
     model_id_allowlist: list[str]
     requires_exact_model_allowlist: bool
     rejection_counters: dict[str, int]
+    # Per-model-family corrections to `model_defaults`, as (id substring, overrides) pairs.
+    # A provider that publishes no per-model metadata forces one optimistic default onto
+    # every row; a family that contradicts it (Groq's compound systems accept no
+    # user-provided tools) needs a narrower truth than the provider-wide guess.
+    model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -135,7 +140,25 @@ class ProviderCatalogAdapter(Protocol):
     def safe_diagnostics(self, provider_cfg: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def adapt_chat_request(
+        self,
+        payload: dict[str, Any],
+        model: dict[str, Any],
+        provider_cfg: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        ...
+
     def catalog_policy(self, provider_cfg: dict[str, Any]) -> ProviderCatalogPolicy:
+        ...
+
+    def reference_prices_for_free_models(self, raw_models: list[Any]) -> dict[str, dict[str, Any]]:
+        """Free-model upstream id -> the paid sibling's recorded prices, or {}.
+
+        A provider whose catalog pairs a strict-zero listing with a paid listing of the
+        same model owns that pairing dialect (id convention, pricing units) here. The
+        refresh runner only stamps the returned entries onto accepted rows as
+        observational ``reference_pricing`` — see ``RouterModel.reference_pricing``.
+        """
         ...
 
     def normalize_catalog_model(

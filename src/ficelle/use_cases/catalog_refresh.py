@@ -7,8 +7,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ficelle.domain_models import RouterModel
-from ficelle.providers.base import ProviderCatalogAdapter as ProviderCatalogAdapterProtocol
+from ficelle.domain_models import CatalogModel, RouterModel
+from ficelle.providers.base import (
+    TRUSTED_FREE_PROVIDER_CLASSES_BY_MODE,
+    ProviderCatalogAdapter as ProviderCatalogAdapterProtocol,
+)
 
 
 LoadJson = Callable[[Path, Any], Any]
@@ -150,10 +153,12 @@ class CatalogRefreshRunner:
                 enabled: bool,
                 rejected: dict[str, int],
                 models: list[dict[str, Any]],
+                result_class: str,
             ) -> dict[str, Any]:
                 return {
                     "adapter": provider_diagnostics.get("adapter"),
                     "catalog_url": provider_diagnostics.get("catalog_url"),
+                    "result_class": result_class,
                     "raw_count": raw_count,
                     "accepted_count": accepted_count,
                     "invokable": invokable,
@@ -185,6 +190,7 @@ class CatalogRefreshRunner:
                     enabled=False,
                     rejected=dict(provider_policy.rejection_counters),
                     models=[],
+                    result_class="disabled",
                 )
                 continue
             if _provider_missing_credentials(str(source), provider_cfg):
@@ -198,6 +204,7 @@ class CatalogRefreshRunner:
                     enabled=True,
                     rejected=dict(provider_policy.rejection_counters),
                     models=[],
+                    result_class="credentials_unavailable",
                 )
                 continue
             # Eligible providers (they passed both skip guards above) were all
@@ -231,6 +238,9 @@ class CatalogRefreshRunner:
                     )
                 )
 
+            # The pairing dialect (id convention, pricing units) is the adapter's; the
+            # runner only stamps what it returns onto accepted rows.
+            reference_prices = provider_adapter.reference_prices_for_free_models(raw_models)
             for model in raw_models:
                 if not isinstance(model, dict):
                     rejected["invalid"] += 1
@@ -358,6 +368,7 @@ class CatalogRefreshRunner:
                         if provider_cfg.get("burn_weight") is not None
                         else None
                     ),
+                    reference_pricing=reference_prices.get(upstream_id),
                 )
                 accepted.append(asdict(entry))
                 append_provider_model(
@@ -389,6 +400,15 @@ class CatalogRefreshRunner:
                 enabled=True,
                 rejected=rejected,
                 models=provider_models,
+                # A fetch error is transient by definition here: an explicit disable or a
+                # credential gap took one of the earlier branches. A clean fetch that listed
+                # nothing is a distinct signal from a transport failure — the publish decision
+                # treats the two differently (L1-R1).
+                result_class=(
+                    "transient_error"
+                    if error
+                    else ("success_nonempty" if raw_models else "success_empty")
+                ),
             )
 
         all_models.sort(
@@ -411,6 +431,212 @@ class CatalogRefreshRunner:
             "providers": provider_summaries,
             "models": all_models,
         }
+
+
+@dataclass(frozen=True)
+class CatalogPublishDecision:
+    """What a finished catalog rebuild is allowed to do to the active catalog (L1-R1).
+
+    ``decision`` is one of:
+
+    - ``promoted``: publish the rebuilt catalog as-is;
+    - ``merged_last_known_good``: publish the rebuilt catalog plus still-policy-valid rows
+      preserved from the cache for providers whose fetch failed transiently (each preserved
+      row is marked ``catalog_stale`` with its original ``stale_since`` epoch);
+    - ``rejected_empty``: do not publish at all — the rebuild accepted zero models while the
+      cache was non-empty and at least one provider failed transiently, so replacing a
+      working catalog with an empty one would be destructive.
+
+    ``pending_empty_listings`` is the updated observation ledger for providers whose fetch
+    succeeded but listed nothing: removal of a previously non-empty provider requires a
+    second, distinct observation before its cached rows stop being preserved.
+    """
+
+    decision: str
+    catalog: dict[str, Any]
+    preserved_by_source: dict[str, int]
+    pending_empty_listings: dict[str, dict[str, Any]]
+    confirmed_empty_sources: list[str]
+    rejected_reason: str | None = None
+    # A policy-filtered, stale-marked view of the still-active generation for request-path
+    # callers. It is populated only for rejected publication; the catalog file is untouched.
+    fallback_catalog: dict[str, Any] | None = None
+
+
+def _cached_row_passes_current_policy(
+    row: dict[str, Any],
+    enabled_sources: set[str],
+    min_context: int,
+    providers_cfg: dict[str, Any],
+) -> bool:
+    # CatalogModel.from_raw owns the row-schema coercion rules (safe ints, bools), so a
+    # malformed cached row degrades to "not restorable" instead of raising here.
+    model = CatalogModel.from_raw(row)
+    if model is None or model.source not in enabled_sources:
+        return False
+    if not model.invokable or not model.supports_tools or model.context_length < min_context:
+        return False
+    if not model.free_access.get("eligible"):
+        return False
+
+    provider_cfg = providers_cfg.get(model.source)
+    if not isinstance(provider_cfg, dict):
+        return False
+    upstream_id = model.upstream_id.lower()
+    excluded = provider_cfg.get("model_id_exclude_patterns")
+    excluded_patterns = (
+        [str(pattern).strip().lower() for pattern in excluded if str(pattern).strip()]
+        if isinstance(excluded, list)
+        else []
+    )
+    if any(pattern in upstream_id for pattern in excluded_patterns):
+        return False
+    allowlist = provider_cfg.get("model_id_allowlist")
+    allowed_patterns = (
+        [str(pattern).strip().lower() for pattern in allowlist if str(pattern).strip()]
+        if isinstance(allowlist, list)
+        else []
+    )
+    if allowed_patterns:
+        provider_class = str(provider_cfg.get("provider_class") or provider_cfg.get("source_type") or "")
+        if provider_class == "free_model":
+            if upstream_id not in allowed_patterns:
+                return False
+        elif not any(pattern in upstream_id for pattern in allowed_patterns):
+            return False
+
+    # Cached pricing proof remains valid only inside the bounded stale grace. Config-owned
+    # free-access proof must additionally still be authorized by the current provider class;
+    # otherwise changing a provider from free_quota/local/free-model to an untrusted class
+    # could keep the old eligible bit alive through a transient refresh failure.
+    access_mode = str(model.free_access.get("mode") or "")
+    access_proof = str(model.free_access.get("proof") or "")
+    if access_mode == "catalog_free" and access_proof == "provider_pricing":
+        return True
+    if access_mode in TRUSTED_FREE_PROVIDER_CLASSES_BY_MODE:
+        configured_mode = str(provider_cfg.get("free_mode") or "")
+        provider_class = str(provider_cfg.get("provider_class") or provider_cfg.get("source_type") or "")
+        return (
+            configured_mode == access_mode
+            and provider_class in TRUSTED_FREE_PROVIDER_CLASSES_BY_MODE[access_mode]
+            and bool(str(provider_cfg.get("free_access_proof") or "").strip())
+        )
+    return False
+
+
+def decide_catalog_publish(
+    refreshed: dict[str, Any],
+    cached: dict[str, Any],
+    effective_config: dict[str, Any],
+    *,
+    pending_empty_listings: dict[str, dict[str, Any]],
+    now_iso: Callable[[], str],
+) -> CatalogPublishDecision:
+    refreshed_models = [model for model in refreshed.get("models", []) if isinstance(model, dict)]
+    cached_models = [
+        model for model in (cached.get("models", []) if isinstance(cached, dict) else []) if isinstance(model, dict)
+    ]
+    summaries = refreshed.get("providers") if isinstance(refreshed.get("providers"), dict) else {}
+    # `refreshed` always comes straight from this build's runner, which tags every summary;
+    # an absent class stays neutral (neither transient nor empty), which is the safe default.
+    classes: dict[str, str] = {
+        str(source): str(summary.get("result_class") or "")
+        for source, summary in summaries.items()
+        if isinstance(summary, dict)
+    }
+
+    providers_cfg = effective_config.get("providers") if isinstance(effective_config.get("providers"), dict) else {}
+    enabled_sources = {
+        str(source)
+        for source, provider_cfg in providers_cfg.items()
+        if isinstance(provider_cfg, dict) and provider_cfg.get("enabled", True)
+    }
+    min_context = int(effective_config.get("min_context_length") or 0)
+    transient_sources = {source for source, cls in classes.items() if cls == "transient_error"}
+    pending = {str(key): dict(value) for key, value in pending_empty_listings.items() if isinstance(value, dict)}
+    cached_by_source: dict[str, list[dict[str, Any]]] = {}
+    for row in cached_models:
+        cached_by_source.setdefault(str(row.get("source") or ""), []).append(row)
+
+    generation = str(refreshed.get("generated_at") or "")
+    confirmed_empty_sources: list[str] = []
+    preserve_sources: set[str] = set(transient_sources)
+    for source, cls in classes.items():
+        if cls == "success_nonempty":
+            pending.pop(source, None)
+        elif cls in {"disabled", "credentials_unavailable"}:
+            # A later re-enable/recredential starts a new observation sequence; an empty
+            # listing seen before the explicit removal cannot confirm a future removal.
+            pending.pop(source, None)
+        elif cls == "success_empty" and cached_by_source.get(source):
+            observed = pending.get(source)
+            if observed and str(observed.get("catalog_generation") or "") != generation:
+                # Second, distinct empty listing: the removal is confirmed.
+                pending.pop(source, None)
+                confirmed_empty_sources.append(source)
+            else:
+                preserve_sources.add(source)
+                pending[source] = {"observed_at": now_iso(), "catalog_generation": generation}
+
+    known_ids = {str(model.get("id") or "") for model in refreshed_models}
+    stale_epoch = str(cached.get("generated_at") or "") or now_iso()
+    preserved: list[dict[str, Any]] = []
+    preserved_by_source: dict[str, int] = {}
+    for source in sorted(preserve_sources):
+        for row in cached_by_source.get(source, []):
+            if str(row.get("id") or "") in known_ids:
+                continue
+            if not _cached_row_passes_current_policy(row, enabled_sources, min_context, providers_cfg):
+                continue
+            stale_row = dict(row)
+            stale_row["catalog_stale"] = True
+            # Keep the original staleness epoch: merging again must not refresh the age of
+            # the row's free-access proof.
+            stale_row["stale_since"] = str(row.get("stale_since") or "") or stale_epoch
+            preserved.append(stale_row)
+            preserved_by_source[source] = preserved_by_source.get(source, 0) + 1
+
+    # Reject only when the rebuild would remove *nothing but* rows belonging to transiently
+    # failed providers and every cached row still passes today's policy. A concurrent explicit
+    # disable, credential removal, allowlist change, or confirmed empty listing must take effect
+    # immediately; publishing the policy-filtered merge does that without sacrificing the failed
+    # providers' last-known-good rows.
+    cached_sources = {str(row.get("source") or "") for row in cached_models}
+    if (
+        not refreshed_models
+        and cached_models
+        and transient_sources
+        and cached_sources <= transient_sources
+        and len(preserved) == len(cached_models)
+    ):
+        return CatalogPublishDecision(
+            decision="rejected_empty",
+            catalog=refreshed,
+            preserved_by_source={},
+            pending_empty_listings=pending,
+            confirmed_empty_sources=confirmed_empty_sources,
+            rejected_reason=(
+                f"refresh accepted zero models while the cached catalog held {len(cached_models)}; "
+                f"transient provider errors: {', '.join(sorted(transient_sources))}"
+            ),
+            fallback_catalog={**cached, "models": preserved},
+        )
+
+    if not preserved:
+        return CatalogPublishDecision(
+            decision="promoted",
+            catalog=refreshed,
+            preserved_by_source={},
+            pending_empty_listings=pending,
+            confirmed_empty_sources=confirmed_empty_sources,
+        )
+    return CatalogPublishDecision(
+        decision="merged_last_known_good",
+        catalog={**refreshed, "models": [*refreshed_models, *preserved]},
+        preserved_by_source=preserved_by_source,
+        pending_empty_listings=pending,
+        confirmed_empty_sources=confirmed_empty_sources,
+    )
 
 
 def load_or_refresh_catalog(

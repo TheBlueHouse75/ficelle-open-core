@@ -9,6 +9,7 @@ from ficelle.use_cases.catalog_refresh import (
     CatalogRefreshPorts,
     CatalogRefreshRunner,
     StateMutator,
+    decide_catalog_publish,
     load_or_refresh_catalog,
     previous_catalog_baseline,
     publish_catalog,
@@ -32,6 +33,12 @@ def _fingerprint(config: dict[str, Any]) -> str:
 
 
 class _Adapter:
+    def __init__(self, reference_prices: dict[str, dict[str, Any]] | None = None):
+        self.reference_prices = reference_prices or {}
+
+    def reference_prices_for_free_models(self, _raw_models: list[Any]) -> dict[str, dict[str, Any]]:
+        return dict(self.reference_prices)
+
     def safe_diagnostics(self, provider_cfg: dict[str, Any]) -> dict[str, Any]:
         return {
             "adapter": "fake",
@@ -81,10 +88,13 @@ class _Adapter:
         return False
 
 
-def _ports(raw_models: list[dict[str, Any]]) -> CatalogRefreshPorts:
+def _ports(
+    raw_models: list[dict[str, Any]],
+    reference_prices: dict[str, dict[str, Any]] | None = None,
+) -> CatalogRefreshPorts:
     return CatalogRefreshPorts(
         auth_status=lambda _config: {"fake": {"invokable": True, "reason": "configured", "base_url": "https://fake.example/v1"}},
-        provider_catalog_adapter=lambda _source: _Adapter(),
+        provider_catalog_adapter=lambda _source: _Adapter(reference_prices),
         fetch_provider_catalog=lambda _source, _config: (raw_models, None),
         strict_zero_pricing=lambda _pricing: (True, "all exposed pricing fields are numeric zero", {"status": "safe"}),
         normalized_free_access=lambda _model, _pricing_ok, _pricing_reason: {
@@ -214,6 +224,45 @@ def test_load_or_refresh_catalog_refreshes_on_fingerprint_or_timestamp_mismatch(
 
     assert fingerprint_changed == refreshed
     assert malformed_timestamp == refreshed
+
+
+def test_refresh_stamps_the_adapter_reference_prices_on_accepted_rows(tmp_path):
+    reference = {"google/gemma:free": {"prompt": 1.5e-06, "completion": 2e-06, "basis": "fake:google/gemma"}}
+    catalog = refresh_catalog(
+        {
+            "allow_paid_fallback": False,
+            "min_context_length": 128000,
+            "providers": {"fake": {"enabled": True, "base_url": "https://fake.example/v1"}},
+        },
+        ports=_ports(
+            [
+                {
+                    "id": "google/gemma:free",
+                    "name": "Gemma (free)",
+                    "pricing": {"prompt": "0", "completion": "0"},
+                    "context_length": 200000,
+                    "supported_parameters": ["tools"],
+                },
+                {
+                    "id": "other-free",
+                    "name": "Other",
+                    "pricing": {"prompt": "0", "completion": "0"},
+                    "context_length": 200000,
+                    "supported_parameters": ["tools"],
+                },
+            ],
+            reference_prices=reference,
+        ),
+        virtual_models={"ficelle/auto-fast"},
+        catalog_path=tmp_path / "catalog.json",
+        load_json=lambda _path, default: default,
+        atomic_write_json=lambda _path, _data: None,
+        update_state=lambda mutator, reason=None: mutator({}) or {},
+    )
+
+    by_upstream = {model["upstream_id"]: model for model in catalog["models"]}
+    assert by_upstream["google/gemma:free"]["reference_pricing"] == reference["google/gemma:free"]
+    assert by_upstream["other-free"]["reference_pricing"] is None
 
 
 def test_refresh_catalog_persists_catalog_and_refresh_state(tmp_path):
@@ -431,3 +480,282 @@ def test_refresh_catalog_fetches_providers_concurrently():
     assert len(catalog["models"]) == len(sources)
     # ...and the fetches overlapped, proving one slow provider can't serialize the rest.
     assert max_active >= 2, f"expected concurrent provider fetches, max in-flight was {max_active}"
+
+
+# --- Lot 1 (synthetic-health remediation): publish decision ---------------------------------
+
+
+def _decision_row(
+    source: str,
+    upstream_id: str,
+    *,
+    eligible: bool = True,
+    tools: bool = True,
+    context_length: int = 131072,
+    stale_since: str | None = None,
+) -> dict[str, Any]:
+    row = {
+        "id": f"ficelle/{source}/{upstream_id}",
+        "source": source,
+        "upstream_id": upstream_id,
+        "invokable": True,
+        "supports_tools": tools,
+        "context_length": context_length,
+        "free_access": {
+            "eligible": eligible,
+            "mode": "catalog_free",
+            "proof": "provider_pricing",
+            "status": "available",
+            "scope": "model",
+        },
+    }
+    if stale_since is not None:
+        row["catalog_stale"] = True
+        row["stale_since"] = stale_since
+    return row
+
+
+def _decision_summary(
+    result_class: str,
+    *,
+    raw_count: int = 0,
+    accepted_count: int = 0,
+    error: str | None = None,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    return {
+        "result_class": result_class,
+        "raw_count": raw_count,
+        "accepted_count": accepted_count,
+        "error": error,
+        "enabled": enabled,
+        "rejected": {},
+        "models": [],
+    }
+
+
+def _decision_config(sources: list[str], *, min_context: int = 128000) -> dict[str, Any]:
+    return {
+        "min_context_length": min_context,
+        "providers": {source: {"enabled": True} for source in sources},
+    }
+
+
+def test_all_transient_failures_reject_destructive_empty_publish():
+    cached = {
+        "generated_at": "2026-08-08T09:00:00+00:00",
+        "models": [_decision_row("alpha", f"model-{index}") for index in range(225)],
+    }
+    refreshed = {
+        "generated_at": "2026-08-08T10:00:00+00:00",
+        "models": [],
+        "providers": {"alpha": _decision_summary("transient_error", error="Timeout: timed out")},
+    }
+
+    decision = decide_catalog_publish(
+        refreshed,
+        cached,
+        _decision_config(["alpha"]),
+        pending_empty_listings={},
+        now_iso=lambda: "2026-08-08T10:00:00+00:00",
+    )
+
+    assert decision.decision == "rejected_empty"
+    assert decision.rejected_reason
+    assert decision.preserved_by_source == {}
+
+
+def test_partial_failure_preserves_only_policy_valid_rows_of_failed_providers():
+    cached = {
+        "generated_at": "2026-08-08T09:00:00+00:00",
+        "models": [
+            _decision_row("alpha", "kept"),
+            _decision_row("beta", "survivor"),
+            _decision_row("beta", "not-free", eligible=False),
+            _decision_row("beta", "tiny-context", context_length=4096),
+            _decision_row("beta", "already-stale", stale_since="2026-08-08T05:00:00+00:00"),
+        ],
+    }
+    refreshed = {
+        "generated_at": "2026-08-08T10:00:00+00:00",
+        "models": [_decision_row("alpha", "kept")],
+        "providers": {
+            "alpha": _decision_summary("success_nonempty", raw_count=1, accepted_count=1),
+            "beta": _decision_summary("transient_error", error="ConnectionError: dns"),
+        },
+    }
+
+    decision = decide_catalog_publish(
+        refreshed,
+        cached,
+        _decision_config(["alpha", "beta"]),
+        pending_empty_listings={},
+        now_iso=lambda: "2026-08-08T10:00:00+00:00",
+    )
+
+    assert decision.decision == "merged_last_known_good"
+    assert decision.preserved_by_source == {"beta": 2}
+    preserved = {
+        str(model.get("upstream_id")): model
+        for model in decision.catalog["models"]
+        if model.get("source") == "beta"
+    }
+    assert set(preserved) == {"survivor", "already-stale"}
+    assert preserved["survivor"]["catalog_stale"] is True
+    assert preserved["survivor"]["stale_since"] == "2026-08-08T09:00:00+00:00"
+    # A row that was already stale keeps its original staleness epoch: merging again must
+    # not refresh the age of its free-access proof.
+    assert preserved["already-stale"]["stale_since"] == "2026-08-08T05:00:00+00:00"
+    # The fresh provider's rows are untouched.
+    alpha_rows = [model for model in decision.catalog["models"] if model.get("source") == "alpha"]
+    assert alpha_rows and not any(model.get("catalog_stale") for model in alpha_rows)
+
+
+def test_disabled_and_credentialless_providers_are_removed_immediately():
+    cached = {
+        "generated_at": "2026-08-08T09:00:00+00:00",
+        "models": [_decision_row("gone", "model-a"), _decision_row("locked", "model-b")],
+    }
+    refreshed = {
+        "generated_at": "2026-08-08T10:00:00+00:00",
+        "models": [],
+        "providers": {
+            "gone": _decision_summary("disabled", enabled=False, error="disabled"),
+            "locked": _decision_summary("credentials_unavailable", error="missing credentials"),
+        },
+    }
+
+    decision = decide_catalog_publish(
+        refreshed,
+        cached,
+        _decision_config(["gone", "locked"]),
+        pending_empty_listings={},
+        now_iso=lambda: "2026-08-08T10:00:00+00:00",
+    )
+
+    # No transient error anywhere: an empty publish here is the operator's explicit intent.
+    assert decision.decision == "promoted"
+    assert decision.catalog["models"] == []
+
+
+def test_successful_empty_listing_needs_a_second_observation_before_pruning():
+    cached = {
+        "generated_at": "2026-08-08T09:00:00+00:00",
+        "models": [_decision_row("alpha", "model-a")],
+    }
+    first_refresh = {
+        "generated_at": "2026-08-08T10:00:00+00:00",
+        "models": [],
+        "providers": {"alpha": _decision_summary("success_empty", raw_count=0)},
+    }
+
+    first = decide_catalog_publish(
+        first_refresh,
+        cached,
+        _decision_config(["alpha"]),
+        pending_empty_listings={},
+        now_iso=lambda: "2026-08-08T10:00:00+00:00",
+    )
+
+    # First observation: rows survive (stale) and the empty listing is recorded as pending.
+    assert first.decision == "merged_last_known_good"
+    assert first.preserved_by_source == {"alpha": 1}
+    assert "alpha" in first.pending_empty_listings
+    assert first.pending_empty_listings["alpha"]["catalog_generation"] == "2026-08-08T10:00:00+00:00"
+
+    second_refresh = {
+        "generated_at": "2026-08-08T11:00:00+00:00",
+        "models": [],
+        "providers": {"alpha": _decision_summary("success_empty", raw_count=0)},
+    }
+
+    second = decide_catalog_publish(
+        second_refresh,
+        first.catalog,
+        _decision_config(["alpha"]),
+        pending_empty_listings=first.pending_empty_listings,
+        now_iso=lambda: "2026-08-08T11:00:00+00:00",
+    )
+
+    # Second, distinct observation confirms the removal.
+    assert second.decision == "promoted"
+    assert second.catalog["models"] == []
+    assert "alpha" not in second.pending_empty_listings
+    assert second.confirmed_empty_sources == ["alpha"]
+
+
+def test_successful_nonempty_listing_clears_a_pending_empty_observation():
+    cached = {
+        "generated_at": "2026-08-08T10:00:00+00:00",
+        "models": [_decision_row("alpha", "model-a", stale_since="2026-08-08T09:00:00+00:00")],
+    }
+    refreshed = {
+        "generated_at": "2026-08-08T11:00:00+00:00",
+        "models": [_decision_row("alpha", "model-a")],
+        "providers": {"alpha": _decision_summary("success_nonempty", raw_count=1, accepted_count=1)},
+    }
+
+    decision = decide_catalog_publish(
+        refreshed,
+        cached,
+        _decision_config(["alpha"]),
+        pending_empty_listings={"alpha": {"observed_at": "2026-08-08T10:00:00+00:00", "catalog_generation": "2026-08-08T10:00:00+00:00"}},
+        now_iso=lambda: "2026-08-08T11:00:00+00:00",
+    )
+
+    assert decision.decision == "promoted"
+    assert decision.pending_empty_listings == {}
+    # The fresh listing replaces the stale row: no stale marker survives a real recovery.
+    assert not any(model.get("catalog_stale") for model in decision.catalog["models"])
+
+
+def test_runner_tags_every_provider_summary_with_a_result_class():
+    import dataclasses
+
+    listed_model = {
+        "id": "listed-model",
+        "name": "Listed",
+        "context_length": 200000,
+        "pricing": {"prompt": 0, "completion": 0},
+        "supported_parameters": ["tools"],
+    }
+    base = _ports([])
+
+    def fetch(source: str, _config: dict[str, Any]):
+        if source == "flaky":
+            return [], "Timeout: timed out"
+        if source == "hollow":
+            return [], None
+        return [dict(listed_model)], None
+
+    ports = dataclasses.replace(
+        base,
+        auth_status=lambda _config: {
+            source: {"invokable": source != "locked", "reason": "configured" if source != "locked" else "missing credentials", "base_url": "https://fake/v1"}
+            for source in ("healthy", "flaky", "hollow", "gone", "locked")
+        },
+        fetch_provider_catalog=fetch,
+    )
+    runner = CatalogRefreshRunner(ports, virtual_models=set())
+    catalog = runner.refresh_catalog(
+        {
+            "allow_paid_fallback": False,
+            "min_context_length": 128000,
+            "providers": {
+                "healthy": {"enabled": True},
+                "flaky": {"enabled": True},
+                "hollow": {"enabled": True},
+                "gone": {"enabled": False},
+                "locked": {"enabled": True, "activation_policy": "configured_credentials"},
+            },
+        }
+    )
+
+    classes = {source: summary.get("result_class") for source, summary in catalog["providers"].items()}
+    assert classes == {
+        "healthy": "success_nonempty",
+        "flaky": "transient_error",
+        "hollow": "success_empty",
+        "gone": "disabled",
+        "locked": "credentials_unavailable",
+    }

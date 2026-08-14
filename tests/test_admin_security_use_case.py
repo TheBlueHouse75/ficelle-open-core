@@ -5,8 +5,13 @@ from ficelle.use_cases.admin_security import (
     ADMIN_HTML_SECURITY_HEADERS,
     admin_origin_allowed,
     admin_token_matches,
+    basic_token_matches,
+    bearer_token_matches,
+    bind_host_is_loopback,
+    inference_origin_allowed,
     is_loopback_origin,
     request_host_allowed,
+    same_origin_allowed,
 )
 
 
@@ -32,6 +37,70 @@ def test_admin_token_matches_requires_present_exact_token() -> None:
     assert admin_token_matches("", "secret-token") is False
     assert admin_token_matches(None, "secret-token") is False
     assert admin_token_matches("wrong-token", "secret-token") is False
+
+
+def test_remote_access_tokens_require_exact_supported_authorization_schemes() -> None:
+    import base64
+
+    basic = base64.b64encode(b"ficelle:secret-token").decode("ascii")
+    assert basic_token_matches(f"Basic {basic}", "secret-token") is True
+    assert basic_token_matches(f"basic {basic}", "secret-token") is True
+    assert basic_token_matches(f"Basic {base64.b64encode(b'other:secret-token').decode('ascii')}", "secret-token") is False
+    assert basic_token_matches("Basic not-base64", "secret-token") is False
+    assert basic_token_matches(None, "secret-token") is False
+
+    assert bearer_token_matches("Bearer secret-token", "secret-token") is True
+    assert bearer_token_matches("bearer secret-token", "secret-token") is True
+    assert bearer_token_matches("Bearer wrong-token", "secret-token") is False
+    assert bearer_token_matches("Basic secret-token", "secret-token") is False
+
+
+def test_same_origin_guard_supports_authenticated_non_loopback_admin() -> None:
+    assert same_origin_allowed(None, "mac-air.tailnet.ts.net:8646", 8646) is True
+    assert same_origin_allowed(
+        "http://mac-air.tailnet.ts.net:8646",
+        "mac-air.tailnet.ts.net:8646",
+        8646,
+    ) is True
+    assert same_origin_allowed(
+        "http://127.0.0.1:8646",
+        "127.0.0.1:8646",
+        8646,
+    ) is True
+    assert same_origin_allowed(
+        "http://evil.example:8646",
+        "127.0.0.1:8646",
+        8646,
+    ) is False
+    assert same_origin_allowed(
+        "http://mac-air.tailnet.ts.net:9999",
+        "mac-air.tailnet.ts.net:8646",
+        8646,
+    ) is False
+    assert same_origin_allowed("http://127.0.0.1:8646", None, 8646) is False
+
+
+def test_inference_origin_guard_accepts_named_native_webview_schemes() -> None:
+    assert inference_origin_allowed("tauri://localhost", "127.0.0.1:8646", 8646) is True
+    assert inference_origin_allowed("app://ficelle-client", "127.0.0.1:8646", 8646) is True
+    assert inference_origin_allowed("vscode-webview://panel", None, 8646) is True
+    # The same-origin acceptances still hold on the inference guard.
+    assert inference_origin_allowed(None, "127.0.0.1:8646", 8646) is True
+    assert inference_origin_allowed("http://127.0.0.1:8646", "127.0.0.1:8646", 8646) is True
+    # Browser-emittable and extension origins stay held to the exact-origin rule.
+    assert inference_origin_allowed("https://evil.example", "127.0.0.1:8646", 8646) is False
+    assert inference_origin_allowed("chrome-extension://abcdefghijk", "127.0.0.1:8646", 8646) is False
+    assert inference_origin_allowed("null", "127.0.0.1:8646", 8646) is False
+    assert inference_origin_allowed("", "127.0.0.1:8646", 8646) is False
+    # The shared guard behind every admin write stays strict: no app-scheme allowance.
+    assert same_origin_allowed("tauri://localhost", "127.0.0.1:8646", 8646) is False
+
+
+def test_loopback_bind_classification_normalizes_dns_spelling() -> None:
+    for host in (None, "", "127.0.0.1", "localhost", "LOCALHOST.", "::1"):
+        assert bind_host_is_loopback(host) is True
+    for host in ("0.0.0.0", "::", "*", "mac-air.tailnet.ts.net"):
+        assert bind_host_is_loopback(host) is False
 
 
 def test_request_host_allowed_accepts_every_loopback_spelling() -> None:

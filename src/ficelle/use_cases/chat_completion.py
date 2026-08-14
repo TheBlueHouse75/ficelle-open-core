@@ -3,7 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import math
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping
 
 try:
@@ -30,12 +31,17 @@ except ImportError:  # pragma: no cover - exercised only in core-only installs
     plan_chat_compression = None
     put_original = None
 from ficelle.failures import (
+    rejected_sampling_parameters,
     CALLER_CAUSED_FAILURE_REASONS,
     NON_RETRYABLE_FAILURE_REASONS,
+    SOURCE_DIVERTING_FAILURE_REASONS,
     UPSTREAM_DETAIL_LIMIT,
     caller_rejected_request,
+    status_for_error_codes,
     upstream_failure_status,
 )
+from ficelle.domain_models import SelectionResult
+from ficelle.use_cases.cooldowns import AppliedCooldown
 from ficelle.redaction import redact_sensitive_json, sanitize_error_detail
 from ficelle.use_cases.benchmark import finish_reason_is_truncation
 
@@ -87,6 +93,16 @@ class ChatCompletionAttemptPlan:
     routed_body: dict[str, Any]
     compression_metadata: dict[str, Any] | None
     requested_model_is_virtual: bool
+    # The scored pool `candidates` was drawn from, kept so the attempt loop can re-plan what is left
+    # of the window once a failure reason rules a whole source out. Empty means "the window is all
+    # that is known", which is what a hand-built plan gets.
+    candidate_pool: list[dict[str, Any]] = field(default_factory=list)
+    # Error rows for candidates ruled out before the window was cut (L3-R4), seeded into the
+    # attempt loop's `errors`. Carried only when the filter left nothing to try: they are then the
+    # whole reason the request fails, and the failure response reads them to answer with the
+    # precise 422 naming the feature. An exclusion a run could route around costs that run nothing
+    # and is not one of its failure reasons.
+    excluded_errors: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -141,6 +157,7 @@ class NonStreamingAttemptDecision:
     cooldown_reason: str | None = None
     cooldown_detail: str | None = None
     cooldown_status: CooldownStatus | None = None
+    usage: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +168,7 @@ class StreamingAttemptDecision:
     cooldown_reason: str | None = None
     cooldown_detail: str | None = None
     cooldown_status: CooldownStatus | None = None
+    usage: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +209,7 @@ class SuccessRouteLogInput:
     stream: bool
     compression: dict[str, Any] | None = None
     stream_started: bool | None = None
+    usage: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -272,6 +291,9 @@ class NonStreamingSuccessResponseInput:
     response_headers: Mapping[str, Any]
     response_content: bytes
     compression: dict[str, Any] | None = None
+    # Sampling knobs removed from this request because the serving model rejected them by
+    # name. Announced to the caller — a dropped parameter must never be silent.
+    dropped_parameters: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -283,14 +305,45 @@ class StreamingResponseStartInput:
     response_status: int
     response_headers: Mapping[str, Any]
     compression: dict[str, Any] | None = None
+    dropped_parameters: tuple[str, ...] = ()
 
 
 CatalogLoader = Callable[[dict[str, Any]], dict[str, Any]]
 CandidateSelector = Callable[[str, dict[str, Any], dict[str, Any]], list[dict[str, Any]]]
+# Returns the typed SelectionResult (candidates + per-model exclusion reasons) so a refusal
+# can name what actually blocked the request instead of one generic message (L1-R4).
+ResultSelector = Callable[[str, dict[str, Any], dict[str, Any]], "SelectionResult"]
+
+# Error types Ficelle emits for its own selection refusals, before any upstream attempt.
+# Exported so the synthetic-health harness recognizes them structurally instead of keeping
+# a hand-synced copy. `invalid_request_error` is deliberately absent: the router also uses
+# it when every upstream rejected the body, and that verdict belongs to the providers.
+SELECTION_REFUSAL_ERROR_TYPES = frozenset({
+    "no_available_model",
+    "model_unavailable",
+    "model_not_found",
+})
+
+# Safe response scope for each selection-exclusion reason. Anything unknown stays "model":
+# the narrowest claim that is always true of a blocked concrete model. A shared-account
+# quota block is reported as `quota_pool` here on purpose: the response should not reveal
+# cross-source account topology to an arbitrary client — the harness's eligibility
+# records, which are local evidence, do distinguish `shared_account`.
+REFUSAL_SCOPE_BY_BLOCK_REASON = {
+    "cooldown": "model",
+    "quarantined": "model",
+    "provider_cooldown": "provider",
+    "quota_cooldown": "quota_pool",
+    "not_invokable": "credential",
+    "stale_catalog": "catalog",
+    "profile_requirements": "profile",
+    "competence_gate": "profile",
+}
 FusionPredicate = Callable[[str], bool]
 VirtualModelPredicate = Callable[[str], bool]
 ResponseHeadersBuilder = Callable[[str, str], dict[str, str]]
-SuccessResponseHeadersBuilder = Callable[[str, str, dict[str, Any], int, dict[str, Any] | None], dict[str, str]]
+# (request_id, safe_requested_model, selected_model, attempt_count, compression, dropped_parameters)
+SuccessResponseHeadersBuilder = Callable[..., dict[str, str]]
 FailureResponseHeadersBuilder = Callable[[str, str, int, dict[str, Any] | None], dict[str, str]]
 UpstreamFailureErrorBuilder = Callable[[str, str, int, list[dict[str, Any]], list[dict[str, Any]]], dict[str, Any]]
 LastRouteRecorder = Callable[[str, str, str, str, int, int, float], None]
@@ -303,12 +356,22 @@ OriginalWriter = Callable[..., str]
 SuccessErrorDetector = Callable[[Any, dict[str, Any] | None], tuple[str, str, int | None] | None]
 DeliverablePredicate = Callable[[Any], bool]
 FailureClassifier = Callable[[int, str, dict[str, Any] | None], str]
-ModelInvoker = Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], Any]
-CooldownApplier = Callable[[AttemptCooldownRequest], None]
+# (model, body, config, *, remaining_budget_seconds=None, deadline_monotonic=None) — the
+# keyword budget arguments are how the request deadline constrains an in-flight attempt.
+ModelInvoker = Callable[..., Any]
+# Returns what the write blocked beyond this candidate, which is what the attempt loop diverts on.
+# `None` stays accepted so a wiring that only needs the side effect keeps working — it then reports
+# nothing, and the loop behaves as it did before any of this existed.
+CooldownApplier = Callable[[AttemptCooldownRequest], "AppliedCooldown | None"]
+# `quota_cooldown_matches_model`: does this key block that candidate? A quota cooldown is keyed at
+# whichever scope the provider declares, so only this predicate can say — comparing sources would
+# over-divert a `model:` key and under-divert a `shared_account:` one.
+QuotaCooldownMatcher = Callable[[str, dict[str, Any]], bool]
 SuccessRecorder = Callable[[dict[str, Any], float], None]
 CompetenceResolver = Callable[[str, dict[str, Any]], str]
 TelemetryRecorder = Callable[[ChatCompletionRouteTelemetry], None]
-StreamResponseHandler = Callable[[Any, dict[str, Any], int], dict[str, Any]]
+# (response, model, attempt_count, *, deadline_monotonic=None)
+StreamResponseHandler = Callable[..., dict[str, Any]]
 TimeoutDetector = Callable[[Exception], bool]
 AttemptPortsFactory = Callable[[ChatCompletionAttemptPlan], "ChatCompletionAttemptPorts"]
 
@@ -331,9 +394,135 @@ class ChatCompletionAttemptPorts:
     build_success_headers: SuccessResponseHeadersBuilder
     build_failure_error: UpstreamFailureErrorBuilder
     build_failure_headers: FailureResponseHeadersBuilder
+    # Recognizes Ficelle's own request-deadline expiry (L2-R2), which must be reported as
+    # `request_deadline_exceeded`, distinct from a provider `timeout`. Optional so existing
+    # wirings and fixtures keep their behavior.
+    is_deadline_exception: TimeoutDetector | None = None
+    # Learned sampling-parameter incompatibilities: read before sending (proactive), written
+    # after a provider rejects a knob by name (reactive). Default to no-ops so a wiring that
+    # does not persist them still gets the reactive drop-and-retry.
+    # Reads a quota cooldown key at its own scope. Defaults to "matches nothing", so a wiring that
+    # does not provide it simply never diverts on a quota key — the behaviour before this port.
+    quota_cooldown_matches_model: QuotaCooldownMatcher = lambda _key, _model: False
+    unsupported_parameters_for: Callable[[dict[str, Any], dict[str, Any]], tuple[str, ...]] = (
+        lambda _model, _body: ()
+    )
+    learn_unsupported_parameters: Callable[[dict[str, Any], tuple[str, ...]], None] = (
+        lambda _model, _parameters: None
+    )
 
 
 COMPRESSION_PENDING_MARKER = "<<ficelle:compressed:pending>>"
+
+
+def detect_tool_schema_features(body: dict[str, Any]) -> set[str]:
+    """The advanced JSON-Schema dialect features this request's tool schemas use (L3-R4).
+
+    Read-only and conservative: only features a provider is known to reject are named, so a
+    candidate is excluded for a feature it declared unsupported — never for schema style.
+    """
+    features: set[str] = set()
+    tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+    if isinstance(body.get("tool_choice"), dict):
+        features.add("forced_tool_choice")
+
+    def walk(schema: Any, *, depth: int) -> None:
+        if not isinstance(schema, dict):
+            return
+        type_value = schema.get("type")
+        if isinstance(type_value, list):
+            features.add("nullable_type_array" if "null" in type_value else "type_array")
+        if isinstance(schema.get("anyOf"), list):
+            if any(isinstance(alt, dict) and alt.get("type") == "null" for alt in schema["anyOf"]):
+                features.add("anyof_nullability")
+        if schema.get("additionalProperties") is False:
+            features.add("additional_properties_false")
+        if isinstance(schema.get("enum"), list):
+            features.add("enums")
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        for child in properties.values():
+            if isinstance(child, dict):
+                if child.get("type") == "object" and depth >= 1:
+                    features.add("nested_objects_arrays")
+                walk(child, depth=depth + 1)
+        items = schema.get("items")
+        if isinstance(items, dict):
+            if items.get("type") == "object":
+                features.add("nested_objects_arrays")
+            walk(items, depth=depth + 1)
+
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        walk(parameters, depth=0)
+    return features
+
+
+def declared_unsupported_schema_features(source: Any, config: dict[str, Any]) -> set[str]:
+    """The tool-schema features a provider declares it cannot take (L3-R4).
+
+    Declaration lives in provider config (curated pack or operator) under
+    `unsupported_tool_schema_features`, and is made per provider rather than per model; absent
+    declaration means nothing is excluded — incompatibility is asserted, never guessed."""
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    provider_cfg = providers.get(str(source or ""))
+    declared = provider_cfg.get("unsupported_tool_schema_features") if isinstance(provider_cfg, dict) else None
+    if not isinstance(declared, list) or not declared:
+        return set()
+    return {str(item) for item in declared}
+
+
+def exclude_incompatible_candidates(
+    body: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a scored pool into what this request's tool schemas can be sent to, and error rows
+    for what they cannot (L3-R4).
+
+    The declaration is per provider, so the verdict is identical for every candidate of a source
+    and is a pure function of the request, the source and the config — knowable before the attempt
+    window is even cut. Evaluated per candidate inside the attempt loop, it cost one window slot
+    per model a declaring provider owns: a window of six mostly from one provider ended as one real
+    attempt and a 502 with the rest of the pool untried. Nothing is sent upstream either way, so
+    what filtering statically buys is a window that can actually be spent, not saved quota.
+
+    The rows are returned rather than dropped: they are what still answers a request whose every
+    candidate is incompatible with the precise 422 naming the feature, instead of a pool that
+    silently reads as empty.
+    """
+    # The two halves are independent, and neither is per candidate: what a provider refuses is
+    # keyed by source, what this request uses is keyed by nothing at all. So the config is read
+    # once per distinct source, and the tool schemas are walked once for the whole pool — and not
+    # at all when no source in it declares anything, which is the ordinary case.
+    declared_by_source = {
+        source: declared_unsupported_schema_features(source, config)
+        for source in {str(candidate.get("source") or "") for candidate in candidates}
+    }
+    if not any(declared_by_source.values()):
+        return list(candidates), []
+    features = detect_tool_schema_features(body)
+    eligible: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for candidate in candidates:
+        incompatible = features & declared_by_source[str(candidate.get("source") or "")]
+        if not incompatible:
+            eligible.append(candidate)
+            continue
+        excluded.append({
+            "model": candidate.get("id"),
+            "upstream": candidate.get("upstream_id"),
+            "source": candidate.get("source"),
+            "reason": "unsupported_tool_schema",
+            "detail": "unsupported tool-schema features: " + ", ".join(sorted(incompatible)),
+        })
+    return eligible, excluded
+
+
+def drop_sampling_parameters(body: dict[str, Any], parameters: tuple[str, ...] | set[str]) -> dict[str, Any]:
+    """A copy of the request without the named sampling knobs. Never mutates the caller's body."""
+    dropped = set(parameters)
+    return {key: value for key, value in body.items() if key not in dropped}
 
 
 def normalize_chat_completion_request(body: Any) -> ChatCompletionRequest:
@@ -450,6 +639,42 @@ def attempts_with_source_diversity(
             break
         selected.append(candidate)
     return selected
+
+
+def attempts_after_source_rejection(
+    pool: list[dict[str, Any]],
+    *,
+    considered_ids: set[str],
+    is_ruled_out: Callable[[dict[str, Any]], bool],
+    remaining_attempts: int,
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """What is left of the attempt window once part of the pool has stopped being worth it.
+
+    The window is chosen before the first attempt, when no failure reason exists yet, and this
+    request can then learn two kinds of fact that invalidate the rest of it: the provider's request
+    validation rejected this body, so its other models validate it the same way; or a cooldown it
+    just wrote now blocks candidates the window is still about to call. Re-planned from the whole
+    pool rather than merely filtered, so the freed attempts go to the best remaining candidates
+    instead of shrinking the window: the observed 502 had spent six of seven attempts inside one
+    provider with 56 candidates available.
+
+    `is_ruled_out` decides, rather than a set of source names, because the two facts do not block
+    the same shape: a contract rejection and a provider cooldown block a source, while a quota
+    cooldown blocks whichever scope its provider declares — one model, or an account several
+    sources share.
+
+    Score order and the per-source cap are whatever `attempts_with_source_diversity` makes of the
+    survivors — this only removes candidates from its input, it never reorders. An empty result means
+    the pool has nothing else to offer, and the caller keeps the window it already had: a
+    single-provider pool spends every attempt the operator configured, here as anywhere else.
+    """
+    survivors = [
+        candidate
+        for candidate in pool
+        if not is_ruled_out(candidate) and str(candidate.get("id") or "") not in considered_ids
+    ]
+    return attempts_with_source_diversity(survivors, remaining_attempts, config)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -674,7 +899,23 @@ def evaluate_non_streaming_success_response(
     return NonStreamingAttemptDecision(
         outcome="success",
         attempt_update={"status": status_code, "reason": "ok", "latency_seconds": latency},
+        usage=normalized_token_usage(payload.get("usage")),
     )
+
+
+def normalized_token_usage(raw: Any) -> dict[str, int] | None:
+    """Prompt/completion token counts from an OpenAI-style usage block, or None.
+
+    Token *counts* are the one usage fact recorded — they are not content, and they are
+    what the admin "estimated saved" figure needs. Anything malformed reads as absent.
+    """
+    if not isinstance(raw, dict):
+        return None
+    prompt = _safe_int(raw.get("prompt_tokens"), None)
+    completion = _safe_int(raw.get("completion_tokens"), None)
+    if prompt is None and completion is None:
+        return None
+    return {"prompt_tokens": max(0, prompt or 0), "completion_tokens": max(0, completion or 0)}
 
 
 def _should_retry(reason: str, requested_model_is_virtual: bool) -> bool:
@@ -721,11 +962,36 @@ def evaluate_streaming_result(
     response_status: int,
     latency_seconds: float,
     requested_model_is_virtual: bool,
+    classify: FailureClassifier | None = None,
 ) -> StreamingAttemptDecision:
     reason = str(stream_result.get("reason") or "stream_failure")
     stream_started = bool(stream_result.get("stream_started"))
+    classified_status: int | None = None
+    if (
+        stream_result.get("status") == "error"
+        and not stream_started
+        and reason == "pre_stream_failure"
+        and classify is not None
+    ):
+        # A provider may put an OpenAI-style error object in the first SSE event while keeping the
+        # HTTP status at 200. The stream reader has not committed that event to the client and keeps
+        # its canonical `type`/`code` as `error_type`; recover the logical status here so this path
+        # earns the same auth/rate-limit/request-contract verdict as a non-streaming wrapped error.
+        error_code = str(stream_result.get("error_type") or "").strip()
+        classified_status = status_for_error_codes(error_code)
+        if classified_status is None:
+            try:
+                numeric_status = int(error_code)
+            except ValueError:
+                numeric_status = 0
+            if 100 <= numeric_status <= 599:
+                classified_status = numeric_status
+        if classified_status is not None:
+            message = str(stream_result.get("message") or "")
+            reason = classify(classified_status, f"{error_code}: {message}".strip(), model)
+    attempt_status = classified_status or response_status
     attempt_update = {
-        "status": response_status,
+        "status": attempt_status,
         "reason": reason,
         "latency_seconds": round(latency_seconds, 4),
         "stream_started": stream_started,
@@ -733,19 +999,23 @@ def evaluate_streaming_result(
         "stream_bytes_sent": _safe_int(stream_result.get("bytes_sent"), 0),
     }
     if stream_result.get("status") == "ok":
-        return StreamingAttemptDecision(outcome="success", attempt_update=attempt_update)
+        return StreamingAttemptDecision(
+            outcome="success",
+            attempt_update=attempt_update,
+            usage=normalized_token_usage(stream_result.get("usage")),
+        )
 
     error = {
         "model": model.get("id"),
         "upstream": model.get("upstream_id"),
         "source": model.get("source"),
-        "status": response_status,
+        "status": attempt_status,
         "reason": reason,
         "stream_started": stream_started,
     }
     if stream_started:
         outcome: Literal["retryable_failure", "terminal_failure", "mid_stream_failure"] = "mid_stream_failure"
-    elif requested_model_is_virtual:
+    elif _should_retry(reason, requested_model_is_virtual):
         outcome = "retryable_failure"
     else:
         outcome = "terminal_failure"
@@ -753,11 +1023,17 @@ def evaluate_streaming_result(
         outcome=outcome,
         attempt_update=attempt_update,
         error=error,
-        # `client_disconnected` carries its own no-cooldown policy: the write to the caller's socket
-        # is what failed, so the model keeps its slot. Every other stream failure is on the upstream.
-        cooldown_reason=reason if reason in CALLER_CAUSED_FAILURE_REASONS else "unavailable",
+        # A classified error object keeps the same cooldown scope as the equivalent HTTP/non-stream
+        # failure. `client_disconnected` independently carries its own no-cooldown policy: the write
+        # to the caller's socket failed, so the model keeps its slot. Other transport failures stay
+        # the generic model-scoped `unavailable` verdict.
+        cooldown_reason=(
+            reason
+            if classified_status is not None or reason in CALLER_CAUSED_FAILURE_REASONS
+            else "unavailable"
+        ),
         cooldown_detail=f"{reason}: {stream_result.get('error_type') or ''} {stream_result.get('message') or ''}".strip(),
-        cooldown_status="stream_error",
+        cooldown_status=classified_status or "stream_error",
     )
 
 
@@ -807,12 +1083,18 @@ def evaluate_invocation_exception(
     *,
     latency_seconds: float,
     timeout: bool,
+    deadline_exceeded: bool = False,
 ) -> InvocationExceptionDecision:
     error_type = type(exc).__name__
     detail = f"{error_type}: {exc}"
-    reason = "timeout" if timeout else "unavailable"
-    status = "timeout" if timeout else "exception"
-    error_reason = "timeout" if timeout else "exception"
+    if deadline_exceeded:
+        # Ficelle's own request budget ended the attempt (L2-R2): named distinctly so the
+        # route row states which budget ended the request, and never blamed on the model.
+        reason = status = error_reason = "request_deadline_exceeded"
+    else:
+        reason = "timeout" if timeout else "unavailable"
+        status = "timeout" if timeout else "exception"
+        error_reason = "timeout" if timeout else "exception"
     return InvocationExceptionDecision(
         attempt_update={
             "status": status,
@@ -852,6 +1134,17 @@ def build_success_route_log(row: SuccessRouteLogInput) -> dict[str, Any]:
     }
     if row.stream_started is not None:
         route_log["stream_started"] = row.stream_started
+    if row.usage is not None:
+        route_log["usage"] = row.usage
+        # Recorded with the request, not joined at read time: the model's catalog row
+        # can change or disappear later, and a savings estimate must be immutable
+        # history — never inflatable by a later price change.
+        reference = row.selected_model.get("reference_pricing")
+        if isinstance(reference, dict):
+            route_log["reference_pricing"] = {
+                "prompt": reference.get("prompt"),
+                "completion": reference.get("completion"),
+            }
     return route_log
 
 
@@ -1004,6 +1297,7 @@ def build_non_streaming_success_response(
             row.selected_model,
             row.attempt_count,
             row.compression,
+            row.dropped_parameters,
         ),
         content=row.response_content,
     )
@@ -1023,6 +1317,7 @@ def build_streaming_response_start(
             row.selected_model,
             row.attempt_count,
             row.compression,
+            row.dropped_parameters,
         ),
     )
 
@@ -1042,6 +1337,7 @@ class ChatCompletionRouter:
         max_attempts_for_request: MaxAttemptsCalculator,
         prepare_compression_route_body: CompressionPlanner,
         now: Clock,
+        select_result: ResultSelector | None = None,
     ) -> None:
         self.config = config
         self.load_catalog = load_catalog
@@ -1054,6 +1350,7 @@ class ChatCompletionRouter:
         self.max_attempts_for_request = max_attempts_for_request
         self.prepare_compression_route_body = prepare_compression_route_body
         self.now = now
+        self.select_result = select_result
 
     def start(
         self,
@@ -1085,11 +1382,21 @@ class ChatCompletionRouter:
         catalog = self.load_catalog(self.config)
         is_fusion_request = self.is_fusion_profile(request.requested_model)
         candidates = []
+        selection = None
         if not is_fusion_request:
-            candidates = self.select_candidates(request.requested_model, catalog, self.config)
+            if self.select_result is not None:
+                selection = self.select_result(request.requested_model, catalog, self.config)
+                candidates = selection.as_legacy_models()
+            else:
+                candidates = self.select_candidates(request.requested_model, catalog, self.config)
         response = None
         if not is_fusion_request and not candidates:
-            response = self._no_available_model_response(body, request, request_id, request_started)
+            if selection is not None:
+                response = self._selection_refusal_response(
+                    body, request, request_id, request_started, catalog, selection
+                )
+            else:
+                response = self._no_available_model_response(body, request, request_id, request_started)
         return ChatCompletionStart(
             request=request,
             catalog=catalog,
@@ -1135,14 +1442,20 @@ class ChatCompletionRouter:
     ) -> ChatCompletionAttemptPlan:
         candidate_count = len(candidates)
         max_attempt_count = self.max_attempts_for_request(request.requested_model, self.config, candidate_count)
-        attempt_candidates = attempts_with_source_diversity(candidates, max_attempt_count, self.config)
         compression_plan = self.prepare_compression_route_body(body, self.config)
+        # Filtered before the diversity cap sees the pool, so the window is cut from candidates
+        # that can actually be tried. The pool goes through the same filter or the loop's dynamic
+        # re-planning would re-offer a candidate the plan just excluded.
+        eligible, excluded = exclude_incompatible_candidates(compression_plan.body, candidates, self.config)
+        attempt_candidates = attempts_with_source_diversity(eligible, max_attempt_count, self.config)
         return ChatCompletionAttemptPlan(
             candidates=attempt_candidates,
             candidate_count=candidate_count,
             routed_body=compression_plan.body,
             compression_metadata=compression_plan.metadata,
             requested_model_is_virtual=self.is_virtual_model(request.requested_model),
+            candidate_pool=eligible,
+            excluded_errors=excluded if not eligible else [],
         )
 
     def run_attempts(
@@ -1155,14 +1468,135 @@ class ChatCompletionRouter:
         request_started: float,
         ports: ChatCompletionAttemptPorts,
     ) -> ChatCompletionAttemptRunResult:
-        errors: list[dict[str, Any]] = []
+        # Seeded with what the plan ruled out before any attempt (L3-R4): copied, so appending a
+        # failure here never writes back into the plan.
+        errors: list[dict[str, Any]] = list(plan.excluded_errors)
         attempts: list[dict[str, Any]] = []
         deadline = request_deadline(self.config, request_started)
-        for index, model in enumerate(plan.candidates):
+        # The body actually sent, and the sampling knobs removed from it. Both are scoped to
+        # the CURRENT candidate: a knob one model refuses says nothing about the next one, so
+        # every candidate starts from the caller's full request minus only what it is itself
+        # known to reject. Caller intent is preserved as widely as it can be.
+        attempt_body = plan.routed_body
+        dropped_parameters: set[str] = set()
+        # The plan's window was chosen before any reason was known, so what is left of it is the
+        # loop's own state: `pending` shrinks by one per iteration and is re-planned when a failure
+        # reason rules a source out. `considered` is the window position; `considered_ids` is what a
+        # re-plan must not offer again.
+        candidate_pool = plan.candidate_pool or plan.candidates
+        pending = list(plan.candidates)
+        considered_ids: set[str] = set()
+        # What this request has ruled out for the rest of its own window, kept as the two shapes a
+        # block actually takes: a source, and a quota key at whatever scope its provider declared.
+        # Names cannot stand in for the second — a `model:` key blocks one candidate of a source and
+        # a `shared_account:` key blocks candidates of several.
+        ruled_out_sources: set[str] = set()
+        ruled_out_quota_keys: set[str] = set()
+        # Raised when a new fact invalidates the remaining window, so it is re-planned once per
+        # useful diversion rather than once per attempt.
+        divert_pending = False
+
+        def is_ruled_out(candidate: dict[str, Any]) -> bool:
+            # Read per candidate on each re-plan. Each attempt contributes at most one key, so the
+            # `any` is bounded by the window and never by the pool — a few hundred string
+            # comparisons on the worst request, against one HTTP round trip per attempt.
+            return str(candidate.get("source") or "") in ruled_out_sources or any(
+                ports.quota_cooldown_matches_model(key, candidate) for key in ruled_out_quota_keys
+            )
+
+        def rule_out(applied: AppliedCooldown | None) -> None:
+            """Remember what a cooldown this request just wrote blocks beyond the candidate."""
+            nonlocal divert_pending
+            if applied is None:
+                return
+            if applied.provider_source and applied.provider_source not in ruled_out_sources:
+                ruled_out_sources.add(applied.provider_source)
+                divert_pending = True
+            if applied.quota_key and applied.quota_key not in ruled_out_quota_keys:
+                ruled_out_quota_keys.add(applied.quota_key)
+                # A `model:` key normally matches only the candidate just considered, and the default
+                # matcher deliberately matches nothing at all. Neither invalidates the remaining
+                # window, and re-planning anyway is not neutral: it re-cuts the window from the pool
+                # under a diversity cap derived from a smaller remaining-attempt count, which can
+                # promote a source the plan had left out. So divert only when this key actually
+                # blocks a candidate the request could still offer. Tested against `applied.quota_key`
+                # rather than through `is_ruled_out`, which answers for every fact gathered so far and
+                # would keep re-planning on candidates an earlier divert already excluded.
+                # The provider branch above needs no such guard: it rules out a whole source, which
+                # is a real exclusion even when the pool holds no other model of it.
+                divert_pending = divert_pending or any(
+                    str(candidate.get("id") or "") not in considered_ids
+                    and ports.quota_cooldown_matches_model(applied.quota_key, candidate)
+                    for candidate in candidate_pool
+                )
+
+        considered = 0
+        # Set when a provider named a sampling knob it refuses: the same model is asked again,
+        # once, with that knob removed. It reuses its window slot rather than taking a new one.
+        retry_same_model: dict[str, Any] | None = None
+        while pending or retry_same_model is not None:
+            is_retry = retry_same_model is not None
+            if is_retry:
+                model = retry_same_model
+                retry_same_model = None
+            else:
+                # Two kinds of fact rule part of the pool out of the rest of the window, and the loop
+                # treats them alike because the remedy is the same. Most of them are read off the
+                # cooldown the attempt just wrote (`rule_out`), which is what makes this exact: a
+                # provider cooldown blocks a source, a quota cooldown blocks its declared scope, and
+                # a model cooldown or a quarantine blocks nothing the window would offer again — so
+                # the model-scoped reasons (timeout, server_error, unavailable, rate_limited_upstream)
+                # leave the planned order alone without being listed anywhere.
+                # `bad_upstream_contract` is the one fact that writes no state at all: the provider's
+                # request validation refused this body, its siblings behind the same endpoint would
+                # refuse it identically, and that is a verdict on the source read from the reason.
+                # It is a per-REQUEST decision even though the cooldowns are persisted: the loop rules
+                # out only what its own failures blocked and deliberately does not re-read cooldown
+                # state. A mid-request re-read would let a concurrent request's writes and a refreshed
+                # catalog move the pool under a window already half spent, where honouring the write we
+                # just made keeps the re-plan derived from evidence this request owns — and keeps the
+                # attempt budget (`considered + pending <= planned`) reasoning about a set that cannot
+                # move.
+                last_attempt = attempts[-1] if attempts else {}
+                rejected_source = str(last_attempt.get("source") or "")
+                if (
+                    str(last_attempt.get("reason") or "") in SOURCE_DIVERTING_FAILURE_REASONS
+                    and rejected_source not in ruled_out_sources
+                ):
+                    ruled_out_sources.add(rejected_source)
+                    divert_pending = True
+                # Once per new fact: an iteration that records no attempt row of its own leaves the
+                # reason standing on the last one, and re-planning twice on it would re-cut the window
+                # under a smaller cap.
+                if divert_pending:
+                    divert_pending = False
+                    replanned = attempts_after_source_rejection(
+                        candidate_pool,
+                        considered_ids=considered_ids,
+                        is_ruled_out=is_ruled_out,
+                        remaining_attempts=len(plan.candidates) - considered,
+                        config=self.config,
+                    )
+                    # Empty means the pool has no other source to offer. Keeping the window as planned
+                    # is the lesser evil, for both facts above: some providers disable an option on
+                    # selected models only, a classification can be wrong, and stranding the request
+                    # after one attempt would be worse than either. The cooldown is what stops the
+                    # NEXT request from coming back here; this one still spends what it was given.
+                    pending = replanned or pending
+                model = pending.pop(0)
+                # New candidate: restore the caller's body, then apply only this model's
+                # learned incompatibilities BEFORE the first send (the proactive half —
+                # after one rejection, this model never sees that knob again).
+                dropped_parameters = set(ports.unsupported_parameters_for(model, plan.routed_body))
+                attempt_body = (
+                    drop_sampling_parameters(plan.routed_body, dropped_parameters)
+                    if dropped_parameters
+                    else plan.routed_body
+                )
             # Checked between attempts, never mid-attempt: an answer already being produced is
             # never abandoned. The first candidate always runs, so a deadline can shorten a
             # failing request but can never turn a request into zero attempts.
-            if index and deadline is not None and self.now() >= deadline:
+            if considered and deadline is not None and self.now() >= deadline:
                 errors.append({
                     "model": model.get("id"),
                     "upstream": model.get("upstream_id"),
@@ -1170,14 +1604,30 @@ class ChatCompletionRouter:
                     "reason": "request_deadline_exceeded",
                 })
                 break
+            if not is_retry:
+                # A re-ask of the same model with a refused knob removed reuses its slot: the
+                # window counts candidates, not round trips. Counting it here would also let a
+                # drop-and-retry eat the budget a source rejection needs to re-plan with.
+                considered += 1
+                considered_ids.add(str(model.get("id") or ""))
             started = self.now()
             attempt = {
                 "model": model.get("id"),
                 "upstream": model.get("upstream_id"),
                 "source": model.get("source"),
             }
+            # The remaining request budget constrains the in-flight attempt (L2-R2), not
+            # only the decision to start one: the invocation derives its read timeout from
+            # it and the streaming consumer stops at the absolute deadline.
+            remaining_budget = deadline - self.now() if deadline is not None else None
             try:
-                response = ports.invoke_model(model, plan.routed_body, self.config)
+                response = ports.invoke_model(
+                    model,
+                    attempt_body,
+                    self.config,
+                    remaining_budget_seconds=remaining_budget,
+                    deadline_monotonic=deadline,
+                )
             except Exception as exc:
                 latency = self.now() - started
                 exception_decision = evaluate_invocation_exception(
@@ -1185,8 +1635,11 @@ class ChatCompletionRouter:
                     model,
                     latency_seconds=latency,
                     timeout=ports.is_timeout_exception(exc),
+                    deadline_exceeded=bool(
+                        ports.is_deadline_exception is not None and ports.is_deadline_exception(exc)
+                    ),
                 )
-                ports.apply_cooldown(build_attempt_cooldown_request(model, exception_decision))
+                rule_out(ports.apply_cooldown(build_attempt_cooldown_request(model, exception_decision)))
                 record_attempt_failure(
                     AttemptFailureRecordInput(
                         attempt=attempt,
@@ -1210,13 +1663,15 @@ class ChatCompletionRouter:
                         has_deliverable=ports.has_deliverable,
                     )
                     if success_decision.outcome != "success":
-                        ports.apply_cooldown(
-                            build_attempt_cooldown_request(
-                                model,
-                                success_decision,
-                                fallback_reason="unavailable",
-                                fallback_detail=success_decision.attempt_update.get("reason"),
-                                fallback_status=response.status_code,
+                        rule_out(
+                            ports.apply_cooldown(
+                                build_attempt_cooldown_request(
+                                    model,
+                                    success_decision,
+                                    fallback_reason="unavailable",
+                                    fallback_detail=success_decision.attempt_update.get("reason"),
+                                    fallback_status=response.status_code,
+                                )
                             )
                         )
                         record_attempt_failure(
@@ -1258,6 +1713,7 @@ class ChatCompletionRouter:
                                 duration_seconds=self.now() - request_started,
                                 stream=False,
                                 compression=plan.compression_metadata,
+                                usage=success_decision.usage,
                             )
                         )
                     )
@@ -1273,12 +1729,15 @@ class ChatCompletionRouter:
                                 response_headers=response.headers,
                                 response_content=response.content,
                                 compression=plan.compression_metadata,
+                                dropped_parameters=tuple(sorted(dropped_parameters)),
                             ),
                             build_headers=ports.build_success_headers,
                         ),
                     )
 
-                stream_result = ports.stream_response(response, model, len(attempts) + 1)
+                stream_result = ports.stream_response(
+                    response, model, len(attempts) + 1, deadline_monotonic=deadline
+                )
                 latency = self.now() - started
                 stream_decision = evaluate_streaming_result(
                     stream_result,
@@ -1286,6 +1745,7 @@ class ChatCompletionRouter:
                     response_status=response.status_code,
                     latency_seconds=latency,
                     requested_model_is_virtual=plan.requested_model_is_virtual,
+                    classify=ports.classify_failure,
                 )
                 record_attempt_result(
                     AttemptResultRecordInput(
@@ -1313,18 +1773,21 @@ class ChatCompletionRouter:
                                 stream=True,
                                 stream_started=True,
                                 compression=plan.compression_metadata,
+                                usage=stream_decision.usage,
                             )
                         )
                     )
                     return ChatCompletionAttemptRunResult(outcome="streaming_complete")
 
-                ports.apply_cooldown(
-                    build_attempt_cooldown_request(
-                        model,
-                        stream_decision,
-                        fallback_reason="unavailable",
-                        fallback_detail=stream_decision.attempt_update.get("reason"),
-                        fallback_status="stream_error",
+                rule_out(
+                    ports.apply_cooldown(
+                        build_attempt_cooldown_request(
+                            model,
+                            stream_decision,
+                            fallback_reason="unavailable",
+                            fallback_detail=stream_decision.attempt_update.get("reason"),
+                            fallback_status="stream_error",
+                        )
                     )
                 )
                 if stream_decision.error is not None:
@@ -1358,7 +1821,34 @@ class ChatCompletionRouter:
                 requested_model_is_virtual=plan.requested_model_is_virtual,
                 classify=ports.classify_failure,
             )
-            ports.apply_cooldown(build_attempt_cooldown_request(model, upstream_failure))
+            # A provider that rejects a sampling knob by name is telling us how to succeed:
+            # drop that knob and ask the SAME model again, once. Only distribution-shaping
+            # parameters qualify (never messages, tools, schemas or budgets), the retry is
+            # announced to the caller, and one retry per attempt keeps the loop bounded.
+            rejected_knobs = rejected_sampling_parameters(
+                str(upstream_failure.error.get("detail") or ""), attempt_body
+            ) if upstream_failure.error else ()
+            retryable_knobs = tuple(knob for knob in rejected_knobs if knob not in dropped_parameters)
+            if retryable_knobs:
+                dropped_parameters.update(retryable_knobs)
+                ports.learn_unsupported_parameters(model, retryable_knobs)
+                attempt_body = drop_sampling_parameters(attempt_body, retryable_knobs)
+                # The attempt keeps its true failure reason — the provider did reject the
+                # body — with the consequence recorded alongside it. Overwriting the reason
+                # would erase the evidence that a 400 happened at all.
+                record_attempt_result(
+                    AttemptResultRecordInput(
+                        attempt=attempt,
+                        attempt_update={
+                            **upstream_failure.attempt_update,
+                            "retried_without_parameters": list(retryable_knobs),
+                        },
+                        attempts=attempts,
+                    )
+                )
+                retry_same_model = model
+                continue
+            rule_out(ports.apply_cooldown(build_attempt_cooldown_request(model, upstream_failure)))
             record_attempt_failure(
                 AttemptFailureRecordInput(
                     attempt=attempt,
@@ -1414,30 +1904,36 @@ class ChatCompletionRouter:
         reason: str,
         error_type: str,
         message: str,
+        refusal_details: dict[str, Any] | None = None,
     ) -> ChatCompletionResponse:
         """A refusal Ficelle owns, logged like any other route so the Requests page shows it.
 
         `candidate_count` and `attempts` are 0/empty and mean it literally: no model was picked,
         none was called, none was cooled. One shape for every such refusal, so the route-log row
-        the index reads cannot drift between them.
+        the index reads cannot drift between them. `refusal_details` carries the same safe
+        scope/reason facts into both the response payload and the route-log row, so telemetry
+        and the client can never disagree about why the request was refused (L1-R4).
         """
         duration = self.now() - request_started
         self.record_last_route(request.safe_requested_model, "fail", reason, request_id, 0, 0, duration)
-        self.write_route_log(
-            {
-                "request_id": request_id,
-                "requested_model": request.safe_requested_model,
-                "final_status": status,
-                "final_reason": reason,
-                "candidate_count": 0,
-                "attempts": [],
-                "duration_seconds": round(duration, 4),
-                "stream": bool(body.get("stream")),
-            }
-        )
+        route_row = {
+            "request_id": request_id,
+            "requested_model": request.safe_requested_model,
+            "final_status": status,
+            "final_reason": reason,
+            "candidate_count": 0,
+            "attempts": [],
+            "duration_seconds": round(duration, 4),
+            "stream": bool(body.get("stream")),
+        }
+        error_payload: dict[str, Any] = {"message": message, "type": error_type, "request_id": request_id}
+        if refusal_details:
+            route_row["refusal"] = dict(refusal_details)
+            error_payload.update(refusal_details)
+        self.write_route_log(route_row)
         return ChatCompletionResponse(
             status=status,
-            payload={"error": {"message": message, "type": error_type, "request_id": request_id}},
+            payload={"error": error_payload},
             headers=self.response_headers(request_id, request.safe_requested_model),
         )
 
@@ -1483,4 +1979,71 @@ class ChatCompletionRouter:
             reason="no_available_model",
             error_type="no_available_model",
             message=f"no invokable free tool-capable model for {request.safe_requested_model}",
+        )
+
+    def _selection_refusal_response(
+        self,
+        body: dict[str, Any],
+        request: ChatCompletionRequest,
+        request_id: str,
+        request_started: float,
+        catalog: dict[str, Any],
+        selection: SelectionResult,
+    ) -> ChatCompletionResponse:
+        """Truthful zero-candidate refusals (L1-R4): a concrete model absent from the active
+        catalog is 404 `model_not_found`; one that is present but blocked is 503
+        `model_unavailable` with its safe scope and reason; an exhausted virtual pool is 503
+        `no_available_model` with bounded exclusion counts. The message reflects the actual
+        request — it never claims "tool-capable" for a plain text request."""
+        requested = request.requested_model
+        safe_requested = request.safe_requested_model
+        if not self.is_virtual_model(requested):
+            row = next(
+                (
+                    model
+                    for model in catalog.get("models", [])
+                    if isinstance(model, dict) and requested in {model.get("id"), model.get("upstream_id")}
+                ),
+                None,
+            )
+            if row is None:
+                return self._refusal_response(
+                    body,
+                    request,
+                    request_id,
+                    request_started,
+                    status=404,
+                    reason="model_not_found",
+                    error_type="model_not_found",
+                    message=f"model {safe_requested} is not in the active catalog",
+                )
+            block_reason = selection.excluded_reasons.get(str(row.get("id") or "")) or "not_selectable"
+            scope = REFUSAL_SCOPE_BY_BLOCK_REASON.get(block_reason, "model")
+            return self._refusal_response(
+                body,
+                request,
+                request_id,
+                request_started,
+                status=503,
+                reason="model_unavailable",
+                error_type="model_unavailable",
+                message=(
+                    f"model {safe_requested} is in the active catalog but temporarily "
+                    f"not selectable ({block_reason}, scope: {scope})"
+                ),
+                refusal_details={"scope": scope, "block_reason": block_reason},
+            )
+        excluded_counts = Counter(selection.excluded_reasons.values())
+        bounded = dict(sorted(excluded_counts.items(), key=lambda item: (-item[1], item[0]))[:8])
+        capability = "tool-capable model" if body.get("tools") else "model"
+        return self._refusal_response(
+            body,
+            request,
+            request_id,
+            request_started,
+            status=503,
+            reason="no_available_model",
+            error_type="no_available_model",
+            message=f"no invokable free {capability} available for {safe_requested}",
+            refusal_details={"excluded": bounded} if bounded else None,
         )

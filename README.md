@@ -191,6 +191,17 @@ its own HTTPS manifest with `FICELLE_UPDATE_MANIFEST_URL`. The compact manifest 
 Update checks are non-blocking and can be disabled for a managed environment with
 `FICELLE_DISABLE_UPDATE_CHECK=1`.
 
+## Point your client at it
+
+One page per client, each ending at the same local endpoint:
+[Codex CLI](docs/clients/codex.md) ·
+[Continue](docs/clients/continue.md) ·
+[Cursor](docs/clients/cursor.md) ·
+[Open WebUI](docs/clients/open-webui.md) ·
+[OpenAI SDK / scripts](docs/clients/openai-sdk.md) ·
+[Claude Code (protocol status)](docs/clients/claude-code.md) —
+shared basics and the model-id table in [the index](docs/clients/README.md).
+
 ## How it works
 
 ```text

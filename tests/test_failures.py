@@ -14,6 +14,7 @@ from ficelle.failures import (
     provider_error_codes,
     PROVIDER_ERROR_REASONS,
     PROVIDER_SCOPED_COOLDOWN_REASONS,
+    SOURCE_DIVERTING_FAILURE_REASONS,
     bad_request_body,
     build_upstream_failure_error,
     caller_rejected_request,
@@ -83,6 +84,34 @@ def test_failure_reason_sets_match_routing_contracts():
         "auth_or_credit",
         "model_not_found",
     }
+
+
+def test_what_the_attempt_window_diverts_on_is_what_the_cooldown_policy_writes():
+    """The attempt loop drops part of the pool on two unrelated facts, and only one is a list.
+
+    Everything that blocks *other* candidates says so in the state it writes, so the loop reads the
+    write (`AppliedCooldown`) and no set has to be kept in step with `cooldown_policy_for_reason`.
+    This test pins that mapping from the policy's side: which reasons block beyond the model that
+    earned them, and which deliberately do not.
+    """
+    for reason in PROVIDER_SCOPED_COOLDOWN_REASONS:
+        assert cooldown_policy_for_reason(reason, source="groq").provider_cooldown
+    # A quota pool is blocked at whichever scope its provider declares, which is why the loop keys
+    # this one and never guesses a source from it.
+    assert cooldown_policy_for_reason("quota_exhausted", source="groq").quota_cooldown
+
+    # Blocks nothing wider than the model that earned it, so the planned order is left alone:
+    # `rate_limited_upstream` is a saturated pool behind one model id, `no_free_quota` quarantines
+    # that model, and `request_too_large` is the caller's own body.
+    for reason in ("rate_limited_upstream", "no_free_quota", "request_too_large"):
+        policy = cooldown_policy_for_reason(reason, source="groq")
+        assert not policy.provider_cooldown and not policy.quota_cooldown
+
+    # `bad_upstream_contract` is the exception that has to be listed: it writes nothing at all — no
+    # cooldown, no quarantine — and is a verdict on the source held for one request only.
+    for reason in SOURCE_DIVERTING_FAILURE_REASONS:
+        policy = cooldown_policy_for_reason(reason, source="groq")
+        assert not policy.provider_cooldown and not policy.quota_cooldown and policy.quarantine is None
 
 
 def test_saturated_model_pool_is_model_scoped_not_a_provider_outage():
@@ -484,6 +513,81 @@ def test_a_rejected_request_body_is_not_an_unavailable_model():
     assert classify_failure(418, "<unreadable response body: RuntimeError>") == "unavailable"
 
 
+def test_a_model_specific_sampling_rejection_fails_over_without_cooling():
+    """Mistral may accept the body generally but disable one option on one model.
+
+    Jan sends ``top_k`` to the OpenAI-compatible endpoint. Mistral's 3051 rejection explicitly
+    says the option is disabled *for this model*, so another candidate can answer the same request.
+    Treating it as a generic bad body stopped the chain and leaked the 400 back to Jan.
+    """
+    mistral_400 = (
+        '{"object":"error","message":"top_k sampling is not enabled for this model",'
+        '"type":"invalid_request_invalid_args","param":null,"code":"3051"}'
+    )
+
+    assert classify_failure(400, mistral_400) == "bad_upstream_contract"
+    policy = cooldown_policy_for_reason("bad_upstream_contract", source="mistral")
+    assert policy.model_cooldown is False
+    assert policy.provider_cooldown is False
+    assert policy.quarantine is None
+
+
+def test_a_forbidden_private_assistant_field_fails_over_without_cooling():
+    """One provider may reject reasoning metadata another candidate needs and accepts.
+
+    Ficelle can restore a previous provider's reasoning trace onto a replayed tool call. Mistral's
+    request schema rejects that private assistant field before inference, but the unchanged history
+    remains valid for the provider that emitted it. That is a contract mismatch, not a malformed
+    request across the whole pool.
+    """
+    mistral_422 = json.dumps(
+        {
+            "detail": [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "messages", 2, "assistant", "reasoning_content"],
+                    "msg": "Extra inputs are not permitted",
+                    "input": "The venue says payment required at the door.",
+                }
+            ]
+        }
+    )
+
+    assert classify_failure(422, mistral_422) == "bad_upstream_contract"
+    policy = cooldown_policy_for_reason("bad_upstream_contract", source="mistral")
+    assert policy.model_cooldown is False
+    assert policy.provider_cooldown is False
+    assert policy.quarantine is None
+
+
+def test_only_structured_private_assistant_field_rejections_get_contract_failover():
+    """Keep the matcher fail-closed for real body defects and spoofed prose."""
+    cases = [
+        {
+            "detail": [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "messages", 2, "assistant", "content"],
+                    "msg": "Extra inputs are not permitted",
+                }
+            ]
+        },
+        {
+            "detail": [
+                {
+                    "type": "string_type",
+                    "loc": ["body", "messages", 2, "assistant", "reasoning_content"],
+                    "msg": "Input should be a valid string",
+                }
+            ]
+        },
+        {"error": {"message": "extra_forbidden reasoning_content: Extra inputs are not permitted"}},
+    ]
+
+    for payload in cases:
+        assert classify_failure(422, json.dumps(payload)) == "bad_upstream_request"
+
+
 def test_caller_caused_policies_record_the_failure_without_cooling():
     """No caller-caused failure may take a healthy model out of the pool.
 
@@ -561,15 +665,19 @@ def test_caller_caused_failures_are_the_only_ones_exempt_from_the_streak():
         assert upstream_fault not in CALLER_CAUSED_FAILURE_REASONS
 
 
-def test_provider_scoped_policy_keeps_model_and_provider_cooldowns():
-    policy = cooldown_policy_for_reason("rate_limited", source="openrouter")
+def test_provider_scoped_policy_uses_the_provider_cooldown_as_sole_blocking_scope():
+    # L2-R4 (synthetic-health remediation): provider-wide rate_limited/auth_or_credit
+    # write ONE blocking cooldown — the provider's. The model keeps its recorded attempt,
+    # error, and stats for diagnosis, but no model cooldown that could outlive recovery.
+    for reason in ("rate_limited", "auth_or_credit"):
+        policy = cooldown_policy_for_reason(reason, source="openrouter")
 
-    assert policy.record_provider_error is True
-    assert policy.provider_cooldown is True
-    assert policy.provider_cooldown_source == "openrouter"
-    assert policy.quota_cooldown is False
-    assert policy.quarantine is None
-    assert policy.model_cooldown is True
+        assert policy.record_provider_error is True
+        assert policy.provider_cooldown is True
+        assert policy.provider_cooldown_source == "openrouter"
+        assert policy.quota_cooldown is False
+        assert policy.quarantine is None
+        assert policy.model_cooldown is False
 
 
 def test_hard_quarantine_policies_skip_recoverable_cooldowns():
@@ -586,7 +694,7 @@ def test_hard_quarantine_policies_skip_recoverable_cooldowns():
     assert not_found.model_cooldown is False
 
 
-def test_false_free_policy_quarantines_and_keeps_model_cooldown():
+def test_false_free_policy_quarantines_without_provider_cooldown():
     policy = cooldown_policy_for_reason("billing_or_paid", source="openrouter")
 
     assert policy.record_provider_error is False
@@ -675,3 +783,49 @@ def test_upstream_failure_error_preserves_requested_model_detail_limit():
     payload = build_upstream_failure_error(requested_model, "req-1", 0, [], [])
 
     assert payload["error"]["requested_model"] == requested_model
+
+
+# --- Lot 4 (synthetic-health remediation) L4-R1: capacity dimensions ------------------------
+
+
+def test_capacity_dimension_names_the_real_limit_without_changing_classification():
+    from ficelle.failures import capacity_dimension, classify_failure
+
+    groq_tpm = "Request too large for model. TPM Limit 12000, Requested 41215. Please reduce your message size."
+    assert capacity_dimension(413, groq_tpm) == "capacity.tpm"
+    # The classification itself stays request_too_large, model-scoped (SHR-011).
+    assert classify_failure(413, groq_tpm) == "request_too_large"
+
+    assert capacity_dimension(429, "requests per minute exceeded for this key") == "capacity.rpm"
+    assert capacity_dimension(429, "free tier quota exhausted until tomorrow") == "capacity.free_quota"
+    assert capacity_dimension(429, "too many concurrent requests") == "capacity.concurrent"
+    # The seventh baseline Groq case: a generic 413 without any stated dimension.
+    assert capacity_dimension(413, "Request Entity Too Large") == "capacity.context_or_body"
+    assert capacity_dimension(413, "nope") == "capacity.unknown"
+    # Non-capacity statuses never get a dimension.
+    assert capacity_dimension(500, "tokens per minute") is None
+    assert capacity_dimension(None, "tpm") is None
+
+
+# --- Upstream treatment of rejected sampling parameters -------------------------------------
+
+
+def test_rejected_sampling_parameters_names_only_refused_present_knobs():
+    from ficelle.failures import rejected_sampling_parameters
+
+    mistral = '{"message":"top_k sampling is not enabled for this model","type":"invalid_request_invalid_args","code":"3051"}'
+    body = {"model": "m", "messages": [], "top_k": 1, "temperature": 0}
+
+    assert rejected_sampling_parameters(mistral, body) == ("top_k",)
+    # Not carried by the request: nothing to drop, whatever the message says.
+    assert rejected_sampling_parameters(mistral, {"model": "m", "messages": []}) == ()
+    # A message that merely echoes a value is not a rejection verdict.
+    assert rejected_sampling_parameters('{"message":"received top_k=1"}', body) == ()
+    # Intent-carrying fields are never droppable, even when named as unsupported.
+    tools_rejection = '{"message":"tools is not supported by this model"}'
+    assert rejected_sampling_parameters(tools_rejection, {"tools": [], "messages": []}) == ()
+    schema_rejection = '{"message":"response_format is not supported for this model"}'
+    assert rejected_sampling_parameters(schema_rejection, {"response_format": {}, "messages": []}) == ()
+    # Several knobs at once, deduplicated to what the body carries.
+    multi = '{"message":"top_k and min_p are not supported by this model"}'
+    assert set(rejected_sampling_parameters(multi, {"top_k": 1, "min_p": 0.1, "top_p": 0.9})) == {"top_k", "min_p"}
