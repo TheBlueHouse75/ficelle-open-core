@@ -24,6 +24,21 @@ def ensure_private_dir(path: Path) -> None:
         path.chmod(RUNTIME_DIR_MODE)
 
 
+def ensure_private_fd(fd: int) -> None:
+    """Tighten an already-open descriptor to RUNTIME_FILE_MODE, where the platform has modes.
+
+    Windows has no ``os.fchmod``, so calling it unguarded raised ``AttributeError`` on every
+    runtime write — including the per-request log append, which made the router unable to serve
+    a single completion there. Windows has no POSIX permission bits to fall back to:
+    confidentiality rests on the ACLs of the user profile directory, which already exclude other
+    local accounts. A genuine ``fchmod`` failure where the call exists still propagates.
+    """
+    if not hasattr(os, "fchmod"):
+        return
+    if (os.fstat(fd).st_mode & 0o777) != RUNTIME_FILE_MODE:
+        os.fchmod(fd, RUNTIME_FILE_MODE)
+
+
 def rotate_if_oversized(path: Path, max_bytes: int, keep: int = 3) -> None:
     """Roll `path` to `path.1` (and shift the rest) once it passes `max_bytes`.
 
@@ -62,8 +77,7 @@ def open_private_append(path: Path) -> TextIO:
     ensure_private_dir(path.parent)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, RUNTIME_FILE_MODE)
     try:
-        if (os.fstat(fd).st_mode & 0o777) != RUNTIME_FILE_MODE:
-            os.fchmod(fd, RUNTIME_FILE_MODE)
+        ensure_private_fd(fd)
         return os.fdopen(fd, "a", encoding="utf-8")
     except BaseException:
         os.close(fd)
@@ -81,8 +95,7 @@ def write_private_text(path: Path, text: str) -> None:
     # replacement contents are visible. O_CREAT's mode is ignored for existing files.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT, RUNTIME_FILE_MODE)
     try:
-        if (os.fstat(fd).st_mode & 0o777) != RUNTIME_FILE_MODE:
-            os.fchmod(fd, RUNTIME_FILE_MODE)
+        ensure_private_fd(fd)
         handle = os.fdopen(fd, "w", encoding="utf-8")
         fd = -1  # The TextIO wrapper now owns and closes this descriptor.
         with handle:

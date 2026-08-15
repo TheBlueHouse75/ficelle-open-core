@@ -11,7 +11,6 @@ one-directional independence — this fetches and installs a wheel, it never imp
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import os
 import shutil
@@ -33,6 +32,7 @@ from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from ficelle import __version__ as CORE_VERSION
 from ficelle.install import CommandResult, pip_is_unavailable
 from ficelle.json_store import atomic_write_json, load_json
+from ficelle.probe_lock import file_lock
 from ficelle.runtime_paths import RuntimePaths
 from ficelle.url_security import uses_secure_http_transport
 
@@ -166,20 +166,17 @@ def exclusive_install_lock(
     """Acquire an advisory file lock, using the installer lock path by default.
 
     Callers may supply a separate path for short serialization work; installer callers hold
-    the default lock through package installation and service restart.
+    the default lock through package installation and service restart. ``wait=True`` waits
+    indefinitely; otherwise a lock already held raises ProInstallInProgress.
+
+    Uses ``probe_lock.file_lock``, the tree's one primitive that speaks both ``fcntl.flock`` and
+    ``msvcrt.locking``. Importing ``fcntl`` here directly is what broke this module on Windows.
     """
     path = lock_path or install_lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as lock_file:
-        try:
-            flags = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
-            fcntl.flock(lock_file.fileno(), flags)
-        except BlockingIOError as exc:
-            raise ProInstallInProgress("another Ficelle Pro installation is already running") from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with file_lock(path, blocking=wait) as acquired:
+        if not acquired:
+            raise ProInstallInProgress("another Ficelle Pro installation is already running")
+        yield
 
 
 def _require_secure_url(url: str) -> None:

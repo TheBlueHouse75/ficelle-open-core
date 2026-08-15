@@ -15,6 +15,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 LOG_FILE_NAME = "ficelle.log"
 ERROR_LOG_FILE_NAME = "ficelle.error.log"
+DEFAULT_ROUTER_PORT = 8646
 
 # Substrings that identify a Ficelle server process command line. Defined here, next to
 # the backends that construct those command lines, and consumed by the CLI's
@@ -157,6 +158,19 @@ class ServiceBackend(Protocol):
 
 
 @dataclass(frozen=True)
+class PortHolder:
+    """A process listening on the configured port, kept with its pid.
+
+    The pid is the whole point: without it, the readiness-failure diagnosis cannot tell a
+    foreign occupant from the service the command just started.
+    """
+
+    port: int
+    pid: int | None
+    detail: str
+
+
+@dataclass(frozen=True)
 class ServicePaths:
     ficelle_home: Path
     runtime_dir: Path
@@ -265,9 +279,24 @@ class LaunchAgentServiceBackend:
             # relaunches forever (KeepAlive on non-zero exit), appending a traceback each time,
             # while the CLI says only "did not become ready". Name the holder and stop the loop.
             sys.stderr.write("Ficelle LaunchAgent started but /admin/status.json did not become ready.\n")
-            holder = self.port_holder_description()
-            if holder:
-                sys.stderr.write(f"The configured port looks busy: {holder}\n")
+            holder = self.port_holder()
+            if holder is not None:
+                if holder.pid is not None and holder.pid == self.launchd_job_pid():
+                    # The holder is the job we just kickstarted: it bound the socket and is
+                    # only slow to answer (a start warms a full provider catalog). Booting it
+                    # out here is the 14/08/2026 incident — three `ficelle start` runs in a row
+                    # killed their own service and blamed a squatter whose pid changed every
+                    # time. The guard below is for a *foreign* occupant; leave this one alone.
+                    sys.stderr.write(
+                        f"The service holds port {holder.port} itself ({holder.detail}), so it bound "
+                        "and is still starting. Left it running.\n"
+                        f"Follow it with `ficelle health`, or read {self.paths.log_dir / LOG_FILE_NAME}.\n"
+                    )
+                    persist_service_context(self.paths)
+                    return 1
+                sys.stderr.write(
+                    f"The configured port looks busy: port {holder.port} is held by: {holder.detail}\n"
+                )
             self.bootout()
             sys.stderr.write("Booted the agent out so it does not relaunch in a loop.\n")
             return 1
@@ -276,19 +305,51 @@ class LaunchAgentServiceBackend:
         print(f"installed {self.paths.plist}")
         return 0
 
-    def port_holder_description(self) -> str | None:
+    def configured_port(self) -> int:
+        """The port the service binds, resolved canonical-first like the runtime resolves it.
+
+        This used to read `runtime_dir/config.json` only, which is backwards on a legacy
+        install: `runtime_dir` is then the read-only compatibility root while the canonical
+        `FICELLE_HOME/config.json` is what the service binds from. Probing the wrong port
+        finds no holder — and the caller reads "no holder" as a service that never bound.
+        """
+        for directory in (self.paths.ficelle_home, self.paths.runtime_dir):
+            path = directory / "config.json"
+            if not path.exists():
+                continue
+            try:
+                return int(json.loads(path.read_text(encoding="utf-8")).get("port") or DEFAULT_ROUTER_PORT)
+            except (OSError, ValueError, TypeError, AttributeError):
+                break
+        return DEFAULT_ROUTER_PORT
+
+    def port_holder(self) -> PortHolder | None:
         """Who is listening on the configured port, when anyone is."""
-        try:
-            config = json.loads((self.paths.runtime_dir / "config.json").read_text(encoding="utf-8"))
-            port = int(config.get("port") or 8646)
-        except (OSError, ValueError, TypeError):
-            port = 8646
+        port = self.configured_port()
         probe = self.run_command(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"])
         if probe.returncode != 0 or not (probe.stdout or "").strip():
             return None
         lines = [line for line in probe.stdout.splitlines() if line.strip()]
-        detail = lines[1] if len(lines) > 1 else lines[0]
-        return f"port {port} is held by: {detail.strip()}"
+        detail = (lines[1] if len(lines) > 1 else lines[0]).strip()
+        # `lsof` columns are COMMAND PID USER …; anything else (a header-only answer) leaves
+        # the pid unknown, which the caller reads as "cannot prove it is ours".
+        fields = detail.split()
+        pid = int(fields[1]) if len(fields) > 1 and fields[1].isdigit() else None
+        return PortHolder(port=port, pid=pid, detail=detail)
+
+    def launchd_job_pid(self) -> int | None:
+        """The pid launchd currently attributes to our own job, when it has one."""
+        probe = self.run_command(["launchctl", "print", f"gui/{self.uid_provider()}/{self.paths.label}"])
+        if probe.returncode != 0:
+            return None
+        for line in (probe.stdout or "").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "pid":
+                try:
+                    return int(value.strip())
+                except ValueError:
+                    return None
+        return None
 
     def recorded_interpreter(self) -> Path | None:
         """The interpreter the installed plist already points at, when it still works.
@@ -416,7 +477,15 @@ class SystemdUserServiceBackend:
             sys.stderr.write(start.stderr or start.stdout)
             return start.returncode
         if not self.wait_for_ready():
-            sys.stderr.write("Ficelle systemd user service started but /admin/status.json did not become ready.\n")
+            sys.stderr.write(
+                "Ficelle systemd user service started but /admin/status.json did not become ready.\n"
+                f"It was left running. Follow it with `ficelle health`, or read "
+                f"{self.paths.log_dir / LOG_FILE_NAME}.\n"
+            )
+            # This backend never stopped the unit on a readiness timeout, so it escaped the
+            # 14/08/2026 kill — but a service left running must be described by the active
+            # context, or the `ficelle health` above reads the wrong roots.
+            persist_service_context(self.paths)
             return 1
         if not persist_service_context(self.paths):
             return 1
@@ -436,7 +505,12 @@ class SystemdUserServiceBackend:
             sys.stderr.write(result.stderr or result.stdout)
             return result.returncode
         if not self.wait_for_ready():
-            sys.stderr.write("Ficelle systemd user service restarted but /admin/status.json did not become ready.\n")
+            sys.stderr.write(
+                "Ficelle systemd user service restarted but /admin/status.json did not become ready.\n"
+                f"It was left running. Follow it with `ficelle health`, or read "
+                f"{self.paths.log_dir / LOG_FILE_NAME}.\n"
+            )
+            persist_service_context(self.paths)
             return 1
         if not persist_service_context(self.paths):
             return 1
@@ -598,10 +672,19 @@ class WindowsScheduledTaskBackend:
             return start.returncode
         if not self.wait_for_ready():
             sys.stderr.write("Ficelle scheduled task started but /admin/status.json did not become ready.\n")
-            self.run_command(["schtasks", "/End", "/TN", self.task_name])
+            # Ending the task here was the 14/08/2026 incident with a different verb: a service
+            # merely slow to answer, killed by the command that started it (see
+            # LaunchAgentServiceBackend.install). Windows needs no ownership proof to skip the
+            # kill — `RestartOnFailure` in the task definition already bounds a real crash loop.
             sys.stderr.write(
-                "Ended the task so it does not restart-loop; check the logs under FICELLE_HOME and the configured port.\n"
+                "Left the task registered: it may still be starting, and Task Scheduler bounds its own "
+                "retries (RestartOnFailure, 10 attempts).\n"
+                f"Follow it with `ficelle health`, read {self.paths.log_dir / LOG_FILE_NAME}, "
+                "or run `ficelle stop` to stop it.\n"
             )
+            # `ficelle health` above reads the active context, so a service we chose to leave
+            # running must be described by it — same reason as the LaunchAgent branch.
+            persist_service_context(self.paths)
             return 1
         if not persist_service_context(self.paths):
             return 1

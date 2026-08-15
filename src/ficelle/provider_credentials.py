@@ -22,6 +22,20 @@ class ProviderCredentialsUnavailable(RuntimeError):
     """
 
 
+class SecretStoreWriteRefused(RuntimeError):
+    """The host's secret store was expected to hold the key and would not take it.
+
+    Raised instead of writing the secret to the `.env` file in plaintext. Carries the
+    store label and, when the backend can name one, the OS reason — never the secret.
+    """
+
+    def __init__(self, store_label: str, detail: str | None = None) -> None:
+        self.store_label = store_label
+        self.detail = detail
+        reason = f" ({detail})" if detail else ""
+        super().__init__(f"the {store_label} secret store refused the write{reason}")
+
+
 class ProviderSecretStore(Protocol):
     """One backend, owning every operation on both of its tiers.
 
@@ -33,6 +47,10 @@ class ProviderSecretStore(Protocol):
     """
 
     label: str
+    # False only for a host with no OS secret store at all, where the `.env` file is the
+    # intended destination rather than a downgrade. Every real backend leaves this True, so
+    # a failed write is treated as a failure instead of a silent fall back to plaintext.
+    provides_storage: bool
 
     def get(self, service: str) -> str | None:
         ...
@@ -54,7 +72,45 @@ class ProviderSecretStore(Protocol):
     def set(self, service: str, secret: str) -> bool:
         ...
 
+    def write_failure_detail(self) -> str | None:
+        """Redacted reason the last ``set`` failed, when the backend can name one.
+
+        Only ever read after a failed write, and only to explain the refusal — the OS
+        error is what makes it actionable ("run this from an interactive logon" rather
+        than "it did not work"). Never carries the secret.
+        """
+        ...
+
     def delete(self, service: str) -> bool:
+        ...
+
+    def delete_failure_detail(self) -> str | None:
+        """Redacted reason a ``delete`` could not be completed, when the backend can name
+        one; ``None`` when the entry was simply not there.
+
+        The twin of ``write_failure_detail``, and the one that carries a security verdict
+        rather than a convenience one: ``delete`` returns ``False`` for "there was nothing
+        to remove" *and* for "the OS refused", and every surface downstream reads the
+        second as the first — so a key the store still holds is reported as gone.
+        """
+        ...
+
+    def read_failure_detail(self) -> str | None:
+        """Redacted reason a ``get`` could not be answered — the store was unreachable, as
+        opposed to the key being absent. ``None`` when the backend has nothing to report.
+
+        Same conflation on the read side: ``get`` answers ``None`` for both, so the
+        resolution a caller re-runs to confirm a removal reports "no key" about a store it
+        never managed to ask.
+
+        **Not yet implemented by every backend.** ``None`` therefore means "this backend did
+        not say", not "the read is trustworthy" — today only the Windows Credential Manager
+        names a reason, because the macOS and Linux read helpers answer through the shared
+        keychain cache on the per-request hot path. Do not gate a safety decision on it
+        alone, or the gate is a silent no-op on two platforms out of three; the *delete*
+        side (``delete_failure_detail``) is implemented everywhere and is what the removal
+        verdict is built on.
+        """
         ...
 
 
@@ -130,6 +186,25 @@ class CredentialLocation:
     @property
     def removable(self) -> bool:
         return self.delete is not None
+
+
+@dataclass(frozen=True)
+class CredentialRemoval:
+    """What a removal cleared, and what it could not confirm it cleared.
+
+    The second half is not a detail: a removal that reports only ``cleared`` says the same
+    empty list about a provider that had no key and about one whose key the store refused
+    to delete, and the caller then re-runs resolution — through the same store, failing the
+    same way — and concludes that no key resolves any more. The user reads a revoked key
+    that is still live.
+    """
+
+    cleared: list[str]
+    unverified: list[str]
+
+    @property
+    def verified(self) -> bool:
+        return not self.unverified
 
 
 @dataclass(frozen=True)
@@ -344,15 +419,33 @@ def store_provider_key(
     store: ProviderSecretStore,
     credential_env_file: Path,
     env_file_set_key: Callable[[Path, str, str], None],
+    allow_plaintext: bool = False,
 ) -> str:
+    """Write a provider key to the host's secret store, or refuse rather than downgrade.
+
+    The `.env` file is a legitimate destination on a host that has no OS secret store at
+    all, and a downgrade everywhere else. Both used to arrive here as the same `False`, so
+    a store that was present and *refused* — the Windows Credential Manager answering 1312
+    from a non-interactive session, a missing dedicated keychain on macOS — silently wrote
+    the secret to disk in plaintext and reported success with a `(plaintext)` suffix
+    (found on a real Windows host, 14/08/2026). A user who runs `set-key` expecting the OS
+    vault must not get a plaintext file because the vault had a bad day: the write is
+    refused, named, and only an explicit `allow_plaintext` opt-in writes it anyway.
+    """
     service = provider_primary_service(source, config)
     if store.set(service, secret):
         return f"{store.label}:{service}"
+    if store.provides_storage and not allow_plaintext:
+        raise SecretStoreWriteRefused(store.label, store.write_failure_detail())
     env_file_set_key(credential_env_file, service, secret)
     return f"{credential_env_file}:{service} (plaintext)"
 
 
-def remove_provider_key(locations: Sequence[CredentialLocation]) -> list[str]:
+def remove_provider_key(
+    locations: Sequence[CredentialLocation],
+    *,
+    store: ProviderSecretStore,
+) -> CredentialRemoval:
     """Clear a provider's key from every canonical location, and only those.
 
     Walking the shared registry is what keeps removal aligned with resolution: each
@@ -360,8 +453,29 @@ def remove_provider_key(locations: Sequence[CredentialLocation]) -> list[str]:
     can no longer be resolved and un-removable. The read-only legacy fallbacks are
     deliberately left alone — another install may still own them — and are cleared only by
     the explicit opt-in ``purge_legacy_credentials``.
+
+    ``store`` is the same instance the locations delete through, and it is taken separately
+    because the OS store is the only place whose delete can fail for a reason that is not
+    "it was not there": the `.env` files are ours to rewrite, and the process environment is
+    not removable at all. It records that reason on itself while clearing, so this reads it
+    back *after* the walk — the way ``store_provider_key`` reads ``write_failure_detail``
+    after its own write.
     """
-    return _delete_credential_locations([location for location in locations if not location.legacy])
+    # Optional rather than part of the Protocol on purpose: the contract above is what a
+    # backend must answer for resolution and removal to work, while clearing the slot is
+    # bookkeeping ``SecretStore`` does for its own subclasses. A minimal stand-in that never
+    # reuses one instance has nothing to reset, and should not have to say so.
+    reset_delete_failure = getattr(store, "reset_delete_failure", None)
+    if callable(reset_delete_failure):
+        reset_delete_failure()
+    cleared = _delete_credential_locations(
+        [location for location in locations if not location.legacy]
+    )
+    detail = store.delete_failure_detail()
+    return CredentialRemoval(
+        cleared=cleared,
+        unverified=[f"{store.label} refused the delete ({detail})"] if detail else [],
+    )
 
 
 def purge_legacy_credentials(locations: Sequence[CredentialLocation]) -> list[str]:

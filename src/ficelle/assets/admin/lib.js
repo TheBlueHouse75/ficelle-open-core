@@ -236,19 +236,30 @@ export function keySourceRemedy(keySource) {
 // for every family: `legacySources` enumerates legacy `.env` files and keychains only, so a
 // key held in a process environment variable or served by an external resolver (R4) used to
 // come back as a green "key removed" with the provider still configured.
-export function providerKeyRemovalNotice(label, removed, legacySources, purgeLegacy, keySource = null) {
+// `unverified` is the server's list of places that could not confirm the delete — an OS store
+// that refused. It has to override the "no key was stored" reading: a store that would not
+// answer the delete does not answer the re-resolution either, so `keySource` comes back null
+// and every other signal here agrees on a removal that may never have happened.
+export function providerKeyRemovalNotice(label, removed, legacySources, purgeLegacy, keySource = null, unverified = []) {
   const cleared = removed.length
     ? (label + " key removed from " + removed.length + " location" + (removed.length > 1 ? "s" : "") + ".")
-    : ("No " + label + " key was stored by Ficelle.");
+    // Silent when the removal was not confirmed: "no key was stored" is a claim about a store
+    // that declined to answer, and the sentence below replaces it rather than qualifying it.
+    : (unverified.length ? "" : ("No " + label + " key was stored by Ficelle."));
+  const unconfirmed = unverified.length
+    ? ((removed.length ? " " : "") + "Could not confirm the " + label + " key removal: "
+      + unverified.join("; ") + ". It may still be stored.")
+    : "";
   const stillConfigured = keySource
     ? (" " + label + " is still configured: a key still resolves from " + keySourceRemedy(keySource) + ".")
     : "";
-  // Each case below states its own message, level and button in one place. Only the rule that
-  // cuts across them lives here: a key that still resolves makes the toast red, unless a button
-  // is still offered that could finish the job.
+  // Each case below states its own message, level and button in one place. Only the rules that
+  // cut across them live here: a key that still resolves makes the toast red, unless a button
+  // is still offered that could finish the job — and an unconfirmed removal is red whatever the
+  // rest says, since no button on this toast can reach the store that refused.
   const notice = (tail, level, offerLegacyPurge) => ({
-    message: cleared + stillConfigured + tail,
-    level: (keySource && !offerLegacyPurge) ? "error" : level,
+    message: cleared + unconfirmed + stillConfigured + tail,
+    level: (unverified.length || (keySource && !offerLegacyPurge)) ? "error" : level,
     offerLegacyPurge,
   });
   if (!legacySources.length) return notice("", removed.length ? "ok" : "warn", false);

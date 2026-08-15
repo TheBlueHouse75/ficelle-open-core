@@ -253,6 +253,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     function reorderModel(id, beforeId) { const p = currentProfile(); const a = p.models.filter((x) => x !== id); const bi = beforeId ? a.indexOf(beforeId) : -1; if (bi >= 0) a.splice(bi, 0, id); else a.push(id); setProfile({ mode: "manual_order", models: a }); }
 
     /* ---------- capability chips ---------- */
+    function credentialsUnreadable(reason) {
+      return String(reason || "").startsWith("unreadable ");
+    }
     function statusDot(m) {
       const q = modelQuarantine(m);
       if (q) return '<span class="sdot danger" title="Disabled &middot; ' + esc(q.note || q.reason) + '"></span>';
@@ -264,6 +267,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const failed = modelFailedProfileEvidence(m);
       if (failed) return '<span class="sdot warn" title="' + esc(reasonDescription(failed.reason)) + '"></span>';
       if (m.invokable) return '<span class="sdot ok" title="Ready"></span>';
+      if (credentialsUnreadable(m.auth_reason)) return '<span class="sdot warn" title="Credential store unavailable &middot; ' + esc(m.auth_reason) + '"></span>';
       return '<span class="sdot warn" title="No API key &middot; ' + esc(m.auth_reason || "missing credentials") + '"></span>';
     }
     /* The dot carries the reason a model is held back only in a hover title —
@@ -287,6 +291,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (providerCooldown(m.source)) return { cls: "warn", text: "Provider paused", title: "Every model from this provider is paused" };
       const qc = modelQuotaCooldown(m);
       if (qc) return { cls: "warn", text: "Quota paused", title: "Free quota paused &middot; next probe " + esc(timeAgo(qc.next_probe_at_iso || qc.next_probe_at).label) };
+      if (!m.invokable && credentialsUnreadable(m.auth_reason)) return { cls: "warn", text: "Credentials unreadable", title: esc(m.auth_reason) };
       if (!m.invokable) return { cls: "warn", text: "No API key", title: "No API key &middot; " + esc(m.auth_reason || "missing credentials") };
       return null;
     }
@@ -1156,6 +1161,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (cd) return { state: "cooldown", label: "Paused " + formatSeconds(cd.seconds_remaining) };
       if (qc) return { state: "quota", label: "Free quota paused" };
       if (p.invokable) return { state: "connected", label: "Connected" };
+      if (credentialsUnreadable(p.auth_reason)) return { state: "credential_error", label: "Credentials unreadable" };
       return { state: "no_key", label: "No API key" };
     }
     const STATUS_DOT_TONE = { connected: "ok", no_key: "muted" }; // default warn
@@ -1250,7 +1256,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           + '<span class="comp-sub">' + accepted + " usable &middot; " + comp.raw + " returned</span></div>"
           + '<div class="comp-bar">' + shownBuckets.map((b) => '<span style="width:' + pct(b.count, comp.raw) + "%;background:" + b.color + '" title="' + b.count + " " + b.label + '"></span>').join("") + "</div>"
           + '<div class="comp-legend">' + shownBuckets.map((b) => '<span class="comp-legend-item"><span class="sw" style="background:' + b.color + '"></span>' + b.count + " " + esc(b.label) + "</span>").join("") + "</div></div>"
-        : '<div class="provider-note">No catalogue loaded' + (p.invokable ? "" : " — add a key to fetch this provider's models") + ".</div>";
+        : '<div class="provider-note">No catalogue loaded' + (p.invokable
+          ? ""
+          : (credentialsUnreadable(p.auth_reason)
+            ? " — the credential store could not be read"
+            : " — add a key to fetch this provider's models")) + ".</div>";
       // A stored key (key_source set) shows a redacted preview (first/last chars only, never the
       // full value) plus where it lives; Replace reveals the hidden paste box to rotate it. Gate on
       // key_source, not p.invokable: a keyless_local provider is invokable with no stored key
@@ -2976,7 +2986,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const key = (input?.value || "").trim();
       if (!key) { showToast("Paste a key first."); return; }
       try { const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/key", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify({ key }) });
-        const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed"); if (input) input.value = ""; showToast(providerLabel(src) + " key saved."); await loadState();
+        // `hint` carries the way out of a refusal the server cannot resolve itself (a secret
+        // store that would not take the key). It rides beside `message` rather than inside it
+        // because the message is truncated server-side, which would cut the actionable half.
+        const p = await r.json(); if (!r.ok) throw new Error([p?.error?.message, p?.error?.hint].filter(Boolean).join(" — ") || "failed"); if (input) input.value = ""; showToast(providerLabel(src) + " key saved."); await loadState();
       } catch (e) { showToast(e.message || String(e)); }
     }
     // `purgeLegacy` is the opt-in second pass over the read-only legacy stores. It is never
@@ -2992,7 +3005,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         // environment variable or an external resolver, so this is what keeps the toast
         // from reporting a success that left the provider configured.
         const stillResolvedFrom = p.auth?.key_source || null;
-        const notice = providerKeyRemovalNotice(providerLabel(src), removed, legacySources, purgeLegacy, stillResolvedFrom);
+        // Places that could not confirm the delete. Without it the two signals above both
+        // read as a clean removal on a host whose store refused, because they are answered
+        // by the same store that refused.
+        const unverified = Array.isArray(p.unverified) ? p.unverified : [];
+        const notice = providerKeyRemovalNotice(providerLabel(src), removed, legacySources, purgeLegacy, stillResolvedFrom, unverified);
         if (notice.offerLegacyPurge) {
           showToast(notice.message, notice.level, {
             label: "Remove these too",
@@ -3131,7 +3148,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
        /admin/state can also simply be *slow* (it builds the catalog), and a pending fetch
        never reaches a catch — so an error-only notice would never paint in that case,
        while showing it upfront would flash on every healthy load. */
-    const BOOT_DEADLINE_MS = 20000; // matches wait_for_admin_status() in cli.py
+    const BOOT_DEADLINE_MS = 90000; // matches wait_for_admin_status() in cli.py
     const BOOT_NOTICE_DELAY_MS = 600;
     function bootNotice(text) {
       const el = $("bootNotice");

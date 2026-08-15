@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import unreleasable_version
+
 
 BOOTSTRAP_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bootstrap-ficelle.py"
 spec = importlib.util.spec_from_file_location("ficelle_bootstrap", BOOTSTRAP_PATH)
@@ -534,8 +536,11 @@ def test_pro_wheel_must_require_the_bootstrap_core_version(tmp_path):
         dry_run=False,
     )
 
-    incompatible = tmp_path / "ficelle_pro-0.2.0-py3-none-any.whl"
-    write_pro_wheel(incompatible, "ficelle-router==0.2.0")
+    # Derived from the version this guard actually reads, never a literal — see
+    # `unreleasable_version`.
+    incompatible_version = unreleasable_version(bootstrap.CORE_VERSION)
+    incompatible = tmp_path / f"ficelle_pro-{incompatible_version}-py3-none-any.whl"
+    write_pro_wheel(incompatible, f"ficelle-router=={incompatible_version}")
     try:
         bootstrap.verify_pro_core_compatibility(
             incompatible,

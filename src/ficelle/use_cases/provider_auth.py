@@ -92,6 +92,22 @@ def unusable_key_provider_reasons(auth: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def unreadable_provider_reasons(auth: Mapping[str, Any]) -> dict[str, str]:
+    """Providers whose credential store did not answer, mapped to the redacted reason.
+
+    These rows have no ``key_source`` because no key was returned, but they are not the
+    same as an absent key: suggesting ``set-key`` can overwrite or duplicate a key that is
+    still live in the unreachable store.
+    """
+    return {
+        str(source): str(row.get("reason"))
+        for source, row in auth.items()
+        if isinstance(row, dict)
+        and not row.get("invokable")
+        and str(row.get("reason") or "").startswith("unreadable ")
+    }
+
+
 def unconfigured_provider_sources(auth: Mapping[str, Any]) -> list[str]:
     """The providers a user would have to give a key to, in configured order.
 
@@ -99,7 +115,11 @@ def unconfigured_provider_sources(auth: Mapping[str, Any]) -> list[str]:
     a key is in ``unusable_key_provider_reasons`` instead, because storing that same key
     again is not what fixes it.
     """
-    accounted = set(invokable_provider_sources(auth)) | set(unusable_key_provider_reasons(auth))
+    accounted = (
+        set(invokable_provider_sources(auth))
+        | set(unusable_key_provider_reasons(auth))
+        | set(unreadable_provider_reasons(auth))
+    )
     return [str(source) for source in auth if str(source) not in accounted]
 
 

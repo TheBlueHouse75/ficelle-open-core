@@ -9,6 +9,7 @@ from ficelle.provider_credentials import (
     PROVIDER_KEY_VALIDATORS,
     CredentialLocation,
     CredentialLocationPorts,
+    SecretStoreWriteRefused,
     generic_provider_credential_aliases,
     generic_provider_credential_activation_fingerprint,
     is_usable_openrouter_key,
@@ -154,9 +155,26 @@ def test_provider_credential_activation_fingerprint_reports_configured_sources(t
 class WritableStore:
     label = "keychain"
 
-    def __init__(self, *, can_write: bool = True, can_delete: bool = True) -> None:
+    # True for every real backend: this stand-in is an OS store, so a failed write is a
+    # failure, not a licence to write the secret to a file in the clear.
+    provides_storage = True
+
+    def __init__(
+        self,
+        *,
+        can_write: bool = True,
+        can_delete: bool = True,
+        write_failure: str | None = None,
+        delete_failure: str | None = None,
+        read_failure: str | None = None,
+    ) -> None:
         self.can_write = can_write
         self.can_delete = can_delete
+        self.write_failure = write_failure
+        # A real backend records these while operating; the double takes them up front
+        # because what matters here is what the registry does with a store that refuses.
+        self.delete_failure = delete_failure
+        self.read_failure = read_failure
         self.writes: dict[str, str] = {}
         self.deletes: list[str] = []
         self.stored: dict[str, str] = {}
@@ -186,10 +204,19 @@ class WritableStore:
         self.writes[service] = secret
         return True
 
+    def write_failure_detail(self) -> str | None:
+        return self.write_failure
+
     def delete(self, service: str) -> bool:
         # Honest about absence, like every real backend: True only when an item was removed.
         self.deletes.append(service)
         return self.can_delete and self.stored.pop(service, None) is not None
+
+    def delete_failure_detail(self) -> str | None:
+        return self.delete_failure
+
+    def read_failure_detail(self) -> str | None:
+        return self.read_failure
 
 
 def test_store_provider_key_prefers_store_and_uses_primary_service(tmp_path: Path) -> None:
@@ -212,8 +239,55 @@ def test_store_provider_key_prefers_store_and_uses_primary_service(tmp_path: Pat
     assert calls == []
 
 
-def test_store_provider_key_falls_back_to_env_file_when_store_fails(tmp_path: Path) -> None:
+def test_store_provider_key_refuses_when_a_real_store_fails(tmp_path: Path) -> None:
+    """A store that exists and refuses must not become a plaintext file write.
+
+    This asserted the opposite until 14/08/2026: the write fell through to `.env` and the
+    caller reported success with a `(plaintext)` suffix, so a Windows host whose Credential
+    Manager is unreachable from a non-interactive session put the key on disk in the clear.
+    """
+    store = WritableStore(can_write=False, write_failure="error 1312 — needs an interactive logon")
+    calls: list[tuple[Path, str, str]] = []
+    env_file = tmp_path / ".env"
+
+    with pytest.raises(SecretStoreWriteRefused) as refusal:
+        store_provider_key(
+            "groq",
+            {"providers": {"groq": {"api_key_env": "GROQ_API_KEY"}}},
+            "secret",
+            store=store,
+            credential_env_file=env_file,
+            env_file_set_key=lambda path, key, value: calls.append((path, key, value)),
+        )
+
+    assert refusal.value.store_label == "keychain"
+    assert "interactive logon" in str(refusal.value)
+    assert calls == []  # nothing was written anywhere
+
+
+def test_store_provider_key_writes_the_env_file_on_the_explicit_opt_in(tmp_path: Path) -> None:
     store = WritableStore(can_write=False)
+    calls: list[tuple[Path, str, str]] = []
+    env_file = tmp_path / ".env"
+
+    target = store_provider_key(
+        "groq",
+        {"providers": {"groq": {"api_key_env": "GROQ_API_KEY"}}},
+        "secret",
+        store=store,
+        credential_env_file=env_file,
+        env_file_set_key=lambda path, key, value: calls.append((path, key, value)),
+        allow_plaintext=True,
+    )
+
+    assert target == f"{env_file}:GROQ_API_KEY (plaintext)"
+    assert calls == [(env_file, "GROQ_API_KEY", "secret")]
+
+
+def test_store_provider_key_uses_the_env_file_where_no_store_exists(tmp_path: Path) -> None:
+    """The `.env` file stays the destination on a host with no OS store — no opt-in needed."""
+    store = WritableStore(can_write=False)
+    store.provides_storage = False
     calls: list[tuple[Path, str, str]] = []
     env_file = tmp_path / ".env"
 
@@ -364,14 +438,15 @@ def test_remove_provider_key_clears_store_and_env_file(tmp_path: Path) -> None:
     host.store.stored["OPENROUTER_API_KEY"] = "sk-or-canonical"
     host.files[host.env_file]["OPENROUTER_API_KEY"] = "sk-or-canonical"
 
-    cleared = remove_provider_key(host.locations("openrouter"))
+    removal = remove_provider_key(host.locations("openrouter"), store=host.store)
 
     # Store before `.env`, which is not resolution order — it is the order the CLI line and
     # the admin toast have always listed, so it stays pinned rather than left to the sort.
-    assert cleared == [
+    assert removal.cleared == [
         "keychain:OPENROUTER_API_KEY",
         f"{host.env_file}:OPENROUTER_API_KEY",
     ]
+    assert removal.verified and removal.unverified == []
     assert host.store.deletes[0] == "OPENROUTER_API_KEY"
     assert (host.env_file, "OPENROUTER_API_KEY") in host.deleted_env
 
@@ -386,11 +461,53 @@ def test_remove_provider_key_clears_secondary_aliases(tmp_path: Path) -> None:
     host = _Host(tmp_path)
     host.files[host.env_file]["NVIDIA_NIM_API_KEY"] = "nv-secondary"
 
-    cleared = remove_provider_key(host.locations("nvidia"))
+    removal = remove_provider_key(host.locations("nvidia"), store=host.store)
 
     assert "NVIDIA_NIM_API_KEY" in host.store.deletes
-    assert f"{host.env_file}:NVIDIA_NIM_API_KEY" in cleared
+    assert f"{host.env_file}:NVIDIA_NIM_API_KEY" in removal.cleared
     assert (host.env_file, "NIM_API_KEY") in host.deleted_env
+
+
+def test_remove_provider_key_reports_a_store_that_refused_the_delete(tmp_path: Path) -> None:
+    """A refused delete must not read as "there was nothing to remove".
+
+    The two arrive at the same empty `cleared` list, and the caller's next move — re-running
+    resolution — is answered by the same store that just refused, so it reports no key
+    either. That is the whole failure: the Windows Credential Manager answers 1312 from a
+    non-interactive session, `remove-key` printed "No <provider> key resolves any more",
+    and the key was still in the vault.
+    """
+    store = WritableStore(
+        can_delete=False,
+        delete_failure="CredDeleteW error 1312 ERROR_NO_SUCH_LOGON_SESSION — needs an interactive logon",
+    )
+    store.stored["OPENROUTER_API_KEY"] = "sk-or-still-there"
+    host = _Host(tmp_path, store=store)
+
+    removal = remove_provider_key(host.locations("openrouter"), store=host.store)
+
+    assert removal.cleared == []
+    assert not removal.verified
+    assert removal.unverified == [
+        "keychain refused the delete (CredDeleteW error 1312 ERROR_NO_SUCH_LOGON_SESSION"
+        " — needs an interactive logon)"
+    ]
+    assert store.stored == {"OPENROUTER_API_KEY": "sk-or-still-there"}  # it really is still there
+
+
+def test_remove_provider_key_is_verified_when_the_store_only_held_nothing(tmp_path: Path) -> None:
+    """The line the fix must not cross: an empty store is not a refusal.
+
+    A `.env`-only install deletes nothing from the OS store on every removal, and calling
+    that unverified would turn the ordinary case into a permanent warning.
+    """
+    host = _Host(tmp_path)
+    host.files[host.env_file]["OPENROUTER_API_KEY"] = "sk-or-in-the-env-file"
+
+    removal = remove_provider_key(host.locations("openrouter"), store=host.store)
+
+    assert removal.cleared == [f"{host.env_file}:OPENROUTER_API_KEY"]
+    assert removal.verified
 
 
 def test_remove_provider_key_never_touches_the_legacy_fallbacks(tmp_path: Path) -> None:
@@ -400,7 +517,7 @@ def test_remove_provider_key_never_touches_the_legacy_fallbacks(tmp_path: Path) 
     host.files[host.legacy_env_file]["OPENROUTER_API_KEY"] = "sk-or-legacy-file"
     host.legacy_store["openrouter-api-key"] = "sk-or-legacy-store"
 
-    assert remove_provider_key(host.locations("openrouter")) == []
+    assert remove_provider_key(host.locations("openrouter"), store=host.store).cleared == []
     assert host.files[host.legacy_env_file] == {"OPENROUTER_API_KEY": "sk-or-legacy-file"}
     assert legacy_credential_sources(host.locations("openrouter")) == [
         f"{host.legacy_env_file}:OPENROUTER_API_KEY",

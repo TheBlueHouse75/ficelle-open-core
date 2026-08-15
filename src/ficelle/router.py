@@ -79,6 +79,7 @@ from ficelle.failures import (
     build_upstream_failure_error as build_upstream_failure_error_result,
     classify_failure as classify_failure_result,
     cooldown_policy_for_reason,
+    error_body as error_body_result,
     error_object_codes,
     safe_error_body as safe_error_body_result,
     status_for_error_codes,
@@ -91,7 +92,9 @@ from ficelle.provider_credentials import (
     PROVIDER_SERVICE_ALIASES,
     CredentialLocation,
     CredentialLocationPorts,
+    CredentialRemoval,
     ProviderCredentialsUnavailable,
+    SecretStoreWriteRefused,
     generic_provider_credential_aliases,
     generic_provider_credential_activation_fingerprint as generic_provider_credential_activation_fingerprint_use_case,
     is_usable_openrouter_key,
@@ -239,6 +242,8 @@ from ficelle.use_cases.admin_status import (
     build_admin_job_row,
     build_catalog_refresh_summary,
     cached_catalog_stale_reason as cached_catalog_stale_reason_use_case,
+    catalog_age_seconds as catalog_age_seconds_use_case,
+    catalog_ttl_seconds,
     stale_reason_keeps_last_known,
     failed_profile_evidence_row as failed_profile_evidence_row_use_case,
     filter_cached_catalog_to_enabled_providers as filter_cached_catalog_to_enabled_providers_use_case,
@@ -1330,9 +1335,9 @@ def load_catalog_document() -> dict[str, Any]:
     re-deriving values that only change when the file changes. Keyed on the file's identity;
     `atomic_write_json` publishes by rename, so a new catalog always changes that signature.
 
-    Returns a fresh top-level dict each call because `admin_status` blanks `models`/`providers`
-    in place on a structurally stale catalog. The nested lists and model rows ARE shared, so
-    callers must keep treating them as read-only — which is what every caller does today, and
+    Returns a fresh top-level dict each call so read surfaces can replace top-level values without
+    changing another request's view. The nested lists and model rows ARE shared, so callers must
+    keep treating them as read-only — which is what every caller does today, and
     `test_catalog_document_cache_does_not_leak_caller_mutations` holds the line.
     """
     global _CATALOG_DOCUMENT_CACHE
@@ -1592,12 +1597,40 @@ def safe_state_key(value: Any) -> str:
     return safe_detail(value) or "[redacted]"
 
 
+def command_failure_detail(result: Any, tool: str) -> str:
+    """The redacted reason a CLI-backed store operation failed: the tool's own words when it
+    wrote any, else its exit code.
+
+    One spelling for `security` and `secret-tool` alike, because these strings are what a
+    refusal shows a person — a store that says "run this from an interactive logon" is
+    actionable and one that says "it exited 51" is not, and the difference must not depend
+    on which backend was asked.
+    """
+    return sanitize_error_detail(result.stderr) or f"{tool} exited {result.returncode}"
+
+
 def safe_error_body(exc: Exception, *, request_id: str | None = None) -> dict[str, Any]:
     return safe_error_body_result(exc, request_id=request_id)
 
 
 def bad_request_body(exc: Exception, *, request_id: str | None = None) -> dict[str, Any]:
     return bad_request_body_result(exc, request_id=request_id)
+
+
+def secret_store_refused_body(exc: Exception, *, source: str) -> dict[str, Any]:
+    """The 409 body for a key write the host's secret store would not take.
+
+    Same envelope as every other admin error — the dashboard reads `error.message` — with
+    its own `type` so a client can tell "the vault said no" from a malformed request, and a
+    `hint` carrying the way out. The hint is a separate field rather than more prose because
+    `message` is truncated at 180 characters: appended, the actionable half is what the cut
+    would take, and a refusal with no way forward is where the user stops.
+    """
+    body = error_body_result(
+        exc, error_type="secret_store_refused", fallback_message="the secret store refused the write"
+    )
+    body["error"]["hint"] = f"fix the store and retry, or run `ficelle set-key {source} --allow-plaintext` on the host"
+    return body
 
 
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
@@ -2864,30 +2897,85 @@ def env_file_delete_key(path: Path, key: str) -> bool:
 
 # Resolving credentials spawns one `security` subprocess per provider per keychain, and the
 # catalog filter resolves EVERY enabled provider on every request — measured at 812 ms and 30-45
-# subprocesses for a single chat completion on a 15-provider install. The answer is identical
-# across those calls, so cache the subprocess results for a short window.
+# subprocesses for a single chat completion on a 15-provider install, and at 647 ms on the
+# `/health` and `/admin/status.json` cached-catalog read. The answer only changes when the
+# keychain does, so the memo is keyed on the keychain FILE rather than expiring on a clock.
+#
+# That key is the right one because it is exactly what a write moves and a lookup does not
+# (measured on macOS, 15/08/2026: add, in-place update and delete each change `(st_mtime_ns,
+# st_size)`; a hit, a miss and an unlock leave it byte-identical). The 30 s TTL it replaces was
+# wrong in both directions: a key added with the `security` CLI stayed invisible for up to 30 s,
+# while any consumer polling *slower* than 30 s — the default for most watchers — paid the full
+# subprocess storm on every single probe.
 #
 # Only the `security` calls are cached, never a resolution *decision*: `.env` reads, provider
 # policy and activation state stay live, so the cache can never keep a disabled provider in the
-# pool. Values live in memory only (the process already holds keys to make requests) and a write
-# through Ficelle drops the cache immediately, so the TTL is only the ceiling for a key changed
-# behind our back with the `security` CLI.
-_KEYCHAIN_CACHE_TTL_SECONDS = 30.0
-_KEYCHAIN_CACHE: dict[tuple[str, str], tuple[float, Any]] = {}
+# pool. Values live in memory only and a write through Ficelle drops the cache immediately. What
+# does change with the clock gone is residency: a resolved key now stays in this process until
+# the keychain changes, rather than for 30 s. That is accepted — a router that is routing holds
+# provider keys continuously anyway, and reading this process's memory already requires owning
+# the account that owns the keychain.
+_KEYCHAIN_RETRY_WINDOW_SECONDS = 30.0
+_KEYCHAIN_CACHE: dict[tuple[str, str], tuple[object, Any]] = {}
 _KEYCHAIN_CACHE_LOCK = threading.Lock()
 
 
-def _keychain_cached(key: tuple[str, str], compute: Callable[[], Any]) -> Any:
-    now = time.monotonic()
+def _keychain_file_signature(keychain: Path) -> tuple[int, int] | None:
+    """Identity of a keychain file, or ``None`` when it does not exist.
+
+    Absence is a cacheable state of its own: most hosts have no legacy keychain at all, and
+    creating one moves the signature off ``None`` like any other write.
+    """
+    try:
+        stat = keychain.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _keychain_retry_window() -> tuple[str, int]:
+    """Validity for what the keychain file cannot vouch for: re-probe once per window.
+
+    Two probes land here, for the same reason — the file is silent about them.
+
+    An **unlock verdict**: locking a keychain leaves it byte-identical (measured 15/08/2026) and
+    a dedicated keychain locks itself, ``security show-keychain-info`` reporting ``lock-on-sleep
+    timeout=300s``. A file-keyed unlock would keep claiming "unlocked" and send the next read at
+    a *locked* keychain, which is the blocking GUI prompt from incident 2026-06-16.
+
+    A **non-answer**: when `security` raises or times out we observed nothing, so the file cannot
+    make that a durable "no key" — it would report a real key as missing until the keychain is
+    written or the service restarts. Nor can it go unmemoized: a locked keychain answers by
+    blocking for the full 5 s timeout, and `read_canonical_keychain_secret` probes the login
+    keychain with no unlock gate, so tens of lookups per request would each pay it.
+
+    Tagged rather than bare so a window can never collide with a file signature.
+    """
+    return ("retry", int(time.monotonic() // _KEYCHAIN_RETRY_WINDOW_SECONDS))
+
+
+def _keychain_cached(key: tuple[str, str], validity: object, compute: Callable[[], Any]) -> Any:
+    """Memoize a `security` result for as long as ``validity`` keeps comparing equal.
+
+    Reads and probes pass the keychain file signature; the unlock probe passes the retry window.
+    ``compute`` returns ``None`` when `security` did not answer at all, and that non-answer is
+    stored under the retry window whatever the caller passed — see `_keychain_retry_window` for
+    why neither the file nor no-memo-at-all can hold it. An entry is therefore served when it
+    still matches the caller's validity *or* the current window, which is what lets one memo hold
+    both an observation of the file and an observation of the store's availability.
+    """
+    retry = _keychain_retry_window()
     with _KEYCHAIN_CACHE_LOCK:
         cached = _KEYCHAIN_CACHE.get(key)
-        if cached is not None and cached[0] > now:
+        if cached is not None and cached[0] in (validity, retry):
             return cached[1]
     # Deliberately outside the lock: holding it across a subprocess would serialize exactly the
     # calls this cache exists to make cheap. Two threads racing a cold key each pay one probe.
+    # ``validity`` is the one sampled *before* the probe, so a keychain written while `security`
+    # runs leaves the entry tagged with the old signature and the next caller re-reads.
     value = compute()
     with _KEYCHAIN_CACHE_LOCK:
-        _KEYCHAIN_CACHE[key] = (time.monotonic() + _KEYCHAIN_CACHE_TTL_SECONDS, value)
+        _KEYCHAIN_CACHE[key] = (validity if value is not None else retry, value)
     return value
 
 
@@ -2907,7 +2995,7 @@ def _unlock_dedicated_keychain(keychain_path: Path) -> Path | None:
     if not keychain_path.exists():
         return None
 
-    def unlock() -> bool:
+    def unlock() -> bool | None:
         try:
             result = subprocess.run(
                 ["security", "unlock-keychain", "-p", "", str(keychain_path)],
@@ -2917,10 +3005,11 @@ def _unlock_dedicated_keychain(keychain_path: Path) -> Path | None:
                 check=False,
             )
         except Exception:
-            return False
+            return None
         return result.returncode == 0
 
-    return keychain_path if _keychain_cached(("unlock", str(keychain_path)), unlock) else None
+    unlocked = _keychain_cached(("unlock", str(keychain_path)), _keychain_retry_window(), unlock)
+    return keychain_path if unlocked else None
 
 
 def _unlock_ficelle_keychain() -> Path | None:
@@ -2967,7 +3056,7 @@ def _login_keychain_path() -> Path:
 
 
 def _read_scoped_keychain_secret(service: str, keychain: Path) -> str:
-    def read() -> str:
+    def read() -> str | None:
         try:
             result = subprocess.run(
                 ["security", "find-generic-password", "-s", service, "-w", str(keychain)],
@@ -2977,12 +3066,15 @@ def _read_scoped_keychain_secret(service: str, keychain: Path) -> str:
                 check=False,
             )
         except Exception:
-            return ""
+            return None
         return result.stdout.strip() if result.returncode == 0 else ""
 
-    # The empty answer is cached too: on a 15-provider install most lookups miss, and those
-    # misses are the bulk of the per-request subprocess storm.
-    return _keychain_cached((f"read:{service}", str(keychain)), read)
+    # The empty answer is cached under the file like any other: on a 15-provider install most
+    # lookups miss, and those misses are the bulk of the per-request subprocess storm. A
+    # *non-answer* is not — hence `None` above, the retry window it lands under, and the
+    # coercion below. See `_keychain_cached`.
+    signature = _keychain_file_signature(keychain)
+    return _keychain_cached((f"read:{service}", str(keychain)), signature, read) or ""
 
 
 def read_canonical_keychain_secret(service: str) -> str:
@@ -3009,7 +3101,7 @@ def unlock_and_read_legacy_keychain_secret(service: str) -> str:
 def _scoped_keychain_secret_exists(service: str, keychain: Path) -> bool:
     """Probe a scoped keychain entry without asking `security` for its value."""
 
-    def exists() -> bool:
+    def exists() -> bool | None:
         try:
             result = subprocess.run(
                 ["security", "find-generic-password", "-s", service, str(keychain)],
@@ -3019,15 +3111,25 @@ def _scoped_keychain_secret_exists(service: str, keychain: Path) -> bool:
                 check=False,
             )
         except Exception:
-            return False
+            return None
         return result.returncode == 0
 
-    return _keychain_cached((f"exists:{service}", str(keychain)), exists)
+    signature = _keychain_file_signature(keychain)
+    return bool(_keychain_cached((f"exists:{service}", str(keychain)), signature, exists))
 
 
-def _scoped_keychain_delete(service: str, keychain: Path) -> bool:
-    """Delete an item from a scoped keychain. Returns True when an item was removed;
-    never raises.
+# `security` exits 44 for errSecItemNotFound — the answer for every alias a provider does
+# not use, and the one non-zero exit that is an absence rather than a refusal.
+SECURITY_ITEM_NOT_FOUND_EXIT = 44
+
+
+def _scoped_keychain_delete(service: str, keychain: Path) -> tuple[bool, str | None]:
+    """Delete an item from a scoped keychain. Never raises.
+
+    Returns ``(deleted, detail)``: ``detail`` is `security`'s own words for a delete that
+    could not be completed, and stays ``None`` when the item was simply not there. A
+    keychain that is locked or unreadable used to arrive as the same ``False`` as an empty
+    one, so a removal reported a key gone that the keychain still held.
 
     Scoping the call to one keychain is what keeps it non-interactive for the dedicated
     stores: callers on that path pass a keychain ``_unlock_dedicated_keychain`` already
@@ -3041,12 +3143,14 @@ def _scoped_keychain_delete(service: str, keychain: Path) -> bool:
             timeout=10,
             check=False,
         )
-    except Exception:
-        return False
-    succeeded = result.returncode == 0
-    if succeeded:
+    except Exception as exc:
+        return False, safe_detail(exc)
+    if result.returncode == 0:
         invalidate_credential_cache()
-    return succeeded
+        return True, None
+    if result.returncode == SECURITY_ITEM_NOT_FOUND_EXIT:
+        return False, None
+    return False, command_failure_detail(result, "security")
 
 
 def unlock_and_list_legacy_keychain_secret_sources(
@@ -3089,6 +3193,9 @@ class SecretStore:
     """
 
     label = "store"
+    # See ProviderSecretStore.provides_storage: only a host with no OS secret store at all
+    # clears this, and only there is the `.env` file the intended destination.
+    provides_storage = True
 
     def get(self, service: str) -> str | None:
         raise NotImplementedError
@@ -3122,8 +3229,86 @@ class SecretStore:
         """
         return []
 
+    # Set by the `record_*` helpers on the instance; the class defaults keep a backend that
+    # never reports a reason (and every store before its first call) answering None.
+    #
+    # A store must live *at least* as long as the whole batch, because the reason is read back
+    # after the alias walk. The batch entrypoints reset their own latch before they start, so
+    # an explicitly reused instance cannot report a refusal from a previous operation.
+    # `default_secret_store()` / `server_secret_store()` still return fresh instances: sharing
+    # one would add cross-request mutable state for no benefit.
+    _write_failure: str | None = None
+    _delete_failure: str | None = None
+    _read_failure: str | None = None
+
     def set(self, service: str, secret: str) -> bool:
         return False
+
+    def record_write(self, outcome: tuple[bool, str | None]) -> bool:
+        """Keep the reason a ``(stored, detail)`` write failed, and return whether it did.
+
+        The backends whose OS call can explain itself route their `set` through this, so
+        the reason reaches ``write_failure_detail`` without each of them repeating the
+        same two lines of bookkeeping.
+        """
+        stored, detail = outcome
+        self._write_failure = None if stored else detail
+        return stored
+
+    def write_failure_detail(self) -> str | None:
+        """See ProviderSecretStore.write_failure_detail. A backend whose OS call cannot
+        explain itself never records one, and the refusal just says which store refused."""
+        return self._write_failure
+
+    def record_delete(self, outcome: tuple[bool, str | None]) -> bool:
+        """Keep the reason a ``(deleted, detail)`` delete could not be completed.
+
+        Two things differ from ``record_write``, both because a write targets one service
+        name while a removal walks every alias a provider accepts:
+
+        - the reason is kept whatever the flag says. A delete that cleared the login
+          keychain and could not open the dedicated one removed something *and* left
+          somewhere unchecked;
+        - it is kept until the batch ends rather than overwritten. Most aliases are simply
+          absent, and an absence carries no detail — letting one overwrite the refusal an
+          earlier alias reported would hand back a store claiming nothing went wrong about
+          a key it never deleted.
+        """
+        deleted, detail = outcome
+        if detail and not self._delete_failure:
+            self._delete_failure = detail
+        return deleted
+
+    def delete_failure_detail(self) -> str | None:
+        """See ProviderSecretStore.delete_failure_detail."""
+        return self._delete_failure
+
+    def reset_delete_failure(self) -> None:
+        """Start a new delete batch without weakening stickiness inside that batch."""
+        self._delete_failure = None
+
+    def record_read(self, outcome: tuple[str, str | None]) -> str | None:
+        """Keep the reason a ``(secret, detail)`` read could not be answered, and return the
+        secret in ``get``'s own shape. Sticky for the same reason as ``record_delete``:
+        resolution tries every alias and most of them hold nothing."""
+        secret, detail = outcome
+        if detail and not self._read_failure:
+            self._read_failure = detail
+        return secret or None
+
+    def read_failure_detail(self) -> str | None:
+        """See ProviderSecretStore.read_failure_detail.
+
+        Only the Windows backend names a reason today: ``CredReadW`` reports its error code
+        for free, while the macOS and Linux read helpers answer through the shared 30s
+        keychain cache on the per-request hot path, where widening the cached value is a
+        change of its own.
+        """
+        return self._read_failure
+
+    def reset_read_failure(self) -> None:
+        """Start a new resolution batch without carrying an earlier refusal into it."""
+        self._read_failure = None
 
     def delete(self, service: str) -> bool:
         return False
@@ -3133,14 +3318,20 @@ class NullSecretStore(SecretStore):
     """No OS secret store on this host; resolution falls back to env/.env only."""
 
     label = "null"
+    # The one store where a `.env` write is the destination, not a downgrade.
+    provides_storage = False
 
     def get(self, service: str) -> str | None:
         return None
 
 
-def keychain_store_write(service: str, secret: str) -> bool:
+def keychain_store_write(service: str, secret: str) -> tuple[bool, str | None]:
     """Write a secret to the macOS login Keychain in the user session (``-U`` updates
-    an existing item, enabling rotation). Returns True on success; never raises.
+    an existing item, enabling rotation). Never raises.
+
+    Returns ``(stored, detail)``: this is the store the CLI writes through on macOS, so a
+    refusal here is the one a person is most likely to read, and `security`'s own words
+    are the only thing that says why.
 
     CLI-only: a launchd daemon must not call this — writing to the login keychain from
     the background daemon can pop a blocking GUI prompt (incident 2026-06-16, R9). The
@@ -3158,17 +3349,17 @@ def keychain_store_write(service: str, secret: str) -> bool:
             timeout=10,
             check=False,
         )
-    except Exception:
-        return False
-    succeeded = result.returncode == 0
-    if succeeded:
+    except Exception as exc:
+        return False, safe_detail(exc)
+    if result.returncode == 0:
         invalidate_credential_cache()
-    return succeeded
+        return True, None
+    return False, command_failure_detail(result, "security")
 
 
-def keychain_store_delete(service: str) -> bool:
-    """Delete a generic-password item from the macOS login Keychain. Returns True when
-    an item was removed; never raises."""
+def keychain_store_delete(service: str) -> tuple[bool, str | None]:
+    """Delete a generic-password item from the macOS login Keychain. Returns
+    ``(deleted, detail)`` as ``_scoped_keychain_delete`` does; never raises."""
     return _scoped_keychain_delete(service, _login_keychain_path())
 
 
@@ -3193,33 +3384,66 @@ class KeychainStore(SecretStore):
         return _purge_legacy_keychain_credentials(services)
 
     def set(self, service: str, secret: str) -> bool:
-        return keychain_store_write(service, secret)
+        return self.record_write(keychain_store_write(service, secret))
 
     def delete(self, service: str) -> bool:
-        login_deleted = keychain_store_delete(service)
-        dedicated_deleted = dedicated_keychain_delete(service)
-        return login_deleted or dedicated_deleted
+        # Both keychains are cleared, and either reason is kept: removing the login copy
+        # while the dedicated keychain stays shut is still a removal that left a place
+        # unchecked, which is exactly what `record_delete` is there to remember.
+        login_deleted, login_detail = keychain_store_delete(service)
+        dedicated_deleted, dedicated_detail = dedicated_keychain_delete(service)
+        return self.record_delete(
+            (login_deleted or dedicated_deleted, login_detail or dedicated_detail)
+        )
 
 
 def secret_tool_lookup(service: str) -> str:
     """Linux libsecret read via the ``secret-tool`` CLI, keyed on a ``service``
-    attribute. Returns "" when absent or on any error; never raises, never prompts."""
-    try:
-        result = subprocess.run(
-            ["secret-tool", "lookup", "service", service],
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return ""
-    return result.stdout.strip() if result.returncode == 0 else ""
+    attribute. Returns "" when absent or on any error; never raises, never prompts.
+
+    Memoized through the same store as the macOS reads, but under the **retry window**
+    rather than a file signature: libsecret is a daemon, so there is nothing to stat and no
+    cheaper way to notice a change. That is deliberately the plain per-window TTL the
+    keychain memo just stopped needing — worse than a file key, and far better than the
+    nothing this had. One spawn per service alias per provider was the whole cost, and
+    `filter_cached_catalog_to_enabled_providers` resolves every configured provider on
+    `GET /health` and `GET /admin/status.json`, with `invoke_model` and
+    `fetch_provider_catalog` resolving on their own paths.
+
+    The window is not the only freshness story here, unlike a TTL on its own: a write or a
+    removal through Ficelle drops the memo outright (`secret_tool_write`,
+    `secret_tool_delete`), so it only ever bounds a key changed with the `secret-tool` CLI
+    behind Ficelle's back.
+    """
+
+    def read() -> str | None:
+        try:
+            result = subprocess.run(
+                ["secret-tool", "lookup", "service", service],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            # `None`, not `""`: the store did not answer, which is not "no key". See
+            # `_keychain_cached` — it lands under the retry window either way here, but the
+            # coercion below is what keeps this function's contract at `str`.
+            return None
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    return _keychain_cached(("secret-tool:read", service), _keychain_retry_window(), read) or ""
 
 
-def secret_tool_write(service: str, secret: str) -> bool:
+def secret_tool_write(service: str, secret: str) -> tuple[bool, str | None]:
     """Store a secret in Linux libsecret via ``secret-tool``, keyed on the ``service``
-    attribute. The secret is passed on stdin, never on argv. Returns True on success."""
+    attribute. The secret is passed on stdin, never on argv. Never raises.
+
+    Returns ``(stored, detail)`` like its macOS and Windows siblings. It was the one backend
+    left returning a bare bool after the write-side fix, so a refusal on Linux — no session
+    D-Bus, no unlocked collection, which is what a headless or `su`-ed session gives — could
+    only ever say "the secretservice secret store refused the write" with nothing to act on.
+    """
     try:
         result = subprocess.run(
             ["secret-tool", "store", "--label", f"ficelle {service}", "service", service],
@@ -3229,14 +3453,24 @@ def secret_tool_write(service: str, secret: str) -> bool:
             timeout=10,
             check=False,
         )
-    except Exception:
-        return False
-    return result.returncode == 0
+    except Exception as exc:
+        return False, safe_detail(exc)
+    if result.returncode == 0:
+        # Same obligation as the macOS write. It matters more here: a keychain write moves the
+        # file signature the memo is keyed on, so macOS would recover on its own — libsecret
+        # has no such tell, and without this `set-key` looks inert for the whole window.
+        invalidate_credential_cache()
+        return True, None
+    return False, command_failure_detail(result, "secret-tool")
 
 
-def secret_tool_delete(service: str) -> bool:
-    """Clear a libsecret item keyed on the ``service`` attribute. Returns True on
-    success; never raises."""
+def secret_tool_delete(service: str) -> tuple[bool, str | None]:
+    """Clear a libsecret item keyed on the ``service`` attribute. Never raises.
+
+    Returns ``(cleared, detail)``. ``secret-tool clear`` exits 0 whether or not anything
+    matched, so a non-zero exit is always a real failure here — never the absence a
+    keychain or the Credential Manager has to be told apart from one.
+    """
     try:
         result = subprocess.run(
             ["secret-tool", "clear", "service", service],
@@ -3245,9 +3479,15 @@ def secret_tool_delete(service: str) -> bool:
             timeout=10,
             check=False,
         )
-    except Exception:
-        return False
-    return result.returncode == 0
+    except Exception as exc:
+        return False, safe_detail(exc)
+    if result.returncode == 0:
+        # `clear` exits 0 even on a no-op, so this drops the memo needlessly sometimes — the
+        # opposite mistake is worse: `remove-key` re-reads to verify, and a memo still holding
+        # the cleared key would report it as still resolving.
+        invalidate_credential_cache()
+        return True, None
+    return False, command_failure_detail(result, "secret-tool")
 
 
 class SecretToolStore(SecretStore):
@@ -3259,14 +3499,18 @@ class SecretToolStore(SecretStore):
         return secret_tool_lookup(service) or None
 
     def set(self, service: str, secret: str) -> bool:
-        return secret_tool_write(service, secret)
+        return self.record_write(secret_tool_write(service, secret))
 
     def delete(self, service: str) -> bool:
-        return secret_tool_delete(service)
+        return self.record_delete(secret_tool_delete(service))
 
 
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
+ERROR_NO_SUCH_LOGON_SESSION = 1312
+# The Credential Manager's "no such credential": an absence, and the answer for every alias
+# a provider does not use. Every other code means the store would not answer at all.
+ERROR_NOT_FOUND = 1168
 
 
 def _windows_advapi32():
@@ -3299,14 +3543,19 @@ def _windows_advapi32():
     return ctypes, wintypes, advapi32, _Credential
 
 
-def windows_credential_read(service: str) -> str:
+def windows_credential_read(service: str) -> tuple[str, str | None]:
     """Windows Credential Manager read for a generic credential named ``service``.
 
     ``cmdkey`` can write a credential but cannot read its secret back, so the read
     goes through the Win32 ``CredReadW`` API via ``ctypes`` against ``advapi32`` —
     still the standard library, no third-party package. The blob is decoded as UTF-8
-    (the write path stores UTF-8 to match). Returns "" on absence or any error; never
-    raises."""
+    (the write path stores UTF-8 to match). Never raises.
+
+    Returns ``(secret, detail)``. ``detail`` names the OS reason the store could not be
+    read and stays ``None`` for an ordinary miss (``ERROR_NOT_FOUND``). Both used to come
+    back as the same ``""``, which is what let a Credential Manager unreachable from a
+    non-interactive session (1312) read as "this provider has no key" — including in the
+    resolution a removal re-runs to decide whether the key is really gone."""
     try:
         ctypes, wintypes, advapi32, _Credential = _windows_advapi32()
         advapi32.CredReadW.argtypes = [
@@ -3320,22 +3569,31 @@ def windows_credential_read(service: str) -> str:
 
         pointer = ctypes.POINTER(_Credential)()
         if not advapi32.CredReadW(service, CRED_TYPE_GENERIC, 0, ctypes.byref(pointer)):
-            return ""
+            code = ctypes.get_last_error()
+            if code == ERROR_NOT_FOUND:
+                return "", None
+            return "", windows_credential_error_detail(code, api="CredReadW")
         try:
             blob_size = int(pointer.contents.CredentialBlobSize)
             if blob_size <= 0:
-                return ""
+                return "", None
             blob = ctypes.string_at(pointer.contents.CredentialBlob, blob_size)
-            return blob.decode("utf-8", "ignore").strip()
+            return blob.decode("utf-8", "ignore").strip(), None
         finally:
             advapi32.CredFree(pointer)
-    except Exception:
-        return ""
+    except Exception as exc:
+        return "", safe_detail(exc)
 
 
-def windows_credential_write(service: str, secret: str) -> bool:
+def windows_credential_write(service: str, secret: str) -> tuple[bool, str | None]:
     """Write a generic credential via ``CredWriteW``, storing the secret as a UTF-8
-    blob to match ``windows_credential_read``. Returns True on success; never raises."""
+    blob to match ``windows_credential_read``. Never raises.
+
+    Returns ``(stored, detail)``: the failure code used to be swallowed, and 1312
+    (``ERROR_NO_SUCH_LOGON_SESSION``, the Credential Manager from a non-interactive
+    session) is the difference between "it did not work" and "run this from an
+    interactive logon".
+    """
     try:
         ctypes, wintypes, advapi32, _Credential = _windows_advapi32()
         advapi32.CredWriteW.argtypes = [ctypes.POINTER(_Credential), wintypes.DWORD]
@@ -3349,21 +3607,51 @@ def windows_credential_write(service: str, secret: str) -> bool:
         cred.CredentialBlobSize = len(blob)
         cred.CredentialBlob = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char))
         cred.Persist = CRED_PERSIST_LOCAL_MACHINE
-        return bool(advapi32.CredWriteW(ctypes.byref(cred), 0))
-    except Exception:
-        return False
+        if advapi32.CredWriteW(ctypes.byref(cred), 0):
+            return True, None
+        return False, windows_credential_error_detail(ctypes.get_last_error(), api="CredWriteW")
+    except Exception as exc:
+        return False, safe_detail(exc)
 
 
-def windows_credential_delete(service: str) -> bool:
-    """Delete a generic credential via ``CredDeleteW``. Returns True on success; never
-    raises."""
+
+def windows_credential_error_detail(code: int, *, api: str) -> str:
+    """A redacted, actionable label for a ``Cred*`` failure code.
+
+    Kept short on purpose: it travels inside an error envelope whose message is truncated
+    at 180 characters (``sanitize_error_detail``), and the actionable half must survive
+    that cut. The longer remediation belongs to the caller, which has no such limit.
+
+    ``api`` names the call that failed and is required rather than defaulted, because the
+    same 1312 means "the key was not stored" from ``CredWriteW`` and "the key may still be
+    stored" from ``CredDeleteW`` — a default would be silently wrong at two of the three
+    call sites.
+    """
+    if code == ERROR_NO_SUCH_LOGON_SESSION:
+        return f"{api} error {code} ERROR_NO_SUCH_LOGON_SESSION — needs an interactive logon"
+    return f"{api} error {code}"
+
+
+def windows_credential_delete(service: str) -> tuple[bool, str | None]:
+    """Delete a generic credential via ``CredDeleteW``. Never raises.
+
+    Returns ``(deleted, detail)``. ``ERROR_NOT_FOUND`` is an absence and carries no detail;
+    every other code does. 1312 from a non-interactive session used to arrive as the same
+    ``False`` as "there was nothing there", so `ficelle remove-key` over SSH reported a key
+    gone that the Credential Manager still held — and the read failed the same way, so the
+    verdict that re-runs resolution agreed with it."""
     try:
         ctypes, wintypes, advapi32, _Credential = _windows_advapi32()
         advapi32.CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
         advapi32.CredDeleteW.restype = wintypes.BOOL
-        return bool(advapi32.CredDeleteW(service, CRED_TYPE_GENERIC, 0))
-    except Exception:
-        return False
+        if advapi32.CredDeleteW(service, CRED_TYPE_GENERIC, 0):
+            return True, None
+        code = ctypes.get_last_error()
+        if code == ERROR_NOT_FOUND:
+            return False, None
+        return False, windows_credential_error_detail(code, api="CredDeleteW")
+    except Exception as exc:
+        return False, safe_detail(exc)
 
 
 class WindowsCredentialStore(SecretStore):
@@ -3372,13 +3660,13 @@ class WindowsCredentialStore(SecretStore):
     label = "wincred"
 
     def get(self, service: str) -> str | None:
-        return windows_credential_read(service) or None
+        return self.record_read(windows_credential_read(service))
 
     def set(self, service: str, secret: str) -> bool:
-        return windows_credential_write(service, secret)
+        return self.record_write(windows_credential_write(service, secret))
 
     def delete(self, service: str) -> bool:
-        return windows_credential_delete(service)
+        return self.record_delete(windows_credential_delete(service))
 
 
 def default_secret_store() -> SecretStore:
@@ -3446,12 +3734,27 @@ def dedicated_keychain_write(service: str, secret: str) -> bool:
     return succeeded
 
 
-def dedicated_keychain_delete(service: str) -> bool:
-    """Delete an item from the dedicated Ficelle keychain (macOS). Returns False when the
-    keychain is absent or the item is missing."""
+def _locked_ficelle_keychain_detail() -> str:
+    """The one wording for "the dedicated keychain would not open", shared by the write and
+    delete refusals so the two cannot drift into two spellings of the same diagnostic."""
+    return f"{FICELLE_SECRETS_KEYCHAIN} could not be unlocked"
+
+
+def dedicated_keychain_delete(service: str) -> tuple[bool, str | None]:
+    """Delete an item from the dedicated Ficelle keychain (macOS). Returns
+    ``(deleted, detail)``.
+
+    A keychain that does not exist is not a refusal: it holds nothing, so there is nothing
+    the removal failed to clear and ``detail`` stays ``None`` — which is what keeps an
+    ordinary macOS install (where the file is only created by setup) from reporting every
+    removal as unconfirmed. A keychain that exists and will not open is the opposite case:
+    it may well hold the key, and says so.
+    """
     keychain = _unlock_ficelle_keychain()
     if keychain is None:
-        return False
+        if not FICELLE_SECRETS_KEYCHAIN.exists():
+            return False, None
+        return False, _locked_ficelle_keychain_detail()
     return _scoped_keychain_delete(service, keychain)
 
 
@@ -3469,8 +3772,19 @@ class DedicatedKeychainStore(SecretStore):
     def set(self, service: str, secret: str) -> bool:
         return dedicated_keychain_write(service, secret)
 
+    def write_failure_detail(self) -> str | None:
+        """The one failure this backend has, and its fix.
+
+        `dedicated_keychain_write` returns False for a keychain it could not unlock, which
+        in practice means the install step never created it (pitfall 11). Saying so turns
+        the refusal into an instruction instead of a dead end.
+        """
+        if not FICELLE_SECRETS_KEYCHAIN.exists():
+            return f"{FICELLE_SECRETS_KEYCHAIN} is missing — re-run ficelle-setup to recreate it"
+        return _locked_ficelle_keychain_detail()
+
     def delete(self, service: str) -> bool:
-        return dedicated_keychain_delete(service)
+        return self.record_delete(dedicated_keychain_delete(service))
 
 
 def server_secret_store() -> SecretStore:
@@ -3531,7 +3845,7 @@ def _purge_legacy_keychain_credentials(services: Sequence[str]) -> list[str]:
     return [
         _legacy_keychain_label(keychain, service)
         for service, keychain in unlock_and_list_legacy_keychain_secret_sources(services)
-        if _scoped_keychain_delete(service, keychain)
+        if _scoped_keychain_delete(service, keychain)[0]
     ]
 
 
@@ -3589,7 +3903,19 @@ def resolve_credentials(
     ``sk-or-`` format check); a rejected one is recorded and the walk continues, so an
     invalid high-priority copy cannot mask a valid lower one. Returns ``(key, source)``
     with redacted source/reason labels only.
+
+    An empty walk has two meanings and now says which: no key anywhere, or an OS store that
+    would not answer. ``unreadable`` is the second, and it exists because ``missing`` was
+    the answer a Credential Manager unreachable from a non-interactive session produced —
+    the same "no key here" a fresh install gives, over a key that is still stored.
     """
+    store = store if store is not None else default_secret_store()
+    # Optional for the same reason as its delete twin in `remove_provider_key`: resetting
+    # the slot is `SecretStore` bookkeeping, not part of the store contract a stand-in has
+    # to satisfy.
+    reset_read_failure = getattr(store, "reset_read_failure", None)
+    if callable(reset_read_failure):
+        reset_read_failure()
     invalid_sources: list[str] = []
     for location in _credential_locations(env_names, services, store=store):
         for value, source in location.read():
@@ -3599,6 +3925,9 @@ def resolve_credentials(
             return str(value).strip(), source
     if invalid_sources:
         return None, f"invalid {env_names[0]} from {', '.join(invalid_sources)}"
+    unreadable = store.read_failure_detail()
+    if unreadable:
+        return None, f"unreadable {env_names[0]} from {store.label}: {unreadable}"
     return None, f"missing {env_names[0]}"
 
 
@@ -3642,7 +3971,10 @@ def credential_source_label(source: str | None) -> str | None:
     rather than plaintext ``.env``. Returns ``None`` when no key is configured. Never
     contains key material. Matches by full prefix so a Windows ``.env`` path (``C:\\...``)
     is not mis-split on its drive-letter colon."""
-    if not source or source.startswith(("missing ", "invalid ")):
+    # `unreadable ` belongs with the other two: it is a diagnostic, not a store, and letting
+    # it fall through to the `external` catch-all would tell a Windows user with an
+    # unreachable Credential Manager to go clear the key in an integration they never set up.
+    if not source or source.startswith(("missing ", "invalid ", "unreadable ")):
         return None
     if source.startswith("env:"):
         return "env"
@@ -4382,11 +4714,23 @@ def provider_primary_service(source: str, config: dict[str, Any]) -> str:
     return provider_primary_service_use_case(source, config)
 
 
-def store_provider_key(source: str, config: dict[str, Any], secret: str, *, store: SecretStore | None = None) -> str:
+def store_provider_key(
+    source: str,
+    config: dict[str, Any],
+    secret: str,
+    *,
+    store: SecretStore | None = None,
+    allow_plaintext: bool = False,
+) -> str:
     """Write a provider's API key to the highest-trust writable store on this host,
-    under the provider's primary service name, falling back to the configured ``.env``
-    (plaintext). Never writes to a process env var. Returns a redacted target label
-    (no secret). Refreshing the router so the provider activates is the caller's job.
+    under the provider's primary service name. Never writes to a process env var. Returns
+    a redacted target label (no secret). Refreshing the router so the provider activates
+    is the caller's job.
+
+    On a host with no OS secret store, this writes the configured ``.env`` (plaintext),
+    which is that host's intended destination. A store that is present and *refuses*
+    raises ``SecretStoreWriteRefused`` instead, unless ``allow_plaintext`` opts into the
+    downgrade — see the use case for why a silent fall back was a security defect.
 
     ``store`` defaults to ``default_secret_store()`` (the interactive/CLI target — the
     macOS login Keychain). The server-side write path passes a non-interactive store
@@ -4399,22 +4743,38 @@ def store_provider_key(source: str, config: dict[str, Any], secret: str, *, stor
         store=store,
         credential_env_file=CREDENTIAL_ENV_FILE,
         env_file_set_key=env_file_set_key,
+        allow_plaintext=allow_plaintext,
     )
     invalidate_provider_budget(source)
     return target
 
 
-def remove_provider_key(source: str, config: dict[str, Any], *, store: SecretStore | None = None) -> list[str]:
+def remove_provider_key(
+    source: str,
+    config: dict[str, Any],
+    *,
+    store: SecretStore | None = None,
+) -> CredentialRemoval:
     """Delete a provider's key from Ficelle's canonical OS store and ``.env`` file.
 
-    Returns the redacted targets cleared. Process environment variables and read-only
-    legacy fallbacks are intentionally left untouched; callers report any remaining
-    legacy sources separately.
+    Returns the redacted targets cleared *and* the redacted reasons a location could not
+    confirm it cleared anything — a store that refused the delete still holds the key, and
+    reporting only the first list is how a refusal became a clean "removed" line. Process
+    environment variables and read-only legacy fallbacks are intentionally left untouched;
+    callers report any remaining legacy sources separately.
+
+    The store is resolved here rather than inside the registry so one instance serves both
+    the deletes and the verdict about them: a per-operation store would record the refusal
+    on an object nobody can still ask.
     """
-    cleared = remove_provider_key_use_case(provider_credential_locations(source, config, store=store))
-    if cleared:
+    store = store if store is not None else default_secret_store()
+    removal = remove_provider_key_use_case(
+        provider_credential_locations(source, config, store=store),
+        store=store,
+    )
+    if removal.cleared:
         invalidate_provider_budget(source)
-    return cleared
+    return removal
 
 
 def provider_auth_ports() -> ProviderAuthPorts:
@@ -5418,12 +5778,18 @@ def build_admin_status(catalog: dict[str, Any], config: dict[str, Any], state: d
 
 
 def load_cached_catalog_for_admin_status(config: dict[str, Any]) -> dict[str, Any]:
+    """The cached catalog document, normalized. Named for its first caller, now shared by
+    every read surface that must not refresh (`cached_catalog_read_view`)."""
     catalog = load_catalog_document()
     return load_cached_catalog_for_admin_status_use_case(
         catalog,
         config,
         default_min_context=DEFAULT_CONFIG["min_context_length"],
     )
+
+
+def catalog_age_seconds(catalog: dict[str, Any]) -> float | None:
+    return catalog_age_seconds_use_case(catalog, now_seconds=time.time)
 
 
 def cached_catalog_stale_reason(catalog: dict[str, Any], config: dict[str, Any]) -> str | None:
@@ -5461,29 +5827,81 @@ def service_build_identity() -> dict[str, Any]:
     return package_build_identity()
 
 
-def admin_status(config: dict[str, Any], *, run_quota_probes: bool = True) -> dict[str, Any]:
-    effective_config = effective_runtime_config(config)
+def cached_catalog_read_view(
+    config: dict[str, Any], effective_config: dict[str, Any]
+) -> tuple[dict[str, Any], str | None]:
+    """The cached catalog as the read surfaces present it, plus its staleness verdict.
+
+    Never refreshes: it reads ``catalog.json`` and judges it. Shared by
+    ``/admin/status.json`` and ``/health`` so the same catalog snapshot receives the same
+    verdict on both surfaces. Two separately timed requests may still observe different
+    snapshots when a background refresh publishes between them.
+
+    Both configs are load-bearing, do not collapse them: ``effective_config`` is what the
+    catalog must be judged against, but ``license_variant_structural_fingerprints`` needs
+    the *canonical* ``config`` to recognise both licence variants — the effective one has
+    already dropped the provider pack it must still be able to match.
+    """
     catalog = load_cached_catalog_for_admin_status(effective_config)
     stale_reason = cached_catalog_stale_reason(catalog, effective_config)
     if stale_reason is None:
-        if run_quota_probes:
-            run_due_quota_probes(effective_config, catalog)
-    else:
-        filtered_catalog = filter_cached_catalog_to_enabled_providers(catalog, effective_config)
-        catalog = {**filtered_catalog, "stale": True, "stale_reason": stale_reason}
-        cached_structural_fingerprint = catalog.get("config_structural_fingerprint")
-        license_transition = (
-            stale_reason == "config_structural_fingerprint_mismatch"
-            and cached_structural_fingerprint in license_variant_structural_fingerprints(config)
-        )
-        # A catalog that is merely aging or whose non-structural config/credentials changed
-        # still describes a valid set of models, so keep the last-known catalog (reported
-        # stale/"degraded" downstream, not a false "0 models / fail" that makes an idle-but-
-        # healthy instance look down). A structurally changed or unparseable catalog is
-        # emptied — the recoverable-reason policy lives next to the classifier.
-        if not stale_reason_keeps_last_known(stale_reason) and not license_transition:
-            catalog["models"] = []
-            catalog["providers"] = {}
+        return catalog, None
+    # A catalog that is merely aging or whose non-structural config/credentials changed
+    # still describes a valid set of models, so keep the last-known catalog (reported
+    # stale/"degraded" downstream, not a false "0 models / fail" that makes an idle-but-
+    # healthy instance look down). A structurally changed or unparseable catalog is
+    # emptied — the recoverable-reason policy lives next to the classifier.
+    license_transition = (
+        stale_reason == "config_structural_fingerprint_mismatch"
+        and catalog.get("config_structural_fingerprint") in license_variant_structural_fingerprints(config)
+    )
+    if not stale_reason_keeps_last_known(stale_reason) and not license_transition:
+        # Decided before filtering, which the emptying would only throw away: that filter
+        # resolves credentials provider by provider, and on macOS a cold credential cache
+        # makes it the most expensive thing on this path (~0.8 s, one Keychain lookup per
+        # provider). Same output, none of the cost.
+        return {**catalog, "stale": True, "stale_reason": stale_reason, "models": [], "providers": {}}, stale_reason
+    filtered_catalog = filter_cached_catalog_to_enabled_providers(catalog, effective_config)
+    return {**filtered_catalog, "stale": True, "stale_reason": stale_reason}, stale_reason
+
+
+def health_payload(config: dict[str, Any]) -> dict[str, Any]:
+    """The `/health` body: liveness, build identity, and catalog freshness as *data*.
+
+    Reads the cached catalog and never refreshes it. `/health` used to call
+    ``load_or_refresh_catalog``, so past the TTL a supervisor's probe paid for a
+    synchronous walk of every configured provider on the request thread. Every consumer a
+    name like `/health` attracts (LaunchAgent watchers, uptime checks, load balancers) has
+    a short timeout and reads that delay as a dead service while routing is serving fine.
+    The measurements, and the refresh paths that stayed synchronous, are in
+    `docs/components/service-backends.md`.
+
+    `status` stays liveness: it is `ok` whenever the service answers, stale catalog or
+    not. Freshness is the `catalog` block — reporting it is the whole point, provoking it
+    was the defect.
+    """
+    effective_config = effective_runtime_config(config)
+    catalog, stale_reason = cached_catalog_read_view(config, effective_config)
+    age_seconds = catalog_age_seconds(catalog)
+    return {
+        "status": "ok",
+        "generated_at": catalog.get("generated_at"),
+        "model_count": len(catalog.get("models") or []),
+        "build": service_build_identity(),
+        "catalog": {
+            "age_seconds": None if age_seconds is None else round(age_seconds, 3),
+            "ttl_seconds": catalog_ttl_seconds(effective_config),
+            "stale": stale_reason is not None,
+            "stale_reason": stale_reason,
+        },
+    }
+
+
+def admin_status(config: dict[str, Any], *, run_quota_probes: bool = True) -> dict[str, Any]:
+    effective_config = effective_runtime_config(config)
+    catalog, stale_reason = cached_catalog_read_view(config, effective_config)
+    if stale_reason is None and run_quota_probes:
+        run_due_quota_probes(effective_config, catalog)
     state = load_runtime_state()
     status = build_admin_status(
         catalog,
@@ -6089,6 +6507,16 @@ _QUOTA_PROBES_IN_FLIGHT: set[str] = set()
 _QUOTA_PROBE_DISPATCH_LOCK = threading.Lock()
 
 
+def _start_quota_probe_worker(run: Callable[[], None]) -> None:
+    """Single dispatch point for the deferred probe worker.
+
+    Kept separate so a caller that must observe the request-thread outcome — the inline probe
+    count, the deferred key still on cooldown — can hold the worker instead of racing it: those
+    facts only hold until the worker lands.
+    """
+    threading.Thread(target=run, name="ficelle-quota-probe", daemon=True).start()
+
+
 def schedule_quota_probes(config: dict[str, Any], catalog: dict[str, Any], *, keys: set[str]) -> None:
     """Run due quota probes off the request thread.
 
@@ -6112,7 +6540,7 @@ def schedule_quota_probes(config: dict[str, Any], catalog: dict[str, Any], *, ke
             with _QUOTA_PROBE_DISPATCH_LOCK:
                 _QUOTA_PROBES_IN_FLIGHT.difference_update(fresh)
 
-    threading.Thread(target=run, name="ficelle-quota-probe", daemon=True).start()
+    _start_quota_probe_worker(run)
 
 
 def cooldown_key(model: dict[str, Any]) -> str:
@@ -9855,16 +10283,9 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._reject_remote_authentication(path)
                 return
             if path in {"/health", "/v1/health"}:
-                catalog = load_or_refresh_catalog(self.config)
-                self._send_json(
-                    200,
-                    {
-                        "status": "ok",
-                        "generated_at": catalog.get("generated_at"),
-                        "model_count": len(catalog.get("models") or []),
-                        "build": service_build_identity(),
-                    },
-                )
+                # Cache read only. `health_payload` documents why this endpoint must never
+                # refresh: what supervisors point at has to answer in milliseconds.
+                self._send_json(200, health_payload(self.config))
                 return
             if path == "/admin":
                 self._send_html(200, admin_page_html(embed_token=self._bind_is_loopback()))
@@ -10377,7 +10798,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                     if not isinstance(raw_purge_legacy, bool):
                         raise ValueError("purge_legacy must be a boolean")
                     purge_legacy = raw_purge_legacy
-                    cleared = remove_provider_key(source, self.config, store=server_secret_store())
+                    removal = remove_provider_key(source, self.config, store=server_secret_store())
+                    cleared = removal.cleared
                     purged_legacy = (
                         purge_legacy_provider_credentials(source, self.config)
                         if purge_legacy
@@ -10406,6 +10828,10 @@ class RouterHandler(BaseHTTPRequestHandler):
                             "purged_legacy": purged_legacy,
                             "remaining_legacy_sources": remaining_legacy_sources,
                             "still_resolved_from": auth.get("key_source"),
+                            # The audit trail is where a removal that was never confirmed
+                            # has to be legible after the fact: `still_resolved_from` is
+                            # null in that case too, and on its own reads as a success.
+                            "unverified": removal.unverified,
                         },
                         metadata={"source": source, "purge_legacy": purge_legacy},
                     )
@@ -10417,6 +10843,11 @@ class RouterHandler(BaseHTTPRequestHandler):
                             # only matters to the audit trail, which keeps it separately.
                             "removed": [*cleared, *purged_legacy],
                             "remaining_legacy_sources": remaining_legacy_sources,
+                            # Not a 409 like a refused *write*: parts of the removal did run
+                            # and the caller needs their labels, so the refusal rides in the
+                            # body rather than replacing it. 200 means "this is what
+                            # happened", not "the key is gone".
+                            "unverified": removal.unverified,
                             "auth": auth,
                         },
                     )
@@ -10427,7 +10858,14 @@ class RouterHandler(BaseHTTPRequestHandler):
                 validator = PROVIDER_KEY_VALIDATORS.get(source)
                 if validator and not validator(key):
                     raise ValueError(f"invalid {source} API key format")
-                target = store_provider_key(source, self.config, key, store=server_secret_store())
+                try:
+                    target = store_provider_key(source, self.config, key, store=server_secret_store())
+                except SecretStoreWriteRefused as exc:
+                    # No `allow_plaintext` here on purpose: the CLI opt-in is a person typing
+                    # a flag on the host, which a browser form cannot stand in for. 409, not
+                    # 500 — the request was well-formed and nothing was written.
+                    self._send_json(409, secret_store_refused_body(exc, source=source))
+                    return
                 try:
                     refresh_catalog(self.config)
                 except CatalogRefreshRejectedError:
@@ -11053,8 +11491,9 @@ def serve(config: dict[str, Any]) -> None:
     service_build_identity()
 
     # Keep the catalog fresh in the background — warm once, then refresh within the TTL so
-    # an idle instance never lets it go stale (a stale catalog is reported as empty by
-    # admin status: a false "0 models / fail"). Daemon so it dies with the process.
+    # an idle instance normally stays current. If a refresh cannot complete, the cached read
+    # surfaces report the stale reason without blocking on provider I/O. Daemon so it dies
+    # with the process.
     threading.Thread(target=catalog_refresh_loop, args=(config,), name="ficelle-catalog-refresh", daemon=True).start()
     # Background capability qualification: the loop reads the live `config` each cycle (same dict the
     # admin mutates), so it is always started and just idles when `auto_benchmark_enabled` is off —

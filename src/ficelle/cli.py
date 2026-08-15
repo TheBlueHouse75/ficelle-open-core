@@ -31,6 +31,7 @@ from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
     provider_key_setup_commands,
     unconfigured_provider_sources,
+    unreadable_provider_reasons,
     unusable_key_provider_lines,
     unusable_key_provider_reasons,
 )
@@ -309,11 +310,33 @@ def read_admin_status(*, timeout_seconds: float = 2.0) -> dict[str, Any]:
     }
 
 
-def wait_for_admin_status(*, timeout_seconds: float = 20.0, interval_seconds: float = 0.5) -> bool:
-    """Wait until the freshly started router answers the machine-readable admin status."""
+def wait_for_admin_status(
+    *,
+    timeout_seconds: float = 90.0,
+    interval_seconds: float = 0.5,
+    probe_timeout_seconds: float = 4.0,
+) -> bool:
+    """Wait until the freshly started router answers the machine-readable admin status.
+
+    The per-probe budget is the one with a measured cause. `serve()` binds before warming,
+    and the status reads the *cached* catalog, so a start answers in ~0.5s whether the
+    catalog is warm or absent (measured 15/08/2026, both ways) — but the first response
+    costs ~1s to build, then ~0.3s. Deriving the probe timeout from `interval_seconds`
+    capped it at half a second, so that first answer could never be read.
+
+    The total budget is margin, not a measurement. The 14/08/2026 incident — three starts
+    in a row reporting "did not become ready", each naming its own new pid as a busy port,
+    with `Ficelle listening on …` followed by `signal 15` in the log — has never been
+    reproduced: no measured start comes close to needing 20s, let alone 90s. What fits the
+    traces is a *second actor* sending the SIGTERM, and this repo has one: every lifecycle
+    command runs `terminate_stale_servers()`, which signals any `-m ficelle.router --serve`
+    on the machine, so a sibling session's `start` kills this session's service. Until that
+    is understood, the budget stays wide: it costs nothing on a healthy start (the loop
+    returns on the first ready answer) and only delays the verdict on a real failure.
+    """
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        if read_admin_status(timeout_seconds=min(2.0, max(0.2, interval_seconds))).get("ready") is True:
+        if read_admin_status(timeout_seconds=probe_timeout_seconds).get("ready") is True:
             return True
         time.sleep(interval_seconds)
     return False
@@ -427,16 +450,23 @@ def doctor_provider_key_lines(auth: dict[str, Any]) -> list[str]:
     """
     configured = invokable_provider_sources(auth)
     unusable = unusable_key_provider_reasons(auth)
+    unreadable = unreadable_provider_reasons(auth)
     unusable_lines = [f"  {line}" for line in unusable_key_provider_lines(unusable)]
+    unreadable_lines = [f"  {line}" for line in unusable_key_provider_lines(unreadable)]
     if configured:
-        return [f"provider_keys: {', '.join(configured)}", *unusable_lines]
+        return [
+            f"provider_keys: {', '.join(configured)}",
+            *unreadable_lines,
+            *unusable_lines,
+        ]
     missing = unconfigured_provider_sources(auth)
     # "none configured" would itself be the lie this line exists to avoid when a key is
-    # sitting in a store and only the provider entry is incomplete.
-    headline = "none usable" if unusable else "none configured"
+    # sitting in a store and only the provider entry is incomplete or unreadable.
+    headline = "none usable" if unusable or unreadable else "none configured"
     return [
         f"provider_keys: {headline} — no completion can be served.",
         *(f"  {line}" for line in provider_key_setup_commands(missing, router.PROVIDER_KEY_URLS)),
+        *unreadable_lines,
         *unusable_lines,
     ]
 
@@ -464,7 +494,7 @@ def doctor(*, json_output: bool = True) -> int:
     return 0 if status.get("status") == "ok" else 1
 
 
-def set_key(provider: str, *, from_stdin: bool = False) -> int:
+def set_key(provider: str, *, from_stdin: bool = False, allow_plaintext: bool = False) -> int:
     config = router.load_config()
     if provider not in (config.get("providers") or {}):
         print(f"Unknown provider: {provider}", file=sys.stderr)
@@ -482,7 +512,19 @@ def set_key(provider: str, *, from_stdin: bool = False) -> int:
     if validator and not validator(secret):
         print(f"That does not look like a valid {provider} API key; aborted.", file=sys.stderr)
         return 1
-    target = router.store_provider_key(provider, config, secret)
+    try:
+        target = router.store_provider_key(provider, config, secret, allow_plaintext=allow_plaintext)
+    except router.SecretStoreWriteRefused as exc:
+        # Refusing beats the old silent downgrade: the key would have landed in a plaintext
+        # `.env` while the user believed it went to the OS vault. Name the store, the OS
+        # reason when the backend has one, and the two ways out.
+        print(
+            f"Did not store the {provider} key: {exc}.\n"
+            "Fix the store and retry, or pass --allow-plaintext to write it to "
+            f"{router.CREDENTIAL_ENV_FILE} in plaintext instead.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"Stored {provider} key in {target}.")
     router.main_args(["--refresh"])
     print(f"Refreshed. Run `ficelle auth-status` to confirm {provider} is configured.")
@@ -505,7 +547,8 @@ def remove_key(provider: str, *, purge_legacy: bool = False) -> int:
     if provider not in (config.get("providers") or {}):
         print(f"Unknown provider: {provider}", file=sys.stderr)
         return 2
-    cleared = router.remove_provider_key(provider, config)
+    removal = router.remove_provider_key(provider, config)
+    cleared = removal.cleared
     if purge_legacy:
         cleared = [*cleared, *router.purge_legacy_provider_credentials(provider, config)]
     remaining_legacy_sources = router.legacy_provider_credential_sources(
@@ -514,21 +557,33 @@ def remove_key(provider: str, *, purge_legacy: bool = False) -> int:
     )
     if cleared:
         print(f"Removed {provider} key from: {', '.join(cleared)}.")
-    else:
+    if not removal.verified:
+        print(
+            f"Could not verify the {provider} key removal: {'; '.join(removal.unverified)}. "
+            f"The key may still be stored — a store that refuses a delete reads as empty "
+            f"too, so nothing below can prove otherwise. Retry from a session that can "
+            f"reach the store (on Windows, an interactive logon).",
+            file=sys.stderr,
+        )
+    elif not cleared:
+        # Withheld when the removal was not confirmed: "no key was stored" is a claim about
+        # a store that just declined to answer, and it is the first half of the false
+        # all-clear the refusal above replaces.
         print(f"No stored {provider} key found in the OS store or .env.")
     # Resolution re-run after the removal: `key_source` names the store a key would still
     # be read from, or None when none would. It is the verdict for every family, including
     # the two `remaining_legacy_sources` cannot enumerate — a process environment variable
     # and an external resolver (R4) — which used to leave a provider configured behind a
-    # clean "removed" line. Computed after the line above, not before: on a cold CLI process
-    # this resolution shells out to `security` once per alias and would hold that line back.
+    # clean "removed" line. Computed after the lines above, not before: on a cold CLI process
+    # this resolution shells out to `security` once per alias and would hold them back.
     key_source = router.provider_auth_row(provider, config).get("key_source")
     if key_source:
         hint = RESIDUAL_KEY_SOURCE_HINTS.get(key_source, key_source)
         print(f"A {provider} key still resolves from {hint}, so {provider} stays configured.")
-    elif not remaining_legacy_sources:
+    elif removal.verified and not remaining_legacy_sources:
         # Only claimed when nothing is left to qualify it: a locked legacy keychain reads as
-        # empty while it stays locked, so "no key resolves" would be a promise for today only.
+        # empty while it stays locked, and an unconfirmed removal reads as empty for the very
+        # reason it failed, so "no key resolves" would be a promise for today only.
         print(f"No {provider} key resolves any more.")
     if remaining_legacy_sources:
         sources = ", ".join(remaining_legacy_sources)
@@ -541,7 +596,9 @@ def remove_key(provider: str, *, purge_legacy: bool = False) -> int:
         )
         print(f"Legacy credential fallback sources still apply: {sources}. Please {next_step}.")
     router.main_args(["--refresh"])
-    return 0
+    # Non-zero on an unconfirmed removal so a script revoking a key can gate on it. A
+    # revocation that may not have happened is a failure, whatever else the run cleared.
+    return 0 if removal.verified else 1
 
 
 def _print_license_status(entitlement: Any, *, json_output: bool) -> int:
@@ -878,6 +935,12 @@ def main(argv: list[str] | None = None) -> int:
         dest="from_stdin",
         help="Read the key from standard input instead of prompting (for wrappers and scripts; keeps the key off argv).",
     )
+    set_key_parser.add_argument(
+        "--allow-plaintext",
+        action="store_true",
+        dest="allow_plaintext",
+        help="Write the key to FICELLE_HOME/.env in plaintext when this host's secret store refuses it (default: refuse).",
+    )
     remove_key_parser = sub.add_parser("remove-key", help="Remove a stored provider API key")
     remove_key_parser.add_argument("provider")
     remove_key_parser.add_argument(
@@ -967,7 +1030,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "demo":
         return cmd_demo(args)
     if args.command == "set-key":
-        return set_key(args.provider, from_stdin=bool(getattr(args, "from_stdin", False)))
+        return set_key(
+            args.provider,
+            from_stdin=bool(getattr(args, "from_stdin", False)),
+            allow_plaintext=bool(getattr(args, "allow_plaintext", False)),
+        )
     if args.command == "remove-key":
         return remove_key(args.provider, purge_legacy=bool(getattr(args, "purge_legacy", False)))
     if args.command == "license":

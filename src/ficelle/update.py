@@ -34,16 +34,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlparse
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows foreground installs
-    fcntl = None  # type: ignore[assignment]
-
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
 from ficelle import __version__ as CORE_VERSION
 from ficelle.json_store import atomic_write_json, load_json
+from ficelle.probe_lock import file_lock
 from ficelle.runtime_paths import RuntimePaths
 from ficelle.url_security import uses_secure_http_transport
 
@@ -653,39 +649,23 @@ def update_check_loop() -> None:
 
 @contextmanager
 def exclusive_update_lock(*, wait: bool = False) -> Iterator[None]:
-    path = update_lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as lock_file:
-        if fcntl is not None:
-            try:
-                flags = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
-                fcntl.flock(lock_file.fileno(), flags)
-            except BlockingIOError as exc:
-                raise UpdateInProgress("another Ficelle update is already running") from exc
-        try:
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with file_lock(update_lock_path(), blocking=wait) as acquired:
+        if not acquired:
+            raise UpdateInProgress("another Ficelle update is already running")
+        yield
 
 
 @contextmanager
 def exclusive_package_install_lock(*, wait: bool = False) -> Iterator[None]:
-    """Share the Pro installer lock so two package swaps cannot overlap."""
-    path = package_install_lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as lock_file:
-        if fcntl is not None:
-            try:
-                flags = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
-                fcntl.flock(lock_file.fileno(), flags)
-            except BlockingIOError as exc:
-                raise UpdateInProgress("another Ficelle package installation is already running") from exc
-        try:
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    """Share the Pro installer lock so two package swaps cannot overlap.
+
+    Same primitive and same file as `pro_install.exclusive_install_lock`, or the sharing would
+    only be nominal where `fcntl` is absent.
+    """
+    with file_lock(package_install_lock_path(), blocking=wait) as acquired:
+        if not acquired:
+            raise UpdateInProgress("another Ficelle package installation is already running")
+        yield
 
 
 def queue_update() -> dict[str, Any]:

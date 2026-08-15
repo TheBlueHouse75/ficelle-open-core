@@ -301,7 +301,7 @@ class OpenAICompatibleCatalogAdapter:
             return ProviderAccess(generic_key, base_url, generic_reason)
         external_key, external_base_url, external_reason = context.resolve_external_credentials(
             self.source,
-            "missing NOUS_API_KEY",
+            generic_reason,
         )
         # The configured Nous URL backs an external key exactly as it backs no key at all. It
         # used to be withheld when require_base_url was False, so the status row called a key

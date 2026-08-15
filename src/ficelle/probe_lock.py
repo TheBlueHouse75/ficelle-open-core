@@ -22,11 +22,18 @@ def file_lock(
     blocking: bool = False,
     timeout_seconds: float = 0.0,
 ) -> Iterator[bool]:
-    """Acquire a process-safe advisory lock and yield whether it was obtained."""
+    """Acquire a process-safe advisory lock and yield whether it was obtained.
+
+    ``blocking=True`` without a timeout waits indefinitely on both platforms. Windows offers no
+    such primitive: ``msvcrt.LK_LOCK`` retries for about ten seconds and then fails with
+    ``EDEADLOCK``, which is neither a wait nor the ``EACCES`` a caller could treat as "held by
+    someone else". The retry loop below already provides an unbounded wait, so the Windows branch
+    always takes the non-blocking mode and lets the loop do the waiting.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     acquired = False
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     try:
         while True:
             try:
@@ -39,14 +46,13 @@ def file_lock(
                     if os.fstat(descriptor).st_size == 0:
                         os.write(descriptor, b"0")
                     os.lseek(descriptor, 0, os.SEEK_SET)
-                    mode = msvcrt.LK_LOCK if blocking and timeout_seconds <= 0 else msvcrt.LK_NBLCK
-                    msvcrt.locking(descriptor, mode, 1)
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
                 acquired = True
                 break
             except OSError as exc:
                 if exc.errno not in {errno.EACCES, errno.EAGAIN}:
                     raise
-                if not blocking or time.monotonic() >= deadline:
+                if not blocking or (deadline is not None and time.monotonic() >= deadline):
                     break
                 time.sleep(0.1)
         yield acquired

@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
+
+from conftest import unreleasable_version
 
 from ficelle import pro_install
 from ficelle.install import CommandResult
@@ -274,7 +277,7 @@ def test_install_status_concurrent_writes_remain_valid() -> None:
     assert pro_install.read_install_status()["status"] in statuses
 
 
-def test_queue_install_rejects_a_second_active_attempt() -> None:
+def test_queue_install_rejects_a_second_active_attempt(lock_platform) -> None:
     pro_install.queue_install()
 
     with pytest.raises(pro_install.ProInstallInProgress):
@@ -301,7 +304,7 @@ def test_queue_install_recovers_an_abandoned_stale_attempt(monkeypatch) -> None:
     assert pro_install.read_install_status()["status"] == "queued"
 
 
-def test_queue_install_rejects_while_real_installer_lock_is_held() -> None:
+def test_queue_install_rejects_while_real_installer_lock_is_held(lock_platform) -> None:
     pro_install.write_install_status("installed")
 
     with pro_install.exclusive_install_lock():
@@ -309,6 +312,8 @@ def test_queue_install_rejects_while_real_installer_lock_is_held() -> None:
             pro_install.queue_install()
 
     assert pro_install.read_install_status()["status"] == "installed"
+    if lock_platform is not None:
+        assert not lock_platform.held, "every lock taken must be released"
 
 
 def test_install_status_failure_is_explicit(monkeypatch) -> None:
@@ -384,8 +389,11 @@ def test_pro_wheel_must_match_the_installed_core(tmp_path: Path) -> None:
     write_pro_wheel(compatible)
     pro_install.verify_pro_core_compatibility(compatible)
 
-    incompatible = tmp_path / "ficelle_pro-0.2.0-py3-none-any.whl"
-    write_pro_wheel(incompatible, "ficelle-router==0.2.0")
+    # Derived from the version this guard actually reads, never a literal — see
+    # `unreleasable_version`.
+    incompatible_version = unreleasable_version(pro_install.CORE_VERSION)
+    incompatible = tmp_path / f"ficelle_pro-{incompatible_version}-py3-none-any.whl"
+    write_pro_wheel(incompatible, f"ficelle-router=={incompatible_version}")
     with pytest.raises(pro_install.ProInstallError, match="incompatible"):
         pro_install.verify_pro_core_compatibility(incompatible)
 
@@ -542,7 +550,7 @@ def test_install_pro_cli_stops_before_install_when_status_cannot_persist(monkeyp
     assert cli.main(["install-pro"]) == 1
 
 
-def test_install_pro_lock_rejects_a_concurrent_helper(tmp_path: Path) -> None:
+def test_install_pro_lock_rejects_a_concurrent_helper(tmp_path: Path, lock_platform) -> None:
     lock_path = tmp_path / "pro-install.lock"
     with pro_install.exclusive_install_lock(lock_path):
         try:
@@ -550,6 +558,8 @@ def test_install_pro_lock_rejects_a_concurrent_helper(tmp_path: Path) -> None:
                 raise AssertionError("concurrent helper unexpectedly acquired the lock")
         except pro_install.ProInstallInProgress:
             pass
+    # The lock file is created private, like every other runtime file.
+    assert lock_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_download_saves_under_the_services_advertised_wheel_name(tmp_path: Path) -> None:
@@ -664,3 +674,47 @@ def test_download_rejects_an_oversized_wheel(tmp_path: Path, monkeypatch) -> Non
     else:
         raise AssertionError("expected ProInstallError for an oversized wheel")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_install_lock_waits_for_the_current_holder_to_release(tmp_path: Path, lock_platform) -> None:
+    """`wait=True` has to actually wait — it carries the whole in-app unlock.
+
+    `POST /admin/license/install` reserves the slot and spawns a detached helper with
+    `FICELLE_INSTALL_QUEUED=1`; that helper takes this lock with `wait=True` (`cli.py`) and must
+    sit there until the request that queued it lets go. Returning early would either abort the
+    install the user just paid for or start a second one beside it.
+
+    Worth asserting on both legs: Windows has no unbounded blocking acquire, so `file_lock` has
+    to produce the wait itself by retrying the non-blocking mode.
+    """
+    lock_path = tmp_path / "pro-install.lock"
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+    waiter_acquired: list[str] = []
+
+    def hold() -> None:
+        with pro_install.exclusive_install_lock(lock_path):
+            holder_ready.set()
+            release_holder.wait(timeout=10)
+
+    def wait_for_the_lock() -> None:
+        with pro_install.exclusive_install_lock(lock_path, wait=True):
+            waiter_acquired.append("acquired")
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    try:
+        assert holder_ready.wait(timeout=10), "the holder never took the lock"
+        waiter = threading.Thread(target=wait_for_the_lock)
+        waiter.start()
+        waiter.join(timeout=0.5)
+
+        assert waiter.is_alive(), "wait=True gave up instead of waiting for the holder"
+        assert waiter_acquired == []
+
+        release_holder.set()
+        waiter.join(timeout=10)
+        assert waiter_acquired == ["acquired"], "the waiter never picked the lock up"
+    finally:
+        release_holder.set()
+        holder.join(timeout=10)

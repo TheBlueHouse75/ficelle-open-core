@@ -12,6 +12,7 @@ from ficelle.use_cases.provider_auth import (
     provider_auth_row,
     provider_key_setup_commands,
     unconfigured_provider_sources,
+    unreadable_provider_reasons,
     unusable_key_provider_block,
     unusable_key_provider_lines,
     unusable_key_provider_reasons,
@@ -213,6 +214,17 @@ def test_no_provider_is_invokable_on_a_fresh_keyless_install() -> None:
 
     assert invokable_provider_sources(auth) == []
     assert unconfigured_provider_sources(auth) == ["openrouter", "nous"]
+
+
+def test_an_unreadable_store_is_not_classified_as_an_unconfigured_key() -> None:
+    reason = "unreadable OPENROUTER_API_KEY from wincred: CredReadW error 1312"
+    auth = {
+        "openrouter": {"invokable": False, "reason": reason, "key_source": None},
+        "nous": {"invokable": False, "reason": "missing NOUS_API_KEY", "key_source": None},
+    }
+
+    assert unreadable_provider_reasons(auth) == {"openrouter": reason}
+    assert unconfigured_provider_sources(auth) == ["nous"]
 
 
 def test_a_stored_key_that_cannot_be_used_is_not_something_to_go_and_store() -> None:

@@ -1,15 +1,23 @@
 """Shared pytest fixtures and suite-wide isolation for Ficelle.
 
-The single concern handled here today is OS secret-store isolation: no test may
-shell out to the real macOS Keychain (``security``) or Linux libsecret
-(``secret-tool``). The Windows Credential Manager is reached through the ctypes
-``Cred*W`` API rather than a CLI, so it is outside this guard's reach — harmless
-because the suite runs on macOS/Linux. See ``block_real_secret_store`` for the rest.
+Two concerns live here:
+
+- OS secret-store isolation: no test may shell out to the real macOS Keychain
+  (``security``) or Linux libsecret (``secret-tool``). The Windows Credential Manager is
+  reached through the ctypes ``Cred*W`` API rather than a CLI, so it is outside this
+  guard's reach — harmless because the suite runs on macOS/Linux. See
+  ``block_real_secret_store``.
+- Running lock tests on both platform branches: CI is ``ubuntu-latest`` only, so the
+  ``msvcrt`` half of ``ficelle.probe_lock.file_lock`` would otherwise never execute. See
+  ``lock_platform``.
 """
 from __future__ import annotations
 
+import errno
 import importlib.util
+import os
 import subprocess
+import threading
 
 import pytest
 
@@ -71,3 +79,75 @@ def block_real_secret_store(monkeypatch):
         return real_run(args, *call_args, **call_kwargs)
 
     monkeypatch.setattr(subprocess, "run", guarded_run)
+
+
+class FakeMsvcrt:
+    """The three ``msvcrt`` symbols ``probe_lock`` uses, with Windows' ownership rule.
+
+    A byte-range lock on Windows belongs to the file *handle*, so a second descriptor on the
+    same file conflicts even inside one process — the same exclusion ``flock`` gives us. Keying
+    the held set by (device, inode) reproduces that on a POSIX test host.
+    """
+
+    LK_NBLCK = 1
+    LK_UNLCK = 2
+
+    def __init__(self) -> None:
+        self.held: set[tuple[int, int]] = set()
+        # The real thing arbitrates in the kernel; tests contend from threads, so the
+        # check-then-take below has to be atomic or a waiter could squeeze in beside a holder.
+        self._guard = threading.Lock()
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        stat = os.fstat(fd)
+        key = (stat.st_dev, stat.st_ino)
+        with self._guard:
+            if mode == self.LK_UNLCK:
+                self.held.discard(key)
+                return
+            if key in self.held:
+                raise OSError(errno.EACCES, "Permission denied")
+            self.held.add(key)
+
+
+@pytest.fixture(params=["posix", "windows"])
+def lock_platform(request, monkeypatch):
+    """Run a lock test twice: once natively, once with `fcntl` absent as on Windows.
+
+    A module-scope `import fcntl` is POSIX-only, so it makes the whole importing module
+    unimportable on Windows — how `ficelle install-pro` and `POST /admin/license/install` came
+    to be broken there while the rest of the service ran fine. CI is `ubuntu-latest` only and
+    the "Windows" tests in `test_service.py` inject `platform_name="win32"` without ever
+    reaching the I/O layer, so nothing caught it.
+
+    Substituting `probe_lock`'s own module-level names keeps the simulation inside the module
+    under test; patching `fcntl` or `os` process-wide would also change what pytest and
+    `tempfile` observe. Returns the fake on the Windows leg and None on the POSIX one, so a
+    test can assert on the calls when it cares and ignore it otherwise.
+    """
+    if request.param == "posix":
+        return None
+
+    from ficelle import probe_lock
+
+    fake = FakeMsvcrt()
+    monkeypatch.setattr(probe_lock, "fcntl", None)
+    monkeypatch.setattr(probe_lock, "msvcrt", fake, raising=False)
+    return fake
+
+
+def unreleasable_version(current: str) -> str:
+    """A version string that cannot be a real release of ``current``'s line.
+
+    Fixtures that need "the *other* version" — an incompatible Pro wheel, a mismatched pin —
+    used to spell one out. A literal works right up until it ships: two Pro compatibility
+    guards stood on `0.2.0`, chosen because it differed from the version of the day, and
+    cutting 0.2.0 made both "incompatible" wheels compatible. The guards stopped raising and
+    the tests went green while asserting nothing.
+
+    Bumping the major cannot collide with any later release of the current line, and deriving
+    it means the caller passes whichever version it is actually guarding (`bootstrap`'s pin and
+    the installed Core version are separate sources of truth that a release can disagree on).
+    """
+    major, _, _ = current.partition(".")
+    return f"{int(major) + 1}.0.0"

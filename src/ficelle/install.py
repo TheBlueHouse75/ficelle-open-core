@@ -23,6 +23,7 @@ from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
     provider_key_setup_commands,
     unconfigured_provider_sources,
+    unreadable_provider_reasons,
     unusable_key_provider_block,
     unusable_key_provider_reasons,
 )
@@ -1207,9 +1208,15 @@ def first_run_provider_key_notice(auth: dict[str, Any] | None, *, command: str =
     PROVIDER_KEY_URLS = provider_key_urls()
     keyless = unconfigured_provider_sources(auth)
     unusable = unusable_key_provider_reasons(auth)
+    unreadable = unreadable_provider_reasons(auth)
+    # A store-wide refusal (the Windows 1312 SSH case) makes every provider look empty.
+    # First-run guidance cannot know whether keys are really absent, so it stays silent as
+    # its contract promises instead of inviting a destructive or redundant replacement.
+    if unreadable and not keyless and not unusable:
+        return []
     headline = (
         "No provider is usable yet, so Ficelle cannot serve a completion."
-        if unusable
+        if unusable or unreadable
         else "No provider API key is configured, so Ficelle cannot serve a completion yet."
     )
     lines = ["", headline]

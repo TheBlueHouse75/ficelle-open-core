@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -873,3 +875,91 @@ def test_state_backups_are_as_private_as_the_state_itself(tmp_path):
     assert (tmp_path / "state-backups").stat().st_mode & 0o777 == 0o700
     for backup in (tmp_path / "state-backups").iterdir():
         assert backup.stat().st_mode & 0o777 == 0o600, backup
+
+
+@pytest.fixture
+def platform_without_posix_modes(monkeypatch):
+    """Make the writer modules see the mode behavior reported by Windows.
+
+    Deleting `fchmod` alone does not reproduce the failure: on POSIX
+    `os.open(..., O_CREAT, 0o600)` really does produce 0o600, so the guard short-circuits and
+    the missing function is never reached. Windows reports 0o666 for a writable file whatever
+    mode was requested, which is what drives the call in the first place. Both halves are
+    needed, and CI only ever runs on Linux — which is how this reached a real Windows host.
+
+    Keep the simulation local to the two modules under test. Patching the process-wide
+    ``os.fstat`` also changes what pytest, tempfile, and file wrappers can observe, and rebuilding
+    an ``os.stat_result`` portably would require preserving platform-specific fields.
+    """
+    from ficelle import json_store, synthetic_health
+
+    class WindowsLikeOs:
+        def __getattr__(self, name):
+            if name == "fchmod":
+                raise AttributeError(name)
+            return getattr(os, name)
+
+        def fstat(self, fd):
+            result = os.fstat(fd)
+            return SimpleNamespace(st_mode=(result.st_mode & ~0o777) | 0o666)
+
+    windows_like_os = WindowsLikeOs()
+    monkeypatch.setattr(json_store, "os", windows_like_os)
+    monkeypatch.setattr(synthetic_health, "os", windows_like_os)
+
+
+def test_private_text_is_written_where_the_platform_has_no_fchmod(tmp_path, platform_without_posix_modes):
+    from ficelle.json_store import write_private_text
+
+    path = tmp_path / "credentials.env"
+    write_private_text(path, "OPENROUTER_API_KEY=value\n")
+    assert path.read_text(encoding="utf-8") == "OPENROUTER_API_KEY=value\n"
+
+    # Replacing an existing file takes the same path, and is how `set-key` rewrites credentials.
+    write_private_text(path, "OPENROUTER_API_KEY=rotated\n")
+    assert path.read_text(encoding="utf-8") == "OPENROUTER_API_KEY=rotated\n"
+
+
+def test_jsonl_append_survives_a_platform_without_fchmod(tmp_path, platform_without_posix_modes):
+    # The route log is appended on every request, so this path failing meant the router could
+    # answer /health and list models while every completion raised AttributeError.
+    from ficelle.json_store import open_private_append
+
+    path = tmp_path / "routes.jsonl"
+    for event in ("first", "second"):
+        with open_private_append(path) as handle:
+            handle.write('{"event":"%s"}\n' % event)
+
+    assert path.read_text(encoding="utf-8").splitlines() == ['{"event":"first"}', '{"event":"second"}']
+
+
+def test_synthetic_health_state_survives_a_platform_without_fchmod(tmp_path, platform_without_posix_modes):
+    from ficelle.synthetic_health import atomic_write_text
+
+    path = tmp_path / "synthetic-state.json"
+    atomic_write_text(path, '{"runs": 1}')
+    assert path.read_text(encoding="utf-8") == '{"runs": 1}'
+
+
+def test_a_real_fchmod_failure_is_not_swallowed(tmp_path, monkeypatch):
+    """The Windows guard must not turn a genuine permission failure into a silent success.
+
+    These writers carry credentials, so a fallback that leaves a readable file with no warning
+    is worse than a crash.
+    """
+    from ficelle import json_store
+
+    class OsWithFailingFchmod:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def fstat(self, fd):
+            return SimpleNamespace(st_mode=0o100666)
+
+        def fchmod(self, fd, mode):
+            raise PermissionError("refused")
+
+    monkeypatch.setattr(json_store, "os", OsWithFailingFchmod())
+
+    with pytest.raises(PermissionError, match="refused"):
+        json_store.write_private_text(tmp_path / "credentials.env", "OPENROUTER_API_KEY=value\n")

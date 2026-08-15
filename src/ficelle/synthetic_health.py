@@ -29,7 +29,7 @@ from ficelle.failures import (
     status_for_error_codes,
 )
 from ficelle.json_store import atomic_write_json as write_atomic_json
-from ficelle.json_store import ensure_private_dir, open_private_append
+from ficelle.json_store import ensure_private_dir, ensure_private_fd, open_private_append
 from ficelle.probe_lock import (
     SYNTHETIC_CASE_ID_HEADER,
     SYNTHETIC_CASE_ID_PATTERN,
@@ -178,7 +178,7 @@ def atomic_write_text(path: Path, value: str) -> None:
     descriptor, raw_path = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     temporary = Path(raw_path)
     try:
-        os.fchmod(descriptor, 0o600)
+        ensure_private_fd(descriptor)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = -1
             handle.write(value)

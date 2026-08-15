@@ -342,6 +342,28 @@ def load_cached_catalog_for_admin_status(
     }
 
 
+def catalog_ttl_seconds(config: dict[str, Any]) -> int:
+    return int(config.get("catalog_ttl_seconds") or 3600)
+
+
+def catalog_age_seconds(catalog: dict[str, Any], *, now_seconds: Callable[[], float]) -> float | None:
+    """Seconds since the cached catalog was generated, or None when unusable.
+
+    The TTL verdict below reads the age through this same function, so `/health` cannot
+    publish an `age_seconds` at or below the TTL while reporting `ttl_expired` — two
+    parsers of one timestamp are an easy source of contradictory fields.
+
+    Deliberately unclamped: a catalog stamped in the future yields a negative age, which
+    reports a skewed clock instead of hiding it behind a floor of zero — and clamping
+    would flip the TTL verdict for a negative `catalog_ttl_seconds`.
+    """
+    try:
+        generated = datetime.fromisoformat(str(catalog.get("generated_at") or ""))
+    except Exception:
+        return None
+    return now_seconds() - generated.timestamp()
+
+
 def cached_catalog_stale_reason(
     catalog: dict[str, Any],
     config: dict[str, Any],
@@ -350,13 +372,10 @@ def cached_catalog_stale_reason(
     catalog_config_fingerprint: CatalogFingerprint,
     catalog_config_structural_fingerprint: CatalogFingerprint,
 ) -> str | None:
-    generated_at = str(catalog.get("generated_at") or "")
-    try:
-        generated = datetime.fromisoformat(generated_at)
-    except Exception:
+    age = catalog_age_seconds(catalog, now_seconds=now_seconds)
+    if age is None:
         return "invalid_generated_at"
-    ttl = int(config.get("catalog_ttl_seconds") or 3600)
-    if now_seconds() - generated.timestamp() > ttl:
+    if age > catalog_ttl_seconds(config):
         return "ttl_expired"
     structural_fingerprint = catalog.get("config_structural_fingerprint")
     if structural_fingerprint and structural_fingerprint != catalog_config_structural_fingerprint(config):

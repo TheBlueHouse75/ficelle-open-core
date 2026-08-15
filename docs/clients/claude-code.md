@@ -29,5 +29,8 @@ encoding.
 
 A native Anthropic-compatible `/v1/messages` endpoint on Ficelle — so Claude
 Code, and every other Anthropic-protocol client, points at the router with one
-environment variable — is on the roadmap as a candidate increment. Until it
-ships, treat any "Claude Code on Ficelle" claim as aspirational.
+environment variable — now has an owning specification:
+[`../prds/anthropic-messages-surface-prd.md`](../prds/anthropic-messages-surface-prd.md)
+(15/08/2026). It is specified, **not implemented**. Until it ships, treat any
+"Claude Code on Ficelle" claim as aspirational, and this page stays the honest
+answer.

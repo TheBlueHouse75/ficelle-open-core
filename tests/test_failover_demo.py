@@ -304,6 +304,20 @@ def test_an_empty_pool_is_explained_by_the_missing_key_when_there_is_one():
     assert "ficelle set-key openrouter  # create a key at https://openrouter.example/keys" in message
 
 
+def test_an_empty_pool_does_not_call_an_unreadable_store_a_missing_key():
+    reason = "unreadable OPENROUTER_API_KEY from wincred: CredReadW error 1312"
+    message = unroutable_pool_message(
+        "ficelle/auto-tools",
+        {"openrouter": {"invokable": False, "reason": reason, "key_source": None}},
+        {"openrouter": "https://openrouter.example/keys"},
+    )
+
+    assert "provider credentials could not be verified" in message
+    assert f"  openrouter  # {reason}" in message
+    assert "ficelle set-key openrouter" not in message
+    assert "no provider API key is configured" not in message
+
+
 def test_an_empty_pool_names_the_key_that_is_stored_and_still_unusable():
     """Selection drops these models too, so the demo has to account for them — but not
     under "no API key is configured", and not behind a `set-key` line for a key it has."""

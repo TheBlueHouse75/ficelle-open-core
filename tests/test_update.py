@@ -353,7 +353,11 @@ def test_update_check_loop_requests_detached_recovery(
 def test_update_package_lock_is_shared_with_pro_installer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lock_platform,
 ) -> None:
+    # Also run on the no-`fcntl` leg: `exclusive_package_install_lock` used to guard its `flock`
+    # calls with `if fcntl is not None`, so where `fcntl` is absent it took no lock at all and
+    # this sharing was nominal — an update could run straight through a Pro install.
     from ficelle import pro_install
 
     lock_path = tmp_path / "pro-install.lock"

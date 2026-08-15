@@ -37,7 +37,9 @@ from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
     provider_key_setup_commands,
     unconfigured_provider_sources,
+    unreadable_provider_reasons,
     unusable_key_provider_block,
+    unusable_key_provider_lines,
     unusable_key_provider_reasons,
 )
 
@@ -297,11 +299,27 @@ def unroutable_pool_message(profile: str, auth: Mapping[str, Any], key_urls: Map
     # the same, so it belongs in this message — but not under "no key is configured", and
     # not behind a `set-key` line that would store the key it already has.
     unusable = unusable_key_provider_reasons(auth)
-    cause = "no configured provider is usable." if unusable else "no provider API key is configured."
+    unreadable = unreadable_provider_reasons(auth)
+    unreadable_block = (
+        [
+            "Credential stores could not be read:",
+            "",
+            *(f"  {line}" for line in unusable_key_provider_lines(unreadable)),
+            "",
+        ]
+        if unreadable
+        else []
+    )
+    cause = (
+        "provider credentials could not be verified."
+        if unreadable
+        else ("no configured provider is usable." if unusable else "no provider API key is configured.")
+    )
     return "\n".join(
         [
             f"Nothing is routable for {profile}: {cause}",
             *_key_setup_block(unconfigured_provider_sources(auth), key_urls),
+            *unreadable_block,
             *unusable_key_provider_block(unusable),
             "Then run `ficelle refresh` and try again.",
         ]

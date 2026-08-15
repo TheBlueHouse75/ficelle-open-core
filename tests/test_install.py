@@ -324,6 +324,23 @@ def test_run_install_tells_an_unkeyed_install_it_cannot_serve_anything(monkeypat
     assert "Verify: `ficelle health` and `ficelle models`." not in output
 
 
+def test_run_install_does_not_offer_to_replace_keys_when_the_store_is_unreadable(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    reason = "unreadable OPENROUTER_API_KEY from wincred: CredReadW error 1312"
+    install_with_doctor_auth(
+        monkeypatch,
+        tmp_path,
+        {"openrouter": {"invokable": False, "reason": reason, "key_source": None}},
+    )
+    output = capsys.readouterr().out
+
+    assert "ficelle set-key openrouter" not in output
+    assert "No provider API key is configured" not in output
+
+
 def test_run_install_does_not_ask_for_a_key_the_install_already_holds(monkeypatch, tmp_path, capsys):
     """First run is where a `base_url` cleared in `config.json` is met, and it used to be
     answered with `ficelle set-key` for a key sitting in the keychain."""

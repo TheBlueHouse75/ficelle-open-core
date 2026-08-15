@@ -143,6 +143,120 @@ def test_launchagent_persists_custom_hermes_home_for_hermes_target(tmp_path):
     }
 
 
+def _launchagent_backend(
+    paths,
+    calls,
+    *,
+    ready: bool,
+    port_holder_pid: int | None = None,
+    launchd_pid: int | None = None,
+):
+    """A LaunchAgent backend whose `launchctl`/`lsof` answers are scripted."""
+
+    def run(cmd):
+        calls.append(cmd)
+        if cmd[0] == "lsof":
+            if port_holder_pid is None:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+            stdout = (
+                "COMMAND     PID             USER   FD   TYPE  DEVICE SIZE/OFF NODE NAME\n"
+                f"python3.1 {port_holder_pid} cyril    3u  IPv4 0x7b5666      0t0  TCP 127.0.0.1:8646 (LISTEN)\n"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[:2] == ["launchctl", "print"]:
+            if launchd_pid is None:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not loaded")
+            stdout = f"com.ficelle.router = {{\n\tstate = running\n\tpid = {launchd_pid}\n\truns = 1\n}}\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    return select_service_backend(
+        platform_name="darwin",
+        paths=paths,
+        run_command=run,
+        uid_provider=lambda: "501",
+        wait_for_ready=lambda: ready,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+
+
+def _launchctl_bootouts(calls) -> list[list[str]]:
+    return [cmd for cmd in calls if cmd[:2] == ["launchctl", "bootout"]]
+
+
+def test_launchagent_keeps_a_slow_service_that_holds_the_port_itself(tmp_path, capsys):
+    """A service that bound the port and is only slow to answer must survive the wait.
+
+    Regression (14/08/2026): three `ficelle start` runs in a row killed the service they
+    had just started. `wait_for_ready()` expired during the catalog warm, the fallback
+    diagnosis ran `lsof`, found the pid `launchctl kickstart` had just produced, printed it
+    as a busy port — a different pid each run — then booted the agent out. The log showed
+    the truth: `Ficelle listening on …` followed by `signal 15 received`.
+    """
+    calls = []
+    paths = make_paths(tmp_path)
+    backend = _launchagent_backend(
+        paths, calls, ready=False, port_holder_pid=41107, launchd_pid=41107
+    )
+
+    assert backend.install() == 1
+    err = capsys.readouterr().err
+    assert "did not become ready" in err
+    assert "holds port 8646 itself" in err
+    assert "Left it running" in err
+    assert "looks busy" not in err
+    # Only install()'s own pre-bootstrap bootout: the started service is not booted out.
+    assert len(_launchctl_bootouts(calls)) == 1
+
+
+def test_launchagent_boots_out_when_a_foreign_process_holds_the_port(tmp_path, capsys):
+    """The anti-relaunch-loop guard still fires for the case it was written for."""
+    calls = []
+    paths = make_paths(tmp_path)
+    backend = _launchagent_backend(
+        paths, calls, ready=False, port_holder_pid=999, launchd_pid=41107
+    )
+
+    assert backend.install() == 1
+    err = capsys.readouterr().err
+    assert "port 8646 is held by" in err
+    assert "Booted the agent out" in err
+    assert len(_launchctl_bootouts(calls)) == 2
+
+
+def test_launchagent_probes_the_canonical_port_not_the_legacy_one(tmp_path):
+    """The port the service binds comes from the canonical config, legacy root second.
+
+    A legacy install keeps `runtime_dir` as a read-only compatibility root. Reading the port
+    from there probes a port nobody holds, and the caller reads "no holder" as "the service
+    never bound" — then boots out a service that is listening on the canonical port.
+    """
+    runtime_dir = tmp_path / ".hermes" / "ficelle"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "config.json").write_text('{"port": 8646}\n', encoding="utf-8")
+    paths = make_paths(tmp_path, runtime_dir=runtime_dir)
+    paths.ficelle_home.mkdir(parents=True)
+    (paths.ficelle_home / "config.json").write_text('{"port": 8700}\n', encoding="utf-8")
+    calls = []
+    backend = _launchagent_backend(paths, calls, ready=True)
+
+    assert backend.configured_port() == 8700
+
+
+def test_launchagent_boots_out_when_nothing_holds_the_port(tmp_path, capsys):
+    """Nothing listening means the service never bound: that is the relaunch loop."""
+    calls = []
+    paths = make_paths(tmp_path)
+    backend = _launchagent_backend(paths, calls, ready=False, launchd_pid=41107)
+
+    assert backend.install() == 1
+    err = capsys.readouterr().err
+    assert "is held by" not in err
+    assert "Booted the agent out" in err
+    assert len(_launchctl_bootouts(calls)) == 2
+
+
 def test_systemd_persists_custom_hermes_home_for_hermes_target(tmp_path):
     hermes_home = tmp_path / "custom-hermes"
     paths = make_paths(tmp_path, hermes_home=hermes_home)
@@ -158,6 +272,28 @@ def test_systemd_persists_custom_hermes_home_for_hermes_target(tmp_path):
 
     assert f'Environment="FICELLE_HOME={paths.ficelle_home}"' in unit
     assert f'Environment="HERMES_HOME={hermes_home}"' in unit
+
+
+def test_systemd_persists_the_context_of_a_service_it_leaves_running(tmp_path, capsys):
+    """systemd escaped the 14/08/2026 kill — it never stopped the unit on a readiness
+    timeout — but it also never described the service it left running. `ficelle health`, the
+    follow-up the other two backends now recommend, reads that context."""
+    paths = make_paths(tmp_path, persist_home=True)
+    backend = SystemdUserServiceBackend(
+        paths=paths,
+        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        wait_for_ready=lambda: False,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+
+    assert backend.install() == 1
+    assert "left running" in capsys.readouterr().err
+    assert read_active_service_context(paths.active_home_pointer) == (
+        paths.ficelle_home,
+        paths.ficelle_home,
+        None,
+    )
 
 
 def test_systemd_quotes_complete_environment_assignments(tmp_path):
@@ -298,7 +434,7 @@ def test_systemd_user_uninstall_removes_unit_and_reloads(tmp_path):
     ]
 
 
-def _windows_backend(paths, calls=None, *, account="EXAMPLE\\cyril"):
+def _windows_backend(paths, calls=None, *, account="EXAMPLE\\cyril", ready=True):
     recorded = calls if calls is not None else []
 
     def run(cmd):
@@ -308,7 +444,7 @@ def _windows_backend(paths, calls=None, *, account="EXAMPLE\\cyril"):
     return WindowsScheduledTaskBackend(
         paths=paths,
         run_command=run,
-        wait_for_ready=lambda: True,
+        wait_for_ready=lambda: ready,
         terminate_stale_servers=lambda: [],
         report_stale_servers=lambda _pids: None,
         account_provider=lambda: account,
@@ -380,6 +516,25 @@ def test_scheduled_task_stop_and_uninstall_use_schtasks(tmp_path):
     assert backend.uninstall() == 0
     assert ["schtasks", "/Delete", "/TN", paths.label, "/F"] in calls
     assert not backend.task_xml.exists()
+
+
+def test_scheduled_task_leaves_a_slow_service_registered(tmp_path, capsys):
+    """Same 14/08/2026 lesson as the LaunchAgent: a slow start is not a failed start.
+
+    Ending the task killed a service that may well have bound the port, and Task Scheduler
+    already bounds its own retries (`RestartOnFailure`, 10 attempts), so the local guard
+    bought little and cost the running service.
+    """
+    calls = []
+    paths = make_paths(tmp_path)
+    backend = _windows_backend(paths, calls, ready=False)
+
+    assert backend.install() == 1
+    err = capsys.readouterr().err
+    assert "did not become ready" in err
+    assert "Left the task registered" in err
+    # Only install()'s own pre-run /End: the started task is not ended.
+    assert len([cmd for cmd in calls if cmd[:2] == ["schtasks", "/End"]]) == 1
 
 
 def test_scheduled_task_install_persists_active_context(tmp_path):
