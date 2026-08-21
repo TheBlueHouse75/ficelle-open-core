@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -4093,17 +4095,54 @@ def credential_source_label(source: str | None) -> str | None:
 
 
 def generic_provider_credential_activation_fingerprint(source: str, provider_cfg: dict[str, Any]) -> dict[str, Any]:
-    return generic_provider_credential_activation_fingerprint_use_case(
+    fingerprint = generic_provider_credential_activation_fingerprint_use_case(
         source,
         provider_cfg,
         env_get=os.getenv,
         parse_env_file=parse_env_file,
         credential_env_files=_credential_env_file_paths(),
-        keychain_paths=(
-            _login_keychain_path(),
-            *_credential_keychain_paths(),
-        ),
+        # The login keychain is shared by the whole user session. Its database mtime
+        # changes for unrelated credentials and used to mark Ficelle's freshly rebuilt
+        # catalog stale immediately. Ficelle-managed CLI writes already force a refresh;
+        # only the dedicated Ficelle/legacy stores are stable activation inputs here.
+        keychain_paths=_credential_keychain_paths(),
     )
+    # Preserve immediate activation when a supported OS-store entry is changed outside
+    # Ficelle. The resolver's file-keyed memo makes an unrelated login-keychain write pay
+    # one cold lookup but keeps the fingerprint stable. Hash the effective credential so
+    # add, removal, and non-empty rotation all rebuild the account-scoped catalog without
+    # persisting the credential itself in catalog.json.
+    credential, _source = resolve_generic_provider_credentials(source, provider_cfg)
+    fingerprint["credential_digest"] = (
+        hashlib.sha256(credential.encode("utf-8")).hexdigest() if credential else None
+    )
+    return fingerprint
+
+
+def provider_credential_identities(config: dict[str, Any]) -> dict[str, str | None]:
+    """Stable, machine-local identities for account credentials, never the credentials.
+
+    The owner API token is a private per-installation HMAC key. Persisting only these
+    identities lets a later process distinguish an actual account rotation from unrelated
+    login-Keychain writes without making a reusable credential verifier public.
+    """
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    signing_key = api_token().encode("utf-8")
+    identities: dict[str, str | None] = {}
+    for source, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        credential, _credential_source = resolve_generic_provider_credentials(str(source), provider_cfg)
+        identities[str(source)] = (
+            hmac.new(
+                signing_key,
+                f"{source}\0{credential}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            if credential
+            else None
+        )
+    return identities
 
 
 # External credential resolvers (R4): optional integration hooks consulted as the
@@ -6424,10 +6463,34 @@ def _refresh_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, A
     previous = load_runtime_json(CATALOG_PATH, {})
     previous_catalog = previous if isinstance(previous, dict) else {}
     catalog = _build_catalog_for_effective_config(config)
+    current_identities = provider_credential_identities(config)
+    previous_identities = previous_catalog.get("credential_identities")
+    changed_sources = (
+        {
+            source
+            for source, identity in current_identities.items()
+            if source in previous_identities and previous_identities.get(source) != identity
+        }
+        if isinstance(previous_identities, dict)
+        else set()
+    )
+    catalog["credential_identities"] = current_identities
+    decision_baseline = (
+        {
+            **previous_catalog,
+            "models": [
+                model
+                for model in previous_catalog.get("models", [])
+                if isinstance(model, dict) and str(model.get("source") or "") not in changed_sources
+            ],
+        }
+        if changed_sources
+        else previous_catalog
+    )
     pending_before = _catalog_pending_empty_listings(load_runtime_state())
     decision = decide_catalog_publish(
         catalog,
-        previous_catalog,
+        decision_baseline,
         config,
         pending_empty_listings=pending_before,
         now_iso=now_iso,
@@ -6537,15 +6600,35 @@ def _refresh_catalog_for_effective_config_or_previous(config: dict[str, Any]) ->
 
 
 def _load_or_refresh_catalog_for_effective_config(config: dict[str, Any], force: bool = False) -> dict[str, Any]:
+    previous = load_runtime_json(CATALOG_PATH, {})
+    current_identities = provider_credential_identities(config)
+    previous_identities = previous.get("credential_identities") if isinstance(previous, dict) else None
+    changed_sources = (
+        {
+            source
+            for source, identity in current_identities.items()
+            if source in previous_identities and previous_identities.get(source) != identity
+        }
+        if isinstance(previous_identities, dict)
+        else set()
+    )
+    expected_fingerprint = catalog_config_fingerprint(config)
     catalog = load_or_refresh_catalog_use_case(
         config,
         catalog_path=CATALOG_PATH,
         load_json=_load_runtime_json_for_catalog_use_case,
         refresh_catalog=_refresh_catalog_for_effective_config_or_previous,
-        catalog_config_fingerprint=catalog_config_fingerprint,
+        catalog_config_fingerprint=lambda _config: expected_fingerprint,
         now_seconds=time.time,
-        force=force,
+        force=force or bool(changed_sources),
     )
+    # A successful account transition must replace only that account's budget before a later
+    # probe can spend against stale state. Unchanged providers retain their last-known cap if
+    # this refresh's independent budget lookup is transiently unavailable.
+    if changed_sources and catalog.get("credential_identities") == current_identities:
+        for source in changed_sources:
+            invalidate_provider_budget(source)
+        refresh_provider_budgets(config)
     return filter_cached_catalog_to_enabled_providers(catalog, config)
 
 

@@ -1,4 +1,4 @@
 name: ficelle
 kind: model-provider
-version: 0.3.4
+version: 0.3.6
 description: Ficelle FREE local strict-zero OpenAI-compatible model router.
