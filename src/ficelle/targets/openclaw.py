@@ -17,7 +17,7 @@ from ficelle.targets.base import (
 )
 
 
-DEFAULT_OPENCLAW_CONTEXT_WINDOW = 128000
+DEFAULT_OPENCLAW_CONTEXT_WINDOW = 64000
 DEFAULT_OPENCLAW_MAX_TOKENS = 8192
 
 
@@ -44,6 +44,7 @@ class OpenClawTargetAdapter:
     virtual_models: Sequence[str]
     fusion_model_id: str | None = None
     fusion_visible_in_model_list: Callable[[Mapping[str, Any]], bool] | None = None
+    model_policy_ids: Mapping[str, str] | None = None
     target_id: str = "openclaw"
     display_name: str = "OpenClaw"
     kind: TargetKind = "agent_host"
@@ -125,6 +126,7 @@ class OpenClawTargetAdapter:
 
     def _openclaw_config(self, base_url: str, primary: str, fallbacks: Sequence[str]) -> dict[str, Any]:
         ordered_model_ids = (primary, *fallbacks)
+        policy_ids = self.model_policy_ids or {}
         allowlist = {
             openclaw_model_ref(self.provider_id, model_id): {
                 "alias": openclaw_model_alias(model_id),
@@ -136,8 +138,8 @@ class OpenClawTargetAdapter:
             {
                 "id": model_id,
                 "name": openclaw_model_alias(model_id),
-                "reasoning": model_id == "ficelle/auto-reasoning",
-                "input": openclaw_model_inputs(model_id),
+                "reasoning": policy_ids.get(model_id, model_id) == "ficelle/auto-reasoning",
+                "input": openclaw_model_inputs(policy_ids.get(model_id, model_id)),
                 "contextWindow": DEFAULT_OPENCLAW_CONTEXT_WINDOW,
                 "maxTokens": DEFAULT_OPENCLAW_MAX_TOKENS,
             }

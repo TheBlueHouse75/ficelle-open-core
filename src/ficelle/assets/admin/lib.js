@@ -3,7 +3,7 @@
 export const profileOrder = [
   "ficelle/auto-orchestrator", "ficelle/auto-tools", "ficelle/auto-json", "ficelle/auto-compression",
   "ficelle/auto-long", "ficelle/auto-fast", "ficelle/auto-reasoning", "ficelle/auto-multimodal",
-  "ficelle/auto-vision", "ficelle/auto-video", "ficelle/auto-audio"
+  "ficelle/auto-vision", "ficelle/auto-video", "ficelle/auto-audio", "ficelle/auto-coding"
 ];
 export const fusionModelId = "ficelle/auto-fusion";
 export const profileLabels = {
@@ -17,11 +17,12 @@ export const profileLabels = {
   "ficelle/auto-multimodal": ["Media input", "Image, video, or audio understanding."],
   "ficelle/auto-vision": ["Vision", "Reading images and screenshots."],
   "ficelle/auto-video": ["Video", "Video understanding experiments."],
-  "ficelle/auto-audio": ["Audio", "Audio understanding experiments."]
+  "ficelle/auto-audio": ["Audio", "Audio understanding experiments."],
+  "ficelle/auto-coding": ["Coding", "Certified coding-assistant models."]
 };
 export const profilePresets = {
-  "ficelle/auto-orchestrator": "A free, Ficelle-only candidate to replace your primary model. Keep a stronger paid fallback ready until it proves itself in real use.",
-  "ficelle/auto-tools": "Catches main-model provider outages without making free models your default. Wire it as a fallback, not the primary.",
+  "ficelle/auto-orchestrator": "The default Ficelle main-model route: strict-zero orchestration through the best eligible provider. Verify a fresh request after setup.",
+  "ficelle/auto-tools": "Catches main-model provider outages through Ficelle's tool-capable fallback pool.",
   "ficelle/auto-json": "Cheaper structured extraction with JSON support. Good for web extract, parsing, and enrichment jobs.",
   "ficelle/auto-compression": "Free, bounded summarization for chat compaction. Run a quick canary on this machine before relying on it.",
   "ficelle/auto-long": "Routes very large prompts when the context window is the constraint. Not your default summarizer.",
@@ -30,7 +31,8 @@ export const profilePresets = {
   "ficelle/auto-multimodal": "One virtual model for media-understanding experiments. Only route payloads that match the declared modality.",
   "ficelle/auto-vision": "Free screenshot and image reading, gated behind a real canary image test.",
   "ficelle/auto-video": "Tests free video understanding when a catalog exposes it. Keep it gated behind benchmarks.",
-  "ficelle/auto-audio": "Tests free audio understanding when a catalog exposes it. Do not replace speech-to-text blindly."
+  "ficelle/auto-audio": "Tests free audio understanding when a catalog exposes it. Do not replace speech-to-text blindly.",
+  "ficelle/auto-coding": "Routes only to exact provider deployments with a current signed Ficelle coding certification."
 };
 
 // Capability -> the specialized profile whose benchmark proves it (for provenance badges).

@@ -6,6 +6,7 @@ import filecmp
 import getpass
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -16,9 +17,11 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
 
+from ficelle.json_store import write_private_text
 from ficelle.runtime_paths import FICELLE_CREDENTIAL_FILENAMES, RuntimePaths
 from ficelle.service import active_home_pointer_path, persist_active_service_context
-from ficelle.url_security import connectable_host
+from ficelle.url_security import connectable_host, connectable_http_url
+from ficelle.use_cases.admin_security import bind_host_is_loopback
 from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
     provider_key_setup_commands,
@@ -31,6 +34,8 @@ from ficelle.use_cases.provider_auth import (
 MANAGED_CONFIG_BEGIN = "# BEGIN FICELLE MANAGED CONFIG"
 MANAGED_CONFIG_END = "# END FICELLE MANAGED CONFIG"
 PROVIDER_PLUGIN_NAME = "ficelle"
+PROVIDER_PLUGIN_ENV_KEY = "FICELLE_API_KEY"
+PROVIDER_PLUGIN_ENV_PLACEHOLDER = "ficelle-local"
 COMPRESSION_PLUGIN_NAME = "ficelle-compression"
 COMPRESSION_TOOLSET_NAME = "ficelle"
 LEGACY_MIGRATION_MARKER = ".ficelle-legacy-migrated"
@@ -522,7 +527,69 @@ def copy_plugin_tree(
     return True
 
 
-def install_plugins(options: InstallOptions) -> None:
+def configured_runtime_config(runtime_dir: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads((runtime_dir / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def provider_plugin_env_value(runtime_dir: Path, *, credential_dir: Path | None = None) -> str:
+    """Return the credential Hermes must send to the selected listener."""
+    if bind_host_is_loopback(configured_runtime_config(runtime_dir).get("host")):
+        return PROVIDER_PLUGIN_ENV_PLACEHOLDER
+    token_dir = credential_dir or runtime_dir
+    try:
+        token = (token_dir / "api-token").read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    if not token:
+        token = secrets.token_hex(16)
+        write_private_text(token_dir / "api-token", token)
+    return token
+
+
+def seed_provider_plugin_env_key(options: InstallOptions, *, runtime_dir: Path | None = None) -> None:
+    """Give the provider plugin the env var Hermes needs before it registers it.
+
+    Hermes only auto-extends its provider registry with an api_key provider that
+    declares at least one env var, and only builds a client once that var
+    resolves to a usable value -- so without this the plugin is installed, the
+    exported config names ``provider: ficelle``, and every call still fails with
+    "provider not configured". A loopback router ignores the placeholder; an exposed router
+    requires the real owner API token, which this setup synchronizes after service installation.
+
+    Seeding the file rather than printing an ``export`` line keeps the marker scoped to the
+    selected Hermes home. Hermes loads that file on restart and may then select Ficelle as its
+    main provider through ``provider: auto``; this is intentional.
+    """
+    from ficelle.router import env_file_set_key, parse_env_file
+
+    env_path = options.hermes_home / ".env"
+    selected_runtime = runtime_dir or options.ficelle_home
+    configured_host = configured_runtime_config(selected_runtime).get("host")
+    protected_listener = not bind_host_is_loopback(configured_host)
+    existing = parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY, "").strip()
+    if existing and not protected_listener:
+        print(f"Provider plugin key already set: {PROVIDER_PLUGIN_ENV_KEY} in {env_path}")
+        return
+    if options.dry_run:
+        action = "sync protected API token" if protected_listener else f"set {PROVIDER_PLUGIN_ENV_KEY}"
+        print(f"DRY RUN: {action} in {env_path}")
+        return
+    value = provider_plugin_env_value(
+        selected_runtime,
+        credential_dir=options.ficelle_home,
+    )
+    if existing == value:
+        print(f"Provider plugin key already set: {PROVIDER_PLUGIN_ENV_KEY} in {env_path}")
+        return
+    env_file_set_key(env_path, PROVIDER_PLUGIN_ENV_KEY, value)
+    print(f"Provider plugin key set: {PROVIDER_PLUGIN_ENV_KEY} in {env_path}")
+
+
+def install_plugins(options: InstallOptions, *, runtime_dir: Path | None = None) -> None:
     install_specs = hermes_plugin_install_specs(options.hermes_home)
     for source, destination in install_specs:
         copy_plugin_tree(
@@ -531,6 +598,44 @@ def install_plugins(options: InstallOptions) -> None:
             dry_run=options.dry_run,
             backup_existing=options.backup_existing,
         )
+    seed_provider_plugin_env_key(options, runtime_dir=runtime_dir)
+
+
+def refresh_installed_hermes_integration(
+    hermes_home: Path,
+    runtime_dir: Path,
+    ficelle_home: Path,
+) -> None:
+    """Refresh packaged Hermes assets during a verified in-place client update.
+
+    The first service start after an update refreshes only installations whose persisted
+    service context identifies a Hermes home. Existing managed files are backed up before
+    replacement so a failed migration remains recoverable.
+    """
+    options = InstallOptions(
+        package="",
+        editable=False,
+        python=sys.executable,
+        ficelle_home=ficelle_home,
+        hermes_home=hermes_home,
+        dry_run=False,
+        skip_package=True,
+        skip_plugin=False,
+        skip_service=True,
+        skip_smoke=True,
+        preflight_only=False,
+        configure_hermes=False,
+        backup_existing=True,
+        target="hermes",
+    )
+    install_plugins(options, runtime_dir=runtime_dir)
+    config_path = hermes_home / "config.yaml"
+    try:
+        config_text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        config_text = ""
+    if MANAGED_CONFIG_BEGIN in config_text and MANAGED_CONFIG_END in config_text:
+        configure_hermes(options, runtime_dir=runtime_dir)
 
 
 def latest_backup(path: Path) -> Path | None:
@@ -804,13 +909,30 @@ def run_preflight(
         raise SystemExit(2)
 
 
-def hermes_config_body() -> str:
-    return "\n".join([
+def configured_ficelle_base_url(runtime_dir: Path) -> str:
+    """Return the client endpoint for the selected Ficelle runtime."""
+    config = configured_runtime_config(runtime_dir)
+    try:
+        port = int(config.get("port") or 8646)
+    except (TypeError, ValueError):
+        port = 8646
+    return connectable_http_url(str(config.get("host") or "127.0.0.1"), port, "/v1")
+
+
+def hermes_config_body(
+    *,
+    include_main_model: bool = True,
+    base_url: str = "http://127.0.0.1:8646/v1",
+) -> str:
+    lines = [
         "# Ficelle provider for Hermes. Strict-zero defaults only; no provider secret is included.",
+        "# Needs FICELLE_API_KEY set to any non-placeholder value in $HERMES_HOME/.env, which",
+        "# ficelle-setup seeds when it installs the plugin: Hermes ignores a provider whose",
+        "# declared env var does not resolve. Keep it in the file rather than exported.",
         "providers:",
         "  ficelle:",
         "    name: \"Ficelle FREE\"",
-        "    api: \"http://127.0.0.1:8646/v1\"",
+        f"    api: \"{base_url}\"",
         "    transport: openai_chat",
         "    models:",
         "      - \"ficelle/auto-orchestrator\"",
@@ -824,8 +946,8 @@ def hermes_config_body() -> str:
         "      - \"ficelle/auto-vision\"",
         "      - \"ficelle/auto-video\"",
         "      - \"ficelle/auto-audio\"",
+        "      - \"ficelle/auto-coding\"",
         "",
-        "# Low-risk slots first. Do not promote Ficelle to the main model before dogfood/canaries stay green.",
         "auxiliary:",
         "  title_generation:",
         "    provider: \"ficelle\"",
@@ -841,7 +963,21 @@ def hermes_config_body() -> str:
         "  - provider: \"ficelle\"",
         "    model: \"ficelle/auto-tools\"",
         "",
-    ])
+    ]
+    if include_main_model:
+        main_model = [
+            "# Ficelle is the main Hermes model route. The custom transport avoids a false",
+            "# vendor/model warning in Hermes 0.17 while still targeting the local Ficelle API.",
+            "model:",
+            "  provider: \"custom\"",
+            f"  base_url: \"{base_url}\"",
+            f"  key_env: \"{PROVIDER_PLUGIN_ENV_KEY}\"",
+            "  model: \"ficelle/auto-orchestrator\"",
+            "",
+        ]
+        auxiliary_index = lines.index("auxiliary:")
+        lines[auxiliary_index:auxiliary_index] = main_model
+    return "\n".join(lines)
 
 
 def hermes_plugins_enabled_block() -> str:
@@ -862,8 +998,8 @@ def hermes_toolsets_block() -> str:
     ])
 
 
-def managed_hermes_config() -> str:
-    return f"{MANAGED_CONFIG_BEGIN}\n{hermes_config_body()}{MANAGED_CONFIG_END}\n"
+def managed_hermes_config(*, base_url: str = "http://127.0.0.1:8646/v1") -> str:
+    return f"{MANAGED_CONFIG_BEGIN}\n{hermes_config_body(base_url=base_url)}{MANAGED_CONFIG_END}\n"
 
 
 def ensure_hermes_plugin_enabled(text: str, plugin_name: str = COMPRESSION_PLUGIN_NAME) -> str:
@@ -991,6 +1127,16 @@ def replace_managed_block(text: str, replacement: str) -> str:
     return f"{text[:start]}{replacement.rstrip()}\n{text[end:].lstrip()}"
 
 
+def has_top_level_model_outside_managed_block(text: str) -> bool:
+    """Return whether user-owned YAML outside Ficelle's block already owns ``model``."""
+    if MANAGED_CONFIG_BEGIN not in text or MANAGED_CONFIG_END not in text:
+        return any(line.startswith("model:") for line in text.splitlines())
+    start = text.index(MANAGED_CONFIG_BEGIN)
+    end = text.index(MANAGED_CONFIG_END, start) + len(MANAGED_CONFIG_END)
+    user_owned = f"{text[:start]}{text[end:]}"
+    return any(line.startswith("model:") for line in user_owned.splitlines())
+
+
 def write_text_file(path: Path, content: str, *, dry_run: bool) -> None:
     if path.exists() and path.read_text(encoding="utf-8", errors="replace") == content:
         print(f"Already up to date: {path}")
@@ -1003,15 +1149,21 @@ def write_text_file(path: Path, content: str, *, dry_run: bool) -> None:
     print(f"wrote: {path}")
 
 
-def configure_hermes(options: InstallOptions) -> None:
+def configure_hermes(options: InstallOptions, *, runtime_dir: Path | None = None) -> None:
     snippet_path = options.hermes_home / "ficelle" / "hermes-config.snippet.yaml"
     config_path = options.hermes_home / "config.yaml"
-    managed = managed_hermes_config()
-    write_text_file(snippet_path, f"{hermes_plugins_enabled_block()}{hermes_toolsets_block()}{hermes_config_body()}", dry_run=options.dry_run)
+    base_url = configured_ficelle_base_url(runtime_dir or options.ficelle_home)
+    managed = managed_hermes_config(base_url=base_url)
+    write_text_file(
+        snippet_path,
+        f"{hermes_plugins_enabled_block()}{hermes_toolsets_block()}"
+        f"{hermes_config_body(base_url=base_url)}",
+        dry_run=options.dry_run,
+    )
 
     if not config_path.exists():
         write_text_file(config_path, ensure_hermes_compression_plugin_enabled(managed), dry_run=options.dry_run)
-        print(f"Hermes config created with Ficelle low-risk slots: {config_path}")
+        print(f"Hermes config created with Ficelle as the main route: {config_path}")
         return
 
     current = config_path.read_text(encoding="utf-8", errors="replace")
@@ -1020,8 +1172,13 @@ def configure_hermes(options: InstallOptions) -> None:
         print(f"Next: review and merge the ready snippet: {snippet_path}")
         return
 
+    replacement = (
+        managed_hermes_config(base_url=base_url)
+        if not has_top_level_model_outside_managed_block(current)
+        else f"{MANAGED_CONFIG_BEGIN}\n{hermes_config_body(include_main_model=False, base_url=base_url)}{MANAGED_CONFIG_END}\n"
+    )
     updated = ensure_hermes_compression_plugin_enabled(
-        replace_managed_block(current, managed)
+        replace_managed_block(current, replacement)
     )
     if updated == current:
         print(f"Hermes config already up to date: {config_path}")
@@ -1333,7 +1490,7 @@ def run_install(options: InstallOptions) -> int:
         install_package(options, target, runtime_dir)
 
     if target == "hermes" and not options.skip_plugin:
-        install_plugins(options)
+        install_plugins(options, runtime_dir=runtime_dir)
 
     ensure_dedicated_keychain(options)
 
@@ -1342,7 +1499,7 @@ def run_install(options: InstallOptions) -> int:
         ensure_success(run_command([options.python, "-m", "ficelle.cli", "install"], dry_run=options.dry_run, env=env))
 
     if target == "hermes" and options.configure_hermes:
-        configure_hermes(options)
+        configure_hermes(options, runtime_dir=runtime_dir)
 
     provider_auth: dict[str, Any] | None = None
     if not options.skip_smoke:
@@ -1380,6 +1537,7 @@ def run_install(options: InstallOptions) -> int:
     cli = installed_cli_command(interpreter=target_interpreter)
     setup_cli = installed_cli_command("ficelle-setup", interpreter=target_interpreter)
     key_notice = first_run_provider_key_notice(provider_auth, command=cli)
+    base_url = configured_ficelle_base_url(runtime_dir)
 
     print("Ficelle setup complete.")
     for line in exposure_lines:
@@ -1394,16 +1552,16 @@ def run_install(options: InstallOptions) -> int:
         else:
             print(f"Next: run `{cli} export --target hermes` or rerun setup with `--configure-hermes` for a safe config snippet/apply step.")
         print(f"Rollback: `{setup_cli} --target hermes --rollback` restores the latest available integration backups.")
-        print("Do not make Ficelle the main Hermes model until dogfood/canaries stay green.")
+        print("Ficelle is ready to be the main Hermes model route; verify one real request after restart.")
     else:
-        print("Local OpenAI-compatible base URL: http://127.0.0.1:8646/v1")
+        print(f"Local OpenAI-compatible base URL: {base_url}")
         # `ficelle models` answers from the public catalogs, which the reference providers
         # serve without credentials — so pointing an unconfigured install at it as its
         # verification step is what teaches the user that setup worked when it did not.
         if not key_notice:
             print(f"Verify: `{cli} health` and `{cli} models`.")
         print(
-            "OpenAI client: `OpenAI(base_url=\"http://127.0.0.1:8646/v1\", "
+            f"OpenAI client: `OpenAI(base_url=\"{base_url}\", "
             "api_key=\"ficelle-local\")`."
         )
         if target == "openclaw":

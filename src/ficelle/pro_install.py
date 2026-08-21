@@ -43,7 +43,7 @@ _ACTIVE_INSTALL_STATUSES = frozenset({"queued", "installing", "restarting"})
 
 # The private, license-gated wheel endpoint — same default as the standalone bootstrap script
 # (scripts/bootstrap-ficelle.py); overridable for staging/testing via FICELLE_WHEEL_URL.
-DEFAULT_WHEEL_URL = "https://install.ficelle.ai/api/releases/latest/wheel"
+DEFAULT_WHEEL_URL = f"https://install.ficelle.ai/api/releases/{CORE_VERSION}/wheel"
 PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
 
 # pip rejects an invalid wheel filename, so the download is saved under the real wheel name the

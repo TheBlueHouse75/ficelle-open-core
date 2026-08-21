@@ -28,6 +28,8 @@ from ficelle.install import (
     ensure_hermes_plugin_enabled,
     expose_cli_scripts,
     install_plugins,
+    PROVIDER_PLUGIN_ENV_KEY,
+    PROVIDER_PLUGIN_ENV_PLACEHOLDER,
     installed_cli_command,
     legacy_service_listener_status,
     managed_service_status,
@@ -40,6 +42,7 @@ from ficelle.install import (
     resolve_install_target,
     rollback_last_hermes_install,
     run_install,
+    seed_provider_plugin_env_key,
     uv_package_install_command,
 )
 
@@ -857,6 +860,10 @@ def test_configure_hermes_creates_config_when_missing(tmp_path):
     managed_block = config_text.split(MANAGED_CONFIG_BEGIN, 1)[1]
     assert MANAGED_CONFIG_BEGIN in config_text
     assert 'provider: "ficelle"' in config_text
+    assert (
+        'model:\n  provider: "custom"\n  base_url: "http://127.0.0.1:8646/v1"\n'
+        '  key_env: "FICELLE_API_KEY"\n  model: "ficelle/auto-orchestrator"'
+    ) in config_text
     assert '      - "ficelle/auto-compression"' in config_text
     assert 'model: "ficelle/auto-compression"' in config_text
     assert '    - "ficelle-compression"' in config_text
@@ -910,6 +917,67 @@ def test_configure_hermes_updates_managed_block_with_backup(tmp_path):
     assert "  - hermes-cli" in updated
     assert '  - "ficelle"' in updated
     assert list(hermes_home.glob("config.yaml.backup-*"))
+
+
+@pytest.mark.parametrize(
+    "user_model",
+    [
+        "model:\n  provider: openrouter\n  model: openai/gpt-oss-120b\n",
+        "model: openai/gpt-5\n",
+        "model: {provider: openrouter, model: openai/gpt-5}\n",
+    ],
+)
+def test_configure_hermes_preserves_user_owned_main_model_without_duplicate(
+    tmp_path,
+    user_model,
+):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    config = hermes_home / "config.yaml"
+    config.write_text(
+        f"{MANAGED_CONFIG_BEGIN}\nold: true\n# END FICELLE MANAGED CONFIG\n"
+        f"{user_model}"
+    )
+    options = make_options(tmp_path, dry_run=False, configure_hermes=True)
+
+    configure_hermes(options)
+
+    updated = config.read_text()
+    assert sum(line.startswith("model:") for line in updated.splitlines()) == 1
+    assert user_model in updated
+    assert 'model: "ficelle/auto-orchestrator"' not in updated
+
+
+def test_configure_hermes_uses_selected_runtime_endpoint(tmp_path):
+    runtime_dir = tmp_path / "legacy-runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "config.json").write_text(
+        json.dumps({"host": "0.0.0.0", "port": 9864}),
+        encoding="utf-8",
+    )
+    options = make_options(tmp_path, dry_run=False, configure_hermes=True)
+
+    configure_hermes(options, runtime_dir=runtime_dir)
+
+    config_text = (tmp_path / ".hermes" / "config.yaml").read_text()
+    assert 'api: "http://127.0.0.1:9864/v1"' in config_text
+    assert 'base_url: "http://127.0.0.1:9864/v1"' in config_text
+
+
+def test_configure_hermes_brackets_selected_ipv6_runtime_endpoint(tmp_path):
+    runtime_dir = tmp_path / "ipv6-runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "config.json").write_text(
+        json.dumps({"host": "::1", "port": 9864}),
+        encoding="utf-8",
+    )
+    options = make_options(tmp_path, dry_run=False, configure_hermes=True)
+
+    configure_hermes(options, runtime_dir=runtime_dir)
+
+    config_text = (tmp_path / ".hermes" / "config.yaml").read_text()
+    assert 'api: "http://[::1]:9864/v1"' in config_text
+    assert 'base_url: "http://[::1]:9864/v1"' in config_text
 
 
 def test_ensure_hermes_plugin_enabled_does_not_duplicate_existing_entry():
@@ -1926,6 +1994,146 @@ def test_plugin_reinstall_repairs_directory_in_place_of_packaged_file(tmp_path):
     assert (backups[0] / "__init__.py" / "unexpected.txt").read_text(
         encoding="utf-8"
     ) == "broken"
+
+
+from ficelle.router import parse_env_file
+
+
+def _install_plugins_into(tmp_path, monkeypatch, **overrides):
+    """Run install_plugins() against throwaway plugin sources, return the options."""
+    provider_source = tmp_path / "provider-source"
+    compression_source = tmp_path / "compression-source"
+    for source in (provider_source, compression_source):
+        source.mkdir()
+        (source / "__init__.py").write_text(source.name)
+        (source / "plugin.yaml").write_text(f"name: {source.name}\n")
+    monkeypatch.setattr("ficelle.install.packaged_plugin_dir", lambda: provider_source)
+    monkeypatch.setattr(
+        "ficelle.install.packaged_compression_plugin_dir",
+        lambda: compression_source,
+    )
+    overrides.setdefault("dry_run", False)
+    options = make_options(tmp_path, target="hermes", **overrides)
+    install_plugins(options)
+    return options
+
+
+def test_install_plugins_seeds_the_provider_plugin_env_key(tmp_path, monkeypatch):
+    """Installing the plugin without its env var leaves Hermes unable to use it.
+
+    Hermes skips an api_key provider declaring no env var and builds no client
+    when the declared one does not resolve, so a seeded value is what makes the
+    exported `provider: ficelle` config work at all.
+    """
+    options = _install_plugins_into(tmp_path, monkeypatch)
+
+    env_values = parse_env_file(options.hermes_home / ".env")
+    assert env_values[PROVIDER_PLUGIN_ENV_KEY] == PROVIDER_PLUGIN_ENV_PLACEHOLDER
+
+
+def test_install_plugins_keeps_an_existing_provider_plugin_env_key(tmp_path, monkeypatch):
+    """A value the user already chose must survive a reinstall."""
+    hermes_home = make_options(tmp_path, target="hermes").hermes_home
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    env_path = hermes_home / ".env"
+    env_path.write_text(f"{PROVIDER_PLUGIN_ENV_KEY}=chosen-by-user\n", encoding="utf-8")
+
+    options = _install_plugins_into(tmp_path, monkeypatch)
+    assert options.hermes_home == hermes_home
+
+    assert parse_env_file(env_path)[PROVIDER_PLUGIN_ENV_KEY] == "chosen-by-user"
+
+
+def test_install_plugins_syncs_real_api_token_for_exposed_listener(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "config.json").write_text('{"host":"0.0.0.0"}', encoding="utf-8")
+    (runtime_dir / "api-token").write_text("owner-api-token\n", encoding="utf-8")
+    hermes_home = make_options(tmp_path, target="hermes").hermes_home
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / ".env").write_text(
+        f"{PROVIDER_PLUGIN_ENV_KEY}={PROVIDER_PLUGIN_ENV_PLACEHOLDER}\n",
+        encoding="utf-8",
+    )
+
+    options = _install_plugins_into(tmp_path, monkeypatch, ficelle_home=runtime_dir)
+
+    assert parse_env_file(options.hermes_home / ".env")[PROVIDER_PLUGIN_ENV_KEY] == "owner-api-token"
+
+
+def test_install_plugins_provisions_private_api_token_before_exposed_service_start(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "config.json").write_text('{"host":"::"}', encoding="utf-8")
+
+    options = _install_plugins_into(tmp_path, monkeypatch, ficelle_home=runtime_dir)
+
+    token_path = runtime_dir / "api-token"
+    token = token_path.read_text(encoding="utf-8")
+    assert len(token) == 32
+    assert set(token) <= set("0123456789abcdef")
+    assert token_path.stat().st_mode & 0o077 == 0
+    assert parse_env_file(options.hermes_home / ".env")[PROVIDER_PLUGIN_ENV_KEY] == token
+
+
+def test_install_plugins_reads_legacy_config_but_uses_canonical_api_token(tmp_path, monkeypatch):
+    canonical_home = tmp_path / "canonical"
+    legacy_runtime = tmp_path / "legacy"
+    canonical_home.mkdir()
+    legacy_runtime.mkdir()
+    (legacy_runtime / "config.json").write_text('{"host":"0.0.0.0"}', encoding="utf-8")
+    (canonical_home / "api-token").write_text("canonical-token", encoding="utf-8")
+
+    options = _install_plugins_into(
+        tmp_path,
+        monkeypatch,
+        ficelle_home=canonical_home,
+    )
+    seed_provider_plugin_env_key(options, runtime_dir=legacy_runtime)
+
+    assert parse_env_file(options.hermes_home / ".env")[PROVIDER_PLUGIN_ENV_KEY] == "canonical-token"
+    assert not (legacy_runtime / "api-token").exists()
+
+
+def test_refresh_installed_hermes_integration_updates_managed_main_route(tmp_path, monkeypatch):
+    from ficelle.install import refresh_installed_hermes_integration
+
+    provider_source = tmp_path / "provider-source"
+    compression_source = tmp_path / "compression-source"
+    for source in (provider_source, compression_source):
+        source.mkdir()
+        (source / "__init__.py").write_text(source.name, encoding="utf-8")
+        (source / "plugin.yaml").write_text("version: 0.3.4\n", encoding="utf-8")
+    monkeypatch.setattr("ficelle.install.packaged_plugin_dir", lambda: provider_source)
+    monkeypatch.setattr("ficelle.install.packaged_compression_plugin_dir", lambda: compression_source)
+    hermes_home = tmp_path / "hermes"
+    runtime_dir = tmp_path / "legacy-runtime"
+    ficelle_home = tmp_path / "canonical"
+    hermes_home.mkdir()
+    runtime_dir.mkdir()
+    ficelle_home.mkdir()
+    (runtime_dir / "config.json").write_text('{"host":"0.0.0.0"}', encoding="utf-8")
+    (ficelle_home / "api-token").write_text("canonical-token", encoding="utf-8")
+    config = hermes_home / "config.yaml"
+    config.write_text(
+        f"{MANAGED_CONFIG_BEGIN}\nmodel:\n  provider: \"custom\"\n"
+        "  base_url: \"http://127.0.0.1:8646/v1\"\n"
+        "  model: \"ficelle/auto-orchestrator\"\n"
+        "# END FICELLE MANAGED CONFIG\n",
+        encoding="utf-8",
+    )
+
+    refresh_installed_hermes_integration(hermes_home, runtime_dir, ficelle_home)
+
+    assert 'key_env: "FICELLE_API_KEY"' in config.read_text(encoding="utf-8")
+    assert parse_env_file(hermes_home / ".env")[PROVIDER_PLUGIN_ENV_KEY] == "canonical-token"
+    assert list(hermes_home.glob("config.yaml.backup-*"))
+
+
+def test_install_plugins_dry_run_writes_no_provider_plugin_env_key(tmp_path, monkeypatch):
+    options = _install_plugins_into(tmp_path, monkeypatch, dry_run=True)
+
+    assert not (options.hermes_home / ".env").exists()
 
 
 def test_rollback_leaves_fresh_hermes_assets_without_backup_untouched(

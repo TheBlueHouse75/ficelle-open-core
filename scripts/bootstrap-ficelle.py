@@ -3,7 +3,7 @@
 
 This script is intentionally stdlib-only so it can be served as:
 
-    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.2.0/scripts/bootstrap-ficelle.py | python3
+    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.4/scripts/bootstrap-ficelle.py | python3
 
 Without a license key it installs the versioned open Core from the public GitHub
 release. With ``FICELLE_LICENSE_KEY`` (or the legacy ``FICELLE_INSTALL_TOKEN``)
@@ -30,15 +30,15 @@ from email.parser import Parser
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
-CORE_VERSION = "0.2.0"
+CORE_VERSION = "0.3.4"
 DEFAULT_CORE_WHEEL_URL = (
     "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
     f"v{CORE_VERSION}/ficelle_router-{CORE_VERSION}-py3-none-any.whl"
 )
 DEFAULT_CORE_SHA256 = (
-    "45ce1956deb9627fd3a20901b6ac52824e1b4bce682fa4e69ba24d95ef63487d"
+    "637d8b79bc1bae7521149e00cfac8e84469474955da906345309a1c8ec718aa3"
 )
-DEFAULT_WHEEL_URL = "https://install.ficelle.ai/api/releases/latest/wheel"
+DEFAULT_WHEEL_URL = f"https://install.ficelle.ai/api/releases/{CORE_VERSION}/wheel"
 PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
 DEFAULT_HERMES_HOME = Path.home() / ".hermes"
 INSTALL_TARGETS = ("auto", "generic", "hermes", "openclaw")

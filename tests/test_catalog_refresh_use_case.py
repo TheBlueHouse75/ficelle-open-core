@@ -565,6 +565,53 @@ def test_all_transient_failures_reject_destructive_empty_publish():
     assert decision.preserved_by_source == {}
 
 
+def test_kilo_stale_fallback_requires_persisted_free_flag_evidence():
+    old_row = _decision_row("kilo", "stealth/ox-alpha")
+    old_row["free_access"]["proof"] = "provider_free_catalog_pricing"
+    verified_row = _decision_row("kilo", "verified-free")
+    verified_row["free_access"].update(
+        {"proof": "provider_free_catalog_pricing", "catalog_free_flag_verified": "isFree"}
+    )
+    refreshed = {
+        "generated_at": "2026-08-21T10:00:00+00:00",
+        "models": [],
+        "providers": {"kilo": _decision_summary("transient_error", error="Timeout")},
+    }
+    config = {
+        "min_context_length": 128_000,
+        "providers": {
+            "kilo": {
+                "enabled": True,
+                "provider_class": "free_model",
+                "free_mode": "catalog_free",
+                "free_access_proof": "provider_free_catalog_pricing",
+                "catalog_free_flag_field": "isFree",
+            }
+        },
+    }
+
+    old_decision = decide_catalog_publish(
+        refreshed,
+        {"generated_at": "2026-08-21T09:00:00+00:00", "models": [old_row]},
+        config,
+        pending_empty_listings={},
+        now_iso=lambda: "2026-08-21T10:00:00+00:00",
+    )
+    verified_decision = decide_catalog_publish(
+        refreshed,
+        {"generated_at": "2026-08-21T09:00:00+00:00", "models": [verified_row]},
+        config,
+        pending_empty_listings={},
+        now_iso=lambda: "2026-08-21T10:00:00+00:00",
+    )
+
+    assert old_decision.decision == "promoted"
+    assert old_decision.catalog["models"] == []
+    assert verified_decision.decision == "rejected_empty"
+    assert verified_decision.fallback_catalog is not None
+    assert [row["upstream_id"] for row in verified_decision.fallback_catalog["models"]] == ["verified-free"]
+
+
 def test_partial_failure_preserves_only_policy_valid_rows_of_failed_providers():
     cached = {
         "generated_at": "2026-08-08T09:00:00+00:00",
@@ -609,6 +656,42 @@ def test_partial_failure_preserves_only_policy_valid_rows_of_failed_providers():
     # The fresh provider's rows are untouched.
     alpha_rows = [model for model in decision.catalog["models"] if model.get("source") == "alpha"]
     assert alpha_rows and not any(model.get("catalog_stale") for model in alpha_rows)
+
+
+def test_required_allowlist_change_drops_stale_cached_rows_immediately():
+    cached_row = _decision_row("candidate", "prefix/verified-model")
+    cached_row["free_access"].update(
+        {"mode": "quota_free", "proof": "provider_free_endpoint", "scope": "provider"}
+    )
+    refreshed = {
+        "generated_at": "2026-08-08T10:00:00+00:00",
+        "models": [],
+        "providers": {
+            "candidate": _decision_summary("transient_error", error="ConnectionError: dns"),
+        },
+    }
+    config = _decision_config(["candidate"])
+    config["providers"]["candidate"].update(
+        {
+            "provider_class": "free_quota",
+            "free_mode": "quota_free",
+            "free_access_proof": "provider_free_endpoint",
+            "require_model_id_allowlist": True,
+            "model_id_allowlist": ["verified-model"],
+        }
+    )
+
+    decision = decide_catalog_publish(
+        refreshed,
+        {"generated_at": "2026-08-08T09:00:00+00:00", "models": [cached_row]},
+        config,
+        pending_empty_listings={},
+        now_iso=lambda: "2026-08-08T10:00:00+00:00",
+    )
+
+    assert decision.decision == "promoted"
+    assert decision.catalog["models"] == []
+    assert decision.fallback_catalog is None
 
 
 def test_disabled_and_credentialless_providers_are_removed_immediately():

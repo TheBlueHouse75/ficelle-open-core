@@ -1,0 +1,13 @@
+{
+  "key_id": "ficelle-coding-2026-01",
+  "manifest": {
+    "certifications": [],
+    "expires_at": "2026-09-20T12:08:36.026410+00:00",
+    "generated_at": "2026-08-21T12:08:36.026410+00:00",
+    "manifest_id": "2026-08-21T120836Z",
+    "policy_version": "coding-v1",
+    "priors": [],
+    "schema_version": 1
+  },
+  "signature": "thC5aJvLWjtSJjXWPXiBd13EqO_ezQcIg3WecB1x13x0tXpA2AaFY3eSQQbpxFbEvz3PBbX6YKOr_LSbafRhCQ"
+}

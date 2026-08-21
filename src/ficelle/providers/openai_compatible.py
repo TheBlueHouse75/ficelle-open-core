@@ -184,6 +184,9 @@ class OpenAICompatibleCatalogAdapter:
             requires_exact_model_allowlist=self._requires_exact_model_allowlist(provider_cfg),
             rejection_counters=rejection_counters,
             model_overrides=self._safe_model_overrides(provider_cfg),
+            requires_model_allowlist=bool(provider_cfg.get("require_model_id_allowlist")),
+            official_free_ids=self._safe_model_id_patterns(provider_cfg, "official_free_ids"),
+            official_free_id_suffixes=self._safe_model_id_patterns(provider_cfg, "official_free_id_suffixes"),
         )
 
     def normalize_catalog_model(
@@ -214,10 +217,15 @@ class OpenAICompatibleCatalogAdapter:
         return (
             self._catalog_row_declares_non_chat(model)
             or self._catalog_row_excluded_by_id(model, policy.model_id_exclude_patterns)
+            or (
+                self._has_official_free_id_gate(policy)
+                and not self._catalog_row_matches_official_free_id(model, policy)
+            )
             or self._catalog_row_excluded_by_allowlist(
                 model,
                 policy.model_id_allowlist,
                 exact=policy.requires_exact_model_allowlist,
+                required=policy.requires_model_allowlist and not self._has_official_free_id_gate(policy),
             )
         )
 
@@ -235,21 +243,47 @@ class OpenAICompatibleCatalogAdapter:
             return None
         if not upstream_id:
             return None
+        if (
+            policy.requires_model_allowlist
+            and not self._has_official_free_id_gate(policy)
+            and not self._catalog_row_matches_allowlist(
+                model,
+                policy.model_id_allowlist,
+                exact=True,
+            )
+        ):
+            return None
         proof = sanitize_error_detail(provider_cfg.get("free_access_proof"), 250) or ""
+        scope = str(provider_cfg.get("free_scope") or "provider")
+        if scope not in FREE_ACCESS_SCOPES:
+            scope = "provider"
+        verified_flag_field = ""
         if mode == "catalog_free":
             if not proof:
                 return None
-            if not self._catalog_row_matches_allowlist(
+            if self._has_official_free_id_gate(policy):
+                if not self._catalog_row_matches_official_free_id(model, policy):
+                    return None
+            elif proof == "provider_free_catalog_pricing":
+                flag_field = sanitize_error_detail(provider_cfg.get("catalog_free_flag_field"), 120) or ""
+                if flag_field and model.get(flag_field) is not True:
+                    return free_access_payload(
+                        False,
+                        mode,
+                        proof,
+                        scope,
+                        "unavailable",
+                        f"provider catalog did not mark {flag_field} as true",
+                    )
+                verified_flag_field = flag_field
+            elif not self._catalog_row_matches_allowlist(
                 model,
                 policy.model_id_allowlist,
                 exact=policy.requires_exact_model_allowlist,
             ):
                 return None
 
-        scope = str(provider_cfg.get("free_scope") or "provider")
-        if scope not in FREE_ACCESS_SCOPES:
-            scope = "provider"
-        return free_access_payload(
+        access = free_access_payload(
             True,
             mode,
             proof or "provider_free_endpoint",
@@ -257,6 +291,9 @@ class OpenAICompatibleCatalogAdapter:
             normalized_free_access_status(provider_cfg.get("free_status"), "available"),
             sanitize_error_detail(provider_cfg.get("free_note"), 250) or f"{mode} provider catalog",
         )
+        if verified_flag_field:
+            access["catalog_free_flag_verified"] = verified_flag_field
+        return access
 
     def access(
         self,
@@ -373,7 +410,7 @@ class OpenAICompatibleCatalogAdapter:
 
     def _requires_exact_model_allowlist(self, provider_cfg: dict[str, Any]) -> bool:
         provider_class = str(provider_cfg.get("provider_class") or provider_cfg.get("source_type") or "")
-        return provider_class == "free_model"
+        return provider_class == "free_model" or bool(provider_cfg.get("require_model_id_allowlist"))
 
     def _catalog_row_with_normalized_context(self, model: dict[str, Any]) -> dict[str, Any]:
         """Map provider context aliases before defaults can mask sparse rows."""
@@ -406,10 +443,26 @@ class OpenAICompatibleCatalogAdapter:
         allowlist: list[str],
         *,
         exact: bool = False,
+        required: bool = False,
     ) -> bool:
         if not allowlist:
-            return False
+            return required
         return not self._catalog_row_matches_allowlist(model, allowlist, exact=exact)
+
+    def _has_official_free_id_gate(self, policy: ProviderCatalogPolicy) -> bool:
+        return bool(policy.official_free_ids or policy.official_free_id_suffixes)
+
+    def _catalog_row_matches_official_free_id(
+        self,
+        model: dict[str, Any],
+        policy: ProviderCatalogPolicy,
+    ) -> bool:
+        model_id = str(model.get("id") or "").strip().lower()
+        if not model_id:
+            return False
+        if model_id in policy.official_free_ids:
+            return True
+        return any(model_id.endswith(suffix) for suffix in policy.official_free_id_suffixes)
 
     def _catalog_row_matches_allowlist(
         self,

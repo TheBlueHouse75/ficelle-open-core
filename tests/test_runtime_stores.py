@@ -51,6 +51,8 @@ def test_runtime_paths_resolve_from_explicit_environment(tmp_path):
     assert paths.capability_discrepancy_log_path == logs_dir / "capability-discrepancies.jsonl"
     assert paths.compression_store_path == router_dir / "compression.sqlite"
     assert paths.capability_oracle_cache_path == router_dir / "capability_oracle.json"
+    assert paths.coding_certification_cache_path == router_dir / "coding-certifications.json"
+    assert paths.coding_certification_status_path == router_dir / "coding-certification-status.json"
     assert paths.hermes_agent_dir == hermes_home / "hermes-agent"
     assert paths.hermes_config_path == hermes_home / "config.yaml"
     assert paths.credential_env_file == ficelle_home / ".env"

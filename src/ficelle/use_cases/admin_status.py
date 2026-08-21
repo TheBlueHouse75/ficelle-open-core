@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Protocol, TypeAlias
 
 from ficelle.redaction import redact_sensitive_json
+from ficelle.url_security import connectable_http_url
 
 
 CandidatesForProfile: TypeAlias = Callable[
@@ -197,9 +198,8 @@ class AdminStateBuilder:
         canary_profiles = self.ports.safe_string_list(
             (config.get("canary") or {}).get("profiles")
         )
-        host = config.get("host") or "127.0.0.1"
         port = self.ports.safe_int(config.get("port"), 8646)
-        base_url = f"http://{host}:{port}/v1"
+        base_url = connectable_http_url(config.get("host"), port, "/v1")
         return {
             "catalog": self.ports.catalog_with_auto_scores(catalog, config, state),
             "virtual_profiles": profiles,
@@ -248,8 +248,8 @@ def catalog_with_auto_scores(
             continue
         model["free_access"] = normalized_free_access(model)
         details_by_profile = {
-            profile_id: model_score_explanation(profile_id, model, state)
-            for profile_id in profiles
+            profile_id: model_score_explanation(str(profile.get("base_profile") or profile_id), model, state)
+            for profile_id, profile in profiles.items()
         }
         model["auto_scores"] = {
             profile_id: details["score_total"]
@@ -410,27 +410,38 @@ def filter_cached_catalog_to_enabled_providers(
     *,
     provider_auth_row: ProviderAuthRow,
 ) -> dict[str, Any]:
-    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    raw_configured = config.get("providers")
+    configured = raw_configured if isinstance(raw_configured, dict) else {}
     enabled_sources = {
         source
-        for source, provider in providers.items()
+        for source, provider in configured.items()
+        if isinstance(provider, dict) and provider.get("enabled", True)
+    }
+    # Models stay off the routing surfaces until a configured_credentials
+    # provider is actually invokable. Provider *cards* do not: the admin
+    # Providers list is how an operator pastes the first key, so dropping
+    # an unkeyed enabled row hides the only UI that can make it invokable.
+    current_auth: dict[str, dict[str, Any]] = {}
+    for source in enabled_sources:
+        source_name = str(source)
+        auth_row = provider_auth_row(source_name, config)
+        current_auth[source_name] = {**auth_row, "auth_reason": auth_row.get("reason")}
+    invokable_sources = {
+        source
+        for source in enabled_sources
         if (
-            isinstance(provider, dict)
-            and provider.get("enabled", True)
-            and (
-                str(provider.get("activation_policy") or "") != "configured_credentials"
-                or bool(provider_auth_row(str(source), config).get("invokable"))
-            )
+            str(configured[source].get("activation_policy") or "") != "configured_credentials"
+            or bool(current_auth[str(source)].get("invokable"))
         )
     }
     models = [
         model
         for model in catalog.get("models", [])
-        if isinstance(model, dict) and str(model.get("source") or "") in enabled_sources
+        if isinstance(model, dict) and str(model.get("source") or "") in invokable_sources
     ]
     raw_catalog_providers = catalog.get("providers") if isinstance(catalog.get("providers"), dict) else {}
     providers = {
-        source: provider
+        source: {**provider, **current_auth[str(source)]}
         for source, provider in raw_catalog_providers.items()
         if source in enabled_sources
     }
@@ -912,6 +923,7 @@ def candidate_rank_rows(
     limit: int = 5,
 ) -> list[dict[str, Any]]:
     canonical_profile_id = canonical_virtual_model_id(profile_id)
+    policy_profile_id = canonical_virtual_model_id(str(profile.get("base_profile") or canonical_profile_id))
     manual_ranks = {
         str(model_id): index + 1
         for index, model_id in enumerate(profile.get("models") or [])
@@ -924,11 +936,11 @@ def candidate_rank_rows(
         origin = "auto"
         if profile.get("mode") == "manual_order":
             origin = "manual" if manual_rank is not None else "auto_tail"
-        score = model_score_explanation(canonical_profile_id, model, state)
-        verified = verified_capability_row(canonical_profile_id, model, state)
-        failed_evidence = failed_profile_evidence_row(canonical_profile_id, model, state)
-        competence = model_route_competence(canonical_profile_id, model, state)
-        gate_capability = gate_capability_by_profile.get(canonical_profile_id)
+        score = model_score_explanation(policy_profile_id, model, state)
+        verified = verified_capability_row(policy_profile_id, model, state)
+        failed_evidence = failed_profile_evidence_row(policy_profile_id, model, state)
+        competence = model_route_competence(policy_profile_id, model, state)
+        gate_capability = gate_capability_by_profile.get(policy_profile_id)
         rows.append(
             {
                 "rank": index + 1,
@@ -1143,6 +1155,8 @@ def build_admin_profile_row(
     selected_score: dict[str, Any],
     selected_verified: dict[str, Any],
     selected_competence: Any,
+    route_candidates: list[dict[str, Any]],
+    policy_candidates: list[dict[str, Any]],
     top_candidates: list[dict[str, Any]],
     failed_candidates: list[dict[str, Any]],
     last_route: dict[str, Any],
@@ -1161,6 +1175,8 @@ def build_admin_profile_row(
         "selected_competence": selected_competence,
         "selected_verified_status": selected_verified.get("status") or "unknown",
         "selected_verified_capability": selected_verified.get("capability"),
+        "route_candidate_ids": [str(model.get("id") or "") for model in route_candidates],
+        "policy_candidate_ids": [str(model.get("id") or "") for model in policy_candidates],
         "top_candidates": top_candidates,
         "failed_profile_candidates": failed_candidates,
         "last_route": last_route,
@@ -1194,15 +1210,21 @@ def build_admin_profile_rows(
 ) -> dict[str, Any]:
     rows: dict[str, Any] = {}
     for profile_id, profile in profiles.items():
+        policy_profile_id = str(profile.get("base_profile") or profile_id)
         candidates = candidates_for_profile(profile_id, available_models, state, profile)
         # selected reflects what routing serves (competence-gated top); the full ranked list
         # in top_candidates stays ungated so failed/unproven candidates remain visible.
-        route_candidates = route_competent_candidates(profile_id, candidates, state)
+        route_candidates = route_competent_candidates(policy_profile_id, candidates, state)
+        policy_candidates = route_competent_candidates(
+            policy_profile_id,
+            available_models,
+            state,
+        )
         selected = route_candidates[0] if route_candidates else None
-        selected_verified = verified_capability_row(profile_id, selected, state) if selected else {}
-        selected_score = model_score_explanation(profile_id, selected, state) if selected else {}
+        selected_verified = verified_capability_row(policy_profile_id, selected, state) if selected else {}
+        selected_score = model_score_explanation(policy_profile_id, selected, state) if selected else {}
         failed_candidates = [
-            failed_profile_evidence_row(profile_id, model, state)
+            failed_profile_evidence_row(policy_profile_id, model, state)
             for model in candidates
         ]
         failed_candidates = [row for row in failed_candidates if row]
@@ -1214,7 +1236,9 @@ def build_admin_profile_rows(
             selected_origin=selected_profile_origin(profile, selected),
             selected_score=selected_score,
             selected_verified=selected_verified,
-            selected_competence=model_route_competence(profile_id, selected, state) if selected else None,
+            selected_competence=model_route_competence(policy_profile_id, selected, state) if selected else None,
+            route_candidates=route_candidates,
+            policy_candidates=policy_candidates,
             top_candidates=candidate_rank_rows(profile_id, candidates, profile, state),
             failed_candidates=failed_candidates,
             last_route=last_route if isinstance(last_route, dict) else {},
@@ -1239,16 +1263,17 @@ def build_admin_performance_history_rows(
 ) -> dict[str, Any]:
     rows: dict[str, Any] = {}
     for profile_id, profile in profiles.items():
+        policy_profile_id = str(profile.get("base_profile") or profile_id)
         candidates = candidates_for_profile(profile_id, available_models, state, profile)
         rank_rows = candidate_rank_rows(profile_id, candidates, profile, state, limit=5)
         rank_by_model = {str(row.get("model_id") or ""): row for row in rank_rows}
         # selected reflects what routing actually serves, not just the top-ranked candidate.
-        route_candidates = route_competent_candidates(profile_id, candidates, state)
+        route_candidates = route_competent_candidates(policy_profile_id, candidates, state)
         selected = route_candidates[0] if route_candidates else None
         last_route = last_routes.get(profile_id) if isinstance(last_routes.get(profile_id), dict) else {}
         compression = last_route.get("compression") if isinstance(last_route.get("compression"), dict) else {}
         candidate_rows = [
-            model_history_row(profile_id, model, state, rank_by_model.get(str(model.get("id") or ""), {}))
+            model_history_row(policy_profile_id, model, state, rank_by_model.get(str(model.get("id") or ""), {}))
             for model in candidates[:5]
         ]
         rows[profile_id] = {
@@ -1258,8 +1283,8 @@ def build_admin_performance_history_rows(
             "selected_model": selected.get("id") if selected else None,
             "selected_upstream": selected.get("upstream_id") if selected else None,
             "selected_source": selected.get("source") if selected else None,
-            "selected_score": round(model_auto_score(profile_id, selected, state), 1) if selected else None,
-            "selected_competence": model_route_competence(profile_id, selected, state) if selected else None,
+            "selected_score": round(model_auto_score(policy_profile_id, selected, state), 1) if selected else None,
+            "selected_competence": model_route_competence(policy_profile_id, selected, state) if selected else None,
             "last_route_status": last_route.get("status"),
             "last_route_reason": last_route.get("reason"),
             "last_route_model": last_route.get("model_id"),

@@ -184,6 +184,50 @@ def test_pure_selection_keeps_benchmark_pool_and_marks_route_anti_empty_fallback
     assert benchmark_result.anti_empty_fallback is False
 
 
+def test_custom_profile_uses_base_policy_for_scoring_and_competence():
+    seen = {"sort": [], "competence": []}
+    policy = simple_policy()
+
+    def sort_models(profile_id, available, _state):
+        seen["sort"].append(profile_id)
+        return list(available)
+
+    def gate_models(profile_id, candidates, _state):
+        seen["competence"].append(profile_id)
+        return candidates, False
+
+    policy = SelectionPolicy(
+        **{
+            **policy.__dict__,
+            "sort_available_for_virtual_model": sort_models,
+            "route_competence_gate_result": gate_models,
+        }
+    )
+    config = {
+        "virtual_profiles": {
+            "ficelle/custom/coding": {
+                "base_profile": "ficelle/auto-tools",
+                "mode": "auto",
+                "requirements": {"tools": True},
+            }
+        }
+    }
+
+    result = select_models_result_from_typed_rows(
+        "ficelle/custom/coding",
+        typed_catalog_rows({"models": [model_row("ficelle/openrouter/a")]}),
+        config,
+        {},
+        policy,
+    )
+
+    assert [candidate.id for candidate in result.candidates] == ["ficelle/openrouter/a"]
+    assert seen == {
+        "sort": ["ficelle/auto-tools"],
+        "competence": ["ficelle/auto-tools"],
+    }
+
+
 def test_sort_available_for_virtual_model_uses_score_failures_context_and_id_tiebreakers():
     models = [
         model_row("ficelle/openrouter/high-failures", upstream_id="high-failures", context_length=200_000),

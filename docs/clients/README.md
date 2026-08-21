@@ -27,7 +27,8 @@ chat endpoint  http://127.0.0.1:8646/v1/chat/completions
 
 | Model | Use it for |
 |---|---|
-| `ficelle/auto-tools` | the default agent profile: tool calling, coding assistants |
+| `ficelle/auto-coding` | coding assistants; only centrally certified provider deployments |
+| `ficelle/auto-tools` | the general agent profile: tool calling without coding-quality certification |
 | `ficelle/auto-fast` | quick, low-stakes calls: titles, summaries, one-liners |
 | `ficelle/auto-json` | structured extraction, JSON output |
 | `ficelle/auto-orchestrator` | heavier multi-step reasoning |
@@ -36,6 +37,10 @@ chat endpoint  http://127.0.0.1:8646/v1/chat/completions
 
 `ficelle models` lists everything currently routable, including the
 capability-specific profiles (reasoning, vision, audio, video).
+
+`auto-coding` may correctly return `503 no_certified_coding_model` even while other profiles
+work. That means the signed manifest has no current certification matching this install's live
+free provider deployments; Ficelle will not silently substitute a merely tool-capable model.
 
 ## Recipes
 

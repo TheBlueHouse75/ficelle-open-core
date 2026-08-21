@@ -275,6 +275,7 @@
       padding: 9px 15px; border-radius: var(--radius-pill);
       border: 1px solid var(--border-strong); background: var(--surface-1); color: var(--text);
       font-weight: 600; font-size: 13px; cursor: pointer; white-space: nowrap;
+      text-decoration: none;
       transition: transform 0.12s var(--ease), background 0.16s var(--ease), border-color 0.16s var(--ease), box-shadow 0.16s var(--ease);
     }
     .btn svg { width: 15px; height: 15px; opacity: 0.85; }
@@ -387,6 +388,23 @@
     .profile-tab .pt-id { grid-column: 1 / -1; font-family: var(--font-mono); font-size: 10.5px; color: var(--brand); }
     .profile-tab .pt-meta { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-muted); }
     .profile-tab .pt-counts { display: flex; gap: 5px; align-items: center; }
+    .profile-tab.is-locked { border-style: dashed; opacity: 0.78; }
+    .profile-group-label { margin: 11px 2px 2px; color: var(--text-muted); font-size: 10.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+    .custom-profile-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-left: auto; }
+    .custom-profile-actions[hidden] { display: none; }
+    .danger-text { color: var(--danger); }
+
+    .profile-dialog { width: min(520px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--border-strong); border-radius: var(--radius-md); background: var(--surface-1); color: var(--text); box-shadow: var(--shadow-pop); }
+    .profile-dialog::backdrop { background: rgb(12 18 26 / 0.62); backdrop-filter: blur(3px); }
+    .profile-dialog form { padding: 20px; }
+    .profile-dialog-head { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; }
+    .profile-dialog-head h2 { margin: 0; font-family: var(--font-display); }
+    .profile-dialog-head p { margin: 5px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+    .profile-dialog-fields { display: grid; gap: 13px; margin-top: 20px; }
+    .profile-dialog-fields .setting > span { display: block; margin-bottom: 6px; color: var(--text-soft); font-size: 12px; font-weight: 650; }
+    .profile-dialog-fields textarea { width: 100%; resize: vertical; border: 1px solid var(--border); border-radius: var(--radius-xs); background: var(--surface-1); color: var(--text); padding: 9px; font: inherit; }
+    .profile-dialog-fields small { display: block; margin-top: 5px; color: var(--text-muted); font-size: 11px; line-height: 1.4; }
+    .profile-dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 20px; }
 
     .editor-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
     .segmented { display: inline-grid; grid-auto-flow: column; gap: 2px; padding: 3px; border-radius: var(--radius-pill); border: 1px solid var(--border); background: var(--surface-1); }
@@ -618,11 +636,49 @@
     .provider-detail-stack { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
     .provider-detail-stack .provider-models { margin-top: 0; }
     .provider-detail-stack .provider-model-list { max-height: none; }
+    .prov-pro-cta {
+      display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px;
+      width: 100%; margin-top: 8px; padding: 11px 10px; text-align: left; cursor: pointer;
+      border: 1px dashed var(--brand-line); border-radius: var(--radius); background: var(--brand-wash); color: var(--text);
+      transition: transform 0.16s var(--ease), border-color 0.16s var(--ease), background 0.16s var(--ease);
+    }
+    .prov-pro-cta:hover { transform: translateY(-1px); border-style: solid; background: color-mix(in srgb, var(--brand) 14%, var(--surface-1)); }
+    .prov-pro-cta .pro-cta-icon { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; background: var(--surface-1); color: var(--brand); border: 1px solid var(--brand-line); }
+    .prov-pro-cta .pro-cta-icon svg { width: 16px; height: 16px; }
+    .prov-pro-cta .pro-cta-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+    .prov-pro-cta .pro-cta-title { font-family: var(--font-display); font-size: 13.5px; font-weight: 650; }
+    .prov-pro-cta .pro-cta-sub { color: var(--text-muted); font-size: 11.5px; line-height: 1.35; }
+    .prov-pro-cta .pro-cta-arrow { color: var(--brand); font-size: 17px; }
     @media (max-width: 1080px) {
       .provider-split { grid-template-columns: 1fr; }
       .prov-list { position: static; max-height: none; flex-direction: row; overflow-x: auto; overflow-y: visible; padding-bottom: 6px; padding-right: 0; }
       .prov-list-item { flex: 0 0 auto; min-width: 200px; }
+      .prov-pro-cta { flex: 0 0 260px; margin-top: 0; }
     }
+
+    /* ============ Ficelle Pro gates + core upgrade hub ============ */
+    .pro-gate-card { overflow: hidden; }
+    .pro-gate-card .card-body { padding: clamp(24px, 4vw, 44px); }
+    .pro-gate-card p { max-width: 64ch; color: var(--text-soft); margin: 8px 0 20px; }
+    .pro-kicker { display: inline-flex; align-items: center; padding: 4px 9px; border-radius: var(--radius-pill); background: var(--brand-wash); border: 1px solid var(--brand-line); color: var(--brand); font-size: 10.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+    .pro-hub { display: flex; flex-direction: column; gap: 16px; }
+    .pro-hub-hero { position: relative; overflow: hidden; padding: clamp(24px, 4vw, 42px); }
+    .pro-hub-hero::after { content: ""; position: absolute; width: 280px; height: 280px; right: -90px; top: -120px; border-radius: 50%; background: color-mix(in srgb, var(--brand) 18%, transparent); filter: blur(4px); pointer-events: none; }
+    .pro-hub-copy { position: relative; z-index: 1; max-width: 760px; }
+    .pro-hub-copy h2 { font-family: var(--font-display); font-size: clamp(25px, 3vw, 36px); letter-spacing: -0.025em; margin: 12px 0 8px; }
+    .pro-hub-copy > p { color: var(--text-soft); font-size: 15px; max-width: 64ch; margin: 0; }
+    .pro-hub-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 22px; }
+    .pro-hub-note { color: var(--text-muted); font-size: 12px; }
+    .pro-feature-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .pro-feature-card { padding: 18px; }
+    .pro-feature-icon { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 11px; background: var(--brand-wash); color: var(--brand); border: 1px solid var(--brand-line); }
+    .pro-feature-icon svg { width: 19px; height: 19px; }
+    .pro-feature-card h3 { font-family: var(--font-display); font-size: 16px; margin: 13px 0 6px; }
+    .pro-feature-card p { color: var(--text-muted); font-size: 12.5px; line-height: 1.5; margin: 0; }
+    .pro-activation .card-head { align-items: center; }
+    .pro-activation-form { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+    .pro-activation-form .key-input { flex: 1 1 320px; min-height: 36px; }
+    @media (max-width: 820px) { .pro-feature-grid { grid-template-columns: 1fr; } }
 
     /* ============ Health ============ */
     .health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }

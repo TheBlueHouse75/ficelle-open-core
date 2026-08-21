@@ -497,7 +497,23 @@ def _cached_row_passes_current_policy(
         if isinstance(allowlist, list)
         else []
     )
-    if allowed_patterns:
+    official_ids = (
+        [str(item).strip().lower() for item in provider_cfg.get("official_free_ids") or [] if str(item).strip()]
+        if isinstance(provider_cfg.get("official_free_ids"), list)
+        else []
+    )
+    official_suffixes = (
+        [str(item).strip().lower() for item in provider_cfg.get("official_free_id_suffixes") or [] if str(item).strip()]
+        if isinstance(provider_cfg.get("official_free_id_suffixes"), list)
+        else []
+    )
+    if official_ids or official_suffixes:
+        if upstream_id not in official_ids and not any(upstream_id.endswith(suffix) for suffix in official_suffixes):
+            return False
+    elif provider_cfg.get("require_model_id_allowlist"):
+        if upstream_id not in allowed_patterns:
+            return False
+    elif allowed_patterns:
         provider_class = str(provider_cfg.get("provider_class") or provider_cfg.get("source_type") or "")
         if provider_class == "free_model":
             if upstream_id not in allowed_patterns:
@@ -511,6 +527,10 @@ def _cached_row_passes_current_policy(
     # could keep the old eligible bit alive through a transient refresh failure.
     access_mode = str(model.free_access.get("mode") or "")
     access_proof = str(model.free_access.get("proof") or "")
+    configured_flag = str(provider_cfg.get("catalog_free_flag_field") or "").strip()
+    if access_proof == "provider_free_catalog_pricing" and configured_flag:
+        if str(model.free_access.get("catalog_free_flag_verified") or "") != configured_flag:
+            return False
     if access_mode == "catalog_free" and access_proof == "provider_pricing":
         return True
     if access_mode in TRUSTED_FREE_PROVIDER_CLASSES_BY_MODE:

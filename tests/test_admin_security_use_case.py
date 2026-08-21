@@ -155,6 +155,14 @@ def test_client_url_host_is_always_accepted_by_the_host_allowlist() -> None:
         assert request_host_allowed(host_header, 8646, bind) is True, bind
 
 
+def test_connectable_http_url_formats_wildcard_and_ipv6_bind_addresses() -> None:
+    from ficelle.url_security import connectable_http_url
+
+    assert connectable_http_url("0.0.0.0", 8646, "/v1") == "http://127.0.0.1:8646/v1"
+    assert connectable_http_url("::", 8646, "v1") == "http://[::1]:8646/v1"
+    assert connectable_http_url("::1", 9864) == "http://[::1]:9864"
+
+
 def test_admin_html_security_headers_deny_framing_and_inline_script() -> None:
     assert ADMIN_HTML_SECURITY_HEADERS["X-Frame-Options"] == "DENY"
     assert ADMIN_HTML_SECURITY_HEADERS["X-Content-Type-Options"] == "nosniff"

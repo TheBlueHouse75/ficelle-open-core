@@ -68,10 +68,14 @@ def provider_config_fingerprint(
         "free_scope": provider_cfg.get("free_scope"),
         "free_status": provider_cfg.get("free_status"),
         "free_access_proof": provider_cfg.get("free_access_proof"),
+        "catalog_free_flag_field": provider_cfg.get("catalog_free_flag_field"),
         "free_note": provider_cfg.get("free_note"),
         "catalog_model_defaults": provider_cfg.get("catalog_model_defaults"),
         "model_id_exclude_patterns": provider_cfg.get("model_id_exclude_patterns"),
+        "official_free_ids": provider_cfg.get("official_free_ids"),
+        "official_free_id_suffixes": provider_cfg.get("official_free_id_suffixes"),
         "model_id_allowlist": provider_cfg.get("model_id_allowlist"),
+        "require_model_id_allowlist": provider_cfg.get("require_model_id_allowlist"),
     }
     if include_credentials and str(provider_cfg.get("activation_policy") or "") == "configured_credentials":
         fingerprint["credential_activation"] = ports.credential_activation_fingerprint(source, provider_cfg)

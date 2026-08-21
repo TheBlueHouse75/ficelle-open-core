@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import errno
 import socket
 import threading
 import time
 import urllib.error
 import urllib.request
+
+import pytest
 
 from ficelle import router
 
@@ -15,6 +18,20 @@ def _free_port() -> int:
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+
+def test_http_server_selects_ipv6_socket_family_for_ipv6_bind():
+    try:
+        server = router.ThreadingHTTPServer(("::1", 0), router.RouterHandler)
+    except OSError as exc:
+        if not socket.has_ipv6 or exc.errno in {errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT}:
+            pytest.skip("IPv6 loopback is unavailable in this environment")
+        raise AssertionError("IPv6 is available but the router could not bind ::1") from exc
+    try:
+        assert server.address_family == socket.AF_INET6
+        assert server.server_address[0] == "::1"
+    finally:
+        server.server_close()
 
 
 def test_serve_binds_before_catalog_warm(monkeypatch):

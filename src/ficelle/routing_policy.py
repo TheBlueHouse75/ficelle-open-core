@@ -78,7 +78,7 @@ def catalog_denies_structured_output(
     the flag can be computed off defaults-inherited params (see the caller) — arrives through
     `structured_support_may_come_from_defaults`. Only the `structured: True` direction is read —
     the only one a probeable profile can carry, since built-in requirements overwrite user config
-    for the four profiles that set it; a user `structured: false` on another built-in profile would
+    for the three profiles that set it; a user `structured: false` on another built-in profile would
     need the opposite provenance guard (a defaults-inflated `True`) and buys nothing today.
     """
     if requirements.get("structured") is not True:

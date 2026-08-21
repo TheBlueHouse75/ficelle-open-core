@@ -409,6 +409,7 @@ def test_install_pro_requires_a_key() -> None:
 
 def test_pro_wheel_url_honors_env_override(monkeypatch) -> None:
     monkeypatch.delenv("FICELLE_WHEEL_URL", raising=False)
+    assert f"/api/releases/{pro_install.CORE_VERSION}/wheel" in pro_install.DEFAULT_WHEEL_URL
     assert pro_install.pro_wheel_url() == pro_install.DEFAULT_WHEEL_URL
     monkeypatch.setenv("FICELLE_WHEEL_URL", "http://127.0.0.1:9/wheel")
     assert pro_install.pro_wheel_url() == "http://127.0.0.1:9/wheel"

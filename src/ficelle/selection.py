@@ -18,10 +18,14 @@ class SelectionPolicy:
     sort_available_for_virtual_model: Callable[[str, list[dict[str, Any]], dict[str, Any]], list[dict[str, Any]]]
     route_competence_gate_result: Callable[[str, list[dict[str, Any]], dict[str, Any]], tuple[list[dict[str, Any]], bool]]
     virtual_models: set[str]
+    benchmark_competence_gate_result: (
+        Callable[[str, list[dict[str, Any]], dict[str, Any]], tuple[list[dict[str, Any]], bool]] | None
+    ) = None
     # Returns a block reason for a catalog row preserved past its stale grace (L1-R1), or
     # None when the row is fresh or still within grace. Optional so pre-existing callers
     # and tests keep their behavior unchanged.
     stale_model_block_reason: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], str | None] | None = None
+    competence_exclusion_reason: Callable[[str], str] = lambda _profile: "competence_gate"
 
 
 def typed_catalog_rows(catalog: dict[str, Any]) -> list[tuple[CatalogModel, dict[str, Any]]]:
@@ -92,10 +96,12 @@ def candidates_for_profile(
     sort_available_for_virtual_model: Callable[[str, list[dict[str, Any]], dict[str, Any]], list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     canonical_profile_id = canonical_virtual_model_id(profile_id)
+    base_profile = canonical_virtual_model_id(str(profile.get("base_profile") or ""))
+    policy_profile_id = base_profile if base_profile else canonical_profile_id
     eligible = [model for model in available if model_matches_profile_requirements(model, profile)]
     if profile.get("mode") == "manual_order":
-        return manual_order_candidates(canonical_profile_id, eligible, state, profile)
-    return sort_available_for_virtual_model(canonical_profile_id, eligible, state)
+        return manual_order_candidates(policy_profile_id, eligible, state, profile)
+    return sort_available_for_virtual_model(policy_profile_id, eligible, state)
 
 
 def select_models_result_from_typed_rows(
@@ -144,6 +150,11 @@ def select_models_result_from_typed_rows(
     profiles = policy.normalized_virtual_profiles(config)
     canonical_requested_model = policy.canonical_virtual_model_id(requested_model)
     profile = profiles.get(requested_model) or profiles.get(canonical_requested_model)
+    policy_profile_id = (
+        policy.canonical_virtual_model_id(str(profile.get("base_profile") or ""))
+        if isinstance(profile, dict) and profile.get("base_profile")
+        else canonical_requested_model
+    )
     if profile:
         before_profile = {str(model.get("id") or "") for model in available}
         eligible = [model for model in available if policy.model_matches_profile_requirements(model, profile)]
@@ -151,9 +162,9 @@ def select_models_result_from_typed_rows(
             if model_id:
                 excluded_reasons[model_id] = "profile_requirements"
         if profile.get("mode") == "manual_order":
-            candidates = policy.manual_order_candidates(canonical_requested_model, eligible, state, profile)
+            candidates = policy.manual_order_candidates(policy_profile_id, eligible, state, profile)
         else:
-            candidates = policy.sort_available_for_virtual_model(canonical_requested_model, eligible, state)
+            candidates = policy.sort_available_for_virtual_model(policy_profile_id, eligible, state)
     elif canonical_requested_model in policy.virtual_models or requested_model in policy.virtual_models or requested_model in profiles:
         candidates = policy.sort_available_for_virtual_model(canonical_requested_model, available, state)
     else:
@@ -165,10 +176,18 @@ def select_models_result_from_typed_rows(
     anti_empty_fallback = False
     if purpose == "route":
         before_competence = {str(model.get("id") or "") for model in candidates}
-        candidates, anti_empty_fallback = policy.route_competence_gate_result(canonical_requested_model, candidates, state)
+        candidates, anti_empty_fallback = policy.route_competence_gate_result(policy_profile_id, candidates, state)
         for model_id in before_competence - {str(model.get("id") or "") for model in candidates}:
             if model_id:
-                excluded_reasons[model_id] = "competence_gate"
+                excluded_reasons[model_id] = policy.competence_exclusion_reason(policy_profile_id)
+    elif policy.benchmark_competence_gate_result is not None:
+        before_competence = {str(model.get("id") or "") for model in candidates}
+        candidates, _unused_fallback = policy.benchmark_competence_gate_result(
+            policy_profile_id, candidates, state
+        )
+        for model_id in before_competence - {str(model.get("id") or "") for model in candidates}:
+            if model_id:
+                excluded_reasons[model_id] = policy.competence_exclusion_reason(policy_profile_id)
 
     typed_candidates: list[CatalogModel] = []
     for raw in candidates:

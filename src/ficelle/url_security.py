@@ -25,6 +25,14 @@ def connectable_host(bind_host: str | None) -> str:
     return host
 
 
+def connectable_http_url(bind_host: str | None, port: int, path: str = "") -> str:
+    """Build an HTTP URL to a router bind address, including valid IPv6 brackets."""
+    host = connectable_host(bind_host)
+    url_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    normalized_path = f"/{path.lstrip('/')}" if path else ""
+    return f"http://{url_host}:{port}{normalized_path}"
+
+
 def uses_secure_http_transport(url: str) -> bool:
     """Whether credentials may be sent to ``url`` without crossing cleartext networking."""
     try:

@@ -42,7 +42,8 @@
           <section class="ws-col lanes">
             <div class="card">
               <div class="card-head">
-                <div><h2>Virtual models</h2><div class="ch-sub">Pick one. Each maps to a <code>ficelle/auto-*</code> id your apps call.</div></div>
+                <div><h2>Virtual models</h2><div class="ch-sub">Pick one. Each exposes a stable <code>ficelle/*</code> id your apps call.</div></div>
+                <button class="btn primary sm" type="button" id="newCustomProfileBtn">New custom model</button>
               </div>
               <div class="card-body">
                 <div class="profile-list" id="profileList"></div>
@@ -69,6 +70,12 @@
                   </div>
                   <label class="switch" id="autoTailWrap"><input type="checkbox" id="autoTailToggle"><span class="track"></span> Auto-fill the rest</label>
                   <button class="btn ghost sm" type="button" id="clearProfileBtn">Reset</button>
+                  <div class="custom-profile-actions" id="customProfileActions" hidden>
+                    <button class="btn ghost sm" type="button" id="editCustomProfileBtn">Edit details</button>
+                    <button class="btn ghost sm" type="button" id="duplicateCustomProfileBtn">Duplicate</button>
+                    <button class="btn ghost sm" type="button" id="copyCustomProfileIdBtn">Copy ID</button>
+                    <button class="btn ghost sm danger-text" type="button" id="deleteCustomProfileBtn">Delete</button>
+                  </div>
                 </div>
                 <div class="lane-stack">
                   <div id="orderBlock" class="order-block">
@@ -125,10 +132,12 @@
       <!-- The real Fusion UI ships in Ficelle Pro (pro-views.js); the open core shows an upsell
            placeholder here. When the Pro module is present it replaces this section's contents. -->
       <section class="view" data-view="fusion" id="view-fusion">
-        <div class="card">
+        <div class="card pro-gate-card">
           <div class="card-body">
-            <h2>Fusion</h2>
-            <p>Fusion is part of <strong>Ficelle Pro</strong>. <a href="https://ficelle.ai" target="_blank" rel="noopener">Learn more</a>.</p>
+            <span class="pro-kicker">Ficelle Pro</span>
+            <h2>Unlock Fusion</h2>
+            <p>Compare several eligible models, judge their answers, and synthesize one stronger response.</p>
+            <a class="btn primary" href="#/license">Explore Ficelle Pro</a>
           </div>
         </div>
       </section>
@@ -147,10 +156,12 @@
       <!-- The real Compression UI ships in Ficelle Pro (pro-views.js); the open core shows an upsell
            placeholder here. When the Pro module is present it replaces this section's contents. -->
       <section class="view" data-view="compression" id="view-compression">
-        <div class="card">
+        <div class="card pro-gate-card">
           <div class="card-body">
-            <h2>Compression</h2>
-            <p>Compression is part of <strong>Ficelle Pro</strong>. <a href="https://ficelle.ai" target="_blank" rel="noopener">Learn more</a>.</p>
+            <span class="pro-kicker">Ficelle Pro</span>
+            <h2>Unlock native compression</h2>
+            <p>Reduce context pressure while keeping local controls for storage, retrieval, and observability.</p>
+            <a class="btn primary" href="#/license">Explore Ficelle Pro</a>
           </div>
         </div>
       </section>
@@ -159,10 +170,12 @@
       <!-- The real License UI ships in Ficelle Pro (pro-views.js); the open core shows an upsell
            placeholder here. When the Pro module is present it replaces this section's contents. -->
       <section class="view" data-view="license" id="view-license">
-        <div class="card">
+        <div class="card pro-gate-card">
           <div class="card-body">
-            <h2>License</h2>
-            <p>Pro license management is part of <strong>Ficelle Pro</strong>. <a href="https://ficelle.ai" target="_blank" rel="noopener">Learn more</a>.</p>
+            <span class="pro-kicker">Ficelle Pro</span>
+            <h2>Keep more free-model capacity working</h2>
+            <p>Add the maintained provider pack, Fusion, native compression, and custom virtual models to the router you already run.</p>
+            <a class="btn primary" href="https://ficelle.ai/#pricing" target="_blank" rel="noopener">See Ficelle Pro plans</a>
           </div>
         </div>
       </section>
@@ -267,7 +280,7 @@
         </button>
         <button class="nav-item" data-nav="license">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.5 12.5 8-8"/><path d="m16 4 3 3"/><path d="m19 7 2-2"/></svg>
-          <span class="nav-text">License</span>
+          <span class="nav-text" id="licenseNavText">Ficelle Pro</span>
         </button>
         <div class="nav-label">Observe</div>
         <button class="nav-item" data-nav="health">
@@ -313,6 +326,28 @@
       </div>
     </aside>
   </div>
+
+  <dialog class="profile-dialog" id="customProfileDialog" aria-labelledby="customProfileDialogTitle">
+    <form method="dialog" id="customProfileForm">
+      <div class="profile-dialog-head">
+        <div>
+          <h2 id="customProfileDialogTitle">New custom model</h2>
+          <p>Create a stable model ID backed by one built-in routing policy.</p>
+        </div>
+        <button class="iconbtn" type="button" id="closeCustomProfileDialogBtn" aria-label="Close">&times;</button>
+      </div>
+      <div class="profile-dialog-fields">
+        <label class="setting"><span>Display name</span><input id="customProfileLabel" maxlength="80" required autocomplete="off"></label>
+        <label class="setting" id="customProfileSlugField"><span>ID slug</span><input id="customProfileSlug" maxlength="96" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" placeholder="coding" required autocomplete="off"><small>The stable ID will be <code>ficelle/custom/&lt;slug&gt;</code>.</small></label>
+        <label class="setting"><span>Start from</span><select id="customProfileBase"></select></label>
+        <label class="setting"><span>Description <small>(optional)</small></span><textarea id="customProfileDescription" maxlength="240" rows="3"></textarea></label>
+      </div>
+      <div class="profile-dialog-actions">
+        <button class="btn ghost" type="button" id="cancelCustomProfileBtn">Cancel</button>
+        <button class="btn primary" type="submit" id="confirmCustomProfileBtn">Create model</button>
+      </div>
+    </form>
+  </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite"><span class="t-dot"></span><span class="t-body"><span id="toastMsg"></span><button type="button" class="btn sm t-action" id="toastAction" hidden></button></span></div>
 

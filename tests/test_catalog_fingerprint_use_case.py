@@ -62,6 +62,32 @@ def test_catalog_config_fingerprint_tracks_structural_provider_fields() -> None:
         ports=ports(calls),
     )
 
+    required_allowlist = {
+        **base,
+        "providers": {
+            "openrouter": {
+                **base["providers"]["openrouter"],
+                "require_model_id_allowlist": True,
+            }
+        },
+    }
+    assert catalog_config_structural_fingerprint(base, ports=ports(calls)) != (
+        catalog_config_structural_fingerprint(required_allowlist, ports=ports(calls))
+    )
+
+    flagged_catalog = {
+        **base,
+        "providers": {
+            "openrouter": {
+                **base["providers"]["openrouter"],
+                "catalog_free_flag_field": "isFree",
+            }
+        },
+    }
+    assert catalog_config_structural_fingerprint(base, ports=ports(calls)) != (
+        catalog_config_structural_fingerprint(flagged_catalog, ports=ports(calls))
+    )
+
 
 def test_structural_fingerprint_excludes_credential_activation_state() -> None:
     calls: list[tuple[str, dict[str, Any]]] = []

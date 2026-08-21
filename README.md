@@ -32,10 +32,15 @@ paid call.
   machine. Ficelle is not a hosted proxy; prompts are sent directly to the upstream
   provider you choose.
 - **OpenAI-compatible:** drop-in `/v1/models` and `/v1/chat/completions`, with stable
-  virtual models (`ficelle/auto-tools`, `ficelle/auto-json`, `ficelle/auto-reasoning`,
+  virtual models (`ficelle/auto-coding`, `ficelle/auto-tools`, `ficelle/auto-json`, `ficelle/auto-reasoning`,
   `ficelle/auto-long`, …).
 
 ## What to route to free models
+
+For coding assistants, use `ficelle/auto-coding`: it admits only exact provider deployments with
+a current Ficelle-signed coding certification and returns a local 503 rather than silently routing
+to an unverified model. Public leaderboard data is used to choose what Ficelle should evaluate
+next, never as route proof.
 
 Free models are not a drop-in replacement for a frontier model on every task, and this
 project does not pretend otherwise. Across a 76-task benchmark against `gpt-5`, free
@@ -56,7 +61,7 @@ raw numbers: [the benchmark write-up](https://ficelle-website.netlify.app/blog/f
 Install the versioned open Core from its GitHub Release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.2.0/scripts/bootstrap-ficelle.py | python3 -
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.4/scripts/bootstrap-ficelle.py | python3 -
 ~/.local/bin/ficelle doctor --text
 ```
 
@@ -68,7 +73,7 @@ key in shell history, enter it silently before running the same command:
 (
   read -s FICELLE_LICENSE_KEY
   export FICELLE_LICENSE_KEY
-  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.2.0/scripts/bootstrap-ficelle.py | python3 -
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.4/scripts/bootstrap-ficelle.py | python3 -
 )
 ```
 
@@ -174,16 +179,17 @@ its own HTTPS manifest with `FICELLE_UPDATE_MANIFEST_URL`. The compact manifest 
 
 ```json
 {
-  "version": "0.1.7",
-  "release_url": "https://ficelle.ai/releases/0.1.7",
+  "version": "0.3.4",
+  "release_url": "https://github.com/TheBlueHouse75/ficelle-open-core/releases/tag/v0.3.4",
   "core": {
-    "wheel_url": "https://downloads.example/ficelle_router-0.1.7-py3-none-any.whl",
+    "wheel_url": "https://downloads.example/ficelle_router-0.3.4-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>"
   },
   "pro": {
-    "wheel_url": "https://downloads.example/ficelle_pro-0.1.7-py3-none-any.whl",
+    "wheel_url": "https://install.ficelle.ai/api/releases/latest/wheel",
+    "filename": "ficelle_pro-0.3.4-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>",
-    "authorization": "bearer"
+    "authorization": "entitlement"
   }
 }
 ```
@@ -255,10 +261,11 @@ plugins with backups. Hermes config is still opt-in:
 plugin/config backups, run `ficelle-setup --target hermes --rollback`; paths without
 backups are left untouched.
 
-The provider name is `ficelle`. Start with low-risk auxiliary slots before any main-model
-experiment:
+The provider name is `ficelle`. Setup makes Ficelle the main Hermes route and also installs
+specialized auxiliary slots:
 
 ```yaml
+model:            { provider: "custom", base_url: "http://127.0.0.1:8646/v1", model: "ficelle/auto-orchestrator" }
 auxiliary:
   title_generation: { provider: "ficelle", model: "ficelle/auto-fast" }
   compression:      { provider: "ficelle", model: "ficelle/auto-compression" }

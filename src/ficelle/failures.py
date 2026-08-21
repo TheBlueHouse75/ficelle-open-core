@@ -689,7 +689,13 @@ def classify_failure(
     # rejected reasoning trace, whose ordinary content may itself say "payment required" or "quota
     # exceeded". Those are caller/model words, not the provider's diagnosis. A contradictory named
     # status remains stronger; only an absent or request-rejection code lets the typed location win.
-    named_status = status_for_error_codes(*(error_codes or provider_error_codes(text)))
+    resolved_error_codes = error_codes or provider_error_codes(text)
+    named_status = status_for_error_codes(*resolved_error_codes)
+    # A free-only virtual route can exhaust while the account key remains valid. The provider's
+    # stable code is stronger than the otherwise generic HTTP 403 auth verdict, and creates a
+    # recoverable quota cooldown without trusting mutable prose.
+    if status_code == 403 and "free_quota_exhausted" in resolved_error_codes:
+        return "quota_exhausted"
     if (
         status_code in REQUEST_REJECTION_STATUSES
         and (named_status is None or named_status in REQUEST_REJECTION_STATUSES)

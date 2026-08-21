@@ -177,3 +177,36 @@ def test_core_dashboard_omits_pro_script(tmp_path: Path) -> None:
     body = "assert '/admin/static/pro/' not in router.admin_page_html()"
     result = _run_core_with_modules_blocked(("ficelle_pro",), tmp_path, body)
     assert result.returncode == 0, result.stderr
+
+
+def test_core_dashboard_pro_gates_converge_on_one_upgrade_hub() -> None:
+    html = (_REPO_ROOT / "src" / "ficelle" / "assets" / "admin" / "index.html").read_text()
+    app = (_REPO_ROOT / "src" / "ficelle" / "assets" / "admin" / "app.js").read_text()
+
+    # Static fallbacks and the interactive gates keep the purchase journey inside the
+    # dashboard first. The website is one explicit next step from the shared hub.
+    assert html.count('href="#/license"') == 2
+    assert 'href="https://ficelle.ai/#pricing"' in html
+    assert 'setView("license")' in app
+    assert 'href="https://ficelle.ai/#pricing"' in app
+
+    # One feature registry feeds the provider CTA, the two locked views, and the hub cards.
+    for feature in (
+        "Maintained provider pack",
+        "Model Fusion",
+        "Native compression",
+        "Custom virtual models",
+    ):
+        assert feature in app
+    assert 'state?.pro_installed ? "" : providerProCtaHTML()' in app
+    assert 'state?.pro_installed ? "License" : "Ficelle Pro"' in app
+
+    selection_guard = (
+        'if (keys.length && (!selectedProvider || !keys.includes(selectedProvider))) '
+        'setSelectedProvider(keys[0]);'
+    )
+    assert app.index(selection_guard) < app.index('listEl.innerHTML = keys.map')
+
+    # Purchase-success links stay compatible and the key still only pre-fills the form.
+    assert '#/license?key=' in app
+    assert 'if (deepLinkedKey) $("proKeyInput").value = deepLinkedKey' in app

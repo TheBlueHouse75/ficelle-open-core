@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ficelle.failures import REQUEST_REJECTION_STATUSES
 from ficelle.use_cases.capability_discovery import (
     MAX_VERDICT_STREAK,
     ROUTE_REJECTION_VERDICT,
@@ -497,6 +498,8 @@ class ProbeRegistry:
             if expected.lower() in text.lower():
                 return True, f"{test_type} ok"
             return False, f"expected {expected!r} in {test_type} answer, got {text[:80]!r}"
+        if test_type == "coding_compatibility":
+            return self._validate_coding_tool_call(payload)
         if test_type == "tool_call":
             return self._validate_tool_call(expected, payload)
         if test_type == "orchestration":
@@ -549,6 +552,24 @@ class ProbeRegistry:
                 return True, "tool call ok"
         return False, f"expected {want_tool} tool call with status={want_status!r} not found"
 
+    def _validate_coding_tool_call(self, payload: Any | None) -> tuple[bool, str]:
+        for call in extract_tool_calls(payload):
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            if function.get("name") != "ficelle_open_file":
+                continue
+            arguments = tool_call_arguments(call)
+            line = arguments.get("line")
+            if (
+                set(arguments) == {"path", "line", "status"}
+                and arguments.get("path") == "src/main.py"
+                and isinstance(line, int)
+                and not isinstance(line, bool)
+                and line == 12
+                and arguments.get("status") == "ready"
+            ):
+                return True, "coding tool call ok"
+        return False, "expected ficelle_open_file call with path='src/main.py', line=12, status='ready'"
+
     def _validate_orchestration(self, expected: str, payload: Any | None) -> tuple[bool, str]:
         parts = expected.split(":")
         want_tool = parts[0] if parts else ""
@@ -593,6 +614,8 @@ class BenchmarkProbeBuilder:
             return self._orchestrator_probe(profile_id)
         if canonical_profile_id == "ficelle/auto-tools":
             return self._tool_probe(profile_id)
+        if canonical_profile_id == "ficelle/auto-coding":
+            return self._coding_compatibility_probe(profile_id)
         if canonical_profile_id == "ficelle/auto-json":
             return self._json_probe(profile_id)
         if canonical_profile_id == "ficelle/auto-vision":
@@ -711,6 +734,48 @@ class BenchmarkProbeBuilder:
             },
             "orchestration",
             "route_task:summarize:A7",
+        )
+
+    @staticmethod
+    def _coding_compatibility_probe(profile_id: str) -> tuple[dict[str, Any], str, str]:
+        return (
+            {
+                "model": profile_id,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a coding assistant. Use the requested tool exactly once and do not answer in prose.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Open src/main.py at line 12 by calling ficelle_open_file with status ready.",
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "ficelle_open_file",
+                            "description": "Open a source file at a line.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "line": {"type": "integer"},
+                                    "status": {"type": "string", "enum": ["ready"]},
+                                },
+                                "required": ["path", "line", "status"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": "required",
+                "temperature": 0,
+                "max_tokens": 160,
+            },
+            "coding_compatibility",
+            "ficelle_open_file:ready",
         )
 
     @staticmethod
@@ -1184,6 +1249,13 @@ class BenchmarkRunner:
             "text_preview": self.safe_detail(response.text, 160),
         })
         self.record_benchmark_result(profile_id, model, result)
+        if (
+            result.get("test_type") == "coding_compatibility"
+            and response.status_code in REQUEST_REJECTION_STATUSES
+            and reason not in self.route_blocking_reasons
+        ):
+            self.record_verified_capability(profile_id, model, result)
+            self.record_capability_discrepancy(profile_id, model, False)
         return result
 
 
