@@ -53,9 +53,22 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
 
     function syncLongRunningActions() {
-      setButtonLoading($("benchmarkBtn"), benchmarkRunInFlight || serverBenchmarkRunning());
+      const button = $("benchmarkBtn");
+      setButtonLoading(button, benchmarkRunInFlight || serverBenchmarkRunning());
+      if (button && isCustomProfileId(activeProfile)) {
+        button.disabled = true;
+        button.title = "Custom models reuse their built-in base profile evidence.";
+      }
     }
 
+    function isCustomProfileId(profileId) { return !profileOrder.includes(profileId) && profileId !== fusionModelId; }
+    function profilePolicyId(profileId) { return draftProfiles?.[profileId]?.base_profile || profileId; }
+    function profileLabel(profileId) {
+      const profile = draftProfiles?.[profileId] || state?.virtual_profiles?.[profileId] || {};
+      return profileLabels[profileId] || [profile.label || profileId, profile.description || "Custom Pro routing policy."];
+    }
+    function customProfileIds() { return Object.keys(draftProfiles || {}).filter(isCustomProfileId).sort(); }
+    function customProfileLocked(profileId) { return (state?.locked_custom_profile_ids || []).includes(profileId); }
     const modelStats = (m) => state?.state?.stats?.[runtimeKey(m)] || null;
     function modelCooldown(m) { const c = state?.state?.cooldowns?.[runtimeKey(m)] || null; return c?.active ? c : null; }
     function providerCooldown(s) { const c = state?.state?.provider_cooldowns?.[s] || null; return c?.active ? c : null; }
@@ -92,8 +105,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     const providerStats = (s) => state?.state?.provider_stats?.[s] || null;
     const providerError = (s) => state?.state?.provider_errors?.[s] || null;
-    const modelBenchmark = (m) => state?.state?.benchmark_results?.[runtimeKey(m)]?.[activeProfile] || null;
-    const modelVerified = (m, p = activeProfile) => state?.state?.verified_capabilities?.[runtimeKey(m)]?.[p] || null;
+    const modelBenchmark = (m) => state?.state?.benchmark_results?.[runtimeKey(m)]?.[profilePolicyId(activeProfile)] || null;
+    const modelVerified = (m, p = activeProfile) => state?.state?.verified_capabilities?.[runtimeKey(m)]?.[profilePolicyId(p)] || null;
     const modelQuarantine = (m) => state?.state?.quarantine?.[runtimeKey(m)] || null;
     function modelFailedProfileEvidence(m, profileId = activeProfile) {
       const rows = state?.profiles?.[profileId]?.failed_profile_candidates || [];
@@ -113,7 +126,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     const incAny = (items, req) => { if (!(req || []).length) return true; const s = new Set((items || []).map(String)); return req.some((x) => s.has(String(x))); };
     // The context floor a requirement set actually enforces: its own value, else the router's
     // configured minimum. Shared so the gate and the note that explains it cannot disagree.
-    const minContextFloor = (req) => Number(req?.min_context || state?.config?.min_context_length || 131072);
+    const minContextFloor = (req) => Number(req?.min_context || state?.config?.min_context_length || 64000);
     function matchesReq(m, req) {
       req = req || {};
       if (Number(m.context_length || 0) < minContextFloor(req)) return false;
@@ -143,7 +156,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     function candidatePreview(profileId) {
       const profile = draftProfiles[profileId] || {};
       const excluded = new Set(excludedModelIds(profile));
-      const eligible = (state?.catalog?.models || []).filter((m) => m.invokable && !excluded.has(String(m.id)) && !modelQuarantine(m) && !modelCooldown(m) && !providerCooldown(m.source) && !modelQuotaCooldown(m) && matchesReq(m, profile.requirements || {}));
+      let eligible = (state?.catalog?.models || []).filter((m) => m.invokable && !excluded.has(String(m.id)) && !modelQuarantine(m) && !modelCooldown(m) && !providerCooldown(m.source) && !modelQuotaCooldown(m) && matchesReq(m, profile.requirements || {}));
+      if (profilePolicyId(profileId) === "ficelle/auto-coding") {
+        const policyIds = state?.profiles?.[profilePolicyId(profileId)]?.policy_candidate_ids;
+        if (!Array.isArray(policyIds)) return [];
+        const policyIdSet = new Set(policyIds.map(String));
+        eligible = eligible.filter((model) => policyIdSet.has(String(model.id)));
+      }
       if (profile.mode !== "manual_order") return sortByScore(profileId, eligible);
       const byId = new Map(eligible.map((m) => [m.id, m])); const head = []; const seen = new Set();
       for (const id of profile.models || []) { const m = byId.get(id); if (!m || seen.has(m.id)) continue; head.push(m); seen.add(m.id); }
@@ -152,20 +171,25 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     const candidateOrigin = (profile, m) => profile.mode !== "manual_order" ? "auto" : ((profile.models || []).includes(m.id) ? "manual" : "auto-fill");
     const eligibleCount = (profileId) => candidatePreview(profileId).length;
-    function defaultReq() { return { free: true, tools: true, min_context: state?.config?.min_context_length || 131072, structured: null, input_modalities: [], input_modalities_any: [], output_modalities: [], output_modalities_any: [], supported_parameters: [], supported_parameters_any: [] }; }
+    function defaultReq() { return { free: true, tools: true, min_context: state?.config?.min_context_length || 64000, structured: null, input_modalities: [], input_modalities_any: [], output_modalities: [], output_modalities_any: [], supported_parameters: [], supported_parameters_any: [] }; }
     const currentProfile = () => draftProfiles[activeProfile] || { mode: "auto", models: [], excluded_models: [], auto_tail: true, requirements: defaultReq() };
     const uniqueStrings = (items) => Array.from(new Set((items || []).map(String).filter(Boolean)));
     const excludedModelIds = (profile = currentProfile()) => uniqueStrings(profile.excluded_models || []);
     const isExcludedFromProfile = (id, profile = currentProfile()) => excludedModelIds(profile).includes(String(id));
     function setProfile(next) {
+      if (customProfileLocked(activeProfile)) {
+        showToast("This custom model is locked until Ficelle Pro is active.", "warn", { label: "Open License", onClick: () => setView("license") });
+        return false;
+      }
       const cur = currentProfile();
       const req = { ...defaultReq(), ...(cur.requirements || {}), ...(next?.requirements || {}) };
       req.free = true; req.tools = true;
-      req.min_context = Math.max(Number(state?.config?.min_context_length || 131072), Number(req.min_context || 131072));
+      req.min_context = Math.max(Number(state?.config?.min_context_length || 64000), Number(req.min_context || 64000));
       const models = uniqueStrings(next?.models || cur.models);
       const excluded = uniqueStrings(next?.excluded_models || cur.excluded_models);
       draftProfiles[activeProfile] = { ...cur, ...next, models, excluded_models: excluded, requirements: req };
       render();
+      return true;
     }
 
     /* ---------- unsaved-draft tracking ----------
@@ -179,7 +203,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     function canonicalProfile(profile) {
       const req = { ...defaultReq(), ...(profile?.requirements || {}) };
       req.free = true; req.tools = true;
-      req.min_context = Math.max(Number(state?.config?.min_context_length || 131072), Number(req.min_context || 131072));
+      req.min_context = Math.max(Number(state?.config?.min_context_length || 64000), Number(req.min_context || 64000));
       return JSON.stringify({
         // Anything that is not manual_order routes as auto — treat it as auto here too.
         mode: profile?.mode === "manual_order" ? "manual_order" : "auto",
@@ -188,6 +212,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         // Absent means on, matching the auto_tail === false test in candidate ranking.
         auto_tail: profile?.auto_tail !== false,
         requirements: Object.keys(req).sort().reduce((out, key) => { out[key] = req[key]; return out; }, {}),
+        label: profile?.label || "",
+        description: profile?.description || "",
+        base_profile: profile?.base_profile || "",
       });
     }
     function unsavedProfileIds() {
@@ -233,10 +260,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         showToast("Already excluded from this virtual model.");
         return;
       }
-      setProfile({
+      if (!setProfile({
         models: (p.models || []).filter((x) => x !== id),
         excluded_models: [...excludedModels, id],
-      });
+      })) return;
       saveProfiles("Model excluded from this virtual model.");
     }
     function restoreModel(id) {
@@ -246,7 +273,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         showToast("Model is not excluded from this virtual model.");
         return;
       }
-      setProfile({ excluded_models: excludedModels.filter((x) => x !== id) });
+      if (!setProfile({ excluded_models: excludedModels.filter((x) => x !== id) })) return;
       saveProfiles("Model restored to this virtual model.");
     }
     function moveModel(id, off) { const p = currentProfile(); const a = [...p.models]; const i = a.indexOf(id); const j = i + off; if (i < 0 || j < 0 || j >= a.length) return; a.splice(i, 1); a.splice(j, 0, id); setProfile({ models: a }); }
@@ -454,12 +481,50 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       latency: '<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/>',
     };
 
+    // One product vocabulary for every core-only Pro gate. Providers, Fusion, Compression,
+    // custom virtual models,
+    // and the central upgrade hub all draw from this list so the promise cannot drift between
+    // four separate bits of upsell copy.
+    const PRO_FEATURES = [
+      {
+        id: "providers",
+        title: "Maintained provider pack",
+        gateTitle: "Unlock more providers",
+        description: "Broaden your free-model pool with providers Ficelle keeps current as endpoints, terms, and quotas change.",
+        icon: ICONS.providers,
+      },
+      {
+        id: "fusion",
+        title: "Model Fusion",
+        gateTitle: "Unlock Fusion",
+        description: "Compare several eligible models, judge their answers, and synthesize one stronger response.",
+        icon: ICONS.fusion,
+      },
+      {
+        id: "compression",
+        title: "Native compression",
+        gateTitle: "Unlock native compression",
+        description: "Reduce context pressure while keeping local controls for storage, retrieval, and observability.",
+        icon: ICONS.compression,
+      },
+      {
+        id: "custom-models",
+        title: "Custom virtual models",
+        gateTitle: "Unlock custom virtual models",
+        description: "Create stable model IDs from Ficelle routing policies, then export them to Hermes, OpenClaw, or generic clients.",
+        icon: ICONS.profiles,
+      },
+    ];
+    const proFeature = (id) => PRO_FEATURES.find((feature) => feature.id === id);
+
     function modelCard(m, ctx, index) {
       const id = m.id;
       const expanded = expandedModels.has(id);
+      const lockedProfile = customProfileLocked(activeProfile);
+      const customProfile = isCustomProfileId(activeProfile);
       const blocked = !!(modelQuarantine(m) || (ctx === "available" && (modelCooldown(m) || providerCooldown(m.source) || modelQuotaCooldown(m) || !m.invokable)));
       const profileExcluded = isExcludedFromProfile(id);
-      const grip = ctx === "selected"
+      const grip = ctx === "selected" && !lockedProfile
         ? '<div class="mcard-grip" title="Drag to reorder"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></div>'
         : '<div class="mcard-grip"><span class="mcard-rank">' + (index != null && index >= 0 ? Number(index) + 1 : "") + "</span></div>";
       const rankPrefix = ctx === "selected" ? '<span class="mcard-rank">' + (Number(index) + 1) + "</span>" : "";
@@ -471,11 +536,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const ctxLabel = formatContext(m.context_length) + " context" + (m.context_length_source === "default" ? " (unconfirmed)" : "");
       const subParts = [esc(providerLabel(m.source)), ...versionSub, ctxLabel, freeModeLabel(fa.mode)];
       let actions = "";
-      if (ctx === "selected") {
+      const benchmarkAction = customProfile ? "" : iconBtn("benchmark", id, "Benchmark this model", ICONS.retest);
+      if (lockedProfile) {
+        actions = "";
+      } else if (ctx === "selected") {
         actions =
           iconBtn("up", id, "Move up", ICONS.arrowUp) +
           iconBtn("down", id, "Move down", ICONS.arrowDown) +
-          iconBtn("benchmark", id, "Benchmark this model", ICONS.retest) +
+          benchmarkAction +
           (modelCooldown(m) ? iconBtn("clearcd", id, "Resume now", ICONS.resume) : "") +
           (modelQuarantine(m) ? iconBtn("unquar", id, "Re-enable", ICONS.restore) : iconBtn("quar", id, "Disable", ICONS.disable)) +
           iconBtn("exclude", id, "Exclude from this virtual model", ICONS.exclude) +
@@ -485,7 +553,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       } else {
         const disabled = blocked || currentProfile().models.includes(id);
         actions =
-          iconBtn("benchmark", id, "Benchmark this model", ICONS.retest) +
+          benchmarkAction +
           (modelCooldown(m) ? iconBtn("clearcd", id, "Resume now", ICONS.resume) : "") +
           (modelQuarantine(m) ? iconBtn("unquar", id, "Re-enable", ICONS.restore) : iconBtn("quar", id, "Disable", ICONS.disable)) +
           (profileExcluded
@@ -494,7 +562,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
               '<button class="iconbtn add" type="button" data-act="add" data-id="' + esc(id) + '" title="Add to virtual model" ' + (disabled ? "disabled" : "") + '><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>');
       }
       return (
-        '<article class="mcard ' + (ctx === "available" || ctx === "excluded" ? "no-grip " : "") + (blocked ? "is-blocked " : "") + (profileExcluded ? "is-excluded " : "") + (expanded ? "is-expanded" : "") + '"' + (ctx === "selected" || ctx === "available" ? ' draggable="true"' : "") + ' data-model="' + esc(id) + '" data-ctx="' + ctx + '">' +
+        '<article class="mcard ' + (ctx === "available" || ctx === "excluded" ? "no-grip " : "") + (blocked ? "is-blocked " : "") + (profileExcluded ? "is-excluded " : "") + (expanded ? "is-expanded" : "") + '"' + (!lockedProfile && (ctx === "selected" || ctx === "available") ? ' draggable="true"' : "") + ' data-model="' + esc(id) + '" data-ctx="' + ctx + '">' +
           '<div class="mcard-top">' +
             grip +
             '<button class="mcard-id" type="button" data-act="toggle" data-id="' + esc(id) + '" style="border:0;background:none;text-align:left;cursor:pointer;padding:0">' +
@@ -532,6 +600,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       });
     }
     function bindDrag(root, ctx) {
+      if (customProfileLocked(activeProfile)) return;
       root.querySelectorAll('[data-model]').forEach((row) => {
         row.addEventListener("dragstart", (e) => { setDragged({ source: ctx, id: row.dataset.model }); row.classList.add("dragging"); e.dataTransfer.effectAllowed = ctx === "selected" ? "move" : "copy"; e.dataTransfer.setData("text/plain", JSON.stringify(dragged)); });
         row.addEventListener("dragend", () => row.classList.remove("dragging"));
@@ -612,18 +681,23 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
 
     function renderProfileList() {
-      const profileCards = profileOrder.map((pid) => {
-        const lab = profileLabels[pid] || [pid, ""];
-        const elig = eligibleCount(pid);
+      const renderCard = (pid) => {
+        const lab = profileLabel(pid);
+        const locked = customProfileLocked(pid);
+        const elig = locked ? 0 : eligibleCount(pid);
         const manual = (draftProfiles[pid] || {}).mode === "manual_order";
         const modeTag = manual ? '<span class="badge info">Manual</span>' : '<span class="badge">Auto</span>';
-        return '<button class="profile-tab ' + (pid === activeProfile ? "active" : "") + '" type="button" data-profile="' + esc(pid) + '">' +
+        const proTag = isCustomProfileId(pid) ? '<span class="badge ' + (locked ? "warn" : "accent") + '">' + (locked ? "Locked" : "Pro") + '</span>' : "";
+        return '<button class="profile-tab ' + (pid === activeProfile ? "active " : "") + (locked ? "is-locked" : "") + '" type="button" data-profile="' + esc(pid) + '">' +
           '<span class="pt-name">' + esc(lab[0]) + '</span>' +
-          '<span class="pt-counts">' + modeTag + '<span class="badge accent">' + elig + " usable</span></span>" +
+          '<span class="pt-counts">' + modeTag + proTag + '<span class="badge accent">' + elig + " usable</span></span>" +
           '<span class="pt-id">' + esc(pid) + '</span>' +
           '<span class="pt-meta">' + esc(lab[1]) + "</span>" +
           "</button>";
-      });
+      };
+      const profileCards = profileOrder.map(renderCard);
+      const customIds = customProfileIds();
+      if (customIds.length) profileCards.push('<div class="profile-group-label">Custom · Pro</div>', ...customIds.map(renderCard));
       if (draftFusion?.enabled && draftFusion?.visible_in_models) {
         const obs = state?.fusion?.observability || {};
         const readiness = obs.readiness || "ready";
@@ -643,11 +717,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
 
     function renderActiveProfile() {
-      const lab = profileLabels[activeProfile] || [activeProfile, ""];
+      const lab = profileLabel(activeProfile);
       const p = currentProfile();
+      const custom = isCustomProfileId(activeProfile);
+      const locked = customProfileLocked(activeProfile);
       $("activeProfileName").textContent = lab[0];
       $("activeProfileId").textContent = activeProfile;
-      $("eligibleBadge").textContent = eligibleCount(activeProfile) + " usable";
+      $("eligibleBadge").textContent = locked ? "Locked" : eligibleCount(activeProfile) + " usable";
       const manual = p.mode === "manual_order";
       const full = candidatePreview(activeProfile);
       const preview = full.slice(0, 4);
@@ -672,6 +748,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const headingColor = unsaved ? "var(--warn)" : "var(--text-soft)";
       $("profileHint").innerHTML = "<b>" + esc(lab[0]) + ".</b> " + esc(profilePresets[activeProfile] || "") +
         '<div class="hint-preview"><span style="color:' + headingColor + ';font-weight:600">' + esc(heading) + "</span>" + previewHtml + "</div>";
+      if (custom) {
+        const base = profileLabel(p.base_profile || "ficelle/auto-orchestrator")[0];
+        $("profileHint").innerHTML = '<b>' + esc(lab[0]) + '.</b> ' + esc(lab[1]) +
+          '<div class="hint-preview"><span>Built from <code>' + esc(base) + '</code>. It inherits that policy\'s capability evidence and timeout.</span>' +
+          (locked ? '<div class="empty" style="text-align:left;margin-top:8px"><strong>Locked.</strong> This ID is preserved, but it is not listed, exported, or routed until Pro is active.</div>' : previewHtml) + '</div>';
+      }
       $("autoModeBtn").classList.toggle("active", p.mode !== "manual_order");
       $("manualModeBtn").classList.toggle("active", p.mode === "manual_order");
       $("autoTailToggle").checked = Boolean(p.auto_tail);
@@ -679,6 +761,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("autoNote").style.display = manual ? "none" : "flex";
       $("autoTailWrap").style.display = manual ? "" : "none";
       $("clearProfileBtn").style.display = manual ? "" : "none";
+      $("customProfileActions").hidden = !custom;
+      ["editCustomProfileBtn", "duplicateCustomProfileBtn"].forEach((id) => { $(id).disabled = locked; });
+      ["autoModeBtn", "manualModeBtn", "autoTailToggle", "clearProfileBtn"].forEach((id) => { $(id).disabled = locked; });
     }
 
     function renderSelected() {
@@ -688,14 +773,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       else {
         list.innerHTML = selectedIds.map((id, i) => {
           const m = models.get(id);
-          if (!m) { const s = staleModelNotice(id); return '<article class="mcard no-grip is-blocked" data-model="' + esc(id) + '" data-ctx="selected"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">' + esc(s.name) + '</div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-right"><span class="badge ' + s.badge + ' mcard-status" title="' + esc(s.title) + '">' + esc(s.label) + '</span><div class="mcard-actions"><button class="iconbtn danger" data-act="remove" data-id="' + esc(id) + '" title="Remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></button></div></div></div></article>'; }
+          if (!m) { const s = staleModelNotice(id); const action = customProfileLocked(activeProfile) ? "" : '<button class="iconbtn danger" data-act="remove" data-id="' + esc(id) + '" title="Remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></button>'; return '<article class="mcard no-grip is-blocked" data-model="' + esc(id) + '" data-ctx="selected"><div class="mcard-top"><div class="mcard-grip"><span class="mcard-rank">' + (i + 1) + '</span></div><div class="mcard-id"><div class="mcard-name">' + esc(s.name) + '</div><div class="mcard-sub mono">' + esc(id) + '</div></div><div class="mcard-right"><span class="badge ' + s.badge + ' mcard-status" title="' + esc(s.title) + '">' + esc(s.label) + '</span><div class="mcard-actions">' + action + '</div></div></div></article>'; }
           return modelCard(m, "selected", i);
         }).join("");
       }
       bindModelCard(list); bindDrag(list, "selected");
-      list.ondragover = (e) => { e.preventDefault(); list.classList.add("drop-active"); };
+      list.ondragover = customProfileLocked(activeProfile) ? null : (e) => { e.preventDefault(); list.classList.add("drop-active"); };
       list.ondragleave = () => list.classList.remove("drop-active");
-      list.ondrop = (e) => { e.preventDefault(); list.classList.remove("drop-active"); const pl = readDrag(e); if (!pl?.id) return; if (pl.source === "available") addModel(pl.id); else reorderModel(pl.id, null); };
+      list.ondrop = customProfileLocked(activeProfile) ? null : (e) => { e.preventDefault(); list.classList.remove("drop-active"); const pl = readDrag(e); if (!pl?.id) return; if (pl.source === "available") addModel(pl.id); else reorderModel(pl.id, null); };
     }
 
     function renderExcluded() {
@@ -747,7 +832,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const req = currentProfile().requirements || {};
       const blocked = catalogArrivals().filter((m) => !matchesReq(m, req));
       if (!blocked.length) return;
-      const lane = profileLabels[activeProfile]?.[0] || activeProfile;
+      const lane = profileLabel(activeProfile)[0];
       const why = blockingRequirementNames(blocked, req);
       const one = blocked.length === 1;
       note.hidden = false;
@@ -807,7 +892,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (!modelFilters.newOnly) return generic;
       const arrivals = catalogArrivals();
       if (!arrivals.length || arrivals.some((m) => matchesReq(m, currentProfile().requirements || {}))) return generic;
-      const lane = profileLabels[activeProfile]?.[0] || activeProfile;
+      const lane = profileLabel(activeProfile)[0];
       const count = arrivals.length;
       return "None of the " + count + " new model" + (count === 1 ? "" : "s") + " meet " + lanePossessive(lane) + " requirements. " +
         ARRIVALS_WAY_OUT.charAt(0).toUpperCase() + ARRIVALS_WAY_OUT.slice(1);
@@ -866,7 +951,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     let openFilter = null;
 
     function contextTiers() {
-      const floor = Number(state?.config?.min_context_length || 131072);
+      const floor = Number(state?.config?.min_context_length || 64000);
       const tiers = [[0, "Any context"]];
       for (const t of [256000, 512000, 1000000]) if (t > floor) tiers.push([t, "≥ " + formatContext(t)]);
       return tiers;
@@ -1070,14 +1155,15 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const listEl = $("providerList"), detailEl = $("providerDetail");
       if (!listEl || !detailEl) return;
       renderProviderStats(keys, provs);
+      if (keys.length && (!selectedProvider || !keys.includes(selectedProvider))) setSelectedProvider(keys[0]);
+      listEl.innerHTML = keys.map((src) => providerListItemHTML(src, provs[src] || {})).join("")
+        + (state?.pro_installed ? "" : providerProCtaHTML());
+      bindProGateActions(listEl);
       if (!keys.length) {
-        listEl.innerHTML = "";
         detailEl.innerHTML = '<div class="empty">No providers configured.</div>';
         return;
       }
-      if (!selectedProvider || !keys.includes(selectedProvider)) setSelectedProvider(keys[0]);
       if (selectedProvider !== providerModelFilter.src) { providerModelFilter.q = ""; providerModelFilter.src = selectedProvider; }
-      listEl.innerHTML = keys.map((src) => providerListItemHTML(src, provs[src] || {})).join("");
       listEl.querySelectorAll("[data-prov]").forEach((b) => b.addEventListener("click", () => {
         if (b.dataset.prov === selectedProvider) return;
         setSelectedProvider(b.dataset.prov);
@@ -1182,6 +1268,15 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           '<span class="pli-sub"><span class="pli-dot ' + (STATUS_DOT_TONE[s.state] || "warn") + '"></span>' + esc(s.label) + "</span></span>" +
         '<span class="pli-count mono" title="usable / total returned">' + accepted + '<span class="pli-sep">/</span>' + raw + "</span>" +
       "</button>";
+    }
+
+    function providerProCtaHTML() {
+      const feature = proFeature("providers");
+      return '<button type="button" class="prov-pro-cta" data-open-pro>'
+        + '<span class="pro-cta-icon">' + ic(feature.icon) + "</span>"
+        + '<span class="pro-cta-copy"><span class="pro-cta-title">' + esc(feature.gateTitle) + '</span><span class="pro-cta-sub">Maintained provider coverage with Ficelle Pro</span></span>'
+        + '<span class="pro-cta-arrow" aria-hidden="true">→</span>'
+        + "</button>";
     }
 
     // Full per-provider detail: the exact card body that used to live in the tile grid, now
@@ -1351,7 +1446,24 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        body + "</section>";
 	    }
 	    // Fusion run-detail/panel helpers moved to the closed-pack module (pro-views.js).
-	    function renderFusion() { proViews.renderFusion?.(proApi); }
+	    function renderFusion() {
+	      if (proViews.renderFusion) { proViews.renderFusion(proApi); return; }
+	      renderCoreFeatureGate("view-fusion", "fusion");
+	    }
+	    function renderCoreFeatureGate(viewId, featureId) {
+	      const view = $(viewId);
+	      const feature = proFeature(featureId);
+	      if (!view || !feature) return;
+	      view.innerHTML = '<div class="card pro-gate-card"><div class="card-body">'
+	        + '<span class="pro-kicker">Ficelle Pro</span><h2>' + esc(feature.gateTitle) + "</h2>"
+	        + "<p>" + esc(feature.description) + "</p>"
+	        + '<button class="btn primary" type="button" data-open-pro>Explore Ficelle Pro</button>'
+	        + "</div></div>";
+	      bindProGateActions(view);
+	    }
+	    function bindProGateActions(root) {
+	      root.querySelectorAll("[data-open-pro]").forEach((button) => button.addEventListener("click", () => setView("license")));
+	    }
 	    // License view: the full activate/refresh/deactivate page lives in the closed-pack module
 	    // (pro-views.js) when the pack is present; core-only shows the in-app unlock form below.
 	    function renderLicense() {
@@ -1365,18 +1477,25 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	    function renderCoreLicenseInstall() {
 	      const view = $("view-license");
 	      if (!view || $("unlockProBtn")) return;
-	      view.innerHTML =
-	        '<div class="card"><div class="card-head"><div>' +
-	          "<h2>Unlock Ficelle Pro</h2>" +
-	          '<div class="ch-sub">Enter your license key — Ficelle installs and activates Pro on this machine, no terminal needed.</div>' +
-	        "</div></div><div class=\"card-body\">" +
-	          '<div class="page-actions">' +
-	            '<input type="text" class="key-input" id="proKeyInput" placeholder="Enter your license key" autocomplete="off" spellcheck="false" />' +
-	            '<button class="btn primary" type="button" id="unlockProBtn">Unlock Pro</button>' +
-	          "</div>" +
-	          '<div class="ch-sub" id="proInstallProgress" style="margin-top:12px"></div>' +
-	          '<p class="ch-sub" style="margin-top:14px">No key yet? <a href="https://ficelle.ai" target="_blank" rel="noopener">Get Ficelle Pro</a>.</p>' +
-	        "</div></div>";
+	      const featureCards = PRO_FEATURES.map((feature) =>
+	        '<article class="card pro-feature-card"><span class="pro-feature-icon">' + ic(feature.icon) + "</span>"
+	          + "<h3>" + esc(feature.title) + "</h3><p>" + esc(feature.description) + "</p></article>"
+	      ).join("");
+	      view.innerHTML = '<div class="pro-hub">'
+	        + '<section class="card pro-hub-hero"><div class="pro-hub-copy"><span class="pro-kicker">Ficelle Pro</span>'
+	          + "<h2>Keep more free-model capacity working</h2>"
+          + "<p>Add the maintained provider pack, Fusion, native compression, and custom virtual models to the router you already run. Your local endpoint, provider keys, and configuration stay in place.</p>"
+	          + '<div class="pro-hub-actions"><a class="btn primary" href="https://ficelle.ai/#pricing" target="_blank" rel="noopener">See Ficelle Pro plans' + ic(ICONS.external) + "</a>"
+	          + '<span class="pro-hub-note">The routing core stays free. Pro adds the maintained layer.</span></div>'
+	        + "</div></section>"
+	        + '<section class="pro-feature-grid" aria-label="Ficelle Pro features">' + featureCards + "</section>"
+	        + '<section class="card pro-activation"><div class="card-head"><div><h2>Already have a license key?</h2>'
+	          + '<div class="ch-sub">Paste it here. Ficelle installs and activates Pro on this machine, with no terminal and no core reinstall.</div></div></div>'
+	          + '<div class="card-body"><div class="pro-activation-form">'
+	            + '<input type="text" class="key-input" id="proKeyInput" aria-label="Ficelle Pro license key" placeholder="Enter your license key" autocomplete="off" spellcheck="false" />'
+	            + '<button class="btn primary" type="button" id="unlockProBtn">Unlock Pro</button>'
+	          + '</div><div class="ch-sub" id="proInstallProgress" style="margin-top:12px" aria-live="polite"></div></div>'
+	        + "</section></div>";
 	      $("unlockProBtn").addEventListener("click", unlockPro);
 	      if (deepLinkedKey) $("proKeyInput").value = deepLinkedKey;
 	    }
@@ -1621,7 +1740,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	    // Compression views (renderCompression + its dashboard/retrieval/metric helpers) live in the
 	    // closed-pack module (pro-views.js); only renderCompression is called from the core render() cycle.
 	    // currentCompressionObservability stays here because the Health view also reads it.
-	    function renderCompression() { proViews.renderCompression?.(proApi); }
+	    function renderCompression() {
+	      if (proViews.renderCompression) { proViews.renderCompression(proApi); return; }
+	      renderCoreFeatureGate("view-compression", "compression");
+	    }
 	    function currentCompressionObservability() {
 	      const obs = compressionPayload?.observability;
 	      return obs && Object.keys(obs).length ? obs : (state?.compression || {});
@@ -1675,7 +1797,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       Object.entries(rt.quarantine || {}).forEach(([key, r]) => guards.push({ title: r.upstream_id || key.split("::")[1] || key, meta: (r.note || r.reason || "disabled") + " - " + timeAgo(r.set_at).label, kind: "danger" }));
       Object.entries(rt.provider_disabled || {}).forEach(([key, r]) => guards.push({ title: providerLabel(key) + " (provider)", meta: "Manually disabled - " + timeAgo(r.set_at).label, detail: "Held out of routing by an operator until re-enabled.", kind: "danger", enableProvider: key }));
       Object.entries(state?.profiles || {}).forEach(([profileId, profile]) => {
-        const label = profileLabels[profileId]?.[0] || profileId;
+        const label = profileLabel(profileId)[0];
         (profile?.failed_profile_candidates || []).forEach((row) => {
           const reason = row.reason || "failed_capability_check";
           guards.push({
@@ -1717,10 +1839,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     function renderPerformance() {
       const hist = state.performance_history || {};
-      const rows = profileOrder.map((p) => hist[p]).filter(Boolean);
+      const rows = [...profileOrder, ...customProfileIds()].map((p) => hist[p]).filter(Boolean);
       if (!rows.length) { $("perfList").innerHTML = '<div class="empty">No traffic yet. Route a request or run a benchmark to see history here.</div>'; return; }
       $("perfList").innerHTML = rows.map((row) => {
-        const lab = profileLabels[row.profile_id] || [row.profile_id, ""];
+        const lab = profileLabel(row.profile_id);
         const routeMeta = row.last_route_seen_at ? esc(row.last_route_upstream || row.last_route_reason || "unknown") + " &middot; " + Number(row.last_route_latency_seconds || 0).toFixed(2) + "s &middot; " + timeAgo(row.last_route_seen_at).label : "no request routed yet";
         const fb = (row.fallback_reasons || []).length ? row.fallback_reasons.map((x) => esc(x.upstream || x.model || "unknown") + ": " + esc(x.reason || x.status || "failed")).join(", ") : "none";
         const models = (row.models || []).map((m) => {
@@ -2191,7 +2313,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const f = requestFilters;
       const sources = (requestsSummary?.by_source || []).map((r) => r.source).filter(Boolean);
       if (f.source && !sources.includes(f.source)) sources.push(f.source);
-      const profileOpts = '<option value="">All virtual models</option>' + [...profileOrder, fusionModelId].map((p) => reqOption(p, (profileLabels[p]?.[0] || p), f.profile)).join("");
+      const profileOpts = '<option value="">All virtual models</option>' + [...profileOrder, ...customProfileIds(), fusionModelId].map((p) => reqOption(p, profileLabel(p)[0], f.profile)).join("");
       const sourceOpts = '<option value="">All providers</option>' + sources.map((s) => reqOption(s, providerLabel(s), f.source)).join("");
       const reasons = (requestsSummary?.by_reason || []).map((r) => r.reason).filter(Boolean);
       if (f.reason && !reasons.includes(f.reason)) reasons.push(f.reason);
@@ -2305,6 +2427,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      set("compression", compressionPayload?.event_count || (compressionPayload?.events || []).length || 0);
 	      set("health", guardCount);
 	      set("audit", auditEntries.length);
+      const licenseNavText = $("licenseNavText");
+      if (licenseNavText) licenseNavText.textContent = state?.pro_installed ? "License" : "Ficelle Pro";
       // rail health
       const canary = rt.canary || {};
       const healthy = canary.status === "pass" && !guardCount;
@@ -2351,9 +2475,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (!notice || readDismissed(PAID_MODEL_NOTICE_KEY) === notice.id) return;
       const provider = providerLabel(notice.provider);
       banner.hidden = false;
-      banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle blocked a paid model</div>' +
+      banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle blocked a provider route</div>' +
         '<div class="update-detail"><span class="mono">' + esc(notice.upstream_id) + "</span> &mdash; " + esc(provider) +
-        " reported that this model now requires paid access. Ficelle removed it from routing and did not pause the rest of " + esc(provider) +
+        " rejected Ficelle's request as paid or billable. Ficelle quarantined only this provider route; it did not pause other providers or the rest of " + esc(provider) +
         "." + (notice.set_at ? " " + esc(timeAgo(notice.set_at).label) + "." : "") + "</div></div>" +
         '<div class="update-actions"><button class="btn sm" type="button" id="paidModelReviewBtn">Review guard</button>' +
         '<button class="btn ghost sm" type="button" id="paidModelDismissBtn">Got it</button></div>';
@@ -2365,7 +2489,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (!notice || shownPaidModelToast === notice.id || readDismissed(PAID_MODEL_TOAST_KEY) === notice.id) return;
       shownPaidModelToast = notice.id;
       writeDismissed(PAID_MODEL_TOAST_KEY, notice.id);
-      showToast("Ficelle removed " + notice.upstream_id + " from routing because " + providerLabel(notice.provider) + " now requires paid access for it.", "error", {
+      showToast("Ficelle quarantined the " + providerLabel(notice.provider) + " route for " + notice.upstream_id + " after a paid or billable response.", "error", {
         label: "Review",
         onClick: () => reviewPaidModelNotice(notice),
       });
@@ -2386,7 +2510,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const where = lanes.length ? " from " + esc(lanes.join(", ")) : "";
       // The lane to open: the first pruned one the config still knows about. A profile that
       // has since disappeared would leave the Routing view on an id nothing renders.
-      const target = (prune.profiles || []).find((pid) => profileOrder.includes(pid));
+      const target = (prune.profiles || []).find((pid) => Object.prototype.hasOwnProperty.call(draftProfiles, pid));
       banner.hidden = false;
       banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle removed ' + what + where + '</div>' +
         '<div class="update-detail">' + esc(models.join(", ")) + " &mdash; no longer offered for free by " + esc(providers.join(", ") || "their provider") +
@@ -2408,11 +2532,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("pruneDismissBtn").addEventListener("click", () => { writeDismissed(PRUNE_NOTICE_KEY, prune.audit_id); banner.hidden = true; });
     }
 
-    const catalogAdditions = () => state?.state?.catalog_additions || {};
+    // Notices carries the current, quarantine-filtered projection. Fall back to the full-state
+    // row for compatibility with a daemon that has not restarted onto this asset version yet.
+    const catalogAdditions = () => state?.notices?.catalog_additions || state?.state?.catalog_additions || {};
     // Read once per card in capChips, so it is memoised on the payload array itself — a new
     // /admin/state response brings a new array and invalidates it on its own.
     let newModelIdCache = { source: undefined, ids: new Set() };
-    function newModelIds() {
+    function recordedNewModelIds() {
       const models = catalogAdditions().models;
       if (newModelIdCache.source !== models) newModelIdCache = { source: models, ids: new Set(models) };
       return newModelIdCache.ids;
@@ -2422,9 +2548,17 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     // to show — everything the filter bar states has to be measured against this, not the
     // raw record, or the chip promises rows that cannot appear.
     function catalogArrivals() {
-      const fresh = newModelIds();
-      return fresh.size ? (state.catalog?.models || []).filter((m) => fresh.has(m.id)) : [];
+      const fresh = recordedNewModelIds();
+      // New daemons have already applied the complete quarantine to `catalog_additions`.
+      // This local check only preserves the best available behaviour during a mixed-version
+      // restart, when the older notices payload still exposes its capped detail list.
+      const blockedModels = new Set((state?.notices?.paid_models || []).map((notice) => notice.model_id));
+      const current = new Map((state.catalog?.models || []).map((model) => [model.id, model]));
+      return [...fresh]
+        .map((id) => current.get(id))
+        .filter((model) => model && !blockedModels.has(model.id));
     }
+    const newModelIds = () => new Set(catalogArrivals().map((model) => model.id));
     // How many ids the banner spells out before falling back to a count. Enough to recognise
     // what arrived, short enough to stay one sentence.
     const ADDITIONS_PREVIEW = 4;
@@ -2435,11 +2569,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       // The mirror of the prune banner, and the reason the feature exists: providers open free
       // models regularly, and without this the only way to find out is to go looking.
       const additions = catalogAdditions();
-      const models = additions.models || [];
-      const count = additions.count || models.length;
+      const arrivals = catalogArrivals();
+      const models = arrivals.map((model) => model.id);
+      const count = Number.isInteger(additions.count) ? additions.count : models.length;
       if (!additions.at || !count || readDismissed(ADDITIONS_NOTICE_KEY) === additions.at) return;
-      const providers = (additions.sources || []).map((src) => providerLabel(src));
-      const what = count === 1 ? "1 new free model" : count + " new free models";
+      const providers = (additions.sources || []).map((source) => providerLabel(source));
+      const what = count === 1 ? "1 new free route" : count + " new free routes";
       const where = providers.length ? " at " + esc(providers.join(", ")) : "";
       // The payload is newest first, so a truncated preview still names what just arrived.
       const shown = models.slice(0, ADDITIONS_PREVIEW);
@@ -2447,7 +2582,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       banner.hidden = false;
       banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle found ' + what + where + '</div>' +
         '<div class="update-detail">' + esc(shown.join(", ")) + (rest > 0 ? " and " + rest + " more" : "") +
-        " &mdash; newly offered for free, so " + (count === 1 ? "it is" : "they are") + " available to add to a virtual model. " +
+        " &mdash; currently advertised as free by " + (count === 1 ? "its provider" : "their providers") +
+        ", so " + (count === 1 ? "it is" : "they are") + " available to add. Runtime guards keep verifying access. " +
         esc(timeAgo(additions.at).label) + ".</div></div>" +
         '<div class="update-actions"><button class="btn sm" type="button" id="additionsSeeBtn" title="Show only these models in the available list.">See them</button>' +
         '<button class="btn ghost sm" type="button" id="additionsDismissBtn">Got it</button></div>';
@@ -2523,6 +2659,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         if (!r.ok) return;
         state.notices = await r.json();
         renderPaidModelBanner();
+        renderNewModelsBanner();
         maybeShowPaidModelToast();
         if (resyncCatalog) void resyncIfCatalogRepublished(state.notices.catalog);
       } catch (_) {
@@ -2732,6 +2869,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      audit: { eyebrow: "Observe", title: "Audit", desc: "Every local change, newest first. Virtual model saves can be undone." },
       export: { eyebrow: "Ship it", title: "Export", desc: "Generate a generic OpenAI-compatible client configuration. No provider secrets included." }
     };
+    const proUpgradeMeta = { eyebrow: "Upgrade", title: "Ficelle Pro", desc: "Add the maintained provider pack, Fusion, and native compression to this installation." };
     function setView(name) {
       name = String(name).split("?")[0];  // tolerate a deep-link query, e.g. #/license?key=…
       if (!viewMeta[name]) name = "routing";
@@ -2739,7 +2877,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.dataset.view === name));
       document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.nav === name));
       document.body.classList.toggle("routing-fixed", name === "routing");
-      const m = viewMeta[name];
+      const m = name === "license" && !state?.pro_installed ? proUpgradeMeta : viewMeta[name];
       $("viewEyebrow").textContent = m.eyebrow; $("viewTitle").textContent = m.title; $("viewDesc").textContent = m.desc;
       $("viewActions").innerHTML = viewActions(name);
       bindViewActions(name);
@@ -2786,7 +2924,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
 
     /* ---------- data + actions ---------- */
-	    async function loadState() {
+	    async function loadState(preserveUnrelatedDrafts = false) {
 	      // Only this fetch can say "the daemon is not up yet"; everything below runs after it
 	      // answered. bootstrapState reads `bootRetryable` rather than sniffing the error type,
 	      // because a TypeError thrown by loadAudit or render() would otherwise be mistaken for
@@ -2799,10 +2937,17 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        err.status = r.status; err.bootRetryable = r.status >= 500;
 	        throw err;
 	      }
-	      setState(await r.json());
-	      seedProfileDrafts();
-	      setDraftFusion(cloneJson(state.fusion?.config || {}));
-	      setDraftSettings(cloneJson(state.settings?.config || {}));
+	      const nextState = await r.json();
+	      // Read the live drafts only after the asynchronous fetch. An operator may switch views
+	      // and keep editing while the refresh is in flight; an earlier snapshot would erase that
+	      // work when the response lands.
+	      const dirtyProfiles = preserveUnrelatedDrafts ? new Set(unsavedProfileIds()) : new Set();
+	      const preservedFusion = preserveUnrelatedDrafts ? cloneJson(draftFusion) : null;
+	      const preservedSettings = preserveUnrelatedDrafts ? cloneJson(draftSettings) : null;
+	      setState(nextState);
+	      seedProfileDrafts(dirtyProfiles);
+	      setDraftFusion(preservedFusion ?? cloneJson(state.fusion?.config || {}));
+	      setDraftSettings(preservedSettings ?? cloneJson(state.settings?.config || {}));
       // Do not let the concurrent notices read compare against the previous render. Once this
       // payload has rendered, anchor the marker to it and then compare the notice we just read:
       // a publish between the two responses triggers one resync, while an explicit state reload
@@ -2829,7 +2974,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         if (Object.prototype.hasOwnProperty.call(previous, pid)) next[pid] = previous[pid];
       });
       setDraftProfiles(next);
-      for (const pid of profileOrder) {
+      for (const pid of [...profileOrder, ...Object.keys(draftProfiles)]) {
         draftProfiles[pid] ||= { mode: "auto", models: [], excluded_models: [], auto_tail: true, requirements: defaultReq() };
         draftProfiles[pid].excluded_models ||= [];
         draftProfiles[pid].requirements = { ...defaultReq(), ...(draftProfiles[pid].requirements || {}) };
@@ -2856,14 +3001,121 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const toastMessage = typeof successMessage === "string" ? successMessage : "Virtual models saved.";
       const btn = $("saveBtn"); setButtonLoading(btn, true);
       try {
-        const r = await fetch("/admin/profiles", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ virtual_profiles: draftProfiles }) });
+        const submittedProfiles = cloneJson(draftProfiles);
+        const r = await fetch("/admin/profiles", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ virtual_profiles: submittedProfiles }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "save failed");
-        state.virtual_profiles = p.virtual_profiles; setDraftProfiles(cloneJson(p.virtual_profiles));
-        showToast(toastMessage); await loadAudit(false); render();
+        // The write is already durable at this point. Reflect that response immediately so a
+        // transient state-refresh failure cannot leave Save active and invite a duplicate write.
+        // Preserve any profile edits made while the POST itself was in flight.
+        const liveProfiles = cloneJson(draftProfiles);
+        const changedDuringSave = new Set([...Object.keys(submittedProfiles), ...Object.keys(liveProfiles)].filter(
+          (id) => JSON.stringify(submittedProfiles[id]) !== JSON.stringify(liveProfiles[id])
+        ));
+        state.virtual_profiles = p.virtual_profiles;
+        const nextDrafts = cloneJson(p.virtual_profiles);
+        changedDuringSave.forEach((id) => {
+          if (Object.prototype.hasOwnProperty.call(liveProfiles, id)) nextDrafts[id] = liveProfiles[id];
+          else delete nextDrafts[id];
+        });
+        setDraftProfiles(nextDrafts);
+        // The backend recomputes custom-profile scores from the saved base profile. Reload the
+        // canonical state so a newly created profile (or a changed base) previews the same order
+        // routing already uses, while keeping unsaved Fusion/Settings work from other views.
+        try {
+          await loadState(true);
+        } catch (e) {
+          render();
+          showToast(toastMessage + " Score preview refresh failed; reload to retry.");
+          return;
+        }
+        showToast(toastMessage);
         // render() ran while the button still carried is-loading, which syncSaveButton
         // refuses to touch — so re-sync once the spinner is off, or the count would
         // survive its own save.
       } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(btn, false); syncSaveButton(); }
+    }
+
+    let editingCustomProfileId = null;
+    function customProfileSlug(value) {
+      return String(value || "").trim().toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    }
+    function requireCustomProfilesPro() {
+      if (state?.pro_entitled) return true;
+      showToast("Custom virtual models require an active Ficelle Pro license.", "warn", { label: "Open License", onClick: () => setView("license") });
+      return false;
+    }
+    function openCustomProfileDialog(profileId = null) {
+      if (!requireCustomProfilesPro()) return;
+      editingCustomProfileId = profileId;
+      const profile = profileId ? draftProfiles[profileId] : {};
+      $("customProfileDialogTitle").textContent = profileId ? "Edit custom model" : "New custom model";
+      $("confirmCustomProfileBtn").textContent = profileId ? "Save details" : "Create model";
+      $("customProfileSlugField").hidden = Boolean(profileId);
+      $("customProfileSlug").required = !profileId;
+      $("customProfileLabel").value = profile.label || "";
+      $("customProfileSlug").value = "";
+      $("customProfileDescription").value = profile.description || "";
+      $("customProfileBase").innerHTML = profileOrder.map((id) => '<option value="' + esc(id) + '">' + esc(profileLabels[id]?.[0] || id) + '</option>').join("");
+      $("customProfileBase").value = profile.base_profile || "ficelle/auto-orchestrator";
+      $("customProfileDialog").showModal();
+      $("customProfileLabel").focus();
+    }
+    function closeCustomProfileDialog() { $("customProfileDialog").close(); editingCustomProfileId = null; }
+    async function submitCustomProfile(event) {
+      event.preventDefault();
+      if (!requireCustomProfilesPro()) return;
+      const label = $("customProfileLabel").value.trim();
+      const description = $("customProfileDescription").value.trim();
+      const baseProfile = $("customProfileBase").value;
+      let profileId = editingCustomProfileId;
+      if (!profileId) {
+        const slug = customProfileSlug($("customProfileSlug").value || label);
+        if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)) { showToast("Use letters, numbers, and single hyphens for the ID slug.", "warn"); return; }
+        profileId = "ficelle/custom/" + slug;
+        if (draftProfiles[profileId]) { showToast("That custom model ID already exists.", "warn"); return; }
+      }
+      const source = draftProfiles[profileId] || draftProfiles[baseProfile] || {};
+      const baseSource = draftProfiles[baseProfile] || {};
+      const requirements = profileId === editingCustomProfileId && source.base_profile === baseProfile
+        ? source.requirements
+        : baseSource.requirements;
+      draftProfiles[profileId] = {
+        ...cloneJson(source),
+        label,
+        description,
+        base_profile: baseProfile,
+        mode: source.mode === "manual_order" ? "manual_order" : "auto",
+        models: uniqueStrings(source.models || []),
+        excluded_models: uniqueStrings(source.excluded_models || []),
+        auto_tail: source.auto_tail !== false,
+        requirements: { ...defaultReq(), ...(requirements || {}) },
+      };
+      const created = !editingCustomProfileId;
+      setActiveProfile(profileId);
+      closeCustomProfileDialog();
+      render();
+      await saveProfiles(created ? "Custom virtual model created." : "Custom virtual model details saved.");
+    }
+    async function duplicateCustomProfile() {
+      if (!requireCustomProfilesPro() || !isCustomProfileId(activeProfile)) return;
+      const source = draftProfiles[activeProfile];
+      let index = 2;
+      const stem = activeProfile.replace(/^ficelle\/custom\//, "").replace(/-copy(?:-\d+)?$/, "");
+      let profileId = "ficelle/custom/" + stem + "-copy";
+      while (draftProfiles[profileId]) profileId = "ficelle/custom/" + stem + "-copy-" + index++;
+      const copyLabel = ((source.label || "Custom model").slice(0, 75).trimEnd() || "Custom") + " copy";
+      draftProfiles[profileId] = { ...cloneJson(source), label: copyLabel };
+      setActiveProfile(profileId);
+      render();
+      await saveProfiles("Custom virtual model duplicated.");
+    }
+    async function deleteCustomProfile() {
+      if (!isCustomProfileId(activeProfile) || !window.confirm("Delete this custom virtual model? Apps using its ID will stop finding it.")) return;
+      delete draftProfiles[activeProfile];
+      setActiveProfile("ficelle/auto-orchestrator");
+      render();
+      await saveProfiles("Custom virtual model deleted.");
     }
 	    async function rollbackProfiles(id) {
 	      if (!id || !window.confirm("Undo to this saved snapshot?")) return;
@@ -3081,6 +3333,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("manualModeBtn").addEventListener("click", () => setProfile({ mode: "manual_order" }));
       $("autoTailToggle").addEventListener("change", (e) => setProfile({ auto_tail: e.target.checked }));
       $("clearProfileBtn").addEventListener("click", () => setProfile({ mode: "auto", models: [], excluded_models: [] }));
+      $("newCustomProfileBtn").addEventListener("click", () => openCustomProfileDialog());
+      $("editCustomProfileBtn").addEventListener("click", () => openCustomProfileDialog(activeProfile));
+      $("duplicateCustomProfileBtn").addEventListener("click", () => duplicateCustomProfile().catch((e) => showToast(e.message || String(e), "error")));
+      $("copyCustomProfileIdBtn").addEventListener("click", () => copyToClipboard(activeProfile, "Custom model ID copied."));
+      $("deleteCustomProfileBtn").addEventListener("click", () => deleteCustomProfile().catch((e) => showToast(e.message || String(e), "error")));
+      $("customProfileForm").addEventListener("submit", (e) => submitCustomProfile(e).catch((err) => showToast(err.message || String(err), "error")));
+      $("closeCustomProfileDialogBtn").addEventListener("click", closeCustomProfileDialog);
+      $("cancelCustomProfileBtn").addEventListener("click", closeCustomProfileDialog);
       $("searchInput").addEventListener("input", renderAvailable);
       $("copyExportBtn").addEventListener("click", () => copyExport().catch((e) => showToast(e.message)));
       initEndpointCard();

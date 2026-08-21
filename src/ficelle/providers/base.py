@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from ficelle.domain_models import ProviderBudget
@@ -15,6 +15,7 @@ HttpGet = Callable[..., Any]
 FREE_ACCESS_MODES = {"catalog_free", "quota_free", "local_free", "paid", "unknown"}
 FREE_ACCESS_SCOPES = {"model", "provider", "account", "shared_account"}
 FREE_ACCESS_STATUSES = {"available", "unavailable", "cooling_down", "unknown"}
+PRICING_BACKED_CATALOG_FREE_PROOFS = {"provider_pricing", "provider_free_catalog_pricing"}
 TRUSTED_FREE_PROVIDER_CLASSES_BY_MODE = {
     "catalog_free": {"free_model"},
     "quota_free": {"free_quota", "trial_credit"},
@@ -114,6 +115,9 @@ class ProviderCatalogPolicy:
     # every row; a family that contradicts it (Groq's compound systems accept no
     # user-provided tools) needs a narrower truth than the provider-wide guess.
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
+    requires_model_allowlist: bool = False
+    official_free_ids: list[str] = field(default_factory=list)
+    official_free_id_suffixes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

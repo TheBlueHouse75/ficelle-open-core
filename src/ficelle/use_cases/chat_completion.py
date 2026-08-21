@@ -40,6 +40,7 @@ from ficelle.failures import (
     status_for_error_codes,
     upstream_failure_status,
 )
+from ficelle.coding_certification import CODING_PROFILE_ID
 from ficelle.domain_models import SelectionResult
 from ficelle.use_cases.cooldowns import AppliedCooldown
 from ficelle.redaction import redact_sensitive_json, sanitize_error_detail
@@ -998,13 +999,8 @@ def evaluate_streaming_result(
         "stream_chunk_count": _safe_int(stream_result.get("chunk_count"), 0),
         "stream_bytes_sent": _safe_int(stream_result.get("bytes_sent"), 0),
     }
-    if stream_result.get("status") == "ok":
-        return StreamingAttemptDecision(
-            outcome="success",
-            attempt_update=attempt_update,
-            usage=normalized_token_usage(stream_result.get("usage")),
-        )
-
+    # The error object is the same six facts on every failure path below, so it is built
+    # once here where they are all final.
     error = {
         "model": model.get("id"),
         "upstream": model.get("upstream_id"),
@@ -1013,6 +1009,49 @@ def evaluate_streaming_result(
         "reason": reason,
         "stream_started": stream_started,
     }
+
+    if stream_result.get("status") == "ok":
+        # The streamed twin of the `empty_assistant_message` verdict the non-streaming path
+        # already returns, with two deliberate differences.
+        #
+        # First, `mid_stream_failure` rather than `terminal_failure`. Both end the attempt
+        # loop without diverting, which is the streaming rule once bytes are on the wire --
+        # but only this one returns `streaming_complete`. `terminal_failure` falls through to
+        # the loop's `json_failure` exit, which writes a fresh HTTP 502 onto a socket that
+        # already carries `200`, the whole SSE body and its `[DONE]`. No terminal error frame
+        # is added either: this stream ended on its own valid terminator.
+        #
+        # Second, a caller's own `max_tokens` can cut a reasoning model off before it ever
+        # reaches an answer. That is the request's doing, not a broken model, so it keeps the
+        # no-cooldown `truncated_before_content` policy the non-streaming path gives it --
+        # otherwise one client sending a small budget would bench a whole profile's pool.
+        #
+        # Defaults to True so a `stream_response` port that does not report the fact keeps
+        # its current verdict.
+        if not stream_result.get("deliverable_sent", True):
+            truncated = finish_reason_is_truncation(
+                {"choices": [{"finish_reason": stream_result.get("finish_reason") or ""}]}
+            )
+            reason = "truncated_before_content" if truncated else "empty_assistant_message"
+            return StreamingAttemptDecision(
+                outcome="mid_stream_failure",
+                attempt_update={**attempt_update, "reason": reason},
+                error={**error, "reason": reason},
+                cooldown_reason=reason if truncated else "unavailable",
+                cooldown_detail=(
+                    "streamed response hit the completion token budget before emitting assistant content"
+                    if truncated
+                    else "streamed response had no assistant content or tool calls"
+                ),
+                cooldown_status="stream_error",
+                usage=normalized_token_usage(stream_result.get("usage")),
+            )
+        return StreamingAttemptDecision(
+            outcome="success",
+            attempt_update=attempt_update,
+            usage=normalized_token_usage(stream_result.get("usage")),
+        )
+
     if stream_started:
         outcome: Literal["retryable_failure", "terminal_failure", "mid_stream_failure"] = "mid_stream_failure"
     elif _should_retry(reason, requested_model_is_virtual):
@@ -2035,6 +2074,21 @@ class ChatCompletionRouter:
             )
         excluded_counts = Counter(selection.excluded_reasons.values())
         bounded = dict(sorted(excluded_counts.items(), key=lambda item: (-item[1], item[0]))[:8])
+        if requested == CODING_PROFILE_ID and excluded_counts.get("coding_certification"):
+            return self._refusal_response(
+                body,
+                request,
+                request_id,
+                request_started,
+                status=503,
+                reason="no_certified_coding_model",
+                error_type="no_certified_coding_model",
+                message=(
+                    "no free model with a valid Ficelle coding certification is currently "
+                    f"available for {safe_requested}"
+                ),
+                refusal_details={"excluded": bounded},
+            )
         capability = "tool-capable model" if body.get("tools") else "model"
         return self._refusal_response(
             body,

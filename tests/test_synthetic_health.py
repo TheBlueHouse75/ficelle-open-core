@@ -64,6 +64,11 @@ class FakeRouter:
         return None
 
 
+def test_service_base_url_uses_the_configured_ipv6_listener() -> None:
+    assert synthetic_health._base_url({"host": "::1", "port": 9123}) == "http://[::1]:9123/v1"
+    assert synthetic_health._base_url({"host": "::", "port": 9123}) == "http://[::1]:9123/v1"
+
+
 def test_deterministic_failure_matrix_uses_shared_classifier_and_policy() -> None:
     statuses: list[str] = []
     for scenario in deterministic_failure_scenarios():

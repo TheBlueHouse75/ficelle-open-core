@@ -30,6 +30,10 @@ export FICELLE_API_KEY=ficelle-local
 codex --profile ficelle
 ```
 
+Hermes uses the same variable name from `$HERMES_HOME/.env`. Ficelle setup seeds it so Hermes can
+select Ficelle as its main provider, explicitly or through `provider: auto`; that behavior is
+intentional. See [Hermes integration](../../README.md#optional-hermes-integration).
+
 To make it the default, set `profile = "ficelle"` at the top of the same file.
 
 ## Notes

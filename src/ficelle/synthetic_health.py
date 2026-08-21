@@ -38,6 +38,7 @@ from ficelle.probe_lock import (
     synthetic_health_lock_path,
 )
 from ficelle.redaction import redact_sensitive_json, sanitize_error_detail
+from ficelle.url_security import connectable_http_url
 from ficelle.use_cases.capability_discovery import provider_probe_interval_seconds
 from ficelle.failures import capacity_dimension
 from ficelle.use_cases.chat_completion import (
@@ -3607,7 +3608,7 @@ def _base_url(config: dict[str, Any]) -> str:
         port_number = int(port)
     except (TypeError, ValueError):
         port_number = 8646
-    return f"http://127.0.0.1:{port_number}/v1"
+    return connectable_http_url(config.get("host"), port_number, "/v1")
 
 
 def _service_request_headers(router: Any, config: dict[str, Any]) -> dict[str, str]:

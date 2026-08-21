@@ -69,6 +69,30 @@ def test_openclaw_target_adapter_exports_experimental_config_without_rewriting_c
     assert export.redaction_status == "no_secrets"
 
 
+def test_openclaw_custom_models_inherit_base_profile_capabilities():
+    custom_vision = "ficelle/custom/visual-review"
+    custom_reasoning = "ficelle/custom/deep-work"
+    adapter = OpenClawTargetAdapter(
+        virtual_models=("ficelle/auto-orchestrator", custom_vision, custom_reasoning),
+        model_policy_ids={
+            custom_vision: "ficelle/auto-vision",
+            custom_reasoning: "ficelle/auto-reasoning",
+        },
+    )
+
+    export = adapter.export_config(TargetExportContext(config={}))
+
+    assert export.config is not None
+    models = {
+        model["id"]: model
+        for model in export.config["models"]["providers"]["ficelle"]["models"]
+    }
+    assert models[custom_vision]["input"] == ["text", "image"]
+    assert models[custom_vision]["reasoning"] is False
+    assert models[custom_reasoning]["input"] == ["text"]
+    assert models[custom_reasoning]["reasoning"] is True
+
+
 def test_openclaw_target_adapter_has_no_hermes_imports_or_plugin_assumptions():
     modules = imported_modules(OPENCLAW_TARGET_PATH)
     forbidden_modules = ("ficelle.targets.hermes", "ficelle.use_cases.hermes_export")

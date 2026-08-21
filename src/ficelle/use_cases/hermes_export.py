@@ -4,6 +4,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from ficelle.url_security import connectable_http_url
+
 
 SafeInt = Callable[[Any, int], int]
 FusionVisibleInModelList = Callable[[dict[str, Any]], bool]
@@ -62,7 +64,11 @@ def build_hermes_config_export(
     safe_int: SafeInt,
     picker_models: Sequence[str],
 ) -> dict[str, Any]:
-    base_url = f"http://{config.get('host') or '127.0.0.1'}:{safe_int(config.get('port'), 8646)}/v1"
+    base_url = connectable_http_url(
+        config.get("host"),
+        safe_int(config.get("port"), 8646),
+        "/v1",
+    )
     provider_yaml = "\n".join([
         "# Ficelle is installed as a Hermes user provider plugin under ~/.hermes/plugins/model-providers/ficelle.",
         "# Paste the desired slots into ~/.hermes/config.yaml and restart the gateway for Discord/Telegram sessions.",
@@ -83,7 +89,7 @@ def build_hermes_config_export(
         "    models:",
         *[f"      - \"{model_id}\"" for model_id in picker_models],
         "",
-        "# Recommended low-risk slots first. Keep the main orchestrator on a strong model until dogfood is green.",
+        "# Ficelle is the main provider; auxiliary slots reuse its specialized profiles.",
         "# Long context is for huge prompts; it is not the default Hermes compression choice.",
         "auxiliary:",
         "  title_generation:",
@@ -96,22 +102,25 @@ def build_hermes_config_export(
         "    provider: \"ficelle\"",
         "    model: \"ficelle/auto-json\"",
         "",
-        "# Optional after canary stays green. This catches failures without making strict-zero models primary.",
+        "# Ficelle also handles fallback through its tool-capable profile.",
         "fallback_providers:",
         "  - provider: \"ficelle\"",
         "    model: \"ficelle/auto-tools\"",
         "",
-        "# Experimental Ficelle-only main model after canaries and real CLI dogfood:",
-        "# model:",
-        "#   provider: \"custom\"",
-        f"#   base_url: \"{base_url}\"",
-        "#   model: \"ficelle/auto-orchestrator\"",
+        "# Ficelle is the active main model route. Hermes 0.17 treats slash-containing model IDs",
+        "# as aggregator slugs in doctor, so use its local custom transport until that validator",
+        "# recognizes provider-plugin model IDs.",
+        "model:",
+        "  provider: \"custom\"",
+        f"  base_url: \"{base_url}\"",
+        "  key_env: \"FICELLE_API_KEY\"",
+        "  model: \"ficelle/auto-orchestrator\"",
     ])
     presets = [
         {
             "model": "ficelle/auto-orchestrator",
-            "benefit": "experimental main Hermes orchestrator candidate",
-            "hermes_slot": "model.provider/model.model after dogfood",
+            "benefit": "main Hermes orchestrator with strict-zero routing",
+            "hermes_slot": "model.provider/model.model",
         },
         {
             "model": "ficelle/auto-fast",

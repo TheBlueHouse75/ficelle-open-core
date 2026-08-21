@@ -38,6 +38,8 @@ class RuntimePaths:
     legacy_ficelle_secrets_keychain: Path
     legacy_hermes_secrets_keychain: Path
     capability_oracle_cache_path: Path
+    coding_certification_cache_path: Path
+    coding_certification_status_path: Path
     admin_assets_dir: Path | None = None
 
     def read_path(self, canonical_path: Path) -> Path:
@@ -98,5 +100,7 @@ class RuntimePaths:
             legacy_ficelle_secrets_keychain=ficelle_home / "hermes-secrets.keychain-db",
             legacy_hermes_secrets_keychain=hermes_home / "hermes-secrets.keychain-db",
             capability_oracle_cache_path=router_dir / "capability_oracle.json",
+            coding_certification_cache_path=router_dir / "coding-certifications.json",
+            coding_certification_status_path=router_dir / "coding-certification-status.json",
             admin_assets_dir=admin_assets_dir,
         )

@@ -259,7 +259,7 @@ def model_score_explanation(
     elif requested_model == "ficelle/auto-json":
         score = (success_rate * 40) + ((1.0 if structured else 0.0) * 30) + (tool_bonus * 15) + (latency_score * 10) + (context_score * 5)
     elif requested_model == "ficelle/auto-compression":
-        score = (success_rate * 42) + (latency_score * 26) + (context_score * 18) + ((1.0 if structured else 0.0) * 10) + (tool_bonus * 4)
+        score = (success_rate * 42) + (latency_score * 26) + (context_score * 18) + (tool_bonus * 4)
     elif requested_model == "ficelle/auto-long":
         score = (success_rate * 35) + (context_score * 35) + (tool_bonus * 15) + ((1.0 if structured else 0.0) * 10) + (latency_score * 5)
     elif requested_model == "ficelle/auto-reasoning":

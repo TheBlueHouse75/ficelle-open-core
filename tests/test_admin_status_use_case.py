@@ -553,10 +553,47 @@ def test_filter_cached_catalog_to_enabled_providers_keeps_only_invokable_sources
     )
 
     assert filtered["providers"] == {
-        "openrouter": {"accepted_count": 1},
-        "nvidia": {"accepted_count": 1},
+        "openrouter": {"accepted_count": 1, "invokable": False, "auth_reason": None},
+        "nvidia": {"accepted_count": 1, "invokable": True, "auth_reason": None},
     }
     assert [model["source"] for model in filtered["models"]] == ["openrouter", "nvidia"]
+
+
+def test_filter_cached_catalog_keeps_unkeyed_enabled_provider_cards():
+    config = {
+        "providers": {
+            "openrouter": {"enabled": True},
+            "orcarouter": {"enabled": True, "activation_policy": "configured_credentials"},
+            "hetzner": {"enabled": True, "activation_policy": "configured_credentials"},
+            "groq": {"enabled": False, "activation_policy": "configured_credentials"},
+        }
+    }
+    catalog = {
+        "providers": {
+            "openrouter": {"accepted_count": 1, "invokable": True},
+            "orcarouter": {"accepted_count": 0, "invokable": False, "auth_reason": "missing credentials"},
+            "hetzner": {"accepted_count": 0, "invokable": False, "auth_reason": "missing credentials"},
+            "groq": {"accepted_count": 1, "invokable": False},
+        },
+        "models": [
+            {"id": "ficelle/openrouter/a", "source": "openrouter"},
+            {"id": "ficelle/orcarouter/free", "source": "orcarouter"},
+            {"id": "ficelle/hetzner/qwen", "source": "hetzner"},
+            {"id": "ficelle/groq/a", "source": "groq"},
+        ],
+    }
+
+    filtered = filter_cached_catalog_to_enabled_providers(
+        catalog,
+        config,
+        provider_auth_row=lambda source, _config: {"invokable": source == "openrouter"},
+    )
+
+    assert set(filtered["providers"]) == {"openrouter", "orcarouter", "hetzner"}
+    assert filtered["providers"]["openrouter"]["invokable"] is True
+    assert filtered["providers"]["orcarouter"]["invokable"] is False
+    assert filtered["providers"]["hetzner"]["invokable"] is False
+    assert [model["source"] for model in filtered["models"]] == ["openrouter"]
 
 
 def test_catalog_refresh_summary_preserves_refresh_contract_shape():
@@ -1115,6 +1152,8 @@ def test_admin_profile_row_preserves_selected_contract_fields():
         selected_score={"score_total": 91.5, "latency": 0.3},
         selected_verified={"status": "verified", "capability": "tool_call"},
         selected_competence="verified",
+        route_candidates=[{"id": "ficelle/openrouter/manual-a"}],
+        policy_candidates=[{"id": "ficelle/openrouter/manual-a"}],
         top_candidates=[{"model_id": "ficelle/openrouter/manual-a"}],
         failed_candidates=[],
         last_route={"status": "ok", "request_id": "req-1"},
@@ -1134,6 +1173,8 @@ def test_admin_profile_row_preserves_selected_contract_fields():
         "selected_competence": "verified",
         "selected_verified_status": "verified",
         "selected_verified_capability": "tool_call",
+        "route_candidate_ids": ["ficelle/openrouter/manual-a"],
+        "policy_candidate_ids": ["ficelle/openrouter/manual-a"],
         "top_candidates": [{"model_id": "ficelle/openrouter/manual-a"}],
         "failed_profile_candidates": [],
         "last_route": {"status": "ok", "request_id": "req-1"},
@@ -1150,6 +1191,8 @@ def test_admin_profile_row_reports_fail_without_candidates():
         selected_score={},
         selected_verified={},
         selected_competence=None,
+        route_candidates=[],
+        policy_candidates=[],
         top_candidates=[],
         failed_candidates=[{"model_id": "ficelle/openrouter/nope"}],
         last_route={},
@@ -1163,6 +1206,8 @@ def test_admin_profile_row_reports_fail_without_candidates():
     assert row["selected_score"] is None
     assert row["selected_verified_status"] == "unknown"
     assert row["failed_profile_candidates"] == [{"model_id": "ficelle/openrouter/nope"}]
+    assert row["route_candidate_ids"] == []
+    assert row["policy_candidate_ids"] == []
 
 
 def test_selected_profile_origin_reports_manual_auto_tail_and_auto():
@@ -1231,6 +1276,8 @@ def test_admin_profile_rows_assembles_selected_and_failed_evidence():
     assert row["selected_score"] == 93.0
     assert row["selected_verified_status"] == "verified"
     assert row["selected_competence"] == "verified"
+    assert row["route_candidate_ids"] == ["ficelle/openrouter/manual-a"]
+    assert row["policy_candidate_ids"] == ["ficelle/openrouter/manual-a"]
     assert row["last_route"] == {"status": "ok", "request_id": "req-1"}
     assert row["top_candidates"] == [
         {"model_id": "ficelle/openrouter/manual-a"},

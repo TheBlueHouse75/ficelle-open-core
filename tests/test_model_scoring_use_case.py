@@ -206,3 +206,27 @@ def test_model_score_explanation_combines_profile_weights_evidence_and_failure_p
     assert score["context_score"] == 0.5
     assert score["evidence_status"] == "fresh"
     assert score["last_evidence_at"] == "newer"
+
+
+def test_auto_compression_score_does_not_prefer_structured_output_support() -> None:
+    plain_model = {
+        "source": "openrouter",
+        "upstream_id": "plain",
+        "context_length": 500_000,
+        "supports_tools": True,
+        "supports_structured_outputs": False,
+    }
+    structured_model = {
+        **plain_model,
+        "upstream_id": "structured",
+        "supports_structured_outputs": True,
+    }
+
+    plain_score = model_score_explanation(
+        "ficelle/auto-compression", plain_model, {}, ports=_score_explanation_ports()
+    )
+    structured_score = model_score_explanation(
+        "ficelle/auto-compression", structured_model, {}, ports=_score_explanation_ports()
+    )
+
+    assert plain_score["score_base"] == structured_score["score_base"]

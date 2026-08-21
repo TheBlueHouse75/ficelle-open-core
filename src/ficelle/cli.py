@@ -17,7 +17,7 @@ from typing import Any, Iterator
 
 from ficelle.build_identity import package_build_identity
 from ficelle.runtime_paths import RuntimePaths
-from ficelle.url_security import connectable_host
+from ficelle.url_security import connectable_http_url
 from ficelle.service import (
     SERVER_COMMAND_SIGNATURES,
     LaunchAgentServiceBackend,
@@ -99,7 +99,7 @@ def active_runtime_environment() -> Iterator[None]:
 
 
 with active_runtime_environment():
-    from ficelle import license_ops, router, update as update_service  # noqa: E402
+    from ficelle import coding_certification, license_ops, router, update as update_service  # noqa: E402
 
 
 def _run(cmd: list[str], *, check: bool = False, timeout: int = 60) -> subprocess.CompletedProcess[str]:
@@ -263,11 +263,8 @@ def report_terminated_stale_servers(stale_pids: list[int]) -> None:
 
 def router_url(path: str) -> str:
     config = router.load_config()
-    # A wildcard bind is not a destination, and the router's Host allowlist refuses the literal,
-    # so echoing it back here would make every CLI status read fail against our own server.
-    host = connectable_host(config.get("host"))
     port = int(config.get("port") or 8646)
-    return f"http://{host}:{port}{path}"
+    return connectable_http_url(config.get("host"), port, path)
 
 
 def router_request_headers(path: str) -> dict[str, str]:
@@ -818,6 +815,30 @@ def cmd_access_token(scope: str) -> int:
     return 0
 
 
+def cmd_coding_certification(args: argparse.Namespace) -> int:
+    action = str(getattr(args, "coding_certification_action", "status"))
+    if action == "refresh":
+        status = coding_certification.refresh_cache(
+            RUNTIME_PATHS.coding_certification_cache_path,
+            RUNTIME_PATHS.coding_certification_status_path,
+        )
+    else:
+        status = coding_certification.public_status(
+            RUNTIME_PATHS.coding_certification_cache_path,
+            RUNTIME_PATHS.coding_certification_status_path,
+        )
+    if bool(getattr(args, "json_output", False)):
+        print(json.dumps(status, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Coding certification: {status.get('status', 'unavailable')}")
+        print(f"Manifest: {status.get('manifest_id') or 'none'}")
+        print(f"Expires: {status.get('expires_at') or 'unknown'}")
+        print(f"Certified models: {status.get('certification_count', 0)}")
+        if status.get("message"):
+            print(str(status["message"]), file=sys.stderr)
+    return 0 if status.get("status") in {"valid", "valid_cache"} else 1
+
+
 def _print_synthetic_health_result(payload: dict[str, Any], *, json_output: bool) -> None:
     if json_output:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -893,8 +914,10 @@ def cmd_synthetic_health(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ficelle", description="Ficelle local OpenAI-compatible model router")
     sub = parser.add_subparsers(dest="command")
-    for name in ["serve", "refresh", "auth-status", "canary"]:
+    for name in ["serve", "refresh", "auth-status"]:
         sub.add_parser(name)
+    canary_parser = sub.add_parser("canary")
+    canary_parser.add_argument("--profile", action="append", default=[])
     sub.add_parser("install")
     sub.add_parser("uninstall")
     sub.add_parser("start")
@@ -965,6 +988,14 @@ def main(argv: list[str] | None = None) -> int:
     update_group.add_argument("--recover", action="store_true", help=argparse.SUPPRESS)
     update_parser.add_argument("--json", action="store_true", dest="json_output", help="Print machine-readable status.")
     update_parser.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
+    coding_parser = sub.add_parser(
+        "coding-certification",
+        help="Inspect or refresh the signed auto-coding certification manifest",
+    )
+    coding_sub = coding_parser.add_subparsers(dest="coding_certification_action", required=True)
+    for action in ("status", "refresh"):
+        action_parser = coding_sub.add_parser(action)
+        action_parser.add_argument("--json", action="store_true", dest="json_output")
     synthetic_parser = sub.add_parser("synthetic-health", help="Run and inspect deep synthetic user health checks")
     synthetic_sub = synthetic_parser.add_subparsers(dest="synthetic_action", required=True)
     synthetic_run = synthetic_sub.add_parser("run", help="Run the synthetic user corpus")
@@ -1006,7 +1037,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "auth-status":
         return router.main_args(["--auth-status"])
     if args.command == "canary":
-        return router.main_args(["--canary"])
+        canary_args = ["--canary"]
+        for profile_id in args.profile:
+            canary_args.extend(["--canary-profile", profile_id])
+        return router.main_args(canary_args)
     if args.command == "install":
         return install_service()
     if args.command == "uninstall":
@@ -1045,6 +1079,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_install_pro()
     if args.command == "update":
         return cmd_update(args)
+    if args.command == "coding-certification":
+        return cmd_coding_certification(args)
     if args.command == "synthetic-health":
         return cmd_synthetic_health(args)
     parser.print_help()

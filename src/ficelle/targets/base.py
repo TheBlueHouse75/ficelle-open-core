@@ -4,6 +4,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from ficelle.url_security import connectable_http_url
+
 
 TargetKind = Literal["agent_host", "native_app", "control_plane", "generic_client"]
 
@@ -85,12 +87,11 @@ class TargetAdapter(Protocol):
 
 
 def target_base_url(config: Mapping[str, Any]) -> str:
-    host = str(config.get("host") or "127.0.0.1")
     try:
         port = int(config.get("port") or 8646)
     except Exception:
         port = 8646
-    return f"http://{host}:{port}/v1"
+    return connectable_http_url(str(config.get("host") or "127.0.0.1"), port, "/v1")
 
 
 def visible_model_ids(

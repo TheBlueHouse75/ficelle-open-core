@@ -336,6 +336,7 @@ def test_download_local_wheel_dry_run_allows_nonexistent_path(tmp_path):
 
 
 def test_default_wheel_endpoint_uses_valid_fallback_filename():
+    assert f"/api/releases/{bootstrap.CORE_VERSION}/wheel" in bootstrap.DEFAULT_WHEEL_URL
     assert bootstrap.wheel_filename_from_url(bootstrap.DEFAULT_WHEEL_URL) == (
         "ficelle_pro-0-py3-none-any.whl"
     )

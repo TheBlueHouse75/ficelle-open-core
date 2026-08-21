@@ -759,6 +759,56 @@ def test_probe_registry_validates_compression_word_budget_and_facts():
     assert "Lena Park" in missing_message
 
 
+def test_coding_compatibility_requires_the_complete_typed_tool_call():
+    registry = ProbeRegistry()
+    complete = tool_call_payload(
+        "ficelle_open_file",
+        {"path": "src/main.py", "line": 12, "status": "ready"},
+    )
+    missing_line = tool_call_payload(
+        "ficelle_open_file",
+        {"path": "src/main.py", "status": "ready"},
+    )
+
+    assert registry.validate_response("coding_compatibility", "ignored", "", complete)[0] is True
+    invalid, message = registry.validate_response("coding_compatibility", "ignored", "", missing_line)
+
+    assert invalid is False
+    assert "line=12" in message
+
+
+def test_coding_compatibility_http_shape_rejection_records_failed_evidence():
+    events = []
+    candidate = {"id": "model-a", "upstream_id": "a", "source": "test"}
+    runner = BenchmarkRunner(
+        load_or_refresh_catalog=lambda _config: {"models": [candidate]},
+        select_models=lambda _profile_id, _catalog, _config, *, purpose: [candidate],
+        order_benchmark_candidates=lambda _profile_id, models: models,
+        benchmark_body=lambda _profile_id, _config: ({}, "coding_compatibility", "ignored"),
+        invoke_model=lambda _model, _body, _config: FakeResponse("schema rejected", status_code=422),
+        classify_failure=lambda _status_code, _text, _model: "bad_upstream_request",
+        set_cooldown=lambda *_args, **_kwargs: events.append("cooldown"),
+        record_benchmark_failure=lambda *_args, **_kwargs: events.append("failure"),
+        record_benchmark_result=lambda *_args, **_kwargs: events.append("result"),
+        record_success=lambda *_args, **_kwargs: events.append("success"),
+        record_verified_capability=lambda *_args, **_kwargs: events.append("verified"),
+        record_capability_discrepancy=lambda *_args, **_kwargs: events.append("discrepancy"),
+        extract_message_text=lambda _payload: "",
+        safe_detail=lambda value, limit=None: str(value)[:limit] if limit else str(value),
+        redact_sensitive_json=dict,
+        now_iso=lambda: "2026-08-21T00:00:00Z",
+        pacer=ProviderProbePacer(pause=lambda _seconds: None),
+        route_blocking_reasons=frozenset({"billing_or_paid"}),
+    )
+
+    result = runner.benchmark_profile("ficelle/auto-coding", {})
+
+    assert result["status"] == "fail"
+    assert "verified" in events
+    assert "discrepancy" in events
+    assert "cooldown" not in events
+
+
 def test_probe_registry_support_helpers_match_legacy_shapes():
     call = {"function": {"arguments": '{"status":"ok"}'}}
 

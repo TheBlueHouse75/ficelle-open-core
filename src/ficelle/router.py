@@ -20,6 +20,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 from urllib.parse import parse_qs, urlparse
 
-from ficelle import license_ops, request_log, update as update_service
+from ficelle import coding_certification, license_ops, request_log, update as update_service
 from ficelle.build_identity import package_build_identity
 from ficelle.config_store import ConfigStore
 try:
@@ -266,6 +267,7 @@ from ficelle.use_cases.admin_security import (
     request_host_allowed,
     same_origin_allowed,
 )
+from ficelle.url_security import connectable_http_url
 from ficelle.use_cases.cooldowns import (
     AppliedCooldown,
     CooldownMutationPorts,
@@ -495,6 +497,7 @@ from ficelle.json_store import write_private_text
 from ficelle.providers.base import (
     FREE_ACCESS_MODES,
     FREE_ACCESS_SCOPES,
+    PRICING_BACKED_CATALOG_FREE_PROOFS,
     ProviderAccess,
     ProviderCatalogPolicy,
     free_access_payload,
@@ -504,16 +507,22 @@ from ficelle.providers.base import (
 from ficelle.providers.openai_compatible import NOUS_DEFAULT_BASE_URL, OPENCODE_ZEN_USER_AGENT
 try:
     from ficelle_pro.provider_pack import PROVIDER_PACK, PROVIDER_PACK_KEY_URLS, PROVIDER_PACK_LABELS
+    try:
+        from ficelle_pro.provider_pack import PROVIDER_PACK_KEY_VALIDATORS
+    except ImportError:  # pragma: no cover - compatibility with an older installed Pro pack
+        PROVIDER_PACK_KEY_VALIDATORS: dict[str, Any] = {}
 except ImportError:  # pragma: no cover - core-only install without the closed pack
     # The curated provider pack (incl. the grey-market relays and their key URLs) ships
     # only in the closed Pro package. Absent → DEFAULT_CONFIG["providers"] is
     # CORE_PROVIDERS and PROVIDER_KEY_URLS holds only the reference providers.
-    # PROVIDER_PACK and PROVIDER_PACK_KEY_URLS are the only pack names router uses; the
-    # pack's individual constants are imported directly from ficelle_pro.provider_pack
+    # The provider-pack registries are the only pack names router uses; the pack's
+    # individual constants are imported directly from ficelle_pro.provider_pack
     # by the tests that assert on them.
     PROVIDER_PACK: dict[str, Any] = {}
     PROVIDER_PACK_KEY_URLS: dict[str, str] = {}
+    PROVIDER_PACK_KEY_VALIDATORS: dict[str, Any] = {}
     PROVIDER_PACK_LABELS: dict[str, str] = {}
+PROVIDER_KEY_VALIDATORS.update(PROVIDER_PACK_KEY_VALIDATORS)
 from ficelle.providers.registry import provider_catalog_adapter
 from ficelle.reasoning_replay import (
     ReasoningReplayStore,
@@ -618,6 +627,9 @@ RUNTIME_STATE_HISTORY_KEYS = state_store_module.RUNTIME_STATE_HISTORY_KEYS
 # Static admin assets shipped inside the package (not under HERMES_HOME).
 PACKAGE_DIR = Path(__file__).resolve().parent
 RUNTIME_PATHS = RuntimePaths.from_env(package_dir=PACKAGE_DIR)
+# RuntimePaths keeps a default Hermes location for legacy read compatibility even for a generic
+# service. Only an explicit/persisted HERMES_HOME means setup installed the Hermes integration.
+HERMES_INTEGRATION_ENABLED = bool(os.getenv("HERMES_HOME"))
 HERMES_HOME = RUNTIME_PATHS.hermes_home
 ROUTER_DIR = RUNTIME_PATHS.router_dir
 _ACCESS_TOKEN_CACHE: dict[str, str] = {}
@@ -679,6 +691,8 @@ CAPABILITY_REFERENCE_PATH = PACKAGE_DIR / "data" / "model_capabilities.json"
 # (never pricing/endpoint/routing), cached under the runtime home and refreshed on a TTL. The
 # route path never hits this endpoint — the fetch runs only at serve startup and `ficelle refresh`.
 CAPABILITY_ORACLE_CACHE_PATH = RUNTIME_PATHS.capability_oracle_cache_path
+CODING_CERTIFICATION_CACHE_PATH = RUNTIME_PATHS.coding_certification_cache_path
+CODING_CERTIFICATION_STATUS_PATH = RUNTIME_PATHS.coding_certification_status_path
 OPENROUTER_ORACLE_URL = "https://openrouter.ai/api/v1/models"
 CAPABILITY_ORACLE_TTL_SECONDS = 7 * 24 * 3600
 _FONT_CACHE: dict[str, bytes] = {}
@@ -838,10 +852,14 @@ VIRTUAL_MODEL_SLUGS = {
     "auto-vision",
     "auto-video",
     "auto-audio",
+    "auto-coding",
 }
 
 VIRTUAL_MODELS = {f"ficelle/{slug}" for slug in VIRTUAL_MODEL_SLUGS}
 VIRTUAL_PROFILE_ID_PATTERN = re.compile(r"^ficelle/[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
+CUSTOM_VIRTUAL_PROFILE_PREFIX = "ficelle/custom/"
+CUSTOM_PROFILE_LABEL_MAX_CHARS = 80
+CUSTOM_PROFILE_DESCRIPTION_MAX_CHARS = 240
 TARGET_EXPORT_VIRTUAL_MODELS = (
     "ficelle/auto-orchestrator",
     "ficelle/auto-tools",
@@ -854,6 +872,7 @@ TARGET_EXPORT_VIRTUAL_MODELS = (
     "ficelle/auto-vision",
     "ficelle/auto-video",
     "ficelle/auto-audio",
+    "ficelle/auto-coding",
 )
 
 
@@ -866,13 +885,39 @@ def is_safe_virtual_profile_id(model_id: str) -> bool:
     return bool(VIRTUAL_PROFILE_ID_PATTERN.fullmatch(candidate)) and redact_sensitive_text(candidate) == candidate
 
 
+def is_custom_virtual_profile_id(model_id: str) -> bool:
+    candidate = canonical_virtual_model_id(model_id)
+    return candidate not in VIRTUAL_MODELS and candidate != FUSION_MODEL_ID and is_safe_virtual_profile_id(candidate)
+
+
+def configured_custom_virtual_model_ids(config: dict[str, Any]) -> list[str]:
+    profiles = config.get("virtual_profiles") if isinstance(config.get("virtual_profiles"), dict) else {}
+    return sorted(str(key) for key in profiles if is_custom_virtual_profile_id(str(key)))
+
+
+def virtual_profile_policy_id(profile_id: str, profile: dict[str, Any] | None) -> str:
+    canonical = canonical_virtual_model_id(profile_id)
+    if is_custom_virtual_profile_id(canonical) and isinstance(profile, dict):
+        base_profile = canonical_virtual_model_id(str(profile.get("base_profile") or ""))
+        if base_profile in VIRTUAL_MODELS:
+            return base_profile
+    return canonical
+
+
+def configured_virtual_profile_policy_id(profile_id: str, config: dict[str, Any]) -> str:
+    profiles = normalized_virtual_profiles(config)
+    canonical = canonical_virtual_model_id(profile_id)
+    profile = profiles.get(profile_id) or profiles.get(canonical)
+    return virtual_profile_policy_id(canonical, profile if isinstance(profile, dict) else None)
+
+
 def canonical_virtual_model_id(model_id: str) -> str:
     return str(model_id or "").strip()
 
 DEFAULT_PROFILE_REQUIREMENTS = {
     "free": True,
     "tools": True,
-    "min_context": 128000,
+    "min_context": 64000,
     "structured": None,
     "input_modalities": [],
     "input_modalities_any": [],
@@ -886,7 +931,7 @@ VIRTUAL_MODEL_REQUIREMENTS = {
     "ficelle/auto-orchestrator": {"structured": True},
     "ficelle/auto-fast": {"structured": True},
     "ficelle/auto-json": {"structured": True},
-    "ficelle/auto-compression": {"structured": True},
+    "ficelle/auto-compression": {"structured": None},
     "ficelle/auto-reasoning": {"supported_parameters_any": ["reasoning", "include_reasoning"]},
     "ficelle/auto-multimodal": {"input_modalities_any": ["image", "video", "audio"]},
     "ficelle/auto-vision": {"input_modalities": ["image"]},
@@ -1041,6 +1086,7 @@ BENCHMARK_TEST_TYPES_BY_PROFILE = {
     "ficelle/auto-vision": "vision",
     "ficelle/auto-video": "video",
     "ficelle/auto-audio": "audio",
+    "ficelle/auto-coding": "coding_compatibility",
 }
 
 # Profiles whose failed or unverified discriminating capability route-EXCLUDES a model (the
@@ -1244,7 +1290,7 @@ CORE_PROVIDERS: dict[str, dict] = {
 DEFAULT_CONFIG: dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8646,
-    "min_context_length": 128000,
+    "min_context_length": 64000,
     "catalog_ttl_seconds": 3600,
     "request_timeout_seconds": 120,
     "request_timeout_seconds_by_profile": {
@@ -1814,9 +1860,15 @@ def effective_runtime_config(
     entitled: bool | None = None,
 ) -> dict[str, Any]:
     is_entitled = license_ops.is_entitled() if entitled is None else entitled
-    if PROVIDER_PACK and not is_entitled:
-        return config_without_provider_pack(config)
-    return copy.deepcopy(config)
+    effective = config_without_provider_pack(config) if PROVIDER_PACK and not is_entitled else copy.deepcopy(config)
+    if not is_entitled:
+        profiles = effective.get("virtual_profiles") if isinstance(effective.get("virtual_profiles"), dict) else {}
+        effective["virtual_profiles"] = {
+            profile_id: profile
+            for profile_id, profile in profiles.items()
+            if not is_custom_virtual_profile_id(str(profile_id))
+        }
+    return effective
 
 
 def config_without_provider_pack(config: dict[str, Any]) -> dict[str, Any]:
@@ -2005,15 +2057,34 @@ def normalize_virtual_profile(
         stale_model_ids,
     )
 
+    custom = is_custom_virtual_profile_id(profile_id)
+    base_profile = canonical_virtual_model_id(str(profile.get("base_profile") or "ficelle/auto-orchestrator"))
+    if custom and base_profile not in VIRTUAL_MODELS:
+        raise ValueError(f"base_profile for {profile_id} must be a built-in virtual model")
+    policy_profile_id = base_profile if custom else canonical_virtual_model_id(profile_id)
     requirements = safe_profile_requirements(profile.get("requirements"), config)
-    requirements.update(VIRTUAL_MODEL_REQUIREMENTS.get(canonical_virtual_model_id(profile_id), {}))
-    return {
+    requirements.update(VIRTUAL_MODEL_REQUIREMENTS.get(policy_profile_id, {}))
+    normalized = {
         "mode": mode,
         "models": model_ids,
         "excluded_models": excluded_model_ids,
         "auto_tail": bool(profile.get("auto_tail", True)),
         "requirements": requirements,
     }
+    if custom:
+        default_label = profile_id.removeprefix(CUSTOM_VIRTUAL_PROFILE_PREFIX).replace("-", " ").replace("/", " ").title()
+        label = str(profile.get("label") or default_label).strip()
+        description = str(profile.get("description") or "").strip()
+        if not label or len(label) > CUSTOM_PROFILE_LABEL_MAX_CHARS or redact_sensitive_text(label) != label:
+            raise ValueError(f"label for {profile_id} must be safe and at most {CUSTOM_PROFILE_LABEL_MAX_CHARS} characters")
+        if len(description) > CUSTOM_PROFILE_DESCRIPTION_MAX_CHARS or (
+            description and redact_sensitive_text(description) != description
+        ):
+            raise ValueError(
+                f"description for {profile_id} must be safe and at most {CUSTOM_PROFILE_DESCRIPTION_MAX_CHARS} characters"
+            )
+        normalized.update({"label": label, "description": description, "base_profile": base_profile})
+    return normalized
 
 
 def normalized_virtual_profiles(config: dict[str, Any]) -> dict[str, Any]:
@@ -2047,6 +2118,7 @@ def validate_virtual_profiles_payload(
     config: dict[str, Any],
     catalog: dict[str, Any],
     extra_stale_ids: Iterable[str] | None = None,
+    extra_existing_profile_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     raw_profiles = payload.get("virtual_profiles", payload.get("profiles"))
     if raw_profiles is None and all(is_virtual_profile_id(str(key)) for key in payload):
@@ -2069,10 +2141,18 @@ def validate_virtual_profiles_payload(
     # prune replays entries this config no longer holds, so persisted_profile_model_ids
     # alone would reject exactly the rows the user is trying to get back.
     stale_model_ids = (persisted_profile_model_ids(config) | set(extra_stale_ids or ())) - known_model_ids
+    existing_profiles = config.get("virtual_profiles") if isinstance(config.get("virtual_profiles"), dict) else {}
+    existing_profile_ids = {str(profile_id) for profile_id in existing_profiles} | set(extra_existing_profile_ids or ())
 
     normalized: dict[str, Any] = {}
     for raw_key, raw_profile in raw_profiles.items():
         profile_id = str(raw_key).strip()
+        if (
+            is_custom_virtual_profile_id(profile_id)
+            and not profile_id.startswith(CUSTOM_VIRTUAL_PROFILE_PREFIX)
+            and profile_id not in existing_profile_ids
+        ):
+            raise ValueError(f"new custom virtual model ids must start with {CUSTOM_VIRTUAL_PROFILE_PREFIX}")
         normalized[profile_id] = normalize_virtual_profile(
             profile_id, raw_profile, config, known_model_ids, stale_model_ids
         )
@@ -2092,6 +2172,23 @@ def save_virtual_profiles(config: dict[str, Any], profiles: dict[str, Any]) -> d
     config["virtual_profiles"] = profiles
     normalize_config_fusion(config, strict=False)
     return profiles
+
+
+def custom_profile_write_requires_pro(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Return true for custom additions or modifications; removals remain available."""
+    before_custom = {key: value for key, value in before.items() if is_custom_virtual_profile_id(key)}
+    after_custom = {key: value for key, value in after.items() if is_custom_virtual_profile_id(key)}
+    return any(before_custom.get(key) != value for key, value in after_custom.items())
+
+
+def custom_profiles_license_error() -> dict[str, Any]:
+    return {
+        "error": {
+            "message": "Custom virtual models require an active Ficelle Pro license — activate or refresh Pro in the License page.",
+            "type": "license_required",
+            "feature": "custom_virtual_profiles",
+        }
+    }
 
 
 def model_id_source(model_id: str) -> str:
@@ -2271,6 +2368,7 @@ def prune_stale_profile_models(
     history that preceded it rather than against itself.
     """
     prunable = prunable_catalog_sources(catalog, previous)
+    custom_profiles_locked = not license_ops.is_entitled()
     record_provider_listing_peaks(catalog, previous)
     if not prunable:
         return {}
@@ -2282,6 +2380,9 @@ def prune_stale_profile_models(
         removed: dict[str, list[str]] = {}
         pruned: dict[str, Any] = {}
         for profile_id, profile in before.items():
+            if custom_profiles_locked and is_custom_virtual_profile_id(profile_id):
+                pruned[profile_id] = profile
+                continue
             updated = dict(profile)
             gone: list[str] = []
             for field in ("models", "excluded_models"):
@@ -2590,7 +2691,11 @@ def rollback_virtual_profiles_from_audit(audit_id: str, config: dict[str, Any]) 
     # is meant to restore.
     snapshot_ids = persisted_profile_model_ids({"virtual_profiles": profiles})
     restored = validate_virtual_profiles_payload(
-        {"virtual_profiles": profiles}, config, catalog, extra_stale_ids=snapshot_ids
+        {"virtual_profiles": profiles},
+        config,
+        catalog,
+        extra_stale_ids=snapshot_ids,
+        extra_existing_profile_ids=profiles,
     )
     restored = save_virtual_profiles(config, restored)
     clear_last_profile_prune(needle)
@@ -4089,6 +4194,30 @@ def strict_zero_pricing(pricing: Any) -> tuple[bool, str, dict[str, Any]]:
     }
 
 
+def official_free_id_pricing(pricing: Any) -> tuple[bool, str, dict[str, Any]]:
+    """Accept request-only $0 rows; still fail closed on any non-zero field."""
+    if not isinstance(pricing, dict):
+        return False, "pricing is not an object", {"status": "unsafe", "checked_fields": []}
+    if not pricing:
+        return True, "sparse official free id", {"status": "not_applicable", "checked_fields": []}
+    checked: dict[str, str] = {}
+    for key, value in pricing.items():
+        if value in {None, ""}:
+            return False, f"empty pricing field: {key}", {"status": "unsafe", "checked_fields": sorted(checked)}
+        try:
+            numeric = float(value)
+        except Exception:
+            return False, f"non numeric pricing field: {key}", {"status": "unsafe", "checked_fields": sorted(checked)}
+        checked[str(key)] = str(value)
+        if numeric != 0.0:
+            return False, f"non-zero pricing field: {key}", {"status": "unsafe", "checked_fields": sorted(checked)}
+    return True, "official free id zero pricing", {
+        "status": "official_free",
+        "checked_fields": sorted(checked),
+        "guard": "all exposed pricing fields are numeric zero",
+    }
+
+
 def pricing_has_non_zero_numeric(pricing: Any) -> bool:
     if not isinstance(pricing, dict):
         return False
@@ -4573,23 +4702,32 @@ def normalized_free_access(
 
         if mode == "catalog_free":
             proof = proof or "provider_pricing"
-            if proof == "provider_pricing":
+            if proof in PRICING_BACKED_CATALOG_FREE_PROOFS:
                 if pricing_ok is None or pricing_reason is None:
                     pricing_ok, pricing_reason, _pricing_safety = strict_zero_pricing(model.get("pricing"))
                 eligible = is_eligible and pricing_ok and status == "available"
                 note = note or str(pricing_reason)
             else:
-                # FreeModel providers may expose a sparse catalog with no pricing fields.
-                # They are trusted only through config-level proof plus an id allowlist,
-                # and an explicit non-zero pricing field still fails closed.
+                # Official free-id / allowlist FreeModel providers may expose a sparse
+                # catalog or a request-only $0 price. They stay fail-closed on any
+                # non-zero field, but missing prompt/completion is not a paid signal.
                 raw_pricing = model.get("pricing")
-                if raw_pricing in (None, {}):
+                if proof == "provider_official_free_ids":
+                    if raw_pricing in (None, {}):
+                        pricing_ok, pricing_reason = True, "sparse official free id"
+                    else:
+                        pricing_ok, pricing_reason, _pricing_safety = official_free_id_pricing(raw_pricing)
+                elif raw_pricing in (None, {}):
                     pricing_ok, pricing_reason = True, "sparse free model catalog"
                 else:
                     pricing_ok, pricing_reason, _pricing_safety = strict_zero_pricing(raw_pricing)
                 eligible = is_eligible and pricing_ok and has_safe_free_access_proof(proof) and status == "available"
                 note = note or ("free model allowlist" if eligible else str(pricing_reason or "free model proof failed"))
-            return free_access_payload(eligible, "catalog_free", proof, scope, status, note)
+            access = free_access_payload(eligible, "catalog_free", proof, scope, status, note)
+            verified_flag = safe_detail(raw.get("catalog_free_flag_verified"))
+            if eligible and proof == "provider_free_catalog_pricing" and verified_flag:
+                access["catalog_free_flag_verified"] = verified_flag
+            return access
 
         if mode in {"quota_free", "local_free"}:
             eligible = is_eligible and has_safe_free_access_proof(proof) and status == "available"
@@ -4624,7 +4762,7 @@ def normalized_free_access(
 def pricing_safety_for_free_access(pricing_safety: dict[str, Any], free_access: dict[str, Any]) -> dict[str, Any]:
     mode = str(free_access.get("mode") or "")
     proof = str(free_access.get("proof") or "")
-    if free_access.get("eligible") and mode == "catalog_free" and proof != "provider_pricing":
+    if free_access.get("eligible") and mode == "catalog_free" and proof not in PRICING_BACKED_CATALOG_FREE_PROOFS:
         return {
             "status": "not_applicable",
             "checked_fields": [],
@@ -5126,8 +5264,22 @@ def admin_notices_payload(state: dict[str, Any] | None = None) -> dict[str, Any]
     raw_catalog = load_catalog_document()
     catalog = raw_catalog if isinstance(raw_catalog, dict) else {}
     models = catalog.get("models")
+    active_paid_model_ids = {row["model_id"] for _timestamp, row in rows}
+    current_model_ids = {
+        model_id
+        for model in (models if isinstance(models, list) else [])
+        if isinstance(model, dict)
+        if (model_id := safe_detail(model.get("id"), 250))
+    }
     return {
         "paid_models": [row for _timestamp, row in rows[:ADMIN_NOTICE_LIMIT]],
+        # Unlike the detailed paid-model banner, this projection uses every active guard:
+        # an older quarantine must not survive in the independent arrivals banner.
+        "catalog_additions": catalog_additions_row(
+            runtime_state.get("catalog_additions") if isinstance(runtime_state, dict) else None,
+            eligible_model_ids=current_model_ids,
+            excluded_model_ids=active_paid_model_ids,
+        ),
         "catalog": {
             "generated_at": safe_detail(catalog.get("generated_at"), 80),
             "model_count": len(models) if isinstance(models, list) else 0,
@@ -5147,7 +5299,12 @@ def last_profile_prune_row(raw_value: Any) -> dict[str, Any]:
     }
 
 
-def catalog_additions_row(raw_value: Any) -> dict[str, Any]:
+def catalog_additions_row(
+    raw_value: Any,
+    *,
+    eligible_model_ids: set[str] | None = None,
+    excluded_model_ids: set[str] | None = None,
+) -> dict[str, Any]:
     """The announceable half of `catalog_additions`, aged on read.
 
     The retention window is applied here rather than only at write time: entries are
@@ -5164,6 +5321,10 @@ def catalog_additions_row(raw_value: Any) -> dict[str, Any]:
     if not isinstance(raw_value, dict):
         return {}
     fresh = unexpired_catalog_additions(raw_value.get("models"))
+    if eligible_model_ids is not None:
+        fresh = {model_id: at for model_id, at in fresh.items() if model_id in eligible_model_ids}
+    if excluded_model_ids:
+        fresh = {model_id: at for model_id, at in fresh.items() if model_id not in excluded_model_ids}
     if not fresh:
         return {}
     ordered = sorted(fresh, key=lambda model_id: (fresh[model_id], model_id), reverse=True)
@@ -5250,6 +5411,10 @@ def admin_state(config: dict[str, Any]) -> dict[str, Any]:
     # core-only install (the views themselves gate structurally — pro-views.js ships
     # and renders them only when the pack is present). False on a core-only install.
     payload["pro_installed"] = pro_installed()
+    payload["pro_entitled"] = license_ops.is_entitled()
+    payload["locked_custom_profile_ids"] = (
+        [] if payload["pro_entitled"] else configured_custom_virtual_model_ids(config)
+    )
     payload["update"] = update_service.public_update_status()
     return payload
 
@@ -5911,6 +6076,10 @@ def admin_status(config: dict[str, Any], *, run_quota_probes: bool = True) -> di
     # The identity of the code answering, not of the state: lets `ficelle doctor` and the
     # synthetic-health preflight prove they talk to the build they are validating.
     status["build"] = service_build_identity()
+    status["coding_certification"] = coding_certification.public_status(
+        CODING_CERTIFICATION_CACHE_PATH,
+        CODING_CERTIFICATION_STATUS_PATH,
+    )
     return status
 
 
@@ -7075,6 +7244,15 @@ def _telemetry_with_synthetic_case(
     return telemetry
 
 
+def _telemetry_with_workload(
+    telemetry: ChatCompletionRouteTelemetry,
+    workload: str | None,
+) -> ChatCompletionRouteTelemetry:
+    if workload is not None:
+        telemetry.route_log["workload"] = workload
+    return telemetry
+
+
 def record_success_with_telemetry(
     model: dict[str, Any],
     latency_seconds: float,
@@ -7352,6 +7530,21 @@ def model_matches_profile_requirements(model: dict[str, Any], profile: dict[str,
 
 
 def sort_available_for_virtual_model(requested_model: str, available: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
+    if canonical_virtual_model_id(requested_model) == coding_certification.CODING_PROFILE_ID:
+        manifest = coding_certification.cached_manifest(CODING_CERTIFICATION_CACHE_PATH)
+        certifications = coding_certification.certification_index(manifest)
+        ordered = list(available)
+        ordered.sort(
+            key=lambda model: (
+                -float(
+                    certifications.get(coding_certification.certification_identity(model), {}).get("quality_score")
+                    or 0.0
+                ),
+                -model_auto_score("ficelle/auto-tools", model, state),
+                str(model.get("id") or ""),
+            )
+        )
+        return ordered
     return sort_available_for_virtual_model_policy(
         requested_model,
         available,
@@ -7685,6 +7878,18 @@ def route_competence_gate_result(
     candidate pool, so the original pool was returned for availability.
     """
     canonical = canonical_virtual_model_id(profile_id)
+    if canonical == coding_certification.CODING_PROFILE_ID:
+        manifest = coding_certification.cached_manifest(CODING_CERTIFICATION_CACHE_PATH)
+        certifications = coding_certification.certification_index(manifest)
+        return (
+            [
+                model
+                for model in candidates
+                if coding_certification.certification_identity(model) in certifications
+                and not model_failed_profile_evidence(canonical, model, state)
+            ],
+            False,
+        )
     return policy_competence_gate_result(
         canonical,
         candidates,
@@ -7692,6 +7897,26 @@ def route_competence_gate_result(
         is_specialized_profile=is_specialized_profile,
         multimodal_route_eligible=lambda model: multimodal_route_eligible(model, state),
         route_eligible_for_profile=lambda model: route_eligible_for_profile(canonical, model, state),
+    )
+
+
+def benchmark_competence_gate_result(
+    profile_id: str,
+    candidates: list[dict[str, Any]],
+    _state: dict[str, Any],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Keep coding canaries exact-certification-only while allowing a failed model to recover."""
+    if canonical_virtual_model_id(profile_id) != coding_certification.CODING_PROFILE_ID:
+        return candidates, False
+    manifest = coding_certification.cached_manifest(CODING_CERTIFICATION_CACHE_PATH)
+    certifications = coding_certification.certification_index(manifest)
+    return (
+        [
+            model
+            for model in candidates
+            if coding_certification.certification_identity(model) in certifications
+        ],
+        False,
     )
 
 
@@ -7705,6 +7930,11 @@ def model_route_competence(profile_id: str, model: dict[str, Any], state: dict[s
     means routing fell back to an unproven candidate because no proven one was available.
     """
     canonical = canonical_virtual_model_id(profile_id)
+    if canonical == coding_certification.CODING_PROFILE_ID:
+        manifest = coding_certification.cached_manifest(CODING_CERTIFICATION_CACHE_PATH)
+        if coding_certification.certification_for_model(model, manifest) is None:
+            return "uncertified"
+        return "failed_compatibility" if model_failed_profile_evidence(canonical, model, state) else "certified"
     return policy_competence_label(
         canonical,
         model,
@@ -7818,7 +8048,13 @@ def selection_policy() -> SelectionPolicy:
         manual_order_candidates=manual_order_candidates,
         sort_available_for_virtual_model=sort_available_for_virtual_model,
         route_competence_gate_result=route_competence_gate_result,
+        competence_exclusion_reason=lambda profile: (
+            "coding_certification"
+            if canonical_virtual_model_id(profile) == coding_certification.CODING_PROFILE_ID
+            else "competence_gate"
+        ),
         virtual_models=set(VIRTUAL_MODELS),
+        benchmark_competence_gate_result=benchmark_competence_gate_result,
         stale_model_block_reason=stale_catalog_block_reason,
     )
 
@@ -7983,6 +8219,15 @@ def request_timeout_seconds_for_profile(requested_model: str, config: dict[str, 
                 return max(1.0, float(raw_value))
             except Exception:
                 return default_timeout
+        profile = normalized_virtual_profiles(config).get(canonical_virtual_model_id(requested_model))
+        base_profile = virtual_profile_policy_id(requested_model, profile)
+        if base_profile != canonical_virtual_model_id(requested_model):
+            raw_value = per_profile.get(base_profile)
+            if raw_value is not None:
+                try:
+                    return max(1.0, float(raw_value))
+                except Exception:
+                    return default_timeout
     return default_timeout
 
 
@@ -8054,6 +8299,8 @@ def pick_vision_fixture(index: int | None = None) -> tuple[str, str]:
 # harness that sends the id and this gate that validates it can never drift apart.
 SYNTHETIC_CASE_ID_HEADER = PROBE_SYNTHETIC_CASE_ID_HEADER
 SYNTHETIC_CASE_ID_PATTERN = PROBE_SYNTHETIC_CASE_ID_PATTERN
+WORKLOAD_HEADER = "X-Ficelle-Workload"
+WORKLOAD_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
 # Socket peer addresses, not bind hosts: deliberately distinct from the loopback sets in
 # use_cases/admin_security.py (bind hosts) and url_security.py (URL hostnames).
 LOOPBACK_CLIENT_ADDRESSES = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
@@ -8095,6 +8342,20 @@ def accept_synthetic_case_id(raw_value: str | None, client_address: str) -> str 
             return None
         _SYNTHETIC_CASE_IDS_SEEN.add(raw_value)
     return raw_value
+
+
+def accept_workload(raw_value: str | None, client_address: str) -> str | None:
+    """Return a privacy-safe workload label from a local client.
+
+    Workload labels are telemetry only. They are accepted from loopback, strictly
+    shape-validated, never forwarded upstream, and never replace the random Ficelle
+    request id. The value describes a class of work (for example
+    ``aux:title_generation``), not user content.
+    """
+    if not raw_value or client_address not in LOOPBACK_CLIENT_ADDRESSES:
+        return None
+    value = raw_value.strip()
+    return value if WORKLOAD_PATTERN.fullmatch(value) else None
 
 
 class RequestDeadlineExceeded(Exception):
@@ -8922,23 +9183,37 @@ def sse_error_event(code: str, detail: str | None = None) -> bytes:
 
 
 def sse_data_objects(text: str) -> Iterator[dict[str, Any]]:
-    """Yield the parsed JSON object of each complete `data:` line, in order.
+    """Yield the parsed JSON object of each SSE event, in order.
 
-    The shared scan under both stream inspectors: a line that is not a `data:` line, is
-    the `[DONE]` terminator, or does not parse to a JSON object is skipped — which also
-    covers a buffer that begins or ends mid-line (the cut fragment fails one of those
-    tests). Bounded by the caller's buffer.
+    SSE joins consecutive ``data:`` fields with a newline before dispatch. Providers normally put
+    one JSON object on one line, but splitting it across legal multiline events must not turn a
+    delivered answer into an empty one. A malformed or partial event is skipped; callers already
+    choose the conservative fallback appropriate to error detection or deliverability.
     """
-    for line in text.splitlines():
-        payload = line.strip()
-        if not payload.startswith("data:"):
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    for event in normalized.split("\n\n"):
+        data_lines: list[str] = []
+        for raw_line in event.split("\n"):
+            line = raw_line.strip()
+            if not line or line.startswith(":"):
+                continue
+            field, delimiter, value = line.partition(":")
+            if field == "data" and delimiter:
+                data_lines.append(value.lstrip())
+        if not data_lines:
             continue
-        payload = payload[len("data:"):].strip()
+        payload = "\n".join(data_lines).strip()
         if not payload or payload == "[DONE]":
             continue
         try:
             parsed = json.loads(payload)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # `RecursionError` is not a `ValueError`, so a frame nested past the interpreter's
+            # limit used to escape this scan entirely. From the first-chunk error probe that
+            # failed the whole relay as `pre_stream_failure`, which carries a model cooldown --
+            # benching a model over a frame nobody could read. Every caller here inspects a
+            # stream that is already being served, so an unparseable frame costs the read and
+            # never the response.
             continue
         if isinstance(parsed, dict):
             yield parsed
@@ -8978,6 +9253,250 @@ def upstream_stream_error_payload(chunk: bytes) -> dict[str, Any] | None:
             error = parsed["error"]
             return error if isinstance(error, dict) else {"message": error}
     return None
+
+
+# The fields an OpenAI-compatible caller can read as the answer itself. Used as a cheap
+# pre-check on raw bytes before any decode, so it has to stay a superset of what the parse
+# below accepts: a frame mentioning none of them cannot carry an answer.
+DELIVERABLE_FIELD_MARKERS = (
+    b'"content"',
+    b'"tool_calls"',
+    b'"refusal"',
+    b'"function_call"',
+    # The audio-output modality answers with `content: null` and the turn in `audio`.
+    b'"audio"',
+)
+
+
+def sse_chunk_carries_deliverable(chunk: bytes) -> bool:
+    """True when these streamed bytes carry an assistant answer.
+
+    A reasoning model can stream a whole turn of `reasoning` deltas and end cleanly on
+    `[DONE]` without ever emitting an assistant message. Recorded as a success, the model's
+    success rate -- the input that drives routing order -- counted an unusable answer as a
+    win and elected the same model again on the next request.
+
+    Counts everything a caller can read as the answer: `content` (string or block list),
+    `tool_calls`, the legacy `function_call`, and `refusal` -- a declined request is still a
+    served answer, and benching a model for refusing would empty the pool on one borderline
+    prompt. `reasoning` never counts: it is precisely the field that is not an answer.
+
+    Note the asymmetry with `upstream_stream_error_payload`, which is conservative because
+    missing an error costs nothing. Here a False is what records the failure and benches the
+    model, so anything unrecognized must err towards True at the call site, not here -- this
+    reader answers only for the wire format providers actually send. The byte pre-check is a
+    fast path over that same format, not a proof: a unicode-escaped key would slip past it,
+    which is survivable only because of that call-site bias.
+    """
+    if not any(marker in chunk for marker in DELIVERABLE_FIELD_MARKERS):
+        return False
+    for parsed in sse_data_objects(chunk.decode("utf-8", errors="replace")):
+        choices = parsed.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            # A streamed turn carries `delta`; a provider that frames a whole non-streamed
+            # choice into one SSE event carries `message`. Both spell the same fields.
+            for holder_key in ("delta", "message"):
+                holder = choice.get(holder_key)
+                if not isinstance(holder, dict):
+                    continue
+                content = holder.get("content")
+                if isinstance(content, (str, list)) and content:
+                    return True
+                refusal = holder.get("refusal")
+                if isinstance(refusal, str) and refusal:
+                    return True
+                if holder.get("tool_calls") or holder.get("function_call") or holder.get("audio"):
+                    return True
+    return False
+
+
+def finish_reason_from_sse_tail(tail: bytes) -> str:
+    """The `finish_reason` of the stream's last chunk that carried one, or "".
+
+    Read from the same bounded tail as the usage block. Only used to tell a model that
+    answered nothing apart from a model the caller's own `max_tokens` cut off first.
+    """
+    if b'"finish_reason"' not in tail:
+        return ""
+    finish_reason = ""
+    for parsed in sse_data_objects(tail.decode("utf-8", errors="replace")):
+        choices = parsed.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if isinstance(choice, dict) and isinstance(choice.get("finish_reason"), str):
+                finish_reason = choice["finish_reason"]
+    return finish_reason
+
+
+def finish_reason_from_clean_sse_eof(
+    tail: bytes,
+    *,
+    tail_truncated: bool = False,
+    expected_choice_count: int = 1,
+) -> str:
+    """A terminal finish reason from complete, well-formed SSE events, or ``""``.
+
+    A normally exhausted upstream iterator is not enough to prove that its last bytes form a
+    complete response: the socket can close between SSE frames or in the middle of one. Every
+    retained event must therefore be complete and valid, no provider error may appear, and every
+    requested choice must end with a non-empty top-level ``choice.finish_reason``.
+    """
+    if b'"finish_reason"' not in tail:
+        return ""
+    text = tail.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.endswith("\n\n"):
+        return ""
+    if tail_truncated and text.startswith("\n"):
+        # The bounded tail can start on the second byte of the separator immediately before a
+        # complete final event. Dropping through to ``partition`` would then find only that final
+        # event's closing separator and discard the very finish_reason we need to validate.
+        text = text.lstrip("\n")
+    if tail_truncated and not text.startswith(("data:", ":", "event:", "id:", "retry:")):
+        _, separator, text = text.partition("\n\n")
+        if not separator:
+            return ""
+
+    expected_choice_count = max(1, expected_choice_count)
+    seen_choices: set[int] = set()
+    finished_choices: dict[int, str] = {}
+    for event in text.split("\n\n"):
+        if not event:
+            continue
+        data_lines: list[str] = []
+        event_type = ""
+        for raw_line in event.split("\n"):
+            line = raw_line.strip()
+            if not line or line.startswith(":"):
+                continue
+            field, delimiter, value = line.partition(":")
+            if field == "event":
+                event_type = value.strip().lower()
+                continue
+            if field in {"id", "retry"}:
+                continue
+            if field != "data" or not delimiter:
+                return ""
+            data_lines.append(value.lstrip())
+        if event_type == "error":
+            return ""
+        if not data_lines:
+            continue
+        payload = "\n".join(data_lines).strip()
+        if not payload or payload == "[DONE]":
+            return ""
+        try:
+            parsed = json.loads(payload)
+        except (ValueError, RecursionError):
+            return ""
+        if not isinstance(parsed, dict):
+            return ""
+        payload_type = str(parsed.get("type") or "").strip().lower()
+        if isinstance(parsed.get("error"), (dict, str)) or payload_type in {"error", "stream_error"}:
+            return ""
+        choices = parsed.get("choices")
+        if choices is None:
+            continue
+        if not isinstance(choices, list):
+            return ""
+        for position, choice in enumerate(choices):
+            if not isinstance(choice, dict):
+                return ""
+            raw_index = choice.get("index")
+            if type(raw_index) is int:
+                choice_index = raw_index
+            elif expected_choice_count == 1 and len(choices) == 1:
+                choice_index = 0
+            else:
+                choice_index = position
+            if choice_index < 0 or choice_index >= expected_choice_count:
+                return ""
+            seen_choices.add(choice_index)
+            candidate = choice.get("finish_reason")
+            if isinstance(candidate, str) and candidate.strip():
+                normalized_candidate = candidate.strip()
+                if normalized_candidate.lower() in {
+                    "abort",
+                    "aborted",
+                    "canceled",
+                    "cancelled",
+                    "error",
+                    "failed",
+                    "failure",
+                }:
+                    return ""
+                finished_choices[choice_index] = normalized_candidate
+            else:
+                # A later delta for the same choice makes an earlier finish reason stale.
+                finished_choices.pop(choice_index, None)
+    # Choice indexes are range-checked above, so equal cardinality proves the complete range
+    # without allocating ``set(range(expected_choice_count))`` from the caller-controlled `n`.
+    if len(seen_choices) != expected_choice_count or set(finished_choices) != seen_choices:
+        return ""
+    for choice_index in sorted(finished_choices):
+        candidate = finished_choices[choice_index]
+        if finish_reason_is_truncation({"choices": [{"finish_reason": candidate}]}):
+            return candidate
+    return finished_choices[min(finished_choices)]
+
+
+def sse_event_allows_done_normalization(event: bytes) -> bool:
+    """Whether one complete SSE event is safe to treat as part of a successful stream."""
+    data_lines: list[bytes] = []
+    event_type = b""
+    for raw_line in event.split(b"\n"):
+        line = raw_line.strip()
+        if not line or line.startswith(b":"):
+            continue
+        field, delimiter, value = line.partition(b":")
+        if field == b"event":
+            event_type = value.strip().lower()
+            continue
+        if field in {b"id", b"retry"}:
+            continue
+        if field != b"data" or not delimiter:
+            return False
+        data_lines.append(value.lstrip())
+    if event_type in {b"error", b"stream_error"}:
+        return False
+    if not data_lines:
+        return True
+    # SSE joins repeated data fields with a newline before dispatching the event. Parsing each
+    # line separately rejects valid JSON split at whitespace between tokens.
+    payload = b"\n".join(data_lines).strip()
+    if payload == b"[DONE]":
+        # A terminal [DONE] is handled independently from the bounded tail. If more events follow
+        # and push it out of that tail, EOF normalization must not manufacture a second terminator.
+        return False
+    if not payload:
+        return False
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    payload_type = str(parsed.get("type") or "").strip().lower()
+    if isinstance(parsed.get("error"), (dict, str)) or payload_type in {"error", "stream_error"}:
+        return False
+    choices = parsed.get("choices")
+    return choices is None or (
+        isinstance(choices, list) and all(isinstance(choice, dict) for choice in choices)
+    )
+
+
+def consume_sse_normalization_events(buffer: bytes, *, final: bool = False) -> tuple[bool, bytes]:
+    """Validate complete SSE events and return the bounded incomplete suffix."""
+    trailing_cr = b""
+    if not final and buffer.endswith(b"\r"):
+        buffer, trailing_cr = buffer[:-1], b"\r"
+    normalized = buffer.replace(b"\r\n", b"\n").replace(b"\r", b"\n") + trailing_cr
+    *events, carry = normalized.split(b"\n\n")
+    return all(sse_event_allows_done_normalization(event) for event in events), carry
 
 
 # How much of the stream's tail is kept to recognize the terminal frame. An SSE terminator is
@@ -9025,6 +9544,7 @@ def stream_chunks_to_writer(
     flush: Any,
     *,
     expect_sse_done: bool = True,
+    expected_choice_count: int = 1,
 ) -> dict[str, Any]:
     response_committed = False
     # True only while a call into `write_chunk`/`flush` is in flight — the delivery side. An
@@ -9037,6 +9557,8 @@ def stream_chunks_to_writer(
     chunk_count = 0
     bytes_sent = 0
     stream_tail = b""
+    normalization_carry = b""
+    normalization_valid = True
 
     def emit_terminal_error(reason: str, detail: str | None) -> None:
         # Best-effort — the client may already be gone (broken pipe); the failure is still
@@ -9054,6 +9576,14 @@ def stream_chunks_to_writer(
         except Exception:
             pass
 
+    # Observed on the chunks already on their way past, never by buffering: the answer to
+    # "did this stream deliver anything usable" is only final at `[DONE]`, and by then the
+    # bytes are long gone. It decides how the attempt is *scored*, never whether it is retried.
+    deliverable_sent = False
+    # Chunk boundaries do not respect SSE events, so retain the trailing partial event rather
+    # than only its last line. Legal multiline `data:` events can span chunks; parsing either
+    # half independently would bench a model that did reply.
+    deliverable_carry = b""
     try:
         for chunk in chunks:
             if not chunk:
@@ -9088,7 +9618,44 @@ def stream_chunks_to_writer(
             write_chunk(chunk)
             chunk_count += 1
             bytes_sent += len(chunk)
+            if expect_sse_done and not deliverable_sent:
+                try:
+                    buffered = deliverable_carry + chunk
+                    trailing_cr = b""
+                    if buffered.endswith(b"\r"):
+                        buffered, trailing_cr = buffered[:-1], b"\r"
+                    buffered = (
+                        buffered.replace(b"\r\n", b"\n").replace(b"\r", b"\n") + trailing_cr
+                    )
+                    scan, _, deliverable_carry = buffered.rpartition(b"\n\n")
+                    if scan and sse_chunk_carries_deliverable(scan):
+                        deliverable_sent = True
+                    elif len(deliverable_carry) > SSE_TERMINAL_TAIL_BYTES:
+                        # One frame wider than the carry window cannot be parsed here. Calling
+                        # it empty would bench a model that may well have answered, so the
+                        # check gives up in the model's favour and the attempt stands.
+                        deliverable_sent = True
+                except Exception:
+                    # This runs inside the write window, where any throw is classified as
+                    # `client_disconnected`, truncates a healthy relay and appends a bogus
+                    # error frame. Scoring must never cost the response -- the same rule the
+                    # reasoning observer follows by swallowing its own parse errors.
+                    deliverable_sent = True
+                    deliverable_carry = b""
             stream_tail = (stream_tail + chunk)[-SSE_TERMINAL_TAIL_BYTES:]
+            if expect_sse_done and normalization_valid:
+                try:
+                    normalization_valid, normalization_carry = consume_sse_normalization_events(
+                        normalization_carry + chunk
+                    )
+                    if len(normalization_carry) > SSE_TERMINAL_TAIL_BYTES:
+                        normalization_valid = False
+                    if not normalization_valid:
+                        normalization_carry = b""
+                except Exception:
+                    # Validation can withhold normalization, but must never interrupt the relay.
+                    normalization_valid = False
+                    normalization_carry = b""
             flush()
             writing_to_client = False
     except Exception as exc:
@@ -9121,29 +9688,92 @@ def stream_chunks_to_writer(
             "chunk_count": 0,
             "bytes_sent": 0,
         }
-    if expect_sse_done and not sse_stream_ended_with_done(stream_tail):
-        # HTTP 200 with bytes delivered but no terminal [DONE]: a clean-looking EOF that is
-        # actually a truncation (L2-R1). The response is committed, so no fallback — the
-        # client gets an explicit terminal error frame and telemetry records the failure.
-        detail = "stream ended without a terminal [DONE] event"
-        emit_terminal_error("mid_stream_failure", detail)
-        return {
-            "status": "fail",
-            "reason": "mid_stream_failure",
-            "stream_started": True,
-            "chunk_count": chunk_count,
-            "bytes_sent": bytes_sent,
-            "error_type": "missing_done",
-            "message": detail,
-        }
-    return {
+    if expect_sse_done and normalization_valid:
+        try:
+            normalization_valid, normalization_carry = consume_sse_normalization_events(
+                normalization_carry,
+                final=True,
+            )
+        except Exception:
+            normalization_valid = False
+            normalization_carry = b""
+    ended_with_done = sse_stream_ended_with_done(stream_tail) if expect_sse_done else False
+    finish_reason = (
+        finish_reason_from_sse_tail(stream_tail)
+        if ended_with_done or not expect_sse_done
+        else finish_reason_from_clean_sse_eof(
+            stream_tail,
+            tail_truncated=bytes_sent > len(stream_tail),
+            expected_choice_count=expected_choice_count,
+        )
+        if normalization_valid and not normalization_carry.strip()
+        else ""
+    )
+    normalized_done = False
+    if expect_sse_done and not ended_with_done:
+        if finish_reason:
+            # Some otherwise OpenAI-compatible relays (observed on Nous/LongCat 2.0)
+            # end cleanly after a choice with a non-null finish_reason and omit the
+            # conventional [DONE] sentinel. The finish_reason is an explicit terminal
+            # signal, so normalize that dialect for downstream clients. A stream without
+            # either signal remains a hard failure below.
+            if stream_tail.endswith(b"\n\n"):
+                boundary = b""
+            elif stream_tail.endswith(b"\n"):
+                boundary = b"\n"
+            else:
+                boundary = b"\n\n"
+            done_event = boundary + b"data: [DONE]\n\n"
+            try:
+                write_chunk(done_event)
+                chunk_count += 1
+                bytes_sent += len(done_event)
+                flush()
+            except Exception as exc:
+                return {
+                    "status": "fail",
+                    "reason": "client_disconnected",
+                    "stream_started": True,
+                    "chunk_count": chunk_count,
+                    "bytes_sent": bytes_sent,
+                    "error_type": type(exc).__name__,
+                    "message": safe_detail(exc),
+                }
+            stream_tail = (stream_tail + done_event)[-SSE_TERMINAL_TAIL_BYTES:]
+            normalized_done = True
+        else:
+            # HTTP 200 with bytes delivered but neither terminal signal: a clean-looking EOF
+            # that is actually a truncation (L2-R1). The response is committed, so no fallback
+            # is possible; emit an explicit terminal error frame and record the failure.
+            detail = "stream ended without a terminal [DONE] event or finish_reason"
+            emit_terminal_error("mid_stream_failure", detail)
+            return {
+                "status": "fail",
+                "reason": "mid_stream_failure",
+                "stream_started": True,
+                "chunk_count": chunk_count,
+                "bytes_sent": bytes_sent,
+                "error_type": "missing_done",
+                "message": detail,
+            }
+    result = {
         "status": "ok",
         "reason": "ok",
         "stream_started": True,
         "chunk_count": chunk_count,
         "bytes_sent": bytes_sent,
+        "finish_reason": finish_reason,
         "usage": usage_from_sse_tail(stream_tail),
     }
+    if expect_sse_done:
+        # Only an SSE body can be read for an assistant message. A provider answering a stream
+        # request with a plain JSON body is exempt from the `[DONE]` contract for exactly the
+        # same reason, and reporting nothing here lets the reader's default credit it — the
+        # alternative benches a model whose complete answer already reached the client.
+        result["deliverable_sent"] = deliverable_sent
+        if normalized_done:
+            result["normalized_done"] = True
+    return result
 
 
 def capability_for_benchmark(profile_id: str, test_type: str) -> str:
@@ -9396,7 +10026,11 @@ def probeable_capability_profiles(config: dict[str, Any]) -> list[str]:
     """
     return probeable_capability_profiles_use_case(
         config,
-        profile_ids=list(BENCHMARK_TEST_TYPES_BY_PROFILE),
+        profile_ids=[
+            profile_id
+            for profile_id in BENCHMARK_TEST_TYPES_BY_PROFILE
+            if profile_id != coding_certification.CODING_PROFILE_ID
+        ],
         benchmark_body=benchmark_body,
     )
 
@@ -9629,6 +10263,16 @@ def auto_benchmark_loop(config: dict[str, Any]) -> None:
 def run_canary(profile_ids: list[str], config: dict[str, Any]) -> dict[str, Any]:
     configured = safe_string_list((config.get("canary") or {}).get("profiles"))
     selected = profile_ids or configured or list(DEFAULT_CANARY_PROFILES)
+    custom_profile_ids = set(configured_custom_virtual_model_ids(config))
+    known_profile_ids = set(normalized_virtual_profiles(config)) | VIRTUAL_MODELS
+    unknown_profile_ids = [profile_id for profile_id in profile_ids if profile_id not in known_profile_ids]
+    if unknown_profile_ids:
+        raise ValueError(f"unknown canary profile: {unknown_profile_ids[0]}")
+    if profile_ids and any(profile_id in custom_profile_ids for profile_id in selected):
+        raise ValueError("custom virtual models reuse their built-in base profile evidence and are not canaried separately")
+    selected = [profile_id for profile_id in selected if profile_id not in custom_profile_ids]
+    if not selected:
+        selected = list(DEFAULT_CANARY_PROFILES)
     run_due_quota_probes(config, load_or_refresh_catalog(config))
     result = run_benchmarks(selected, config)
     status = canary_status_from_benchmark_result(result, safe_int=safe_int)
@@ -9751,7 +10395,11 @@ def run_failover_demo(
             ),
             apply_cooldown=lambda _cooldown: None,
             record_success=lambda _model, _latency, **_kwargs: None,
-            resolve_competence=lambda profile_id, model: model_route_competence(profile_id, model, fresh_runtime_state()),
+            resolve_competence=lambda profile_id, model: model_route_competence(
+                configured_virtual_profile_policy_id(profile_id, effective_config),
+                model,
+                fresh_runtime_state(),
+            ),
             record_telemetry=capture_telemetry,
             record_success_with_telemetry=lambda _model, _latency, telemetry: capture_telemetry(telemetry),
             stream_response=refuse_stream,
@@ -9817,24 +10465,34 @@ def find_catalog_model(catalog: dict[str, Any], model_id: str) -> dict[str, Any]
     return None
 
 
-def build_hermes_export_builder() -> HermesExportBuilder:
+def build_hermes_export_builder(virtual_models: Sequence[str] = TARGET_EXPORT_VIRTUAL_MODELS) -> HermesExportBuilder:
     return HermesExportBuilder(
-        picker_virtual_models=TARGET_EXPORT_VIRTUAL_MODELS,
+        picker_virtual_models=virtual_models,
         fusion_model_id=FUSION_MODEL_ID,
         fusion_visible_in_model_list=fusion_visible_in_model_list,
         safe_int=safe_int,
     )
 
 
-def build_target_registry() -> dict[str, TargetAdapter]:
-    hermes = HermesTargetAdapter(export_builder=build_hermes_export_builder())
+def build_target_registry(config: dict[str, Any] | None = None) -> dict[str, TargetAdapter]:
+    virtual_models = (
+        TARGET_EXPORT_VIRTUAL_MODELS
+        if config is None
+        else (*TARGET_EXPORT_VIRTUAL_MODELS, *configured_custom_virtual_model_ids(config))
+    )
+    hermes = HermesTargetAdapter(export_builder=build_hermes_export_builder(virtual_models))
     openclaw = OpenClawTargetAdapter(
-        virtual_models=TARGET_EXPORT_VIRTUAL_MODELS,
+        virtual_models=virtual_models,
         fusion_model_id=FUSION_MODEL_ID,
         fusion_visible_in_model_list=fusion_visible_in_model_list,
+        model_policy_ids=(
+            None
+            if config is None
+            else {model_id: configured_virtual_profile_policy_id(model_id, config) for model_id in virtual_models}
+        ),
     )
     generic = GenericClientTargetAdapter(
-        virtual_models=TARGET_EXPORT_VIRTUAL_MODELS,
+        virtual_models=virtual_models,
         fusion_model_id=FUSION_MODEL_ID,
         fusion_visible_in_model_list=fusion_visible_in_model_list,
     )
@@ -9843,7 +10501,8 @@ def build_target_registry() -> dict[str, TargetAdapter]:
 
 
 def target_legacy_export_payload(target_id: str, config: dict[str, Any]) -> dict[str, Any] | None:
-    export = target_export(build_target_registry(), target_id, config)
+    effective_config = effective_runtime_config(config)
+    export = target_export(build_target_registry(effective_config), target_id, effective_config)
     if export is None:
         return None
     return export.legacy_payload()
@@ -9863,7 +10522,8 @@ def target_export_public_fields(export: TargetExport) -> dict[str, Any]:
 
 
 def target_public_export_payload(target_id: str, config: dict[str, Any]) -> dict[str, Any] | None:
-    export = target_export(build_target_registry(), target_id, config)
+    effective_config = effective_runtime_config(config)
+    export = target_export(build_target_registry(effective_config), target_id, effective_config)
     if export is None:
         return None
     payload = target_export_public_fields(export)
@@ -9887,7 +10547,8 @@ def target_summary_payload(adapter: TargetAdapter, config: dict[str, Any]) -> di
 
 
 def targets_contract_payload(config: dict[str, Any]) -> dict[str, Any]:
-    registry = build_target_registry()
+    config = effective_runtime_config(config)
+    registry = build_target_registry(config)
     return {
         "targets": [target_summary_payload(registry[target_id], config) for target_id in sorted(registry)],
         "exports": {target_id: f"/admin/export/{target_id}" for target_id in sorted(registry)},
@@ -9923,6 +10584,9 @@ class ThreadingHTTPServer(_StdThreadingHTTPServer):
     request_queue_size = 128
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if args and isinstance(args[0], tuple) and args[0]:
+            host = str(args[0][0])
+            self.address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
         super().__init__(*args, **kwargs)
         self.chat_admission = ChatRequestAdmission(
             max_active=MAX_ACTIVE_CHAT_REQUESTS,
@@ -10631,6 +11295,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_body()
                 profile_ids = profile_ids_from_admin_body(body)
+                if any(profile_id in configured_custom_virtual_model_ids(self.config) for profile_id in profile_ids):
+                    if not license_ops.is_entitled():
+                        self._send_json(402, custom_profiles_license_error())
+                        return
+                    raise ValueError("custom virtual models reuse their built-in base profile evidence and are not benchmarked separately")
                 all_candidates = bool(body.get("all_candidates") or body.get("retest_all_candidates"))
                 only_model_id = body.get("model_id")
                 if only_model_id is not None and (not isinstance(only_model_id, str) or not only_model_id.strip()):
@@ -10653,6 +11322,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_body()
                 profile_ids = profile_ids_from_admin_body(body)
+                if any(profile_id in configured_custom_virtual_model_ids(self.config) for profile_id in profile_ids):
+                    if not license_ops.is_entitled():
+                        self._send_json(402, custom_profiles_license_error())
+                        return
+                    raise ValueError("custom virtual models reuse their built-in base profile evidence and are not canaried separately")
                 result = run_canary(profile_ids, self.config)
                 write_admin_audit("admin.canary", after={"summary": result.get("summary") or {}, "status": result.get("canary_status")}, metadata={"profiles": profile_ids})
                 self._send_json(200, result)
@@ -11028,6 +11702,9 @@ class RouterHandler(BaseHTTPRequestHandler):
                 catalog = load_or_refresh_catalog(self.config)
                 before = normalized_virtual_profiles(self.config)
                 profiles = validate_virtual_profiles_payload(body, self.config, catalog)
+                if custom_profile_write_requires_pro(before, profiles) and not license_ops.is_entitled():
+                    self._send_json(402, custom_profiles_license_error())
+                    return
                 saved = save_virtual_profiles(self.config, profiles)
                 audit = write_admin_audit(
                     "admin.profiles.save",
@@ -11046,6 +11723,20 @@ class RouterHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_body()
                 audit_id = str(body.get("audit_id") or body.get("id") or "").strip()
+                before = normalized_virtual_profiles(self.config)
+                row = find_admin_audit_entry(audit_id)
+                snapshot = ((row or {}).get("before") or {}).get("virtual_profiles") if isinstance((row or {}).get("before"), dict) else None
+                if isinstance(snapshot, dict):
+                    candidate = validate_virtual_profiles_payload(
+                        {"virtual_profiles": snapshot},
+                        self.config,
+                        load_or_refresh_catalog(self.config),
+                        extra_stale_ids=persisted_profile_model_ids({"virtual_profiles": snapshot}),
+                        extra_existing_profile_ids=snapshot,
+                    )
+                    if custom_profile_write_requires_pro(before, candidate) and not license_ops.is_entitled():
+                        self._send_json(402, custom_profiles_license_error())
+                        return
                 profiles = rollback_virtual_profiles_from_audit(audit_id, self.config)
                 self._send_json(200, {"virtual_profiles": profiles})
             except ValueError as exc:
@@ -11088,14 +11779,21 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.headers.get(SYNTHETIC_CASE_ID_HEADER),
             str(self.client_address[0]) if self.client_address else "",
         )
+        workload = accept_workload(
+            self.headers.get(WORKLOAD_HEADER),
+            str(self.client_address[0]) if self.client_address else "",
+        )
 
         def write_route_log_with_case(row: dict[str, Any]) -> None:
             if synthetic_case_id is not None:
                 row = {**row, "synthetic_case_id": synthetic_case_id}
+            if workload is not None:
+                row = {**row, "workload": workload}
             write_route_log(row)
 
         def record_telemetry_with_case(telemetry: ChatCompletionRouteTelemetry) -> None:
-            apply_chat_route_telemetry(_telemetry_with_synthetic_case(telemetry, synthetic_case_id))
+            telemetry = _telemetry_with_synthetic_case(telemetry, synthetic_case_id)
+            apply_chat_route_telemetry(_telemetry_with_workload(telemetry, workload))
 
         try:
             body = self._read_body()
@@ -11103,6 +11801,13 @@ class RouterHandler(BaseHTTPRequestHandler):
             requested_model = chat_request.requested_model
             safe_requested_model = chat_request.safe_requested_model
             entitled = license_ops.is_entitled()
+            if requested_model in configured_custom_virtual_model_ids(self.config) and not entitled:
+                self._send_json(
+                    402,
+                    custom_profiles_license_error(),
+                    headers=ficelle_response_headers(request_id, safe_requested_model),
+                )
+                return
             effective_config = effective_runtime_config(self.config, entitled=entitled)
             chat_router = ChatCompletionRouter(
                 config=effective_config,
@@ -11182,6 +11887,11 @@ class RouterHandler(BaseHTTPRequestHandler):
                             write_stream_chunk,
                             self.wfile.flush,
                             expect_sse_done="event-stream" in upstream_content_type.lower(),
+                            expected_choice_count=(
+                                body.get("n")
+                                if type(body.get("n")) is int and body["n"] > 0
+                                else 1
+                            ),
                         )
                     finally:
                         # The guard may have abandoned the upstream mid-body; close so the
@@ -11197,12 +11907,19 @@ class RouterHandler(BaseHTTPRequestHandler):
                         profile_id=safe_requested_model,
                     ),
                     record_success=record_success,
-                    resolve_competence=lambda profile, model: model_route_competence(profile, model, fresh_runtime_state()),
+                    resolve_competence=lambda profile, model: model_route_competence(
+                        configured_virtual_profile_policy_id(profile, effective_config),
+                        model,
+                        fresh_runtime_state(),
+                    ),
                     record_telemetry=record_telemetry_with_case,
                     record_success_with_telemetry=lambda model, latency, telemetry: record_success_with_telemetry(
                         model,
                         latency,
-                        _telemetry_with_synthetic_case(telemetry, synthetic_case_id),
+                        _telemetry_with_workload(
+                            _telemetry_with_synthetic_case(telemetry, synthetic_case_id),
+                            workload,
+                        ),
                     ),
                     stream_response=stream_response,
                     detect_success_error=success_error_payload_failure,
@@ -11466,9 +12183,26 @@ def install_shutdown_handler(server: Any) -> None:
             return
 
 
+def refresh_hermes_integration_on_startup() -> bool:
+    if HERMES_INTEGRATION_ENABLED:
+        # A verified update is applied by the previously installed client process, so code added
+        # to the new wheel cannot run in that helper. The first new service start is the guaranteed
+        # migration boundary for copied Hermes assets and its managed config block.
+        from ficelle.install import refresh_installed_hermes_integration
+
+        refresh_installed_hermes_integration(
+            RUNTIME_PATHS.hermes_home,
+            RUNTIME_PATHS.runtime_read_dir,
+            RUNTIME_PATHS.ficelle_home,
+        )
+        return True
+    return False
+
+
 def serve(config: dict[str, Any]) -> None:
     host = str(config.get("host") or "127.0.0.1")
     port = int(config.get("port") or 8646)
+    refresh_hermes_integration_on_startup()
     # Strict-zero fail-fast: refuse to start if paid fallback was somehow enabled.
     # The catalog warm runs in a background thread below (where this guard would be
     # swallowed), so assert it synchronously here before binding — cheap, no network.
@@ -11500,13 +12234,19 @@ def serve(config: dict[str, Any]) -> None:
     # letting the Settings toggle take effect without a restart. Daemon so it dies with the process.
     threading.Thread(target=auto_benchmark_loop, args=(config,), name="ficelle-auto-benchmark", daemon=True).start()
     threading.Thread(target=update_service.update_check_loop, name="ficelle-update-check", daemon=True).start()
+    threading.Thread(
+        target=coding_certification.refresh_loop,
+        args=(CODING_CERTIFICATION_CACHE_PATH, CODING_CERTIFICATION_STATUS_PATH),
+        name="ficelle-coding-certification",
+        daemon=True,
+    ).start()
     # A SIGKILL between create and rename leaves a temp file behind for good; startup is the
     # natural moment to clear them, when no write of ours is in flight.
     swept = sweep_orphan_temp_files(ROUTER_DIR)
     if swept:
         print(f"ficelle: removed {swept} orphaned temp file(s) from an interrupted write", flush=True)
     install_shutdown_handler(server)
-    print(f"Ficelle listening on http://{host}:{port}/v1")
+    print(f"Ficelle listening on {connectable_http_url(host, port, '/v1')}")
     try:
         server.serve_forever()
     finally:
@@ -11524,6 +12264,12 @@ def main_args(argv: list[str] | None = None) -> int:
     parser.add_argument("--auth-status", action="store_true", help="Print credential availability without secrets")
     parser.add_argument("--serve", action="store_true", help="Run the OpenAI-compatible HTTP server")
     parser.add_argument("--canary", action="store_true", help="Run configured canary benchmarks and print redacted JSON")
+    parser.add_argument(
+        "--canary-profile",
+        action="append",
+        default=[],
+        help="Restrict --canary to a virtual profile (repeatable)",
+    )
     parser.add_argument("--probe-provider", help="Run due quota probes for a provider and print redacted JSON")
     parser.add_argument("--host", help="Override host")
     parser.add_argument("--port", type=int, help="Override port")
@@ -11548,7 +12294,7 @@ def main_args(argv: list[str] | None = None) -> int:
         print_summary(catalog)
         return 0
     if args.canary:
-        print(json.dumps(run_canary([], config), indent=2, ensure_ascii=False))
+        print(json.dumps(run_canary(args.canary_profile, config), indent=2, ensure_ascii=False))
         return 0
     if args.probe_provider:
         catalog = load_or_refresh_catalog(config)
