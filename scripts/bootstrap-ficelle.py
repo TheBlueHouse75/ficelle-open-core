@@ -3,7 +3,7 @@
 
 This script is intentionally stdlib-only so it can be served as:
 
-    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.6/scripts/bootstrap-ficelle.py | python3
+    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.7/scripts/bootstrap-ficelle.py | python3
 
 Without a license key it installs the versioned open Core from the public GitHub
 release. With ``FICELLE_LICENSE_KEY`` (or the legacy ``FICELLE_INSTALL_TOKEN``)
@@ -28,22 +28,21 @@ import zipfile
 from dataclasses import dataclass
 from email.parser import Parser
 from pathlib import Path
-from typing import Literal, Mapping, Sequence
+from typing import Mapping, Sequence
 
-CORE_VERSION = "0.3.6"
+CORE_VERSION = "0.3.7"
 DEFAULT_CORE_WHEEL_URL = (
     "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
     f"v{CORE_VERSION}/ficelle_router-{CORE_VERSION}-py3-none-any.whl"
 )
 DEFAULT_CORE_SHA256 = (
-    "b56865cab854371ce3c783370878e2dcea7c5b7f9617c690ee3c6bff3273cf81"
+    "4475adef1ccfffbb03b1ff338b2b65bea5607813a92a7e2f414e3cbb47727f16"
 )
 DEFAULT_WHEEL_URL = f"https://install.ficelle.ai/api/releases/{CORE_VERSION}/wheel"
 PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
+CORE_RUNTIME_REQUIREMENTS = ("cryptography>=42", "packaging>=24", "requests>=2.31")
 DEFAULT_HERMES_HOME = Path.home() / ".hermes"
-INSTALL_TARGETS = ("auto", "generic", "hermes", "openclaw")
-InstallTarget = Literal["auto", "generic", "hermes", "openclaw"]
-ResolvedInstallTarget = Literal["generic", "hermes", "openclaw"]
+CONNECTORS = ("hermes", "openclaw")
 FALLBACK_WHEEL_FILENAME = "ficelle_pro-0-py3-none-any.whl"
 # Deliberately accepts only the PEP 440 subset emitted by Ficelle's release service.
 # Any valid-but-unrecognized form safely falls back to FALLBACK_WHEEL_FILENAME.
@@ -67,10 +66,9 @@ class BootstrapOptions:
     sha256: str | None
     python: str | None
     venv: Path
-    target: InstallTarget
+    connectors: tuple[str, ...]
     ficelle_home: Path
     hermes_home: Path
-    configure_hermes: bool
     backup_existing: bool
     skip_service: bool
     skip_smoke: bool
@@ -94,17 +92,14 @@ def redact_url(url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "[REDACTED]", parsed.fragment))
 
 
-def command_env(options: BootstrapOptions, target: ResolvedInstallTarget) -> dict[str, str]:
+def command_env(options: BootstrapOptions) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("FICELLE_RUNTIME_DIR", None)
     if options.ficelle_home_explicit:
         env["FICELLE_HOME"] = str(options.ficelle_home)
     else:
         env.pop("FICELLE_HOME", None)
-    if target == "hermes":
-        env["HERMES_HOME"] = str(options.hermes_home)
-    else:
-        env.pop("HERMES_HOME", None)
+    env.pop("HERMES_HOME", None)
     return env
 
 
@@ -113,7 +108,7 @@ def run_command(command: Sequence[str], *, dry_run: bool, env: Mapping[str, str]
     if env:
         hints = [
             f"{name}={env[name]}"
-            for name in ("FICELLE_HOME", "HERMES_HOME")
+            for name in ("FICELLE_HOME",)
             if env.get(name)
         ]
         if hints:
@@ -141,26 +136,6 @@ def pip_is_unavailable(result: CommandResult) -> bool:
     return "No module named pip" in combined or "No module named 'pip'" in combined
 
 
-def candidate_hermes_pythons(home: Path) -> list[Path]:
-    candidates: list[Path] = []
-    if os.getenv("HERMES_PYTHON"):
-        candidates.append(Path(os.environ["HERMES_PYTHON"]).expanduser())
-    candidates.extend([
-        home / "hermes-agent" / "venv" / "bin" / "python",
-        home / "venv" / "bin" / "python",
-        Path.home() / ".local" / "share" / "hermes" / "venv" / "bin" / "python",
-    ])
-    candidates.append(Path(sys.executable))
-    seen: set[Path] = set()
-    unique: list[Path] = []
-    for candidate in candidates:
-        expanded = candidate.expanduser()
-        if expanded not in seen:
-            unique.append(expanded)
-            seen.add(expanded)
-    return unique
-
-
 def run_python_probe(python: Path, code: str) -> CommandResult:
     command = [str(python), "-c", code]
     try:
@@ -184,39 +159,6 @@ def python_version_result(python: Path) -> CommandResult:
     )
 
 
-def hermes_runtime_result(python: Path) -> CommandResult:
-    return run_python_probe(
-        python,
-        "import importlib.util; "
-        "raise SystemExit(0 if importlib.util.find_spec('hermes_cli') is not None else 1)",
-    )
-
-
-def detect_hermes_python(options: BootstrapOptions) -> Path | None:
-    for candidate in candidate_hermes_pythons(options.hermes_home):
-        if (
-            candidate.is_file()
-            and os.access(candidate, os.X_OK)
-            and python_version_result(candidate).returncode == 0
-            and hermes_runtime_result(candidate).returncode == 0
-        ):
-            return candidate
-    return None
-
-
-def non_python_hermes_installation_signal(options: BootstrapOptions) -> Path | None:
-    hermes_cli = shutil.which("hermes")
-    if hermes_cli:
-        return Path(hermes_cli)
-    config_path = options.hermes_home / "config.yaml"
-    if config_path.is_file():
-        return config_path
-    agent_path = options.hermes_home / "hermes-agent"
-    if agent_path.is_dir():
-        return agent_path
-    return None
-
-
 def validate_python(python: Path) -> Path:
     result = python_version_result(python)
     if result.returncode != 0:
@@ -229,23 +171,14 @@ def venv_python(venv: Path) -> Path:
     return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def prepare_target_python(
+def prepare_ficelle_python(
     options: BootstrapOptions,
-    target: ResolvedInstallTarget,
     selected_python: Path,
-) -> tuple[Path, bool]:
-    """Use an isolated runtime unless the caller selected Python or Hermes owns it."""
-    if options.python is not None:
-        return selected_python, False
-    if (
-        target == "hermes"
-        and hermes_runtime_result(selected_python).returncode == 0
-    ):
-        return selected_python, False
-
+) -> Path:
+    """Create or reuse the Ficelle-owned runtime from the selected base Python."""
     python = venv_python(options.venv)
     if python.exists():
-        return validate_python(python), True
+        return validate_python(python)
     result = run_command(
         [str(selected_python), "-m", "venv", str(options.venv)],
         dry_run=options.dry_run,
@@ -263,44 +196,13 @@ def prepare_target_python(
         )
     ensure_success(result, action="isolated Python environment creation")
     if options.dry_run:
-        return python, True
-    return validate_python(python), True
+        return python
+    return validate_python(python)
 
 
-def resolve_install_context(
-    options: BootstrapOptions,
-) -> tuple[ResolvedInstallTarget, Path]:
-    """Resolve the install target and interpreter with at most one Hermes probe."""
-    explicit_python = (
-        validate_python(Path(options.python).expanduser())
-        if options.python is not None
-        else None
-    )
-    detected_hermes_python: Path | None = None
-    if options.target == "auto":
-        if explicit_python is not None:
-            if hermes_runtime_result(explicit_python).returncode == 0:
-                detected_hermes_python = explicit_python
-        else:
-            detected_hermes_python = detect_hermes_python(options)
-        target: ResolvedInstallTarget = (
-            "hermes"
-            if detected_hermes_python is not None
-            or non_python_hermes_installation_signal(options) is not None
-            else "generic"
-        )
-    else:
-        target = options.target
-        if target == "hermes" and options.python is None:
-            detected_hermes_python = detect_hermes_python(options)
-
-    if explicit_python is not None:
-        python = explicit_python
-    elif target == "hermes" and detected_hermes_python is not None:
-        python = detected_hermes_python
-    else:
-        python = validate_python(Path(sys.executable))
-    return target, python
+def resolve_base_python(options: BootstrapOptions) -> Path:
+    selected = Path(options.python).expanduser() if options.python else Path(sys.executable)
+    return validate_python(selected)
 
 
 def safe_wheel_filename(value: str | None) -> str | None:
@@ -521,11 +423,8 @@ def install_wheel(
     options: BootstrapOptions,
     python: Path,
     wheel: Path,
-    target: ResolvedInstallTarget,
-    *,
-    no_deps: bool = False,
 ) -> None:
-    env = command_env(options, target)
+    env = command_env(options)
     pip_command = [
         str(python),
         "-m",
@@ -533,8 +432,7 @@ def install_wheel(
         "install",
         "--force-reinstall",
     ]
-    if no_deps:
-        pip_command.append("--no-deps")
+    pip_command.append("--no-deps")
     pip_command.append(str(wheel))
     result = run_command(
         pip_command,
@@ -553,8 +451,7 @@ def install_wheel(
             str(python),
             "--reinstall",
         ]
-        if no_deps:
-            uv_command.append("--no-deps")
+        uv_command.append("--no-deps")
         uv_command.append(str(wheel))
         result = run_command(
             uv_command,
@@ -567,10 +464,11 @@ def install_wheel(
 def install_requirements(
     options: BootstrapOptions,
     python: Path,
-    target: ResolvedInstallTarget,
     requirements: Sequence[str],
 ) -> None:
-    env = command_env(options, target)
+    if not requirements:
+        return
+    env = command_env(options)
     pip_command = [str(python), "-m", "pip", "install", *requirements]
     result = run_command(
         pip_command,
@@ -592,16 +490,54 @@ def install_requirements(
             dry_run=options.dry_run,
             env=env,
         )
-    ensure_success(result, action="Pro runtime dependency install")
+    ensure_success(result, action="runtime dependency install")
+
+
+def wheel_runtime_requirements(
+    wheel: Path,
+    *,
+    fallback: Sequence[str] = (),
+) -> tuple[str, ...]:
+    if not wheel.is_file():
+        return tuple(fallback)
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            metadata_name = next(
+                name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+            )
+            metadata = Parser().parsestr(archive.read(metadata_name).decode("utf-8"))
+    except (OSError, UnicodeError, zipfile.BadZipFile, StopIteration) as exc:
+        raise SystemExit(f"wheel metadata could not be read: {wheel}") from exc
+    return tuple(
+        requirement
+        for requirement in metadata.get_all("Requires-Dist", [])
+        if not requirement.lower().replace("_", "-").startswith(
+            ("ficelle-router", "ficelle-pro")
+        )
+    )
+
+
+def check_runtime(options: BootstrapOptions, python: Path) -> None:
+    result = run_command(
+        [str(python), "-m", "pip", "check"],
+        dry_run=options.dry_run,
+        env=command_env(options),
+    )
+    if result.returncode != 0 and pip_is_unavailable(result) and shutil.which("uv"):
+        result = run_command(
+            ["uv", "pip", "check", "--python", str(python)],
+            dry_run=options.dry_run,
+            env=command_env(options),
+        )
+    ensure_success(result, action="Ficelle runtime dependency check")
 
 
 def setup_command(
     options: BootstrapOptions,
     python: Path,
     wheel: Path,
-    target: ResolvedInstallTarget,
     *,
-    expose_cli: bool = False,
+    expose_cli: bool = True,
 ) -> list[str]:
     command = [
         str(python),
@@ -611,15 +547,13 @@ def setup_command(
         "--package",
         str(wheel),
         "--no-editable",
-        "--target",
-        target,
-        "--hermes-home",
-        str(options.hermes_home),
     ]
     if options.ficelle_home_explicit:
         command.extend(("--ficelle-home", str(options.ficelle_home)))
-    if options.configure_hermes and target == "hermes":
-        command.append("--configure-hermes")
+    for connector in options.connectors:
+        command.extend(("--connector", connector))
+    if "hermes" in options.connectors:
+        command.extend(("--hermes-home", str(options.hermes_home)))
     if not options.backup_existing:
         command.append("--no-backup")
     if options.skip_service:
@@ -637,14 +571,13 @@ def run_packaged_setup(
     options: BootstrapOptions,
     python: Path,
     wheel: Path,
-    target: ResolvedInstallTarget,
     *,
-    expose_cli: bool = False,
+    expose_cli: bool = True,
 ) -> None:
     result = run_command(
-        setup_command(options, python, wheel, target, expose_cli=expose_cli),
+        setup_command(options, python, wheel, expose_cli=expose_cli),
         dry_run=options.dry_run,
-        env=command_env(options, target),
+        env=command_env(options),
     )
     ensure_success(result, action="Ficelle setup")
 
@@ -652,7 +585,6 @@ def run_packaged_setup(
 def verify_install(
     options: BootstrapOptions,
     python: Path,
-    target: ResolvedInstallTarget,
     *,
     expect_pro: bool,
 ) -> None:
@@ -668,7 +600,7 @@ def verify_install(
     result = run_command(
         [str(python), "-c", code],
         dry_run=options.dry_run,
-        env=command_env(options, target),
+        env=command_env(options),
     )
     if result.returncode != 0:
         raise SystemExit(
@@ -679,7 +611,6 @@ def verify_install(
 def run_license_activation(
     options: BootstrapOptions,
     python: Path,
-    target: ResolvedInstallTarget,
 ) -> None:
     """Activate this machine's Pro entitlement after a confirmed install (R7), best-effort.
 
@@ -690,7 +621,7 @@ def run_license_activation(
     """
     if options.dry_run or not options.license_key:
         return
-    env = command_env(options, target)
+    env = command_env(options)
     env["FICELLE_LICENSE_KEY"] = options.license_key
     result = run_command([str(python), "-m", "ficelle", "license", "activate"], dry_run=options.dry_run, env=env)
     if result.returncode == 0:
@@ -705,29 +636,29 @@ def run_license_activation(
 
 # Exposing the CLI lives in `ficelle.install` (`--expose-cli`), not here: it is one rule about
 # writing outside the install's footprint, and a second copy in this script could drift from the
-# one the packaged `ficelle-setup` applies. The isolation verdict stays here, because it is the
-# thing only the bootstrap knows — it exposes the commands when it made the environment itself,
-# and keeps its hands off an interpreter the user named or a host application owns.
+# one the packaged `ficelle-setup` applies. The bootstrap always owns the isolated runtime, so
+# its commands are always safe to expose through that single implementation.
 
 
 def run_bootstrap(options: BootstrapOptions) -> int:
-    target, selected_python = resolve_install_context(options)
-    python, isolated = prepare_target_python(
-        options,
-        target,
-        selected_python,
-    )
-    print(f"Install target: {target}")
-    print(f"Target Python: {python}")
+    selected_python = resolve_base_python(options)
+    python = prepare_ficelle_python(options, selected_python)
+    print(f"Ficelle runtime: {options.venv}")
+    print(f"Ficelle Python: {python}")
     print(f"Ficelle home: {options.ficelle_home}")
-    if target == "hermes":
-        print(f"Hermes home: {options.hermes_home}")
+    if options.connectors:
+        print(f"Connectors: {', '.join(options.connectors)}")
 
     if options.dry_run:
         download_dir = Path(tempfile.gettempdir()) / "ficelle-bootstrap-dry-run"
         core_wheel = download_core_wheel(options, download_dir)
         print("DRY RUN: skip checksums because no wheel was downloaded.")
-        install_wheel(options, python, core_wheel, target)
+        install_requirements(
+            options,
+            python,
+            wheel_runtime_requirements(core_wheel, fallback=CORE_RUNTIME_REQUIREMENTS),
+        )
+        install_wheel(options, python, core_wheel)
         if options.license_key:
             pro_wheel = download_wheel(options, download_dir)
             verify_pro_core_compatibility(
@@ -737,18 +668,23 @@ def run_bootstrap(options: BootstrapOptions) -> int:
             install_requirements(
                 options,
                 python,
-                target,
-                PRO_RUNTIME_REQUIREMENTS,
+                wheel_runtime_requirements(pro_wheel, fallback=PRO_RUNTIME_REQUIREMENTS),
             )
-            install_wheel(options, python, pro_wheel, target, no_deps=True)
-        run_packaged_setup(options, python, core_wheel, target, expose_cli=isolated)
+            install_wheel(options, python, pro_wheel)
+        check_runtime(options, python)
+        run_packaged_setup(options, python, core_wheel)
         return 0
 
     with tempfile.TemporaryDirectory(prefix="ficelle-bootstrap-") as tmp:
         download_dir = Path(tmp)
         core_wheel = download_core_wheel(options, download_dir)
         verify_sha256(core_wheel, options.core_sha256)
-        install_wheel(options, python, core_wheel, target)
+        install_requirements(
+            options,
+            python,
+            wheel_runtime_requirements(core_wheel),
+        )
+        install_wheel(options, python, core_wheel)
         wheels = [core_wheel]
         if options.license_key:
             pro_wheel = download_wheel(options, download_dir)
@@ -757,19 +693,18 @@ def run_bootstrap(options: BootstrapOptions) -> int:
             install_requirements(
                 options,
                 python,
-                target,
-                PRO_RUNTIME_REQUIREMENTS,
+                wheel_runtime_requirements(pro_wheel),
             )
-            install_wheel(options, python, pro_wheel, target, no_deps=True)
+            install_wheel(options, python, pro_wheel)
             wheels.append(pro_wheel)
-        run_packaged_setup(options, python, core_wheel, target, expose_cli=isolated)
+        check_runtime(options, python)
+        run_packaged_setup(options, python, core_wheel)
         verify_install(
             options,
             python,
-            target,
             expect_pro=bool(options.license_key),
         )
-        run_license_activation(options, python, target)
+        run_license_activation(options, python)
         if options.keep_wheel:
             keep_dir = options.ficelle_home / "artifacts"
             keep_dir.mkdir(parents=True, exist_ok=True)
@@ -797,11 +732,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--wheel-url", default=os.getenv("FICELLE_WHEEL_URL", DEFAULT_WHEEL_URL), help="Private wheel URL or local wheel path. Default: Ficelle install service endpoint.")
     parser.add_argument("--sha256", default=os.getenv("FICELLE_WHEEL_SHA256"), help="Expected wheel SHA256. Strongly recommended for release validation.")
-    parser.add_argument("--target", choices=INSTALL_TARGETS, default="auto", help="Integration target. Auto detects Hermes, otherwise installs standalone Core.")
     parser.add_argument(
         "--python",
-        default=os.getenv("FICELLE_PYTHON") or os.getenv("HERMES_PYTHON"),
-        help="Target Python. Defaults to FICELLE_PYTHON, then legacy HERMES_PYTHON; otherwise target-aware detection applies.",
+        default=os.getenv("FICELLE_PYTHON"),
+        help="Base Python 3.11+ used to create Ficelle's isolated runtime.",
     )
     parser.add_argument(
         "--venv",
@@ -809,11 +743,17 @@ def build_parser() -> argparse.ArgumentParser:
             "FICELLE_VENV",
             str(Path.home() / ".local" / "share" / "ficelle" / "venv"),
         ),
-        help="Isolated runtime used when no explicit or Hermes Python is selected.",
+        help="Ficelle-owned isolated runtime. It is always used for the installation.",
     )
     parser.add_argument("--ficelle-home", default=None, help="Ficelle state root. Default: FICELLE_HOME or ~/.ficelle")
+    parser.add_argument(
+        "--connector",
+        action="append",
+        choices=CONNECTORS,
+        default=[],
+        help="Install an optional client connector after Core verification. Repeatable.",
+    )
     parser.add_argument("--hermes-home", default=str(DEFAULT_HERMES_HOME), help="Hermes home directory. Default: ~/.hermes")
-    parser.add_argument("--configure-hermes", action="store_true", help="For the Hermes target, write the safe optional snippet/config helper.")
     parser.add_argument("--no-backup", action="store_true", help="Do not backup existing plugin/config files before replacement.")
     parser.add_argument("--skip-service", action="store_true", help="Install package/plugin/config helper but do not start the managed service.")
     parser.add_argument("--skip-smoke", action="store_true", help="Skip doctor/health/models smoke checks.")
@@ -832,12 +772,11 @@ def options_from_args(args: argparse.Namespace) -> BootstrapOptions:
         sha256=args.sha256,
         python=args.python,
         venv=Path(args.venv).expanduser().resolve(),
-        target=args.target,
+        connectors=tuple(dict.fromkeys(args.connector)),
         ficelle_home=Path(
             configured_ficelle_home or Path.home() / ".ficelle"
         ).expanduser().resolve(),
         hermes_home=Path(args.hermes_home).expanduser().resolve(),
-        configure_hermes=args.configure_hermes,
         backup_existing=not args.no_backup,
         skip_service=args.skip_service,
         skip_smoke=args.skip_smoke,

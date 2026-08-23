@@ -101,14 +101,13 @@ from ficelle.provider_credentials import (
     generic_provider_credential_aliases,
     generic_provider_credential_activation_fingerprint as generic_provider_credential_activation_fingerprint_use_case,
     is_usable_openrouter_key,
-    legacy_credential_sources as legacy_credential_sources_use_case,
     provider_credential_locations as provider_credential_locations_use_case,
     provider_primary_service as provider_primary_service_use_case,
-    purge_legacy_credentials as purge_legacy_credentials_use_case,
     remove_provider_key as remove_provider_key_use_case,
     resolve_provider_access,
     store_provider_key as store_provider_key_use_case,
 )
+from ficelle.connector_registry import load_connectors
 from ficelle.probe_lock import (
     SYNTHETIC_CASE_ID_HEADER as PROBE_SYNTHETIC_CASE_ID_HEADER,
     SYNTHETIC_CASE_ID_PATTERN as PROBE_SYNTHETIC_CASE_ID_PATTERN,
@@ -420,11 +419,10 @@ from ficelle.use_cases.hermes_export import HermesExportBuilder
 from ficelle.targets import TargetAdapter, TargetExport, TargetExportContext, target_export
 from ficelle.targets.base import target_base_url
 from ficelle.targets.generic import GenericClientTargetAdapter
-from ficelle.targets.hermes import HermesTargetAdapter, build_hermes_runtime_resolver
+from ficelle.targets.hermes import HermesTargetAdapter
 from ficelle.targets.openclaw import OpenClawTargetAdapter
 from ficelle.targets.online import (
     ONLINE_CONTROL_PLANE_TARGET_VERSION,
-    OnlineControlPlaneTargetAdapter,
     safe_online_status_payload,
 )
 from ficelle.use_cases.model_selection import ModelSelectionPorts, ModelSelectionRunner
@@ -629,10 +627,6 @@ RUNTIME_STATE_HISTORY_KEYS = state_store_module.RUNTIME_STATE_HISTORY_KEYS
 # Static admin assets shipped inside the package (not under HERMES_HOME).
 PACKAGE_DIR = Path(__file__).resolve().parent
 RUNTIME_PATHS = RuntimePaths.from_env(package_dir=PACKAGE_DIR)
-# RuntimePaths keeps a default Hermes location for legacy read compatibility even for a generic
-# service. Only an explicit/persisted HERMES_HOME means setup installed the Hermes integration.
-HERMES_INTEGRATION_ENABLED = bool(os.getenv("HERMES_HOME"))
-HERMES_HOME = RUNTIME_PATHS.hermes_home
 ROUTER_DIR = RUNTIME_PATHS.router_dir
 _ACCESS_TOKEN_CACHE: dict[str, str] = {}
 CATALOG_PATH = RUNTIME_PATHS.catalog_path
@@ -647,20 +641,12 @@ STATE_BACKUP_DIR = RUNTIME_PATHS.state_backup_dir
 CAPABILITY_DISCREPANCY_LOG_PATH = RUNTIME_PATHS.capability_discrepancy_log_path
 COMPRESSION_STORE_PATH = RUNTIME_PATHS.compression_store_path
 REQUEST_LOG_STORE_PATH = RUNTIME_PATHS.request_log_store_path
-HERMES_AGENT_DIR = RUNTIME_PATHS.hermes_agent_dir
-HERMES_CONFIG_PATH = RUNTIME_PATHS.hermes_config_path
 COMPRESSION_PENDING_MARKER = CHAT_COMPLETION_COMPRESSION_PENDING_MARKER
 
-# Ficelle's runtime state may still be discovered in the legacy Hermes layout until
-# setup migrates it. Credential WRITES are different: all new writes go to the
-# Ficelle-owned home, while resolution below keeps read-only legacy fallbacks.
 FICELLE_HOME = RUNTIME_PATHS.ficelle_home
 PROVIDER_PROBE_LOCK_PATH = probe_lock_path(FICELLE_HOME)
 CREDENTIAL_ENV_FILE = RUNTIME_PATHS.credential_env_file
-LEGACY_CREDENTIAL_ENV_FILE = RUNTIME_PATHS.legacy_credential_env_file
 FICELLE_SECRETS_KEYCHAIN = RUNTIME_PATHS.ficelle_secrets_keychain
-LEGACY_FICELLE_SECRETS_KEYCHAIN = RUNTIME_PATHS.legacy_ficelle_secrets_keychain
-LEGACY_HERMES_SECRETS_KEYCHAIN = RUNTIME_PATHS.legacy_hermes_secrets_keychain
 _STATE_STORE = StateStore(
     STATE_PATH,
     STATE_LOCK_PATH,
@@ -668,8 +654,8 @@ _STATE_STORE = StateStore(
     backup_keep=STATE_BACKUP_KEEP,
     backup_min_interval_seconds=STATE_BACKUP_MIN_INTERVAL_SECONDS,
     history_keys=RUNTIME_STATE_HISTORY_KEYS,
-    fallback_state_path=RUNTIME_PATHS.runtime_read_dir / STATE_PATH.name,
-    fallback_backup_dir=RUNTIME_PATHS.runtime_read_dir / STATE_BACKUP_DIR.name,
+    fallback_state_path=STATE_PATH,
+    fallback_backup_dir=STATE_BACKUP_DIR,
 )
 _REQUEST_LOG_LOCK = threading.Lock()
 # Live request tail (SSE, admin Requests page). Each subscriber holds one handler thread,
@@ -693,8 +679,6 @@ CAPABILITY_REFERENCE_PATH = PACKAGE_DIR / "data" / "model_capabilities.json"
 # (never pricing/endpoint/routing), cached under the runtime home and refreshed on a TTL. The
 # route path never hits this endpoint — the fetch runs only at serve startup and `ficelle refresh`.
 CAPABILITY_ORACLE_CACHE_PATH = RUNTIME_PATHS.capability_oracle_cache_path
-CODING_CERTIFICATION_CACHE_PATH = RUNTIME_PATHS.coding_certification_cache_path
-CODING_CERTIFICATION_STATUS_PATH = RUNTIME_PATHS.coding_certification_status_path
 OPENROUTER_ORACLE_URL = "https://openrouter.ai/api/v1/models"
 CAPABILITY_ORACLE_TTL_SECONDS = 7 * 24 * 3600
 _FONT_CACHE: dict[str, bytes] = {}
@@ -1362,12 +1346,12 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def runtime_read_path(path: Path) -> Path:
-    """Resolve a canonical runtime path through the read-only compatibility root."""
+    """Resolve a Ficelle-owned canonical runtime path."""
     return RUNTIME_PATHS.read_path(path)
 
 
 def load_runtime_json(path: Path, default: Any) -> Any:
-    """Read a canonical runtime JSON file with canonical-first legacy fallback."""
+    """Read a Ficelle-owned canonical runtime JSON file."""
     return load_json(runtime_read_path(path), default)
 
 
@@ -1690,7 +1674,8 @@ def not_found_body(method: str, path: str, base_url: str) -> dict[str, Any]:
     Clients whose settings ask for a full chat URL POST the configured value verbatim, so a
     `/v1` base arrives as `POST /v1`; they then surface our `error.message` as-is, and a terse
     "not found" reads as a router failure rather than a client-config mistake. `base_url` is
-    the one the export endpoints advertise, so the hint agrees with `/admin/export/generic`.
+    the one the client-config endpoint advertises, so the hint agrees with
+    `/admin/client-config`.
     Misses outside the OpenAI surface (`/favicon.ico`, admin typos) keep the terse body.
     """
     if path != "/" and not path.startswith("/v1"):
@@ -1848,7 +1833,7 @@ def runtime_config_store() -> ConfigStore:
         CONFIG_PATH,
         DEFAULT_CONFIG,
         normalize=lambda config: normalize_config_fusion(config, strict=False),
-        fallback_config_path=RUNTIME_PATHS.runtime_read_dir / CONFIG_PATH.name,
+        fallback_config_path=CONFIG_PATH,
     )
 
 
@@ -3030,8 +3015,8 @@ _KEYCHAIN_CACHE_LOCK = threading.Lock()
 def _keychain_file_signature(keychain: Path) -> tuple[int, int] | None:
     """Identity of a keychain file, or ``None`` when it does not exist.
 
-    Absence is a cacheable state of its own: most hosts have no legacy keychain at all, and
-    creating one moves the signature off ``None`` like any other write.
+    Absence is a cacheable state of its own; creating the keychain moves the signature off
+    ``None`` like any other write.
     """
     try:
         stat = keychain.stat()
@@ -3125,37 +3110,13 @@ def _unlock_ficelle_keychain() -> Path | None:
 
 
 def _credential_env_file_paths() -> tuple[Path, ...]:
-    """Canonical credential file followed by unique read-only migration fallbacks."""
-    return tuple(dict.fromkeys((CREDENTIAL_ENV_FILE, LEGACY_CREDENTIAL_ENV_FILE)))
-
-
-def _legacy_credential_env_file_paths() -> tuple[Path, ...]:
-    """Unique read-only credential files that are not the canonical Ficelle file."""
-    return tuple(
-        path
-        for path in _credential_env_file_paths()
-        if path != CREDENTIAL_ENV_FILE
-    )
-
-
-def _legacy_credential_keychain_paths() -> tuple[Path, ...]:
-    """Unique read-only keychains that are not Ficelle's canonical write keychain."""
-    candidates = (
-        LEGACY_FICELLE_SECRETS_KEYCHAIN,
-        LEGACY_HERMES_SECRETS_KEYCHAIN,
-    )
-    return tuple(
-        dict.fromkeys(
-            path
-            for path in candidates
-            if path != FICELLE_SECRETS_KEYCHAIN
-        )
-    )
+    """Return Ficelle's canonical credential file."""
+    return (CREDENTIAL_ENV_FILE,)
 
 
 def _credential_keychain_paths() -> tuple[Path, ...]:
-    """Canonical write keychain followed by unique read-only upgrade fallbacks."""
-    return (FICELLE_SECRETS_KEYCHAIN, *_legacy_credential_keychain_paths())
+    """Ficelle's canonical credential keychain."""
+    return (FICELLE_SECRETS_KEYCHAIN,)
 
 
 def _login_keychain_path() -> Path:
@@ -3193,38 +3154,6 @@ def read_canonical_keychain_secret(service: str) -> str:
     return _read_scoped_keychain_secret(service, keychain) if keychain is not None else ""
 
 
-def unlock_and_read_legacy_keychain_secret(service: str) -> str:
-    """Unlock and read unique legacy keychains without changing stored secrets."""
-    for keychain_path in _legacy_credential_keychain_paths():
-        keychain = _unlock_dedicated_keychain(keychain_path)
-        if keychain is None:
-            continue
-        candidate = _read_scoped_keychain_secret(service, keychain)
-        if candidate:
-            return candidate
-    return ""
-
-
-def _scoped_keychain_secret_exists(service: str, keychain: Path) -> bool:
-    """Probe a scoped keychain entry without asking `security` for its value."""
-
-    def exists() -> bool | None:
-        try:
-            result = subprocess.run(
-                ["security", "find-generic-password", "-s", service, str(keychain)],
-                text=True,
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-        except Exception:
-            return None
-        return result.returncode == 0
-
-    signature = _keychain_file_signature(keychain)
-    return bool(_keychain_cached((f"exists:{service}", str(keychain)), signature, exists))
-
-
 # `security` exits 44 for errSecItemNotFound — the answer for every alias a provider does
 # not use, and the one non-zero exit that is an absence rather than a refusal.
 SECURITY_ITEM_NOT_FOUND_EXIT = 44
@@ -3260,31 +3189,9 @@ def _scoped_keychain_delete(service: str, keychain: Path) -> tuple[bool, str | N
     return False, command_failure_detail(result, "security")
 
 
-def unlock_and_list_legacy_keychain_secret_sources(
-    services: Sequence[str],
-) -> list[tuple[str, Path]]:
-    """Unlock legacy keychains and list matching service/path pairs without values."""
-    sources: list[tuple[str, Path]] = []
-    for keychain_path in _legacy_credential_keychain_paths():
-        keychain = _unlock_dedicated_keychain(keychain_path)
-        if keychain is None:
-            continue
-        for service in services:
-            if _scoped_keychain_secret_exists(service, keychain):
-                sources.append((service, keychain))
-    return sources
-
-
 def read_keychain_secret(service: str) -> str:
-    """Compatibility lookup across canonical then legacy scoped keychains.
-
-    An unscoped lookup is deliberately avoided because it can prompt for locked
-    keychains in a launchd-managed process.
-    """
-    return (
-        read_canonical_keychain_secret(service)
-        or unlock_and_read_legacy_keychain_secret(service)
-    )
+    """Read Ficelle's scoped canonical keychains without an unscoped lookup."""
+    return read_canonical_keychain_secret(service)
 
 
 class SecretStore:
@@ -3306,35 +3213,6 @@ class SecretStore:
 
     def get(self, service: str) -> str | None:
         raise NotImplementedError
-
-    def get_legacy(self, service: str) -> str | None:
-        return None
-
-    def probe_legacy(self, services: Sequence[str]) -> list[str]:
-        """Which of ``services`` the legacy tier holds, as redacted labels.
-
-        Derived from ``get_legacy`` so a backend that can read a migration secret reports
-        it without having to remember to: a store with no legacy tier answers ``None`` for
-        every service and this is empty, which is all it ever meant. A backend overrides it
-        when it can answer presence more cheaply or more safely than by reading —
-        ``KeychainStore`` does, because listing without ``-w`` never pulls a secret at all.
-
-        The label shape matches the one the legacy location's own ``read`` produces
-        (``_alias_reader`` over ``get_legacy`` in ``provider_credentials.py``), so the two
-        sides of that location agree by default as they do everywhere else in the registry.
-        """
-        return [f"{self.label}:{service}" for service in services if self.get_legacy(service)]
-
-    def delete_legacy(self, services: Sequence[str]) -> list[str]:
-        """Clear the legacy entries for ``services``; return the labels cleared.
-
-        The one legacy operation with no generic default — deleting has to know where the
-        entries live — so it is what a backend must write itself once it can read that tier.
-        Returning nothing here is correct only for a store that reads nothing:
-        ``test_a_store_that_reads_a_legacy_secret_can_also_clear_it`` fails the suite when
-        the two stop agreeing, rather than leaving it to a user's removal.
-        """
-        return []
 
     # Set by the `record_*` helpers on the instance; the class defaults keep a backend that
     # never reports a reason (and every store before its first call) answering None.
@@ -3477,18 +3355,6 @@ class KeychainStore(SecretStore):
 
     def get(self, service: str) -> str | None:
         return read_canonical_keychain_secret(service) or None
-
-    def get_legacy(self, service: str) -> str | None:
-        return unlock_and_read_legacy_keychain_secret(service) or None
-
-    # The legacy tier is keychain files, so all three operations address it as such: one
-    # entry per service per keychain, listed and cleared by path. Kept next to the read
-    # they belong with — a backend owns its whole tier or has none.
-    def probe_legacy(self, services: Sequence[str]) -> list[str]:
-        return _legacy_keychain_credential_sources(services)
-
-    def delete_legacy(self, services: Sequence[str]) -> list[str]:
-        return _purge_legacy_keychain_credentials(services)
 
     def set(self, service: str, secret: str) -> bool:
         return self.record_write(keychain_store_write(service, secret))
@@ -3914,48 +3780,6 @@ def server_secret_store() -> SecretStore:
     return NullSecretStore()
 
 
-def _legacy_keychain_label(keychain: Path, entry: str) -> str:
-    """The one redacted label shape for a legacy keychain entry, or `locked` for a keychain
-    that could not be opened. Shared so the report and the purge can never name the same
-    entry differently — which is how they would start disagreeing again."""
-    return f"keychain:{keychain}:{entry}"
-
-
-def _legacy_keychain_credential_sources(services: Sequence[str]) -> list[str]:
-    """Redacted labels for the legacy keychain entries holding one of ``services``.
-
-    A locked legacy keychain cannot safely be queried: `security find` or `delete` would
-    open a GUI password prompt and hang the daemon (incident 2026-06-16). It can still
-    contain the provider key, though, so retain a redacted, conservative remaining-source
-    label rather than falsely reporting complete removal.
-    """
-    sources = [
-        _legacy_keychain_label(keychain_path, service)
-        for service, keychain_path in unlock_and_list_legacy_keychain_secret_sources(services)
-    ]
-    sources.extend(
-        _legacy_keychain_label(keychain_path, "locked")
-        for keychain_path in _legacy_credential_keychain_paths()
-        if keychain_path.exists() and _unlock_dedicated_keychain(keychain_path) is None
-    )
-    return sources
-
-
-def _purge_legacy_keychain_credentials(services: Sequence[str]) -> list[str]:
-    """Delete the legacy keychain entries for ``services``; return the labels cleared.
-
-    Reuses the enumeration that reports the remaining sources, so the purge and the report
-    can never disagree about what exists — and so a locked keychain is skipped here for the
-    same reason it is skipped there. It also means only entries that actually exist are
-    deleted, instead of one `security` call per alias per keychain.
-    """
-    return [
-        _legacy_keychain_label(keychain, service)
-        for service, keychain in unlock_and_list_legacy_keychain_secret_sources(services)
-        if _scoped_keychain_delete(service, keychain)[0]
-    ]
-
-
 def _credential_locations(
     env_names: Sequence[str],
     services: Sequence[str],
@@ -3972,7 +3796,6 @@ def _credential_locations(
             parse_env_file=parse_env_file,
             env_file_delete_key=env_file_delete_key,
             credential_env_file=CREDENTIAL_ENV_FILE,
-            legacy_credential_env_files=_legacy_credential_env_file_paths(),
             store=store,
         ),
     )
@@ -3984,11 +3807,7 @@ def provider_credential_locations(
     *,
     store: SecretStore | None = None,
 ) -> tuple[CredentialLocation, ...]:
-    """Every place ``source``'s key can live, in resolution precedence order.
-
-    The single enumeration behind resolution, legacy reporting and both removal paths, so
-    a read path can no longer reach a place a write path does not.
-    """
+    """Every Ficelle-owned place ``source``'s key can live, in precedence order."""
     provider_cfg = (config.get("providers") or {}).get(source) or {}
     env_names, services = generic_provider_credential_aliases(source, provider_cfg)
     return _credential_locations(env_names, services, store=store)
@@ -4001,12 +3820,12 @@ def resolve_credentials(
     store: SecretStore | None = None,
     validator: Callable[[Any], bool] | None = None,
 ) -> tuple[str | None, str]:
-    """Resolve env, canonical file/store, then read-only legacy fallbacks.
+    """Resolve process env, Ficelle's canonical file, then its canonical OS store.
 
     Walks ``_credential_locations`` in precedence order and takes the first accepted
     candidate: ``env_names`` against the process environment and the canonical ``.env``
-    file, ``services`` against the canonical OS store, then the legacy Hermes ``.env`` and
-    keychains. ``validator`` optionally gates each candidate (e.g. the OpenRouter
+    file, then ``services`` against the canonical OS store. ``validator`` optionally gates
+    each candidate (e.g. the OpenRouter
     ``sk-or-`` format check); a rejected one is recorded and the walk continues, so an
     invalid high-priority copy cannot mask a valid lower one. Returns ``(key, source)``
     with redacted source/reason labels only.
@@ -4036,29 +3855,6 @@ def resolve_credentials(
     if unreadable:
         return None, f"unreadable {env_names[0]} from {store.label}: {unreadable}"
     return None, f"missing {env_names[0]}"
-
-
-def legacy_provider_credential_sources(
-    source: str,
-    config: dict[str, Any],
-) -> list[str]:
-    """Return redacted, read-only labels for configured legacy credential sources."""
-    return legacy_credential_sources_use_case(provider_credential_locations(source, config))
-
-
-def purge_legacy_provider_credentials(source: str, config: dict[str, Any]) -> list[str]:
-    """Delete a provider's credentials from the read-only legacy fallbacks.
-
-    Never reached by the default removal: a legacy store may still be owned by another
-    install, so clearing it takes an explicit opt-in (``remove-key --purge-legacy`` or a
-    confirmed admin removal). Returns the redacted labels cleared, matching the shape
-    ``legacy_provider_credential_sources`` reports — both walk the same locations.
-    """
-    cleared = purge_legacy_credentials_use_case(provider_credential_locations(source, config))
-    if cleared:
-        invalidate_credential_cache()
-        invalidate_provider_budget(source)
-    return cleared
 
 
 # Per-OS secret-store backends report their store via ``SecretStore.label``; map those
@@ -4104,7 +3900,7 @@ def generic_provider_credential_activation_fingerprint(source: str, provider_cfg
         # The login keychain is shared by the whole user session. Its database mtime
         # changes for unrelated credentials and used to mark Ficelle's freshly rebuilt
         # catalog stale immediately. Ficelle-managed CLI writes already force a refresh;
-        # only the dedicated Ficelle/legacy stores are stable activation inputs here.
+        # only Ficelle's dedicated store is a stable activation input here.
         keychain_paths=_credential_keychain_paths(),
     )
     # Preserve immediate activation when a supported OS-store entry is changed outside
@@ -4151,9 +3947,7 @@ def provider_credential_identities(config: dict[str, Any]) -> dict[str, str | No
 CredentialResolver = Callable[[str], "tuple[str | None, str | None, str] | None"]
 
 
-_external_credential_resolvers: list[CredentialResolver] = [
-    build_hermes_runtime_resolver(HERMES_AGENT_DIR)
-]
+_external_credential_resolvers: list[CredentialResolver] = []
 
 
 def register_credential_resolver(resolver: CredentialResolver, *, prepend: bool = False) -> None:
@@ -4937,8 +4731,8 @@ def remove_provider_key(
     Returns the redacted targets cleared *and* the redacted reasons a location could not
     confirm it cleared anything — a store that refused the delete still holds the key, and
     reporting only the first list is how a refusal became a clean "removed" line. Process
-    environment variables and read-only legacy fallbacks are intentionally left untouched;
-    callers report any remaining legacy sources separately.
+    environment variables are intentionally left untouched and remain visible through the
+    post-removal authentication status.
 
     The store is resolved here rather than inside the registry so one instance serves both
     the deletes and the verdict about them: a per-operation store would record the refusal
@@ -6115,10 +5909,7 @@ def admin_status(config: dict[str, Any], *, run_quota_probes: bool = True) -> di
     # The identity of the code answering, not of the state: lets `ficelle doctor` and the
     # synthetic-health preflight prove they talk to the build they are validating.
     status["build"] = service_build_identity()
-    status["coding_certification"] = coding_certification.public_status(
-        CODING_CERTIFICATION_CACHE_PATH,
-        CODING_CERTIFICATION_STATUS_PATH,
-    )
+    status["coding_certification"] = coding_certification.public_status()
     return status
 
 
@@ -7614,7 +7405,7 @@ def model_matches_profile_requirements(model: dict[str, Any], profile: dict[str,
 
 def sort_available_for_virtual_model(requested_model: str, available: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
     if canonical_virtual_model_id(requested_model) == coding_certification.CODING_PROFILE_ID:
-        manifest = coding_certification.cached_manifest(CODING_CERTIFICATION_CACHE_PATH)
+        manifest = coding_certification.cached_manifest()
         certifications = coding_certification.certification_index(manifest)
         ordered = list(available)
         ordered.sort(
@@ -7962,7 +7753,7 @@ def route_competence_gate_result(
     """
     canonical = canonical_virtual_model_id(profile_id)
     if canonical == coding_certification.CODING_PROFILE_ID:
-        manifest = coding_certification.cached_manifest(CODING_CERTIFICATION_CACHE_PATH)
+        manifest = coding_certification.cached_manifest()
         certifications = coding_certification.certification_index(manifest)
         return (
             [
@@ -7991,7 +7782,7 @@ def benchmark_competence_gate_result(
     """Keep coding canaries exact-certification-only while allowing a failed model to recover."""
     if canonical_virtual_model_id(profile_id) != coding_certification.CODING_PROFILE_ID:
         return candidates, False
-    manifest = coding_certification.cached_manifest(CODING_CERTIFICATION_CACHE_PATH)
+    manifest = coding_certification.cached_manifest()
     certifications = coding_certification.certification_index(manifest)
     return (
         [
@@ -8014,7 +7805,7 @@ def model_route_competence(profile_id: str, model: dict[str, Any], state: dict[s
     """
     canonical = canonical_virtual_model_id(profile_id)
     if canonical == coding_certification.CODING_PROFILE_ID:
-        manifest = coding_certification.cached_manifest(CODING_CERTIFICATION_CACHE_PATH)
+        manifest = coding_certification.cached_manifest()
         if coding_certification.certification_for_model(model, manifest) is None:
             return "uncertified"
         return "failed_compatibility" if model_failed_profile_evidence(canonical, model, state) else "certified"
@@ -8940,6 +8731,23 @@ def fusion_run_metadata(
     )
 
 
+def fusion_route_log_selection(model: dict[str, Any] | None) -> dict[str, Any]:
+    """Name the model a Fusion route answered with, in the shape the request index reads.
+
+    The Requests page fills its provider and upstream columns from ``selected_source`` and
+    ``selected_upstream``, so a line carrying only ``selected_model`` renders "—" for both.
+    Only the success line calls this: a Fusion failure never pins a synthesizer (the runner
+    rejects an empty answer before selecting one), so its row has nothing to attribute.
+    """
+    if not model:
+        return {}
+    return {
+        "selected_model": model.get("id"),
+        "selected_upstream": model.get("upstream_id"),
+        "selected_source": model.get("source"),
+    }
+
+
 def run_fusion_chat_completion(
     body: dict[str, Any],
     config: dict[str, Any],
@@ -9187,7 +8995,7 @@ def run_fusion_chat_completion(
         write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": synth_failure_status, "final_reason": reason_code, "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
         return synth_failure_status, build_upstream_failure_error(FUSION_MODEL_ID, request_id, synth_failure_candidate_count, synth_failure_errors, synth_failure_errors), fusion_response_headers(request_id, None, len(attempts), metadata)
     record_last_route(FUSION_MODEL_ID, "ok", "ok", request_id, len(panel_candidates), len(attempts), time.monotonic() - request_started, selected_synth, attempts)
-    write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "selected_model": selected_synth.get("id") if selected_synth else None, "final_status": 200, "final_reason": "ok", "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
+    write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, **fusion_route_log_selection(selected_synth), "final_status": 200, "final_reason": "ok", "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
     return 200, fusion_openai_response(request_id, final_text), fusion_response_headers(request_id, selected_synth, len(attempts), metadata)
 
 
@@ -10557,7 +10365,7 @@ def build_hermes_export_builder(virtual_models: Sequence[str] = TARGET_EXPORT_VI
     )
 
 
-def build_target_registry(config: dict[str, Any] | None = None) -> dict[str, TargetAdapter]:
+def build_connector_registry(config: dict[str, Any] | None = None) -> dict[str, TargetAdapter]:
     virtual_models = (
         TARGET_EXPORT_VIRTUAL_MODELS
         if config is None
@@ -10574,18 +10382,12 @@ def build_target_registry(config: dict[str, Any] | None = None) -> dict[str, Tar
             else {model_id: configured_virtual_profile_policy_id(model_id, config) for model_id in virtual_models}
         ),
     )
-    generic = GenericClientTargetAdapter(
-        virtual_models=virtual_models,
-        fusion_model_id=FUSION_MODEL_ID,
-        fusion_visible_in_model_list=fusion_visible_in_model_list,
-    )
-    online = OnlineControlPlaneTargetAdapter()
-    return {hermes.target_id: hermes, openclaw.target_id: openclaw, generic.target_id: generic, online.target_id: online}
+    return {hermes.target_id: hermes, openclaw.target_id: openclaw}
 
 
 def target_legacy_export_payload(target_id: str, config: dict[str, Any]) -> dict[str, Any] | None:
     effective_config = effective_runtime_config(config)
-    export = target_export(build_target_registry(effective_config), target_id, effective_config)
+    export = target_export(build_connector_registry(effective_config), target_id, effective_config)
     if export is None:
         return None
     return export.legacy_payload()
@@ -10606,12 +10408,27 @@ def target_export_public_fields(export: TargetExport) -> dict[str, Any]:
 
 def target_public_export_payload(target_id: str, config: dict[str, Any]) -> dict[str, Any] | None:
     effective_config = effective_runtime_config(config)
-    export = target_export(build_target_registry(effective_config), target_id, effective_config)
+    export = target_export(build_connector_registry(effective_config), target_id, effective_config)
     if export is None:
         return None
     payload = target_export_public_fields(export)
     if export.config_text is not None:
         payload["yaml"] = export.config_text
+    if export.config is not None:
+        payload["config"] = dict(export.config)
+    return payload
+
+
+def generic_client_export_payload(config: dict[str, Any]) -> dict[str, Any]:
+    effective_config = effective_runtime_config(config)
+    virtual_models = (*TARGET_EXPORT_VIRTUAL_MODELS, *configured_custom_virtual_model_ids(effective_config))
+    adapter = GenericClientTargetAdapter(
+        virtual_models=virtual_models,
+        fusion_model_id=FUSION_MODEL_ID,
+        fusion_visible_in_model_list=fusion_visible_in_model_list,
+    )
+    export = adapter.export_config(TargetExportContext(config=effective_config))
+    payload = target_export_public_fields(export)
     if export.config is not None:
         payload["config"] = dict(export.config)
     return payload
@@ -10629,12 +10446,21 @@ def target_summary_payload(adapter: TargetAdapter, config: dict[str, Any]) -> di
     }
 
 
-def targets_contract_payload(config: dict[str, Any]) -> dict[str, Any]:
+def connectors_contract_payload(config: dict[str, Any]) -> dict[str, Any]:
     config = effective_runtime_config(config)
-    registry = build_target_registry(config)
+    registry = build_connector_registry(config)
+    installed = load_connectors(FICELLE_HOME)
+    connectors = []
+    for connector_id in sorted(registry):
+        summary = target_summary_payload(registry[connector_id], config)
+        summary["installed"] = bool(installed.get(connector_id, {}).get("installed"))
+        connectors.append(summary)
     return {
-        "targets": [target_summary_payload(registry[target_id], config) for target_id in sorted(registry)],
-        "exports": {target_id: f"/admin/export/{target_id}" for target_id in sorted(registry)},
+        "connectors": connectors,
+        "exports": {
+            connector_id: f"/admin/connectors/{connector_id}/export"
+            for connector_id in sorted(registry)
+        },
         "service": {
             "status_endpoint": "/admin/status.json",
             "state_endpoint": "/admin/state",
@@ -11053,8 +10879,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             if path == "/admin/notices":
                 self._send_json(200, admin_notices_payload())
                 return
-            if path == "/admin/targets":
-                self._send_json(200, targets_contract_payload(self.config))
+            if path == "/admin/connectors":
+                self._send_json(200, connectors_contract_payload(self.config))
+                return
+            if path == "/admin/client-config":
+                self._send_json(200, generic_client_export_payload(self.config))
                 return
             if path == "/admin/online/status.json":
                 self._send_json(200, online_safe_status(self.config))
@@ -11126,18 +10955,14 @@ class RouterHandler(BaseHTTPRequestHandler):
                 else:
                     self._send_bytes(200, asset[0], asset[1], no_cache=True)
                 return
-            if path == "/admin/export/hermes-config":
-                export = hermes_config_export(self.config)
-                self._send_export_payload(export)
-                return
-            if path.startswith("/admin/export/"):
-                target_id = path.removeprefix("/admin/export/")
-                if target_id == "hermes":
-                    export = target_legacy_export_payload(target_id, self.config)
+            if path.startswith("/admin/connectors/") and path.endswith("/export"):
+                connector_id = path.removeprefix("/admin/connectors/").removesuffix("/export").rstrip("/")
+                if connector_id == "hermes":
+                    export = target_legacy_export_payload(connector_id, self.config)
                 else:
-                    export = target_public_export_payload(target_id, self.config)
+                    export = target_public_export_payload(connector_id, self.config)
                 if export is None:
-                    self._send_json(404, {"error": {"message": f"unknown target export: {target_id}", "type": "not_found"}})
+                    self._send_json(404, {"error": {"message": f"unknown connector: {connector_id}", "type": "not_found"}})
                     return
                 self._send_export_payload(export)
                 return
@@ -11549,23 +11374,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 # Manager / libsecret), never the login keychain, and fall back to .env
                 # where none is available (R9). Cross-platform, never macOS-only.
                 if body.get("remove"):
-                    # Opt-in second pass: without it a key held only in a legacy store stays
-                    # resolvable and the remove looks like it silently failed.
-                    raw_purge_legacy = body.get("purge_legacy", False)
-                    if not isinstance(raw_purge_legacy, bool):
-                        raise ValueError("purge_legacy must be a boolean")
-                    purge_legacy = raw_purge_legacy
                     removal = remove_provider_key(source, self.config, store=server_secret_store())
                     cleared = removal.cleared
-                    purged_legacy = (
-                        purge_legacy_provider_credentials(source, self.config)
-                        if purge_legacy
-                        else []
-                    )
-                    remaining_legacy_sources = legacy_provider_credential_sources(
-                        source,
-                        self.config,
-                    )
                     try:
                         refresh_catalog(self.config)
                     except CatalogRefreshRejectedError:
@@ -11574,32 +11384,27 @@ class RouterHandler(BaseHTTPRequestHandler):
                         pass
                     # The post-removal verdict: resolution re-run after the delete and after
                     # refresh_catalog, so it names whatever store would still serve this
-                    # provider — process env and external resolvers included, which
-                    # `remaining_legacy_sources` does not enumerate. Computed once so the audit
-                    # entry and the response body can never disagree about it.
+                    # provider — process env and explicit connector resolvers included.
+                    # Computed once so the audit and response cannot disagree.
                     auth = provider_auth_row(source, self.config)
                     write_admin_audit(
                         "admin.providers.remove_key",
                         after={
                             "cleared": cleared,
-                            "purged_legacy": purged_legacy,
-                            "remaining_legacy_sources": remaining_legacy_sources,
                             "still_resolved_from": auth.get("key_source"),
                             # The audit trail is where a removal that was never confirmed
                             # has to be legible after the fact: `still_resolved_from` is
                             # null in that case too, and on its own reads as a success.
                             "unverified": removal.unverified,
                         },
-                        metadata={"source": source, "purge_legacy": purge_legacy},
+                        metadata={"source": source},
                     )
                     self._send_json(
                         200,
                         {
                             "source": source,
-                            # One list: what the removal cleared. The canonical/legacy split
-                            # only matters to the audit trail, which keeps it separately.
-                            "removed": [*cleared, *purged_legacy],
-                            "remaining_legacy_sources": remaining_legacy_sources,
+                            # One list: every Ficelle-owned location the removal cleared.
+                            "removed": cleared,
                             # Not a 409 like a refused *write*: parts of the removal did run
                             # and the caller needs their labels, so the refusal rides in the
                             # body rather than replacing it. 200 means "this is what
@@ -12267,15 +12072,17 @@ def install_shutdown_handler(server: Any) -> None:
 
 
 def refresh_hermes_integration_on_startup() -> bool:
-    if HERMES_INTEGRATION_ENABLED:
+    record = load_connectors(FICELLE_HOME).get("hermes")
+    client_home = record.get("client_home") if isinstance(record, dict) else None
+    if isinstance(client_home, str) and client_home:
         # A verified update is applied by the previously installed client process, so code added
         # to the new wheel cannot run in that helper. The first new service start is the guaranteed
         # migration boundary for copied Hermes assets and its managed config block.
         from ficelle.install import refresh_installed_hermes_integration
 
         refresh_installed_hermes_integration(
-            RUNTIME_PATHS.hermes_home,
-            RUNTIME_PATHS.runtime_read_dir,
+            Path(client_home).expanduser(),
+            RUNTIME_PATHS.router_dir,
             RUNTIME_PATHS.ficelle_home,
         )
         return True
@@ -12317,12 +12124,6 @@ def serve(config: dict[str, Any]) -> None:
     # letting the Settings toggle take effect without a restart. Daemon so it dies with the process.
     threading.Thread(target=auto_benchmark_loop, args=(config,), name="ficelle-auto-benchmark", daemon=True).start()
     threading.Thread(target=update_service.update_check_loop, name="ficelle-update-check", daemon=True).start()
-    threading.Thread(
-        target=coding_certification.refresh_loop,
-        args=(CODING_CERTIFICATION_CACHE_PATH, CODING_CERTIFICATION_STATUS_PATH),
-        name="ficelle-coding-certification",
-        daemon=True,
-    ).start()
     # A SIGKILL between create and rename leaves a temp file behind for good; startup is the
     # natural moment to clear them, when no write of ours is in flight.
     swept = sweep_orphan_temp_files(ROUTER_DIR)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import importlib.util
 import json
@@ -9,10 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from ficelle import coding_certification
+from ficelle import coding_benchmark_policy, coding_certification
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "coding-certification.py"
@@ -31,12 +28,19 @@ def write_run_record(
     repository: str,
     commit: str,
 ) -> None:
+    payload = json.loads(official.read_text(encoding="utf-8"))
+    settings_payload = json.loads(settings.read_text(encoding="utf-8"))
     path.write_text(
         json.dumps(
             {
                 "benchmark": benchmark,
                 "harness_repository": repository,
                 "harness_commit": commit,
+                "run_mode": payload["run_mode"],
+                "provider": settings_payload["provider"],
+                "upstream_model_id": settings_payload["upstream_model_id"],
+                "policy_fingerprint": payload["policy_fingerprint"],
+                "source_revisions": payload["source_revisions"],
                 "settings_fingerprint": "sha256:" + hashlib.sha256(settings.read_bytes()).hexdigest(),
                 "official_result_fingerprint": "sha256:" + hashlib.sha256(official.read_bytes()).hexdigest(),
                 "command_fingerprint": "sha256:" + "d" * 64,
@@ -48,11 +52,56 @@ def write_run_record(
     )
 
 
+def official_payload(benchmark: str, *, pass_at_1: float) -> dict[str, object]:
+    policy = coding_benchmark_policy.BENCHMARK_POLICIES[benchmark]
+    return {
+        "benchmark": benchmark,
+        "run_mode": "calibration",
+        "suite_version": policy.suite_version,
+        "harness_repository": policy.harness_repository,
+        "harness_commit": policy.harness_commit,
+        "reference_agent": policy.reference_agent,
+        "reference_agent_commit": policy.reference_agent_commit,
+        "source_revisions": [
+            {
+                "name": source.name,
+                "repository": source.repository,
+                "commit": source.commit,
+            }
+            for source in policy.sources
+        ],
+        "policy_fingerprint": coding_benchmark_policy.policy_fingerprint(),
+        "completion_token_budget": policy.completion_token_budget,
+        "model_settings_fingerprint": coding_benchmark_policy.aider_model_settings(policy)[1],
+        "task_count": policy.calibration_task_count,
+        "completed_count": policy.calibration_task_count,
+        "model_verdict_count": policy.calibration_task_count,
+        "provider_error_count": 0,
+        "harness_error_count": 0,
+        "attempts_per_task": policy.calibration_attempts_per_task,
+        "wall_clock_timeout_seconds": policy.calibration_wall_clock_seconds,
+        "harness_exit_code": 0,
+        "timed_out": False,
+        "pass_at_1": pass_at_1,
+        "efficiency": {
+            "measured_task_count": policy.calibration_task_count,
+            "duration_seconds": 50.0,
+            "mean_duration_seconds": 50.0 / policy.calibration_task_count,
+            "prompt_tokens": 1200,
+            "completion_tokens": 800,
+            "total_tokens": 2000,
+        },
+    }
+
+
 def test_normalizer_preserves_exact_identity_and_provenance(tmp_path):
     official = tmp_path / "official.json"
     settings = tmp_path / "settings.json"
     run_record = tmp_path / "run.json"
-    official.write_text(json.dumps({"results": [{"passed": True}, {"passed": False}]}), encoding="utf-8")
+    policy = coding_benchmark_policy.BENCHMARK_POLICIES["aider-polyglot"]
+    official.write_text(
+        json.dumps(official_payload("aider-polyglot", pass_at_1=0.5)), encoding="utf-8"
+    )
     settings.write_text(
         '{"provider":"openrouter","upstream_model_id":"exact/code-id","temperature":0}',
         encoding="utf-8",
@@ -63,7 +112,7 @@ def test_normalizer_preserves_exact_identity_and_provenance(tmp_path):
         settings=settings,
         benchmark="aider-polyglot",
         repository="https://github.com/Aider-AI/aider",
-        commit="abcdef12" * 5,
+        commit=policy.harness_commit,
     )
 
     row = tool.normalize_result(
@@ -72,27 +121,37 @@ def test_normalizer_preserves_exact_identity_and_provenance(tmp_path):
             input=official,
             provider="OpenRouter",
             model="exact/code-id",
-            suite_version="2026-08",
-            harness_repository="https://github.com/Aider-AI/aider",
-            harness_commit="abcdef12" * 5,
+            suite_version=policy.suite_version,
+            harness_repository=policy.harness_repository,
+            harness_commit=policy.harness_commit,
             settings=settings,
             run_record=run_record,
+            run_mode="calibration",
         )
     )
 
     assert row["provider"] == "openrouter"
     assert row["upstream_model_id"] == "exact/code-id"
-    assert row["task_count"] == 2
+    assert row["task_count"] == policy.calibration_task_count
     assert row["pass_at_1"] == 0.5
+    assert row["efficiency"]["mean_duration_seconds"] == 10.0
+    assert row["efficiency"]["total_tokens"] == 2000
+    assert row["completion_token_budget"] == policy.completion_token_budget
+    assert row["model_settings_fingerprint"] == coding_benchmark_policy.aider_model_settings(
+        policy
+    )[1]
     assert row["settings_fingerprint"].startswith("sha256:")
-    assert row["evidence_kind"] == "central_run"
+    assert row["evidence_kind"] == "calibration_run"
 
 
-def test_normalizer_accepts_an_official_result_array_and_a_zero_score(tmp_path):
+def test_normalizer_accepts_a_zero_score_and_rejects_an_identity_mismatch(tmp_path):
     official = tmp_path / "official.json"
     settings = tmp_path / "settings.json"
     run_record = tmp_path / "run.json"
-    official.write_text('[{"resolved":false}]', encoding="utf-8")
+    policy = coding_benchmark_policy.BENCHMARK_POLICIES["aider-polyglot"]
+    official.write_text(
+        json.dumps(official_payload("aider-polyglot", pass_at_1=0)), encoding="utf-8"
+    )
     settings.write_text(
         '{"provider":"openrouter","upstream_model_id":"exact/code-id"}',
         encoding="utf-8",
@@ -101,20 +160,21 @@ def test_normalizer_accepts_an_official_result_array_and_a_zero_score(tmp_path):
         run_record,
         official=official,
         settings=settings,
-        benchmark="swe-rebench",
-        repository="https://github.com/example/harness",
-        commit="abcdef12" * 5,
+        benchmark="aider-polyglot",
+        repository=policy.harness_repository,
+        commit=policy.harness_commit,
     )
     args = argparse.Namespace(
-        benchmark="swe-rebench",
+        benchmark="aider-polyglot",
         input=official,
         provider="openrouter",
         model="exact/code-id",
-        suite_version="2026-08",
-        harness_repository="https://github.com/example/harness",
-        harness_commit="abcdef12" * 5,
+        suite_version=policy.suite_version,
+        harness_repository=policy.harness_repository,
+        harness_commit=policy.harness_commit,
         settings=settings,
         run_record=run_record,
+        run_mode="calibration",
     )
 
     assert tool.normalize_result(args)["pass_at_1"] == 0
@@ -124,10 +184,48 @@ def test_normalizer_accepts_an_official_result_array_and_a_zero_score(tmp_path):
         tool.normalize_result(args)
 
 
-def test_builder_refuses_incomplete_suite_and_weights_complete_results(tmp_path):
+def test_efficiency_rejects_nonzero_metrics_without_measured_tasks():
+    with pytest.raises(ValueError, match="zero measured tasks"):
+        tool._efficiency_summary(
+            {
+                "efficiency": {
+                    "measured_task_count": 0,
+                    "duration_seconds": 1.0,
+                    "mean_duration_seconds": 0.0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                }
+            },
+            5,
+        )
+
+
+def test_pass_summary_excludes_provider_and_harness_errors():
+    payload = {
+        "task_count": 5,
+        "pass_at_1": 2 / 3,
+        "results": [
+            {"status": "passed", "passed": True},
+            {"status": "failed", "passed": False},
+            {"status": "passed", "passed": True},
+            {"status": "provider_error", "passed": False},
+            {"status": "harness_error", "passed": False},
+        ],
+    }
+
+    assert tool._pass_summary(payload) == (5, pytest.approx(2 / 3))
+
+    payload["pass_at_1"] = 0.4
+    with pytest.raises(ValueError, match="does not match model verdict"):
+        tool._pass_summary(payload)
+
+
+def test_builder_refuses_incomplete_or_weak_results_and_weights_complete_results(tmp_path):
     paths = []
-    scores = {"aider-polyglot": 0.8, "swe-rebench": 0.6, "terminal-bench-2.1": 0.4}
+    scores = {"aider-polyglot": 0.8}
     for name, score in scores.items():
+        policy = coding_benchmark_policy.BENCHMARK_POLICIES[name]
         path = tmp_path / f"{name}.json"
         path.write_text(
             json.dumps(
@@ -135,10 +233,32 @@ def test_builder_refuses_incomplete_suite_and_weights_complete_results(tmp_path)
                     "provider": "openrouter",
                     "upstream_model_id": "exact/code-id",
                     "name": name,
-                    "suite_version": "2026-08",
-                    "harness_repository": "https://github.com/example/harness",
-                    "harness_commit": "abcdef12" * 5,
-                    "task_count": 10,
+                    "run_mode": "certification",
+                    "suite_version": policy.suite_version,
+                    "harness_repository": policy.harness_repository,
+                    "harness_commit": policy.harness_commit,
+                    "reference_agent": policy.reference_agent,
+                    "reference_agent_commit": policy.reference_agent_commit,
+                    "source_revisions": [
+                        {
+                            "name": source.name,
+                            "repository": source.repository,
+                            "commit": source.commit,
+                        }
+                        for source in policy.sources
+                    ],
+                    "policy_fingerprint": coding_benchmark_policy.policy_fingerprint(),
+                    "completion_token_budget": policy.completion_token_budget,
+                    "model_settings_fingerprint": coding_benchmark_policy.aider_model_settings(policy)[1],
+                    "task_count": policy.certification_task_count,
+                    "completed_count": policy.certification_task_count,
+                    "model_verdict_count": policy.certification_task_count,
+                    "provider_error_count": 0,
+                    "harness_error_count": 0,
+                    "attempts_per_task": policy.certification_attempts_per_task,
+                    "harness_exit_code": 0,
+                    "timed_out": False,
+                    "wall_clock_timeout_seconds": policy.calibration_wall_clock_seconds,
                     "pass_at_1": score,
                     "settings_fingerprint": "sha256:" + "a" * 64,
                     "run_record_fingerprint": "sha256:" + "b" * 64,
@@ -151,48 +271,21 @@ def test_builder_refuses_incomplete_suite_and_weights_complete_results(tmp_path)
             encoding="utf-8",
         )
         paths.append(path)
-    args = argparse.Namespace(results=paths[:-1], priors=[], manifest_id="test", expires_days=30)
+    args = argparse.Namespace(results=[], priors=[], manifest_id="test", expires_days=30)
     with pytest.raises(ValueError, match="exact required"):
-        tool.build_manifest(args)
+        tool.build_manifest(argparse.Namespace(results=[paths[0], paths[0]], priors=[], manifest_id="test", expires_days=30))
 
     args.results = paths
     manifest = tool.build_manifest(args)
     row = manifest["certifications"][0]
-    assert row["quality_score"] == pytest.approx(62.0)
+    assert row["quality_score"] == pytest.approx(80.0)
     assert {item["name"] for item in row["benchmarks"]} == coding_certification.REQUIRED_BENCHMARKS
 
-
-def test_signer_uses_raw_private_key_and_core_verifier(monkeypatch):
-    private = Ed25519PrivateKey.generate()
-    raw_private = private.private_bytes(
-        serialization.Encoding.Raw,
-        serialization.PrivateFormat.Raw,
-        serialization.NoEncryption(),
-    )
-    public = private.public_key().public_bytes(
-        serialization.Encoding.Raw,
-        serialization.PublicFormat.Raw,
-    )
-    monkeypatch.setattr(tool, "private_key_bytes", lambda: raw_private)
-    monkeypatch.setitem(
-        coding_certification.PUBLIC_KEYS_B64,
-        tool.KEY_ID,
-        base64.b64encode(public).decode("ascii"),
-    )
-    now = datetime.now(UTC)
-    manifest = {
-        "schema_version": 1,
-        "manifest_id": "empty-test",
-        "generated_at": now.isoformat(),
-        "expires_at": (now + __import__("datetime").timedelta(days=1)).isoformat(),
-        "policy_version": "coding-v1",
-        "certifications": [],
-        "priors": [],
-    }
-
-    envelope = tool.sign_manifest(manifest)
-
-    assert coding_certification.verify_envelope(envelope)["manifest_id"] == "empty-test"
+    weak = json.loads(paths[0].read_text(encoding="utf-8"))
+    weak["pass_at_1"] = 0.6
+    paths[0].write_text(json.dumps(weak), encoding="utf-8")
+    with pytest.raises(ValueError, match="below the 80 qualification floor"):
+        tool.build_manifest(args)
 
 
 def test_public_result_import_is_structurally_a_prior(tmp_path):
@@ -217,14 +310,14 @@ def test_public_result_import_is_structurally_a_prior(tmp_path):
     assert row["task_count"] == 2
 
 
-def test_checked_in_launch_envelope_is_valid_and_intentionally_empty():
-    path = Path(__file__).resolve().parents[1] / "certifications" / "auto-coding-manifest.json"
-    envelope = coding_certification.strict_json_loads(path.read_bytes())
-
-    manifest = coding_certification.verify_envelope(
-        envelope,
-        now=datetime(2026, 8, 22, tzinfo=UTC),
+def test_bundled_manifest_is_valid():
+    path = Path(__file__).resolve().parents[1] / "src" / "ficelle" / "assets" / "auto-coding-manifest.json"
+    manifest = coding_certification.validate_manifest(
+        coding_certification.strict_json_loads(path.read_bytes()),
+        require_complete_policy=True,
     )
 
-    assert manifest["certifications"] == []
+    assert [row["upstream_model_id"] for row in manifest["certifications"]] == [
+        "moonshotai/kimi-k3",
+    ]
     assert manifest["priors"] == []

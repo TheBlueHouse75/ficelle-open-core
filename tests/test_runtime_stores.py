@@ -34,12 +34,10 @@ def test_runtime_paths_resolve_from_explicit_environment(tmp_path):
         package_dir=package_dir,
     )
 
-    assert paths.hermes_home == hermes_home
     router_dir = ficelle_home
     logs_dir = router_dir / "logs"
     assert paths.ficelle_home == ficelle_home
     assert paths.router_dir == router_dir
-    assert paths.runtime_read_dir == runtime_dir
     assert paths.config_path == router_dir / "config.json"
     assert paths.state_path == router_dir / "state.json"
     assert paths.catalog_path == router_dir / "catalog.json"
@@ -51,15 +49,8 @@ def test_runtime_paths_resolve_from_explicit_environment(tmp_path):
     assert paths.capability_discrepancy_log_path == logs_dir / "capability-discrepancies.jsonl"
     assert paths.compression_store_path == router_dir / "compression.sqlite"
     assert paths.capability_oracle_cache_path == router_dir / "capability_oracle.json"
-    assert paths.coding_certification_cache_path == router_dir / "coding-certifications.json"
-    assert paths.coding_certification_status_path == router_dir / "coding-certification-status.json"
-    assert paths.hermes_agent_dir == hermes_home / "hermes-agent"
-    assert paths.hermes_config_path == hermes_home / "config.yaml"
     assert paths.credential_env_file == ficelle_home / ".env"
-    assert paths.legacy_credential_env_file == hermes_home / ".env"
     assert paths.ficelle_secrets_keychain == ficelle_home / "ficelle-secrets.keychain-db"
-    assert paths.legacy_ficelle_secrets_keychain == ficelle_home / "hermes-secrets.keychain-db"
-    assert paths.legacy_hermes_secrets_keychain == hermes_home / "hermes-secrets.keychain-db"
     assert paths.admin_assets_dir == package_dir / "assets" / "admin"
 
 
@@ -70,14 +61,10 @@ def test_runtime_paths_default_to_standalone_ficelle_home(monkeypatch, tmp_path)
 
     assert paths.ficelle_home == tmp_path / ".ficelle"
     assert paths.router_dir == tmp_path / ".ficelle"
-    assert paths.runtime_read_dir == tmp_path / ".ficelle"
-    assert paths.hermes_home == tmp_path / ".hermes"
-    assert paths.legacy_ficelle_secrets_keychain == (
-        tmp_path / ".ficelle" / "hermes-secrets.keychain-db"
-    )
+    assert paths.read_path(paths.state_path) == paths.state_path
 
 
-def test_runtime_paths_discover_legacy_layout_without_mutating_it(monkeypatch, tmp_path):
+def test_runtime_paths_ignore_legacy_layout_without_mutating_it(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     legacy_router_dir = tmp_path / ".hermes" / "ficelle"
     legacy_router_dir.mkdir(parents=True)
@@ -89,11 +76,9 @@ def test_runtime_paths_discover_legacy_layout_without_mutating_it(monkeypatch, t
 
     assert paths.ficelle_home == tmp_path / ".ficelle"
     assert paths.router_dir == tmp_path / ".ficelle"
-    assert paths.runtime_read_dir == legacy_router_dir
     assert paths.credential_env_file == tmp_path / ".ficelle" / ".env"
-    assert paths.legacy_credential_env_file == tmp_path / ".hermes" / ".env"
     assert paths.request_log_store_path == tmp_path / ".ficelle" / "requests.sqlite"
-    assert paths.read_path(paths.state_path) == legacy_state
+    assert paths.read_path(paths.state_path) == paths.state_path
     assert file_snapshot(legacy_state) == legacy_snapshot
     assert not (tmp_path / ".ficelle").exists()
 
@@ -104,7 +89,7 @@ def test_runtime_paths_discover_legacy_layout_without_mutating_it(monkeypatch, t
     assert file_snapshot(legacy_state) == legacy_snapshot
 
 
-def test_runtime_paths_prefer_existing_standalone_home_over_legacy(monkeypatch, tmp_path):
+def test_runtime_paths_use_existing_standalone_home(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     (tmp_path / ".ficelle").mkdir()
     (tmp_path / ".ficelle" / "state.json").write_text("{}", encoding="utf-8")
@@ -114,7 +99,6 @@ def test_runtime_paths_prefer_existing_standalone_home_over_legacy(monkeypatch, 
 
     assert paths.ficelle_home == tmp_path / ".ficelle"
     assert paths.router_dir == tmp_path / ".ficelle"
-    assert paths.runtime_read_dir == tmp_path / ".hermes" / "ficelle"
     assert paths.read_path(paths.state_path) == paths.state_path
 
 
@@ -134,13 +118,10 @@ def test_runtime_paths_explicit_ficelle_home_wins_over_legacy(monkeypatch, tmp_p
 
     assert paths.ficelle_home == ficelle_home
     assert paths.router_dir == ficelle_home
-    assert paths.runtime_read_dir == ficelle_home
-    assert paths.legacy_ficelle_secrets_keychain == (
-        ficelle_home / "hermes-secrets.keychain-db"
-    )
+    assert paths.read_path(paths.state_path) == paths.state_path
 
 
-def test_runtime_paths_default_legacy_keychain_is_credential_only(monkeypatch, tmp_path):
+def test_runtime_paths_ignore_legacy_keychain_and_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     ficelle_home = tmp_path / ".ficelle"
     ficelle_home.mkdir()
@@ -156,14 +137,11 @@ def test_runtime_paths_default_legacy_keychain_is_credential_only(monkeypatch, t
 
     assert paths.ficelle_home == ficelle_home
     assert paths.router_dir == ficelle_home
-    assert paths.runtime_read_dir == legacy_router_dir
-    assert paths.read_path(paths.state_path) == legacy_router_dir / "state.json"
-    assert paths.legacy_ficelle_secrets_keychain == (
-        ficelle_home / "hermes-secrets.keychain-db"
-    )
+    assert paths.read_path(paths.state_path) == ficelle_home / "state.json"
+    assert not hasattr(paths, "legacy_ficelle_secrets_keychain")
 
 
-def test_runtime_paths_explicit_runtime_dir_wins_over_legacy(monkeypatch, tmp_path):
+def test_runtime_paths_ignore_external_runtime_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     legacy_router_dir = tmp_path / ".hermes" / "ficelle"
     legacy_router_dir.mkdir(parents=True)
@@ -175,10 +153,10 @@ def test_runtime_paths_explicit_runtime_dir_wins_over_legacy(monkeypatch, tmp_pa
 
     assert paths.ficelle_home == tmp_path / ".ficelle"
     assert paths.router_dir == tmp_path / ".ficelle"
-    assert paths.runtime_read_dir == runtime_dir
+    assert paths.read_path(paths.state_path) == tmp_path / ".ficelle" / "state.json"
 
 
-def test_credential_write_does_not_switch_unmigrated_legacy_runtime(monkeypatch, tmp_path):
+def test_credential_write_stays_in_standalone_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     legacy_router_dir = tmp_path / ".hermes" / "ficelle"
     legacy_router_dir.mkdir(parents=True)
@@ -192,8 +170,7 @@ def test_credential_write_does_not_switch_unmigrated_legacy_runtime(monkeypatch,
 
     assert before.ficelle_home == after.ficelle_home == tmp_path / ".ficelle"
     assert before.router_dir == after.router_dir == tmp_path / ".ficelle"
-    assert before.runtime_read_dir == after.runtime_read_dir == legacy_router_dir
-    assert after.read_path(after.state_path) == legacy_router_dir / "state.json"
+    assert after.read_path(after.state_path) == tmp_path / ".ficelle" / "state.json"
     assert after.credential_env_file == tmp_path / ".ficelle" / ".env"
     assert after.ficelle_secrets_keychain == tmp_path / ".ficelle" / "ficelle-secrets.keychain-db"
 

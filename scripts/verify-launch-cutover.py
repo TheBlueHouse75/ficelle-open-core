@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 REPOSITORY = "TheBlueHouse75/ficelle-open-core"
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 CORE_WHEEL = f"ficelle_router-{VERSION}-py3-none-any.whl"
-CORE_SHA256 = "b56865cab854371ce3c783370878e2dcea7c5b7f9617c690ee3c6bff3273cf81"
+CORE_SHA256 = "4475adef1ccfffbb03b1ff338b2b65bea5607813a92a7e2f414e3cbb47727f16"
 BOOTSTRAP_PATH = f"/{REPOSITORY}/v{VERSION}/scripts/bootstrap-ficelle.py"
 
 
@@ -29,7 +29,7 @@ Fetcher = Callable[[str], Snapshot]
 def fetch(url: str) -> Snapshot:
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "ficelle-launch-canary/0.3.6"},
+        headers={"User-Agent": f"ficelle-launch-canary/{VERSION}"},
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:

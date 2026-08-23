@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,14 +15,26 @@ SPEC.loader.exec_module(runner)
 
 def base_args(tmp_path: Path) -> list[str]:
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    settings.write_text(
+        json.dumps(
+            {
+                "provider": "openrouter",
+                "upstream_model_id": "exact/code-id",
+                "run_mode": "calibration",
+                "task_count": 5,
+                "attempts_per_task": 1,
+                "wall_clock_timeout_seconds": 1800,
+            }
+        ),
+        encoding="utf-8",
+    )
     return [
         "--benchmark",
         "aider-polyglot",
         "--repository",
-        "https://github.com/example/harness.git",
+        "https://github.com/Aider-AI/aider.git",
         "--commit",
-        "abcdef12" * 5,
+        "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
         "--settings",
         str(settings),
         "--result",
@@ -38,14 +51,39 @@ def test_runner_rejects_a_preexisting_result(tmp_path):
     assert runner.main([*args, "--", "/usr/bin/true"]) == 2
 
 
+def test_runner_rejects_a_preexisting_run_record(tmp_path):
+    args = base_args(tmp_path)
+    (tmp_path / "record.json").write_text('{"stale":true}', encoding="utf-8")
+
+    assert runner.main([*args, "--", "/usr/bin/true"]) == 2
+
+
+def test_runner_rejects_identical_result_and_record_paths(tmp_path):
+    args = base_args(tmp_path)
+    record_flag = args.index("--record")
+    args[record_flag + 1] = args[args.index("--result") + 1]
+
+    assert runner.main([*args, "--", "/usr/bin/true"]) == 2
+
+
+def test_runner_rejects_duplicate_settings_keys(tmp_path):
+    args = base_args(tmp_path)
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        '{"provider":"openrouter","provider":"nous","upstream_model_id":"exact/code-id",'
+        '"run_mode":"calibration","task_count":5,"attempts_per_task":1}',
+        encoding="utf-8",
+    )
+
+    assert runner.main([*args, "--", "/usr/bin/true"]) == 2
+
+
 def test_runner_passes_only_a_minimal_explicit_environment(tmp_path, monkeypatch):
     args = base_args(tmp_path)
-    checkout_commit = "abcdef12" * 5
+    checkout_commit = "5dc9490bb35f9729ef2c95d00a19ccd30c26339c"
     command_environment = {}
     monkeypatch.setenv("PROVIDER_API_KEY", "provider-secret")
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-leak")
-    monkeypatch.setattr(runner, "signing_material_is_accessible", lambda: False)
-
     def fake_run(command, **kwargs):
         if command[:2] == ["git", "clone"]:
             Path(command[-1]).mkdir()
@@ -63,27 +101,3 @@ def test_runner_passes_only_a_minimal_explicit_environment(tmp_path, monkeypatch
     assert runner.main([*args, "--pass-env", "PROVIDER_API_KEY", "--", "/usr/bin/true"]) == 0
     assert command_environment["PROVIDER_API_KEY"] == "provider-secret"
     assert "UNRELATED_SECRET" not in command_environment
-    assert "FICELLE_CODING_CERT_PRIVATE_KEY_B64" not in command_environment
-
-
-def test_runner_refuses_to_execute_when_signing_material_is_accessible(tmp_path, monkeypatch):
-    monkeypatch.setattr(runner, "signing_material_is_accessible", lambda: True)
-    calls = []
-    monkeypatch.setattr(runner.subprocess, "run", lambda *args, **kwargs: calls.append(args))
-
-    assert runner.main([*base_args(tmp_path), "--", "/usr/bin/true"]) == 2
-    assert calls == []
-
-
-def test_runner_refuses_to_pass_the_signing_key(tmp_path, monkeypatch):
-    monkeypatch.setenv("FICELLE_CODING_CERT_PRIVATE_KEY_B64", "signing-secret")
-
-    assert runner.main(
-        [
-            *base_args(tmp_path),
-            "--pass-env",
-            "FICELLE_CODING_CERT_PRIVATE_KEY_B64",
-            "--",
-            "/usr/bin/true",
-        ]
-    ) == 2

@@ -1,0 +1,271 @@
+{
+  "$id": "https://ficelle.ai/schemas/provider-intake-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "account_key_posture": {
+      "enum": [
+        "card_required",
+        "deposit_required",
+        "discord_checkin",
+        "no_card",
+        "not_required",
+        "real_name_required",
+        "unknown"
+      ]
+    },
+    "adapter_fit": {
+      "enum": [
+        "generic_config_only",
+        "generic_config_with_allowlist",
+        "generic_config_with_catalog_pricing",
+        "generic_plus_normalizer",
+        "not_integrable",
+        "provider_specific_runtime",
+        "unknown"
+      ]
+    },
+    "aliases": {
+      "items": {
+        "minLength": 1,
+        "pattern": "^(?=.*\\S)[^\\x00-\\x1f\\x7f\\x85\\u2028\\u2029]+$",
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "auth_env": {
+      "pattern": "^(?:none|[A-Z][A-Z0-9_]*)$",
+      "type": "string"
+    },
+    "billing_cap_behavior": {
+      "enum": [
+        "auto_bills",
+        "credit_balance",
+        "fails_closed",
+        "unknown"
+      ]
+    },
+    "blockers": {
+      "items": {
+        "minLength": 1,
+        "pattern": "^(?=.*\\S)[^\\x00-\\x1f\\x7f\\x85\\u2028\\u2029]+$",
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "canonical_chat_path": {
+      "not": {
+        "pattern": "(?:^|/)\\.\\.(?:/|$)"
+      },
+      "pattern": "^/\\S*$",
+      "type": "string"
+    },
+    "catalog_path": {
+      "not": {
+        "pattern": "(?:^|/)\\.\\.(?:/|$)"
+      },
+      "pattern": "^/\\S*$",
+      "type": "string"
+    },
+    "claimed_base_url": {
+      "anyOf": [
+        {
+          "const": ""
+        },
+        {
+          "not": {
+            "pattern": "[?&#][^=&#]*(?:[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Kk][Ee][Yy]|[Aa][Uu][Tt][Hh](?:[Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])?|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll])="
+          },
+          "pattern": "^https?://[^\\s/?#@\\x00-\\x1f\\x7f]+(?:[/?#][^\\s\\x00-\\x1f\\x7f]*)?$",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "commercial_use_posture": {
+      "enum": [
+        "allowed",
+        "non_commercial",
+        "training_or_retention_caveat",
+        "unknown"
+      ]
+    },
+    "context_status": {
+      "enum": [
+        "below_floor",
+        "claimed_128k_plus",
+        "unknown",
+        "verified_128k_plus"
+      ]
+    },
+    "endpoint_shape": {
+      "enum": [
+        "anthropic_messages",
+        "new_api_panel",
+        "non_openai",
+        "openai_compatible_nonstandard_path",
+        "openai_v1",
+        "unknown"
+      ]
+    },
+    "evidence": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "claim": {
+            "minLength": 1,
+            "pattern": "^(?=.*\\S)[^\\x00-\\x1f\\x7f\\x85\\u2028\\u2029]+$",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "type": "string"
+          },
+          "source_class": {
+            "enum": [
+              "directory_claim",
+              "manual_note",
+              "official_docs",
+              "runtime_probe",
+              "x_claim"
+            ]
+          },
+          "url": {
+            "not": {
+              "pattern": "[?&#][^=&#]*(?:[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Kk][Ee][Yy]|[Aa][Uu][Tt][Hh](?:[Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])?|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll])="
+            },
+            "pattern": "^https?://[^\\s/?#@\\x00-\\x1f\\x7f]+(?:[/?#][^\\s\\x00-\\x1f\\x7f]*)?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_class",
+          "url",
+          "observed_at",
+          "claim"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "free_mechanism": {
+      "enum": [
+        "free_model",
+        "grey_market_relay",
+        "no_published_cap",
+        "paid_topup_unlock",
+        "public_shared_key",
+        "recurring_free_quota",
+        "signup_credit",
+        "strict_zero_catalog",
+        "trial_credit",
+        "unknown"
+      ]
+    },
+    "model_ids": {
+      "items": {
+        "pattern": "^[^\\s\\x00-\\x1f\\x7f]+$",
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "name": {
+      "minLength": 1,
+      "pattern": "^(?=.*\\S)[^\\x00-\\x1f\\x7f\\x85\\u2028\\u2029]+$",
+      "type": "string"
+    },
+    "next_action": {
+      "minLength": 1,
+      "pattern": "^(?=.*\\S)[^\\x00-\\x1f\\x7f\\x85\\u2028\\u2029]+$",
+      "type": "string"
+    },
+    "official_urls": {
+      "items": {
+        "not": {
+          "pattern": "[?&#][^=&#]*(?:[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Kk][Ee][Yy]|[Aa][Uu][Tt][Hh](?:[Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])?|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll])="
+        },
+        "pattern": "^https?://[^\\s/?#@\\x00-\\x1f\\x7f]+(?:[/?#][^\\s\\x00-\\x1f\\x7f]*)?$",
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "provider_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "served_model_identity_status": {
+      "enum": [
+        "documented_alias",
+        "drift",
+        "exact",
+        "unknown"
+      ]
+    },
+    "source_urls": {
+      "items": {
+        "not": {
+          "pattern": "[?&#][^=&#]*(?:[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Kk][Ee][Yy]|[Aa][Uu][Tt][Hh](?:[Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])?|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll])="
+        },
+        "pattern": "^https?://[^\\s/?#@\\x00-\\x1f\\x7f]+(?:[/?#][^\\s\\x00-\\x1f\\x7f]*)?$",
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "status": {
+      "enum": [
+        "closed",
+        "do_not_use",
+        "needs_account_check",
+        "new_signal",
+        "official_docs_found",
+        "sheet_ready_candidate"
+      ]
+    },
+    "tool_call_status": {
+      "enum": [
+        "claimed",
+        "unknown",
+        "unsupported",
+        "verified"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "provider_id",
+    "name",
+    "aliases",
+    "source_urls",
+    "official_urls",
+    "claimed_base_url",
+    "endpoint_shape",
+    "canonical_chat_path",
+    "served_model_identity_status",
+    "free_mechanism",
+    "billing_cap_behavior",
+    "account_key_posture",
+    "commercial_use_posture",
+    "tool_call_status",
+    "context_status",
+    "status",
+    "adapter_fit",
+    "auth_env",
+    "catalog_path",
+    "model_ids",
+    "evidence",
+    "blockers",
+    "next_action"
+  ],
+  "title": "Ficelle provider intake record",
+  "type": "object"
+}

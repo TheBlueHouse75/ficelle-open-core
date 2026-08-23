@@ -1,0 +1,62 @@
+{
+  "certifications": [
+    {
+      "benchmarks": [
+        {
+          "attempts_per_task": 1,
+          "command_fingerprint": "sha256:c64d44e27fa10d5c656ddba38598422490ceec1d1f8de44bc6eb067ce592538b",
+          "completed_count": 5,
+          "completion_token_budget": 12000,
+          "efficiency": {
+            "completion_tokens": 6082,
+            "duration_seconds": 614.3217024803162,
+            "mean_duration_seconds": 122.86434049606324,
+            "measured_task_count": 5,
+            "prompt_tokens": 11300,
+            "total_tokens": 17382
+          },
+          "evidence_kind": "calibration_run",
+          "harness_commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+          "harness_error_count": 0,
+          "harness_exit_code": 0,
+          "harness_repository": "https://github.com/Aider-AI/aider",
+          "model_settings_fingerprint": "sha256:2b9125abf7530a112d7934a947d6f5e9d71482f798fff83f7ed1b1ae4c7bf56e",
+          "model_verdict_count": 5,
+          "name": "aider-polyglot",
+          "observed_at": "2026-08-22T20:17:42.410903+00:00",
+          "official_result_fingerprint": "sha256:abb2fabcaf7f7584ed7ea8429109d6ac803da9dd477db0ec2b560104e876e6f4",
+          "pass_at_1": 1.0,
+          "policy_fingerprint": "sha256:fdbe42687810465708faca0d27b1c387a881ad39e71d2e05795b6ff6642386ba",
+          "provider": "nvidia",
+          "provider_error_count": 0,
+          "reference_agent": "aider",
+          "reference_agent_commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+          "run_mode": "calibration",
+          "run_record_fingerprint": "sha256:b191638ceb7601d5b42b3ecd9b30a313b57a3955a011361cecce33780473dbd5",
+          "settings_fingerprint": "sha256:6a735d93f981386811418e5c1bc3d1c529c89002c10640c6019e2abff56ecb3b",
+          "source_revisions": [
+            {
+              "commit": "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f",
+              "name": "polyglot-benchmark",
+              "repository": "https://github.com/Aider-AI/polyglot-benchmark"
+            }
+          ],
+          "suite_version": "polyglot-2026-08-21",
+          "task_count": 5,
+          "timed_out": false,
+          "upstream_model_id": "moonshotai/kimi-k3",
+          "wall_clock_timeout_seconds": 1800
+        }
+      ],
+      "certified_at": "2026-08-22T21:48:13.199928+00:00",
+      "compatibility_canary_version": "coding-compatibility-v1",
+      "provider": "nvidia",
+      "quality_score": 100.0,
+      "upstream_model_id": "moonshotai/kimi-k3"
+    }
+  ],
+  "manifest_id": "2026-08-22-kimi-k3-policy-v2",
+  "policy_version": "coding-v1",
+  "priors": [],
+  "schema_version": 1
+}

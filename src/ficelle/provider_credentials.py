@@ -37,14 +37,7 @@ class SecretStoreWriteRefused(RuntimeError):
 
 
 class ProviderSecretStore(Protocol):
-    """One backend, owning every operation on both of its tiers.
-
-    The legacy tier is three operations, not one: a backend that can *read* a migration
-    secret must also be able to say it holds one and to clear it. They live together here
-    because splitting them is what makes a key readable, unreported and un-removable —
-    resolution asks the backend, so a host-side purge wired to one platform's shape cannot
-    follow a second backend that learns to read.
-    """
+    """One backend owning Ficelle's credential-store operations."""
 
     label: str
     # False only for a host with no OS secret store at all, where the `.env` file is the
@@ -53,20 +46,6 @@ class ProviderSecretStore(Protocol):
     provides_storage: bool
 
     def get(self, service: str) -> str | None:
-        ...
-
-    def get_legacy(self, service: str) -> str | None:
-        """The read-only migration tier, for a backend that has one; else ``None``."""
-        ...
-
-    def probe_legacy(self, services: Sequence[str]) -> list[str]:
-        """Redacted labels for the legacy entries holding one of ``services``; ``[]`` for a
-        backend with no legacy tier."""
-        ...
-
-    def delete_legacy(self, services: Sequence[str]) -> list[str]:
-        """Clear those entries; return the redacted labels actually cleared, ``[]`` for a
-        backend with no legacy tier."""
         ...
 
     def set(self, service: str, secret: str) -> bool:
@@ -169,8 +148,7 @@ class CredentialLocation:
       earlier one already won.
     - ``probe`` returns the redacted labels that hold a value, and by default derives them
       from ``read`` so the two cannot drift. A location overrides it when it can answer
-      presence more cheaply or more safely — the legacy keychains do, because listing them
-      with ``security find-generic-password`` and no ``-w`` never pulls a secret at all.
+      presence more cheaply or more safely.
     - ``delete`` returns the redacted labels it actually cleared, or is ``None`` for a
       place Ficelle may read but must not write. Every removal path skips those.
 
@@ -178,7 +156,6 @@ class CredentialLocation:
     """
 
     kind: str
-    legacy: bool
     read: Callable[[], Iterator[tuple[str, str]]]
     probe: Callable[[], list[str]]
     delete: Callable[[], list[str]] | None
@@ -215,13 +192,6 @@ class CredentialLocationPorts:
     parse_env_file: Callable[[Path], dict[str, str]]
     env_file_delete_key: Callable[[Path, str], bool]
     credential_env_file: Path
-    legacy_credential_env_files: tuple[Path, ...]
-    # Both tiers of the OS store, canonical and legacy, come from this one object. The
-    # legacy tier used to arrive split: read through ``store.get_legacy``, but listed and
-    # cleared through host callables wired to the macOS keychain shape. That split is what
-    # made a second backend learning to read a legacy secret produce a key that resolves,
-    # goes unreported and cannot be purged — the purge could not follow the store because
-    # it was not asking the store.
     store: ProviderSecretStore
 
 
@@ -253,7 +223,6 @@ def _alias_location(
     label: Callable[[str], str],
     open_lookup: Callable[[], Callable[[str], str | None]],
     *,
-    legacy: bool = False,
     delete_alias: Callable[[str], bool] | None = None,
 ) -> CredentialLocation:
     """A location addressed by a list of aliases resolution accepts interchangeably.
@@ -265,7 +234,6 @@ def _alias_location(
     read = _alias_reader(aliases, label, open_lookup)
     return CredentialLocation(
         kind=kind,
-        legacy=legacy,
         read=read,
         probe=lambda: [source for _value, source in read()],
         delete=(
@@ -280,15 +248,12 @@ def _env_file_location(
     path: Path,
     env_names: Sequence[str],
     ports: CredentialLocationPorts,
-    *,
-    legacy: bool,
 ) -> CredentialLocation:
     return _alias_location(
         "env_file",
         env_names,
         lambda env_name: f"{path}:{env_name}",
         lambda: ports.parse_env_file(path).get,
-        legacy=legacy,
         delete_alias=lambda env_name: ports.env_file_delete_key(path, env_name),
     )
 
@@ -299,12 +264,7 @@ def provider_credential_locations(
     *,
     ports: CredentialLocationPorts,
 ) -> tuple[CredentialLocation, ...]:
-    """Every place a provider key can live, in resolution precedence order.
-
-    The order is load-bearing and must not change: process environment, canonical ``.env``,
-    canonical OS store, legacy ``.env`` files, legacy OS store. It decides which copy of a
-    key wins when several exist.
-    """
+    """Every Ficelle-owned place a provider key can live, in precedence order."""
     store = ports.store
     return (
         _alias_location(
@@ -315,7 +275,7 @@ def provider_credential_locations(
             # No ``delete_alias``: a process environment variable belongs to whoever
             # exported it, and Ficelle cannot unset it for that session.
         ),
-        _env_file_location(ports.credential_env_file, env_names, ports, legacy=False),
+        _env_file_location(ports.credential_env_file, env_names, ports),
         _alias_location(
             "store",
             services,
@@ -324,27 +284,6 @@ def provider_credential_locations(
             # Bound late, like every other operation here: building the registry must not
             # require a capability the traversal about to run will never use.
             delete_alias=lambda service: store.delete(service),
-        ),
-        *(
-            _env_file_location(path, env_names, ports, legacy=True)
-            for path in ports.legacy_credential_env_files
-        ),
-        CredentialLocation(
-            kind="legacy_store",
-            legacy=True,
-            read=_alias_reader(
-                services,
-                lambda service: f"{store.label}:{service}",
-                lambda: store.get_legacy,
-            ),
-            # Listing and clearing are the backend's too, and take the whole alias list at
-            # once because a backend may address the tier as more than one place — the
-            # macOS keychain is one entry per service *per keychain file*, and lists them
-            # without ever reading a value. So these labels can name that file, which a
-            # ``read`` label cannot: they are the removal vocabulary, not resolution's
-            # ``key_source``.
-            probe=lambda: store.probe_legacy(services),
-            delete=lambda: store.delete_legacy(services),
         ),
     )
 
@@ -358,11 +297,6 @@ def _delete_credential_locations(locations: Sequence[CredentialLocation]) -> lis
     """
     ordered = sorted(locations, key=lambda location: location.kind != "store")
     return [label for location in ordered if location.delete for label in location.delete()]
-
-
-def legacy_credential_sources(locations: Sequence[CredentialLocation]) -> list[str]:
-    """Redacted labels for the legacy locations that still hold a key."""
-    return [label for location in locations if location.legacy for label in location.probe()]
 
 
 def generic_provider_credential_activation_fingerprint(
@@ -448,11 +382,8 @@ def remove_provider_key(
 ) -> CredentialRemoval:
     """Clear a provider's key from every canonical location, and only those.
 
-    Walking the shared registry is what keeps removal aligned with resolution: each
-    location clears the same alias list it reads, so a key stored under a secondary name
-    can no longer be resolved and un-removable. The read-only legacy fallbacks are
-    deliberately left alone — another install may still own them — and are cleared only by
-    the explicit opt-in ``purge_legacy_credentials``.
+    Walking the shared registry keeps removal aligned with resolution: each location
+    clears the same alias list it reads.
 
     ``store`` is the same instance the locations delete through, and it is taken separately
     because the OS store is the only place whose delete can fail for a reason that is not
@@ -468,25 +399,12 @@ def remove_provider_key(
     reset_delete_failure = getattr(store, "reset_delete_failure", None)
     if callable(reset_delete_failure):
         reset_delete_failure()
-    cleared = _delete_credential_locations(
-        [location for location in locations if not location.legacy]
-    )
+    cleared = _delete_credential_locations(locations)
     detail = store.delete_failure_detail()
     return CredentialRemoval(
         cleared=cleared,
         unverified=[f"{store.label} refused the delete ({detail})"] if detail else [],
     )
-
-
-def purge_legacy_credentials(locations: Sequence[CredentialLocation]) -> list[str]:
-    """Delete a provider's key from the read-only legacy fallbacks.
-
-    Resolution reads legacy keychains and ``.env`` files as a migration convenience, so a
-    key that lives *only* there is used by the router but is out of reach of the ordinary
-    removal. This is the explicit opt-in escape hatch, reached only from a confirmed
-    removal, because it writes to files another install may still own.
-    """
-    return _delete_credential_locations([location for location in locations if location.legacy])
 
 
 def resolve_provider_access(

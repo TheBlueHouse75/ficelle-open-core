@@ -4,21 +4,22 @@ from __future__ import annotations
 import argparse
 import filecmp
 import getpass
+import hashlib
 import json
 import os
 import secrets
 import shutil
-import socket
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from ficelle.json_store import write_private_text
-from ficelle.runtime_paths import FICELLE_CREDENTIAL_FILENAMES, RuntimePaths
+from ficelle.connector_registry import load_connectors, register_connector, unregister_connector
+from ficelle.runtime_paths import RuntimePaths
 from ficelle.service import active_home_pointer_path, persist_active_service_context
 from ficelle.url_security import connectable_host, connectable_http_url
 from ficelle.use_cases.admin_security import bind_host_is_loopback
@@ -38,11 +39,7 @@ PROVIDER_PLUGIN_ENV_KEY = "FICELLE_API_KEY"
 PROVIDER_PLUGIN_ENV_PLACEHOLDER = "ficelle-local"
 COMPRESSION_PLUGIN_NAME = "ficelle-compression"
 COMPRESSION_TOOLSET_NAME = "ficelle"
-LEGACY_MIGRATION_MARKER = ".ficelle-legacy-migrated"
-INSTALL_TARGETS = ("auto", "generic", "hermes", "openclaw")
-InstallTarget = Literal["auto", "generic", "hermes", "openclaw"]
-ResolvedInstallTarget = Literal["generic", "hermes", "openclaw"]
-ManagedServiceStatus = Literal["active", "inactive", "unknown"]
+CONNECTORS = ("hermes", "openclaw")
 
 
 @dataclass(frozen=True)
@@ -58,11 +55,8 @@ class InstallOptions:
     skip_service: bool
     skip_smoke: bool
     preflight_only: bool
-    configure_hermes: bool
     backup_existing: bool
-    target: InstallTarget = "auto"
-    rollback: bool = False
-    ficelle_home_explicit: bool = True
+    connectors: tuple[str, ...] = ()
     expose_cli: bool = False
     non_interactive: bool = False
 
@@ -95,29 +89,6 @@ def default_ficelle_home() -> Path:
     return RuntimePaths.from_env().ficelle_home
 
 
-def candidate_hermes_pythons(
-    hermes_home: Path,
-    selected_python: str | Path,
-) -> tuple[Path, ...]:
-    candidates: list[Path] = []
-    configured = os.getenv("HERMES_PYTHON")
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    candidates.extend(
-        (
-            hermes_home / "hermes-agent" / "venv" / "bin" / "python",
-            hermes_home / "venv" / "bin" / "python",
-            Path.home() / ".local" / "share" / "hermes" / "venv" / "bin" / "python",
-            Path(sys.executable),
-        )
-    )
-    selected_value = str(selected_python)
-    candidates.append(
-        Path(shutil.which(selected_value) or selected_value).expanduser()
-    )
-    return tuple(dict.fromkeys(candidates))
-
-
 def run_python_probe(python: str | Path, code: str) -> CommandResult:
     command = [str(python), "-c", code]
     try:
@@ -130,234 +101,6 @@ def run_python_probe(python: str | Path, code: str) -> CommandResult:
         completed.stdout or "",
         completed.stderr or "",
     )
-
-
-def probe_hermes_runtime(python: Path) -> CommandResult:
-    code = (
-        "import importlib.util; "
-        "raise SystemExit(0 if importlib.util.find_spec('hermes_cli') is not None else 1)"
-    )
-    return run_python_probe(python, code)
-
-
-def hermes_installation_signal(options: InstallOptions) -> Path | None:
-    for candidate in candidate_hermes_pythons(
-        options.hermes_home,
-        options.python,
-    ):
-        if (
-            candidate.is_file()
-            and os.access(candidate, os.X_OK)
-            and probe_hermes_runtime(candidate).returncode == 0
-        ):
-            return candidate
-    hermes_cli = shutil.which("hermes")
-    if hermes_cli:
-        return Path(hermes_cli)
-    config_path = options.hermes_home / "config.yaml"
-    if config_path.is_file():
-        return config_path
-    agent_path = options.hermes_home / "hermes-agent"
-    if agent_path.is_dir():
-        return agent_path
-    return None
-
-
-def resolve_install_target(options: InstallOptions) -> ResolvedInstallTarget:
-    if options.target != "auto":
-        return options.target
-    return "hermes" if hermes_installation_signal(options) is not None else "generic"
-
-
-def recover_interrupted_legacy_migration(
-    destination: Path,
-    *,
-    dry_run: bool,
-) -> bool:
-    """Restore credentials and remove staging left by an interrupted migration."""
-    parent = destination.parent
-    artifact_prefix = f".{destination.name.lstrip('.')}"
-    previous_paths = sorted(
-        parent.glob(f"{artifact_prefix}.pre-migration-*"),
-        key=lambda path: path.name,
-    )
-    staging_paths = tuple(
-        parent.glob(f"{artifact_prefix}.migration-*")
-    )
-    promotion_marker = destination / LEGACY_MIGRATION_MARKER
-    recovered_promotion = destination.exists() and bool(previous_paths)
-    promotion_completed = destination.exists() and (
-        recovered_promotion or promotion_marker.is_file()
-    )
-    if not destination.exists() and previous_paths:
-        latest_previous = previous_paths.pop()
-        if dry_run:
-            print(
-                "DRY RUN: recover interrupted Ficelle migration "
-                f"{latest_previous} -> {destination}"
-            )
-        else:
-            latest_previous.rename(destination)
-            print(f"Recovered interrupted Ficelle migration: {destination}")
-    for path in (*previous_paths, *staging_paths):
-        if dry_run:
-            print(f"DRY RUN: remove interrupted migration artifact {path}")
-        elif path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-    if recovered_promotion:
-        message = f"Recovered completed Ficelle migration at {destination}"
-        print(f"DRY RUN: {message}" if dry_run else message)
-    return promotion_completed
-
-
-def migrate_legacy_ficelle_home(
-    options: InstallOptions,
-    *,
-    before_copy: Callable[[], None] | None = None,
-) -> bool:
-    if options.ficelle_home_explicit:
-        return False
-    legacy_home = options.hermes_home / "ficelle"
-    destination = options.ficelle_home
-    if not legacy_home.is_dir():
-        return False
-    if recover_interrupted_legacy_migration(
-        destination,
-        dry_run=options.dry_run,
-    ):
-        return True
-    existing_credentials: frozenset[str] = frozenset()
-    if destination.exists():
-        if not destination.is_dir():
-            return False
-        entries = tuple(destination.iterdir())
-        if any(
-            entry.name not in FICELLE_CREDENTIAL_FILENAMES or not entry.is_file()
-            for entry in entries
-        ):
-            return False
-        existing_credentials = frozenset(entry.name for entry in entries)
-    if before_copy is not None:
-        before_copy()
-    if options.dry_run:
-        print(f"DRY RUN: migrate Ficelle state {legacy_home} -> {destination} (source preserved)")
-        return True
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    suffix = timestamp_suffix()
-    artifact_prefix = f".{destination.name.lstrip('.')}"
-    staging = destination.with_name(f"{artifact_prefix}.migration-{suffix}")
-    previous = destination.with_name(
-        f"{artifact_prefix}.pre-migration-{suffix}"
-    )
-    moved_previous = False
-    try:
-        shutil.copytree(legacy_home, staging)
-        for name in existing_credentials:
-            shutil.copy2(destination / name, staging / name)
-        (staging / LEGACY_MIGRATION_MARKER).write_text(
-            "migrated\n",
-            encoding="utf-8",
-        )
-        if destination.exists():
-            destination.rename(previous)
-            moved_previous = True
-        staging.rename(destination)
-    except Exception:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
-        if moved_previous and previous.exists() and not destination.exists():
-            previous.rename(destination)
-        raise
-    if moved_previous:
-        shutil.rmtree(previous, ignore_errors=True)
-    print(f"Migrated Ficelle state to {destination}; preserved legacy source at {legacy_home}.")
-    return True
-
-
-def quiesce_legacy_service(
-    options: InstallOptions,
-    target: ResolvedInstallTarget,
-    legacy_home: Path,
-) -> None:
-    """Stop the legacy service and stale server processes before copying runtime state."""
-    env = command_env(options, target, legacy_home)
-    package_root = str(Path(__file__).resolve().parents[1])
-    inherited_python_path = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        os.pathsep.join((package_root, inherited_python_path))
-        if inherited_python_path
-        else package_root
-    )
-    result = run_command(
-        [sys.executable, "-m", "ficelle.cli", "stop"],
-        dry_run=options.dry_run,
-        env=env,
-    )
-    status = run_command(
-        [sys.executable, "-m", "ficelle.cli", "status"],
-        dry_run=options.dry_run,
-        env=env,
-    )
-    if options.dry_run:
-        return
-    manager_status = managed_service_status(status)
-    listener_status = legacy_service_listener_status(legacy_home)
-    if manager_status != "inactive" or listener_status != "absent":
-        raise SystemExit(
-            "Legacy Ficelle service inactivity could not be confirmed after stop "
-            f"(manager={manager_status}, listener={listener_status}); "
-            "migration aborted to protect runtime state."
-        )
-    if result.returncode != 0:
-        print("No managed legacy service was loaded; no active listener remains.")
-
-
-def managed_service_status(result: CommandResult) -> ManagedServiceStatus:
-    """Normalize platform-specific service status output conservatively."""
-    if result.returncode == 0:
-        return "active"
-    output = f"{result.stdout}\n{result.stderr}".lower()
-    inactive_markers = (
-        "not loaded",
-        "could not find service",
-        "could not be found",
-        "not-found",
-        "active: inactive",
-        "inactive (dead)",
-    )
-    if any(marker in output for marker in inactive_markers):
-        return "inactive"
-    return "unknown"
-
-
-def legacy_service_listener_status(
-    legacy_home: Path,
-) -> Literal["active", "absent", "unknown"]:
-    """Confirm whether the legacy runtime's configured TCP listener still accepts."""
-    config_path = legacy_home / "config.json"
-    try:
-        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raw_config = {}
-    except (OSError, ValueError):
-        return "unknown"
-    config = raw_config if isinstance(raw_config, dict) else {}
-    host = connectable_host(config.get("host"))
-    try:
-        port = int(config.get("port") or 8646)
-    except (TypeError, ValueError):
-        return "unknown"
-    if not 1 <= port <= 65_535:
-        return "unknown"
-    try:
-        connection = socket.create_connection((host, port), timeout=1)
-    except ConnectionRefusedError:
-        return "absent"
-    except OSError:
-        return "unknown"
-    connection.close()
-    return "active"
 
 
 def package_install_command(options: InstallOptions) -> list[str]:
@@ -383,21 +126,11 @@ def pip_is_unavailable(result: CommandResult) -> bool:
     return "No module named pip" in combined or "No module named 'pip'" in combined
 
 
-def command_env(
-    options: InstallOptions,
-    target: ResolvedInstallTarget,
-    runtime_dir: Path,
-) -> dict[str, str]:
+def command_env(options: InstallOptions) -> dict[str, str]:
     env = os.environ.copy()
     env["FICELLE_HOME"] = str(options.ficelle_home)
-    if runtime_dir != options.ficelle_home:
-        env["FICELLE_RUNTIME_DIR"] = str(runtime_dir)
-    else:
-        env.pop("FICELLE_RUNTIME_DIR", None)
-    if target == "hermes":
-        env["HERMES_HOME"] = str(options.hermes_home)
-    else:
-        env.pop("HERMES_HOME", None)
+    env.pop("FICELLE_RUNTIME_DIR", None)
+    env.pop("HERMES_HOME", None)
     return env
 
 
@@ -413,7 +146,7 @@ def run_command(
     if env:
         hints = [
             f"{name}={env[name]}"
-            for name in ("FICELLE_HOME", "FICELLE_RUNTIME_DIR", "HERMES_HOME")
+            for name in ("FICELLE_HOME",)
             if env.get(name)
         ]
         if hints:
@@ -624,10 +357,18 @@ def refresh_installed_hermes_integration(
         skip_service=True,
         skip_smoke=True,
         preflight_only=False,
-        configure_hermes=False,
         backup_existing=True,
-        target="hermes",
+        connectors=("hermes",),
     )
+    previous = load_connectors(ficelle_home).get("hermes") or {}
+    previous_metadata = previous.get("metadata")
+    previous_metadata = previous_metadata if isinstance(previous_metadata, dict) else {}
+    config_existed = (hermes_home / "config.yaml").exists()
+    env_path = hermes_home / ".env"
+    env_file_existed = env_path.exists()
+    from ficelle.router import parse_env_file
+
+    env_key_existed = bool(parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY))
     install_plugins(options, runtime_dir=runtime_dir)
     config_path = hermes_home / "config.yaml"
     try:
@@ -636,6 +377,22 @@ def refresh_installed_hermes_integration(
         config_text = ""
     if MANAGED_CONFIG_BEGIN in config_text and MANAGED_CONFIG_END in config_text:
         configure_hermes(options, runtime_dir=runtime_dir)
+    metadata = hermes_connector_metadata(
+        options,
+        config_existed=config_existed,
+        env_file_existed=env_file_existed,
+        env_key_existed=env_key_existed,
+    )
+    for ownership_key in ("config_created", "env_file_created", "env_key_created"):
+        metadata[ownership_key] = bool(
+            metadata[ownership_key] or previous_metadata.get(ownership_key)
+        )
+    register_connector(
+        ficelle_home,
+        "hermes",
+        client_home=hermes_home,
+        metadata=metadata,
+    )
 
 
 def latest_backup(path: Path) -> Path | None:
@@ -739,10 +496,8 @@ def ensure_success(result: CommandResult) -> None:
 
 def install_package(
     options: InstallOptions,
-    target: ResolvedInstallTarget,
-    runtime_dir: Path,
 ) -> None:
-    env = command_env(options, target, runtime_dir)
+    env = command_env(options)
     result = run_command(package_install_command(options), dry_run=options.dry_run, env=env)
     if result.returncode == 0:
         return
@@ -781,15 +536,13 @@ def probe_target_python(python: str) -> CommandResult:
 
 def collect_preflight_checks(
     options: InstallOptions,
-    target: ResolvedInstallTarget,
 ) -> list[PreflightCheck]:
     checks: list[PreflightCheck] = []
     checks.append(
         PreflightCheck(
-            "target",
+            "core",
             "ok",
-            f"selected target: {target}"
-            + (" (auto-detected)" if options.target == "auto" else " (explicit)"),
+            "standalone Ficelle runtime selected",
         )
     )
 
@@ -813,12 +566,12 @@ def collect_preflight_checks(
         detail = (python_result.stderr or python_result.stdout or "target Python did not run").strip()
         checks.append(PreflightCheck("python", "fail", detail, "Check --python points to a working interpreter."))
 
-    if target != "hermes":
+    if "hermes" not in options.connectors:
         checks.append(
             PreflightCheck(
                 "plugin",
                 "ok",
-                f"Hermes plugin copy not applicable to target {target}",
+                "Hermes connector not requested",
             )
         )
     elif options.skip_plugin:
@@ -856,7 +609,7 @@ def collect_preflight_checks(
         else:
             checks.append(PreflightCheck("keychain", "ok", f"dedicated secrets keychain will be created (encrypted server-side write target): {keychain}"))
 
-    if target == "hermes":
+    if "hermes" in options.connectors:
         hermes_parent = options.hermes_home.parent
         if options.dry_run:
             checks.append(PreflightCheck("hermes-home", "ok", f"dry-run target: {options.hermes_home}"))
@@ -865,16 +618,7 @@ def collect_preflight_checks(
         else:
             checks.append(PreflightCheck("hermes-home", "fail", f"parent does not exist: {hermes_parent}", "Create the parent directory or pass --hermes-home."))
 
-    if options.configure_hermes and target != "hermes":
-        checks.append(
-            PreflightCheck(
-                "hermes-config",
-                "fail",
-                f"--configure-hermes requires --target hermes (selected: {target})",
-                "Select --target hermes or omit --configure-hermes.",
-            )
-        )
-    elif options.configure_hermes:
+    if "hermes" in options.connectors:
         config_path = options.hermes_home / "config.yaml"
         if not config_path.exists():
             checks.append(PreflightCheck("hermes-config", "ok", "config.yaml is absent; setup can create a Ficelle-only config with backup-safe semantics"))
@@ -884,9 +628,6 @@ def collect_preflight_checks(
                 checks.append(PreflightCheck("hermes-config", "ok", "existing Ficelle managed config block can be updated with backup"))
             else:
                 checks.append(PreflightCheck("hermes-config", "warn", "existing config.yaml is unmanaged; setup will not rewrite it", "A ready snippet will be written under ~/.hermes/ficelle/."))
-    elif target == "hermes":
-        checks.append(PreflightCheck("hermes-config", "ok", "Hermes config edit disabled; use --configure-hermes to write a safe snippet/apply when possible"))
-
     return checks
 
 
@@ -901,9 +642,8 @@ def print_preflight_report(checks: Sequence[PreflightCheck]) -> None:
 
 def run_preflight(
     options: InstallOptions,
-    target: ResolvedInstallTarget,
 ) -> None:
-    checks = collect_preflight_checks(options, target)
+    checks = collect_preflight_checks(options)
     print_preflight_report(checks)
     if any(check.failed for check in checks):
         raise SystemExit(2)
@@ -1147,6 +887,145 @@ def write_text_file(path: Path, content: str, *, dry_run: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     print(f"wrote: {path}")
+
+
+def file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def tree_sha256(path: Path) -> str | None:
+    if not path.is_dir():
+        return None
+    digest = hashlib.sha256()
+    try:
+        for child in sorted(item for item in path.rglob("*") if item.is_file()):
+            digest.update(str(child.relative_to(path)).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(child.read_bytes())
+            digest.update(b"\0")
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def hermes_connector_metadata(
+    options: InstallOptions,
+    *,
+    config_existed: bool,
+    env_file_existed: bool,
+    env_key_existed: bool,
+) -> dict[str, Any]:
+    config_path = options.hermes_home / "config.yaml"
+    snippet_path = options.hermes_home / "ficelle" / "hermes-config.snippet.yaml"
+    env_path = options.hermes_home / ".env"
+    try:
+        config_text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        config_text = ""
+    from ficelle.router import parse_env_file
+
+    env_value = parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY)
+    return {
+        "config_created": not config_existed and config_path.is_file(),
+        "config_managed": MANAGED_CONFIG_BEGIN in config_text and MANAGED_CONFIG_END in config_text,
+        "config_sha256": file_sha256(config_path),
+        "snippet_sha256": file_sha256(snippet_path),
+        "env_file_created": not env_file_existed and env_path.is_file(),
+        "env_key_created": not env_key_existed and bool(env_value),
+        "env_value_sha256": (
+            hashlib.sha256(env_value.encode("utf-8")).hexdigest()
+            if env_value
+            else None
+        ),
+        "plugin_sha256": {
+            str(destination.relative_to(options.hermes_home)): tree_sha256(destination)
+            for _source, destination in hermes_plugin_install_specs(options.hermes_home)
+        },
+    }
+
+
+def remove_hermes_connector(ficelle_home: Path) -> tuple[bool, list[str]]:
+    """Remove only unchanged Hermes artifacts previously registered by Ficelle."""
+    record = load_connectors(ficelle_home).get("hermes")
+    if not record:
+        return False, ["Hermes connector is not registered."]
+    client_home_value = record.get("client_home")
+    if not isinstance(client_home_value, str) or not client_home_value:
+        return False, ["Hermes connector registry has no client home."]
+    hermes_home = Path(client_home_value)
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    config_path = hermes_home / "config.yaml"
+    snippet_path = hermes_home / "ficelle" / "hermes-config.snippet.yaml"
+    env_path = hermes_home / ".env"
+    guarded_files = [(snippet_path, metadata.get("snippet_sha256"))]
+    if metadata.get("config_managed"):
+        guarded_files.append((config_path, metadata.get("config_sha256")))
+    changed = [
+        str(path)
+        for path, expected in guarded_files
+        if path.exists()
+        and (not isinstance(expected, str) or file_sha256(path) != expected)
+    ]
+    if metadata.get("env_key_created"):
+        from ficelle.router import parse_env_file
+
+        env_value = parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY)
+        expected_env_hash = metadata.get("env_value_sha256")
+        if env_value and (
+            not isinstance(expected_env_hash, str)
+            or hashlib.sha256(env_value.encode("utf-8")).hexdigest() != expected_env_hash
+        ):
+            changed.append(f"{env_path}:{PROVIDER_PLUGIN_ENV_KEY}")
+    plugin_hashes = metadata.get("plugin_sha256")
+    expected_plugin_hashes = plugin_hashes if isinstance(plugin_hashes, dict) else {}
+    unchanged_plugin_destinations: list[Path] = []
+    for source, destination in hermes_plugin_install_specs(hermes_home):
+        if not destination.exists():
+            continue
+        relative = str(destination.relative_to(hermes_home))
+        expected = expected_plugin_hashes.get(relative)
+        unchanged = (
+            tree_sha256(destination) == expected
+            if isinstance(expected, str)
+            else trees_equal(source, destination)
+        )
+        if not unchanged:
+            changed.append(str(destination))
+        else:
+            unchanged_plugin_destinations.append(destination)
+    if changed:
+        return False, [
+            "Connector artifacts were modified; nothing was removed:",
+            *changed,
+        ]
+
+    for destination in unchanged_plugin_destinations:
+        shutil.rmtree(destination)
+    if snippet_path.exists():
+        snippet_path.unlink()
+    if metadata.get("env_key_created"):
+        from ficelle.router import env_file_delete_key
+
+        env_file_delete_key(env_path, PROVIDER_PLUGIN_ENV_KEY)
+        if (
+            metadata.get("env_file_created")
+            and env_path.exists()
+            and not env_path.read_text(encoding="utf-8").strip()
+        ):
+            env_path.unlink()
+    if config_path.exists() and metadata.get("config_managed"):
+        if metadata.get("config_created"):
+            config_path.unlink()
+        else:
+            current = config_path.read_text(encoding="utf-8", errors="replace")
+            start = current.index(MANAGED_CONFIG_BEGIN)
+            end = current.index(MANAGED_CONFIG_END, start) + len(MANAGED_CONFIG_END)
+            write_text_file(config_path, f"{current[:start]}{current[end:].lstrip()}", dry_run=False)
+    unregister_connector(ficelle_home, "hermes")
+    return True, ["Hermes connector artifacts removed."]
 
 
 def configure_hermes(options: InstallOptions, *, runtime_dir: Path | None = None) -> None:
@@ -1457,49 +1336,19 @@ def offer_first_key_capture(
 
 
 def run_install(options: InstallOptions) -> int:
-    if options.rollback:
-        if options.target != "hermes":
-            raise SystemExit("--rollback requires explicit --target hermes")
-        return 0 if rollback_last_hermes_install(options) else 1
-
-    target = resolve_install_target(options)
-    run_preflight(options, target)
+    run_preflight(options)
     if options.preflight_only:
         print("Preflight complete. No install actions were run.")
         return 0
 
-    # Running setup is the explicit mutation boundary for one-command upgrades.
-    legacy_home = options.hermes_home / "ficelle"
-    migrated_legacy_home = migrate_legacy_ficelle_home(
-        options,
-        before_copy=lambda: quiesce_legacy_service(
-            options,
-            target,
-            legacy_home,
-        ),
-    )
-    runtime_dir = (
-        legacy_home
-        if not options.ficelle_home_explicit
-        and legacy_home.is_dir()
-        and not migrated_legacy_home
-        else options.ficelle_home
-    )
-
     if not options.skip_package:
-        install_package(options, target, runtime_dir)
-
-    if target == "hermes" and not options.skip_plugin:
-        install_plugins(options, runtime_dir=runtime_dir)
+        install_package(options)
 
     ensure_dedicated_keychain(options)
 
-    env = command_env(options, target, runtime_dir)
+    env = command_env(options)
     if not options.skip_service:
         ensure_success(run_command([options.python, "-m", "ficelle.cli", "install"], dry_run=options.dry_run, env=env))
-
-    if target == "hermes" and options.configure_hermes:
-        configure_hermes(options, runtime_dir=runtime_dir)
 
     provider_auth: dict[str, Any] | None = None
     if not options.skip_smoke:
@@ -1509,13 +1358,52 @@ def run_install(options: InstallOptions) -> int:
         ensure_success(run_command([options.python, "-m", "ficelle.cli", "health"], dry_run=options.dry_run, env=env))
         ensure_success(run_command([options.python, "-m", "ficelle.cli", "models"], dry_run=options.dry_run, env=env))
 
+    # Connectors are downstream add-ons. Core is installed, started and verified before
+    # any client-owned path can be touched.
+    for connector in options.connectors:
+        if connector == "hermes":
+            previous = load_connectors(options.ficelle_home).get("hermes") or {}
+            previous_metadata = previous.get("metadata")
+            previous_metadata = previous_metadata if isinstance(previous_metadata, dict) else {}
+            config_existed = (options.hermes_home / "config.yaml").exists()
+            env_path = options.hermes_home / ".env"
+            env_file_existed = env_path.exists()
+            from ficelle.router import parse_env_file
+
+            env_key_existed = bool(parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY))
+            if not options.skip_plugin:
+                install_plugins(options, runtime_dir=options.ficelle_home)
+            configure_hermes(options, runtime_dir=options.ficelle_home)
+            if not options.dry_run:
+                metadata = hermes_connector_metadata(
+                    options,
+                    config_existed=config_existed,
+                    env_file_existed=env_file_existed,
+                    env_key_existed=env_key_existed,
+                )
+                for ownership_key in (
+                    "config_created",
+                    "env_file_created",
+                    "env_key_created",
+                ):
+                    metadata[ownership_key] = bool(
+                        metadata[ownership_key] or previous_metadata.get(ownership_key)
+                    )
+                register_connector(
+                    options.ficelle_home,
+                    "hermes",
+                    client_home=options.hermes_home,
+                    metadata=metadata,
+                )
+        elif connector == "openclaw":
+            if not options.dry_run:
+                register_connector(options.ficelle_home, "openclaw")
+
     if options.skip_service and not options.dry_run:
         options.ficelle_home.mkdir(parents=True, exist_ok=True)
         if not persist_active_service_context(
             options.ficelle_home,
             active_home_pointer_path(),
-            runtime_dir=runtime_dir,
-            hermes_home=options.hermes_home if target == "hermes" else None,
         ):
             raise SystemExit("Ficelle setup could not persist the selected --ficelle-home.")
 
@@ -1537,7 +1425,7 @@ def run_install(options: InstallOptions) -> int:
     cli = installed_cli_command(interpreter=target_interpreter)
     setup_cli = installed_cli_command("ficelle-setup", interpreter=target_interpreter)
     key_notice = first_run_provider_key_notice(provider_auth, command=cli)
-    base_url = configured_ficelle_base_url(runtime_dir)
+    base_url = configured_ficelle_base_url(options.ficelle_home)
 
     print("Ficelle setup complete.")
     for line in exposure_lines:
@@ -1546,26 +1434,19 @@ def run_install(options: InstallOptions) -> int:
     # a second ago would read as the step having failed.
     for line in cli_reachability_notice(cli, expose_command=None if options.expose_cli else setup_cli):
         print(line)
-    if target == "hermes":
-        if options.configure_hermes:
-            print("Hermes config step complete or snippet written. Restart Hermes gateway after merging config changes.")
-        else:
-            print(f"Next: run `{cli} export --target hermes` or rerun setup with `--configure-hermes` for a safe config snippet/apply step.")
-        print(f"Rollback: `{setup_cli} --target hermes --rollback` restores the latest available integration backups.")
-        print("Ficelle is ready to be the main Hermes model route; verify one real request after restart.")
-    else:
-        print(f"Local OpenAI-compatible base URL: {base_url}")
-        # `ficelle models` answers from the public catalogs, which the reference providers
-        # serve without credentials — so pointing an unconfigured install at it as its
-        # verification step is what teaches the user that setup worked when it did not.
-        if not key_notice:
-            print(f"Verify: `{cli} health` and `{cli} models`.")
-        print(
-            f"OpenAI client: `OpenAI(base_url=\"{base_url}\", "
-            "api_key=\"ficelle-local\")`."
-        )
-        if target == "openclaw":
-            print("OpenClaw target is experimental; merge `/admin/export/openclaw` into OpenClaw manually.")
+    print(f"Local OpenAI-compatible base URL: {base_url}")
+    if not key_notice:
+        print(f"Verify: `{cli} health` and `{cli} models`.")
+    print(
+        f"OpenAI client: `OpenAI(base_url=\"{base_url}\", "
+        "api_key=\"ficelle-local\")`."
+    )
+    for connector in options.connectors:
+        print(f"Connector installed: {connector}")
+    if "hermes" in options.connectors:
+        print("Restart Hermes gateway, then verify one real request through Ficelle.")
+    if "openclaw" in options.connectors:
+        print(f"Next: `{cli} connectors export openclaw` and merge the generated config.")
     # `key_notice` non-empty is the one "this install cannot serve yet" verdict; the
     # keyless list reuses the same helper the notice itself derives its advice from.
     if key_notice and offer_first_key_capture(
@@ -1580,17 +1461,15 @@ def run_install(options: InstallOptions) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Install Ficelle Core and an optional target integration.")
+    parser = argparse.ArgumentParser(description="Install standalone Ficelle Core and optional client connectors.")
     parser.add_argument("--package", default=".", help="Package spec/path to install with pip. Default: current directory.")
     parser.add_argument("--no-editable", action="store_true", help="Do not use pip editable mode for local directory installs.")
     parser.add_argument("--python", default=sys.executable, help="Python interpreter used for pip and ficelle CLI commands.")
-    parser.add_argument("--target", choices=INSTALL_TARGETS, default="auto", help="Integration target. Auto detects Hermes, otherwise installs standalone Core.")
     parser.add_argument("--ficelle-home", default=None, help="Ficelle state root. Default: FICELLE_HOME or ~/.ficelle")
+    parser.add_argument("--connector", action="append", choices=CONNECTORS, default=[], help="Install an optional client connector after Core verification. Repeatable.")
     parser.add_argument("--hermes-home", default=str(default_hermes_home()), help="Hermes home directory. Default: ~/.hermes")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without writing files or running commands.")
     parser.add_argument("--preflight-only", action="store_true", help="Run install preflight checks and stop before mutating anything.")
-    parser.add_argument("--configure-hermes", action="store_true", help="Write a ready Hermes config snippet, and safely create/update config.yaml only when it is absent or Ficelle-managed.")
-    parser.add_argument("--rollback", action="store_true", help="With --target hermes, restore the latest available plugin/config backups.")
     parser.add_argument("--no-backup", action="store_true", help="Do not backup existing plugin/config files before replacement.")
     parser.add_argument("--skip-package", action="store_true", help="Skip pip install step.")
     parser.add_argument("--skip-plugin", action="store_true", help="Skip Hermes provider plugin copy.")
@@ -1619,7 +1498,7 @@ def options_from_args(args: argparse.Namespace) -> InstallOptions:
         package=args.package,
         editable=not args.no_editable,
         python=args.python,
-        target=args.target,
+        connectors=tuple(dict.fromkeys(args.connector)),
         ficelle_home=Path(configured_ficelle_home or default_ficelle_home()).expanduser().resolve(),
         hermes_home=Path(args.hermes_home).expanduser().resolve(),
         dry_run=args.dry_run,
@@ -1628,10 +1507,7 @@ def options_from_args(args: argparse.Namespace) -> InstallOptions:
         skip_service=args.skip_service,
         skip_smoke=args.skip_smoke,
         preflight_only=args.preflight_only,
-        configure_hermes=args.configure_hermes,
         backup_existing=not args.no_backup,
-        rollback=args.rollback,
-        ficelle_home_explicit=configured_ficelle_home is not None,
         expose_cli=args.expose_cli,
         # The flag's "implied without a terminal" promise is implemented here, at the one
         # place the option is decided, so every prompt gates on the option alone. Both

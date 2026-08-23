@@ -99,7 +99,7 @@ class HermesTargetAdapter:
             verification_commands=(
                 ("ficelle", "health"),
                 ("ficelle", "models"),
-                ("ficelle", "export", "--target", "hermes"),
+                ("ficelle", "connectors", "export", "hermes"),
             ),
         )
 
@@ -107,7 +107,7 @@ class HermesTargetAdapter:
         return TargetInstallResult(
             target_id=self.target_id,
             warnings=(
-                "Run `ficelle-setup --target hermes` to install or preview Hermes assets.",
+                "Run `ficelle connectors install hermes` to install Hermes assets.",
             ),
         )
 
@@ -117,7 +117,7 @@ class HermesTargetAdapter:
             SmokeCheck("model-list", ("ficelle", "models"), "Core service exposes virtual models."),
             SmokeCheck(
                 "hermes-export",
-                ("ficelle", "export", "--target", "hermes"),
+                ("ficelle", "connectors", "export", "hermes"),
                 "Hermes export renders without secrets.",
             ),
         ]

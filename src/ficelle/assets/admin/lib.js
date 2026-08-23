@@ -32,7 +32,7 @@ export const profilePresets = {
   "ficelle/auto-vision": "Free screenshot and image reading, gated behind a real canary image test.",
   "ficelle/auto-video": "Tests free video understanding when a catalog exposes it. Keep it gated behind benchmarks.",
   "ficelle/auto-audio": "Tests free audio understanding when a catalog exposes it. Do not replace speech-to-text blindly.",
-  "ficelle/auto-coding": "Routes only to exact provider deployments with a current signed Ficelle coding certification."
+  "ficelle/auto-coding": "Routes only to qualified coding models on locally compatible provider deployments."
 };
 
 // Capability -> the specialized profile whose benchmark proves it (for provenance badges).
@@ -219,7 +219,7 @@ export function showToast(msg, level = "", action = null) {
 // The `auth.key_source` families a removal cannot reach, mapped to the next move — same shape
 // as REASON_LABELS/reasonLabel above, so a family added later falls back to its own name and is
 // still stated rather than silently dropped. `env` and `external` are the two nothing inside
-// Ficelle can clear, and the two `remaining_legacy_sources` never enumerated.
+// Ficelle can clear.
 const KEY_SOURCE_REMEDIES = {
   env: "a process environment variable — unset it where the service starts, then restart",
   external: "an external credential resolver — clear the key in that integration",
@@ -229,20 +229,14 @@ export function keySourceRemedy(keySource) {
   return KEY_SOURCE_REMEDIES[family] || family;
 }
 
-// Keep the removal verdict pure so it can be tested without a DOM, and so the destructive
-// legacy purge is offered exactly once: after a normal removal reveals a source the purge
-// can reach, never after an explicit purge and never on a locked keychain it must skip.
-//
 // `keySource` is `auth.key_source` recomputed after the removal — the store the resolver
 // would read a key from *now*, or null when none does. It is what makes the verdict honest
-// for every family: `legacySources` enumerates legacy `.env` files and keychains only, so a
-// key held in a process environment variable or served by an external resolver (R4) used to
-// come back as a green "key removed" with the provider still configured.
+// when a key held in a process environment variable remains configured.
 // `unverified` is the server's list of places that could not confirm the delete — an OS store
 // that refused. It has to override the "no key was stored" reading: a store that would not
 // answer the delete does not answer the re-resolution either, so `keySource` comes back null
 // and every other signal here agrees on a removal that may never have happened.
-export function providerKeyRemovalNotice(label, removed, legacySources, purgeLegacy, keySource = null, unverified = []) {
+export function providerKeyRemovalNotice(label, removed, keySource = null, unverified = []) {
   const cleared = removed.length
     ? (label + " key removed from " + removed.length + " location" + (removed.length > 1 ? "s" : "") + ".")
     // Silent when the removal was not confirmed: "no key was stored" is a claim about a store
@@ -259,22 +253,10 @@ export function providerKeyRemovalNotice(label, removed, legacySources, purgeLeg
   // cut across them live here: a key that still resolves makes the toast red, unless a button
   // is still offered that could finish the job — and an unconfirmed removal is red whatever the
   // rest says, since no button on this toast can reach the store that refused.
-  const notice = (tail, level, offerLegacyPurge) => ({
-    message: cleared + unconfirmed + stillConfigured + tail,
-    level: (unverified.length || (keySource && !offerLegacyPurge)) ? "error" : level,
-    offerLegacyPurge,
-  });
-  if (!legacySources.length) return notice("", removed.length ? "ok" : "warn", false);
-  if (purgeLegacy) {
-    return notice(" Could not clear " + legacySources.join(", ") + " — remove it manually.", "error", false);
-  }
-  // A locked keychain is reported but cannot be purged — the purge skips it so it never
-  // opens the GUI prompt that would hang the daemon. Offering the button there would spend
-  // a "other tools may lose access" confirmation on a guaranteed no-op.
-  if (!legacySources.some((source) => !source.endsWith(":locked"))) {
-    return notice(" " + legacySources.join(", ") + " is locked, so it cannot be read or cleared — unlock it, or remove the key manually.", "warn", false);
-  }
-  return notice(" Legacy credential sources remain at " + legacySources.join(", ") + ".", "warn", true);
+  return {
+    message: cleared + unconfirmed + stillConfigured,
+    level: (unverified.length || keySource) ? "error" : (removed.length ? "ok" : "warn"),
+  };
 }
 
 // The clipboard rejects for reasons the user can act on (permission denied, document not

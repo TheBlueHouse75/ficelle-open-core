@@ -5,6 +5,7 @@ import argparse
 import getpass
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -16,6 +17,10 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from ficelle.build_identity import package_build_identity
+from ficelle.connector_registry import (
+    SUPPORTED_CONNECTORS,
+    unregister_connector,
+)
 from ficelle.runtime_paths import RuntimePaths
 from ficelle.url_security import connectable_http_url
 from ficelle.service import (
@@ -43,59 +48,33 @@ SYSTEMD_UNIT = Path.home() / ".config" / "systemd" / "user" / f"{LABEL}.service"
 ACTIVE_HOME_POINTER = active_home_pointer_path()
 
 
-def cli_runtime_context() -> tuple[RuntimePaths, Path | None]:
-    """Resolve env first, then persisted service context, then legacy/default discovery."""
+def cli_runtime_context() -> RuntimePaths:
+    """Resolve the explicit, persisted, or default Ficelle state root."""
     source = os.environ.copy()
-    if not source.get("FICELLE_HOME") and not source.get("FICELLE_RUNTIME_DIR"):
+    if not source.get("FICELLE_HOME"):
         context = read_active_service_context(ACTIVE_HOME_POINTER)
         if context is not None:
-            ficelle_home, runtime_dir, hermes_home = context
-            source["FICELLE_HOME"] = str(ficelle_home)
-            source["FICELLE_RUNTIME_DIR"] = str(runtime_dir)
-            if not source.get("HERMES_HOME"):
-                if hermes_home is not None:
-                    source["HERMES_HOME"] = str(hermes_home)
-                else:
-                    source.pop("HERMES_HOME", None)
-    paths = RuntimePaths.from_env(environ=source)
-    hermes_home = (
-        Path(source["HERMES_HOME"]).expanduser()
-        if source.get("HERMES_HOME")
-        else None
-    )
-    return paths, hermes_home
+            source["FICELLE_HOME"] = str(context)
+    return RuntimePaths.from_env(environ=source)
 
 
-RUNTIME_PATHS, ACTIVE_HERMES_HOME = cli_runtime_context()
+RUNTIME_PATHS = cli_runtime_context()
 FICELLE_HOME = RUNTIME_PATHS.ficelle_home
-RUNTIME_DIR = RUNTIME_PATHS.runtime_read_dir
 INSTALL_PYTHON = Path(sys.executable)
 
 
 @contextmanager
 def active_runtime_environment() -> Iterator[None]:
     """Temporarily expose the selected roots to runtime modules, including lazy imports."""
-    previous = {
-        name: os.environ.get(name)
-        for name in ("FICELLE_HOME", "FICELLE_RUNTIME_DIR", "HERMES_HOME")
-    }
+    previous = os.environ.get("FICELLE_HOME")
     try:
         os.environ["FICELLE_HOME"] = str(FICELLE_HOME)
-        if RUNTIME_DIR != FICELLE_HOME:
-            os.environ["FICELLE_RUNTIME_DIR"] = str(RUNTIME_DIR)
-        else:
-            os.environ.pop("FICELLE_RUNTIME_DIR", None)
-        if ACTIVE_HERMES_HOME is not None:
-            os.environ["HERMES_HOME"] = str(ACTIVE_HERMES_HOME)
-        else:
-            os.environ.pop("HERMES_HOME", None)
         yield
     finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        if previous is None:
+            os.environ.pop("FICELLE_HOME", None)
+        else:
+            os.environ["FICELLE_HOME"] = previous
 
 
 with active_runtime_environment():
@@ -113,12 +92,10 @@ def _uid() -> str:
 def service_paths() -> ServicePaths:
     return ServicePaths(
         ficelle_home=FICELLE_HOME,
-        runtime_dir=RUNTIME_DIR,
         label=LABEL,
         plist=PLIST,
         systemd_unit=SYSTEMD_UNIT,
         install_python=INSTALL_PYTHON,
-        hermes_home=ACTIVE_HERMES_HOME,
         active_home_pointer=ACTIVE_HOME_POINTER,
     )
 
@@ -419,7 +396,7 @@ def doctor_status() -> dict[str, Any]:
         "state_exists": state_read_path.exists(),
         "runtime": {
             "write_dir": str(router.ROUTER_DIR),
-            "read_dir": str(router.RUNTIME_PATHS.runtime_read_dir),
+            "read_dir": str(router.RUNTIME_PATHS.router_dir),
             "config_read_path": str(config_read_path),
             "catalog_read_path": str(catalog_read_path),
             "state_read_path": str(state_read_path),
@@ -539,19 +516,13 @@ RESIDUAL_KEY_SOURCE_HINTS = {
 }
 
 
-def remove_key(provider: str, *, purge_legacy: bool = False) -> int:
+def remove_key(provider: str) -> int:
     config = router.load_config()
     if provider not in (config.get("providers") or {}):
         print(f"Unknown provider: {provider}", file=sys.stderr)
         return 2
     removal = router.remove_provider_key(provider, config)
     cleared = removal.cleared
-    if purge_legacy:
-        cleared = [*cleared, *router.purge_legacy_provider_credentials(provider, config)]
-    remaining_legacy_sources = router.legacy_provider_credential_sources(
-        provider,
-        config,
-    )
     if cleared:
         print(f"Removed {provider} key from: {', '.join(cleared)}.")
     if not removal.verified:
@@ -568,34 +539,73 @@ def remove_key(provider: str, *, purge_legacy: bool = False) -> int:
         # all-clear the refusal above replaces.
         print(f"No stored {provider} key found in the OS store or .env.")
     # Resolution re-run after the removal: `key_source` names the store a key would still
-    # be read from, or None when none would. It is the verdict for every family, including
-    # the two `remaining_legacy_sources` cannot enumerate — a process environment variable
-    # and an external resolver (R4) — which used to leave a provider configured behind a
-    # clean "removed" line. Computed after the lines above, not before: on a cold CLI process
+    # be read from, or None when none would. Computed after the lines above, not before: on a cold CLI process
     # this resolution shells out to `security` once per alias and would hold them back.
     key_source = router.provider_auth_row(provider, config).get("key_source")
     if key_source:
         hint = RESIDUAL_KEY_SOURCE_HINTS.get(key_source, key_source)
         print(f"A {provider} key still resolves from {hint}, so {provider} stays configured.")
-    elif removal.verified and not remaining_legacy_sources:
-        # Only claimed when nothing is left to qualify it: a locked legacy keychain reads as
-        # empty while it stays locked, and an unconfirmed removal reads as empty for the very
-        # reason it failed, so "no key resolves" would be a promise for today only.
+    elif removal.verified:
+        # Only claimed when nothing is left to qualify it: an unconfirmed removal reads as
+        # empty for the same reason it failed.
         print(f"No {provider} key resolves any more.")
-    if remaining_legacy_sources:
-        sources = ", ".join(remaining_legacy_sources)
-        # After an explicit purge these are the ones it could not reach — a locked keychain,
-        # or a store another install owns — so the only remaining move is a manual one.
-        next_step = (
-            "remove them manually"
-            if purge_legacy
-            else "re-run with --purge-legacy to clear them"
-        )
-        print(f"Legacy credential fallback sources still apply: {sources}. Please {next_step}.")
     router.main_args(["--refresh"])
     # Non-zero on an unconfirmed removal so a script revoking a key can gate on it. A
     # revocation that may not have happened is a failure, whatever else the run cleared.
     return 0 if removal.verified else 1
+
+
+def cmd_connectors(args: argparse.Namespace) -> int:
+    action = args.connector_action
+    if action in {"list", "status"}:
+        return http_json("/admin/connectors")
+    if action == "export":
+        return http_json(f"/admin/connectors/{args.connector}/export")
+    if action == "detect":
+        payload = {
+            "connectors": [
+                {
+                    "id": "hermes",
+                    "detected": (Path.home() / ".hermes").is_dir() or bool(shutil.which("hermes")),
+                },
+                {
+                    "id": "openclaw",
+                    "detected": (Path.home() / ".openclaw").is_dir() or bool(shutil.which("openclaw")),
+                },
+            ]
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    if action == "install":
+        command = [
+            sys.executable,
+            "-m",
+            "ficelle.install",
+            "--skip-package",
+            "--skip-service",
+            "--skip-smoke",
+            "--ficelle-home",
+            str(FICELLE_HOME),
+            "--connector",
+            args.connector,
+        ]
+        if args.connector == "hermes" and args.client_home:
+            command.extend(("--hermes-home", args.client_home))
+        return subprocess.run(command, check=False).returncode
+    if action == "remove":
+        if args.connector == "hermes":
+            from ficelle.install import remove_hermes_connector
+
+            removed, messages = remove_hermes_connector(FICELLE_HOME)
+            for message in messages:
+                print(message, file=sys.stdout if removed else sys.stderr)
+            return 0 if removed else 1
+        if not unregister_connector(FICELLE_HOME, args.connector):
+            print(f"Connector is not registered: {args.connector}", file=sys.stderr)
+            return 1
+        print(f"Connector removed: {args.connector}.")
+        return 0
+    raise SystemExit(f"unsupported connector action: {action}")
 
 
 def _print_license_status(entitlement: Any, *, json_output: bool) -> int:
@@ -661,6 +671,63 @@ def cmd_license(args: argparse.Namespace) -> int:
             print("warning: service deactivation failed; cleared the local license anyway.")
         return 0
     return 2
+
+
+def cmd_provider_intake(args: argparse.Namespace) -> int:
+    from ficelle.provider_intake import (
+        IntakeValidationError,
+        ProviderIntakeRecord,
+        build_registry_context,
+        evaluate_automation_readiness,
+        generate_artifacts,
+        generated_intake_schema,
+        sync_intake_record,
+    )
+
+    if args.intake_action == "schema":
+        print(json.dumps(generated_intake_schema(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    try:
+        if args.intake_action == "context":
+            result = build_registry_context(Path(args.registry_dir), limit=args.limit)
+        else:
+            record_path = Path(args.record)
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise IntakeValidationError("intake record must be a JSON object")
+            record = ProviderIntakeRecord.from_dict(payload)
+            if args.intake_action == "validate":
+                result = {"provider_id": record.provider_id, "status": record.status, "valid": True}
+            elif args.intake_action == "evaluate":
+                result = evaluate_automation_readiness(record).to_dict()
+            elif args.intake_action == "generate":
+                generated = generate_artifacts(record, Path(args.output_dir))
+                result = {
+                    "provider_id": record.provider_id,
+                    "state": (
+                        "generated_disabled"
+                        if "integration_scaffold" in generated
+                        else "generated_sheet_only"
+                    ),
+                    "artifacts": {name: str(path) for name, path in generated.items()},
+                }
+            elif args.intake_action == "sync":
+                result = sync_intake_record(
+                    record,
+                    Path(args.registry_dir),
+                    dry_run=bool(args.dry_run),
+                    expected_sha256=args.expected_sha256,
+                ).to_dict()
+            else:
+                raise IntakeValidationError("missing provider-intake action")
+    # ValueError covers the three input-driven failures: a non-UTF-8 file (UnicodeDecodeError),
+    # malformed JSON (JSONDecodeError) and record validation (IntakeValidationError). They must
+    # all leave through the machine-readable error contract, never as a traceback.
+    except (OSError, ValueError, TypeError) as exc:
+        print(json.dumps({"valid": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
 
 
 def _run_pro_install_locked(pro_install: Any, license_key: str) -> int:
@@ -816,27 +883,16 @@ def cmd_access_token(scope: str) -> int:
 
 
 def cmd_coding_certification(args: argparse.Namespace) -> int:
-    action = str(getattr(args, "coding_certification_action", "status"))
-    if action == "refresh":
-        status = coding_certification.refresh_cache(
-            RUNTIME_PATHS.coding_certification_cache_path,
-            RUNTIME_PATHS.coding_certification_status_path,
-        )
-    else:
-        status = coding_certification.public_status(
-            RUNTIME_PATHS.coding_certification_cache_path,
-            RUNTIME_PATHS.coding_certification_status_path,
-        )
+    status = coding_certification.public_status()
     if bool(getattr(args, "json_output", False)):
         print(json.dumps(status, ensure_ascii=False, sort_keys=True))
     else:
         print(f"Coding certification: {status.get('status', 'unavailable')}")
         print(f"Manifest: {status.get('manifest_id') or 'none'}")
-        print(f"Expires: {status.get('expires_at') or 'unknown'}")
         print(f"Certified models: {status.get('certification_count', 0)}")
         if status.get("message"):
             print(str(status["message"]), file=sys.stderr)
-    return 0 if status.get("status") in {"valid", "valid_cache"} else 1
+    return 0 if status.get("status") == "bundled" else 1
 
 
 def _print_synthetic_health_result(payload: dict[str, Any], *, json_output: bool) -> None:
@@ -929,13 +985,17 @@ def main(argv: list[str] | None = None) -> int:
     doctor_parser.add_argument("--text", action="store_true", dest="text_output", help="Print a compact human-readable summary")
     sub.add_parser("models")
     sub.add_parser("health")
-    export_parser = sub.add_parser("export", help="Export a client configuration")
-    export_parser.add_argument(
-        "--target",
-        choices=["generic", "hermes"],
-        default="generic",
-        help="Client target (default: generic)",
-    )
+    sub.add_parser("client-config", help="Export the generic OpenAI-compatible client configuration")
+    connectors_parser = sub.add_parser("connectors", help="Manage optional client connectors")
+    connectors_sub = connectors_parser.add_subparsers(dest="connector_action", required=True)
+    connectors_sub.add_parser("list", help="List supported connectors")
+    connectors_sub.add_parser("detect", help="Detect supported clients without changing them")
+    connectors_sub.add_parser("status", help="Show connector capabilities and exports")
+    for action in ("install", "export", "remove"):
+        action_parser = connectors_sub.add_parser(action)
+        action_parser.add_argument("connector", choices=SUPPORTED_CONNECTORS)
+        if action == "install":
+            action_parser.add_argument("--client-home", help="Explicit client home (Hermes only)")
     demo_parser = sub.add_parser(
         "demo",
         help="Show the failover: knock out the model that would have answered, on a real request",
@@ -966,12 +1026,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     remove_key_parser = sub.add_parser("remove-key", help="Remove a stored provider API key")
     remove_key_parser.add_argument("provider")
-    remove_key_parser.add_argument(
-        "--purge-legacy",
-        action="store_true",
-        dest="purge_legacy",
-        help="Also delete the key from read-only legacy stores (previous Hermes/Ficelle keychains and .env files), which the router still resolves. Other tools reading them lose access.",
-    )
     license_parser = sub.add_parser("license", help="Manage the Ficelle Pro license (Pro only)")
     license_parser.add_argument("action", choices=["activate", "status", "refresh", "deactivate"])
     license_parser.add_argument("--json", action="store_true", dest="json_output", help="Machine-readable status (JSON)")
@@ -990,12 +1044,11 @@ def main(argv: list[str] | None = None) -> int:
     update_parser.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
     coding_parser = sub.add_parser(
         "coding-certification",
-        help="Inspect or refresh the signed auto-coding certification manifest",
+        help="Inspect bundled auto-coding qualifications",
     )
     coding_sub = coding_parser.add_subparsers(dest="coding_certification_action", required=True)
-    for action in ("status", "refresh"):
-        action_parser = coding_sub.add_parser(action)
-        action_parser.add_argument("--json", action="store_true", dest="json_output")
+    coding_status = coding_sub.add_parser("status")
+    coding_status.add_argument("--json", action="store_true", dest="json_output")
     synthetic_parser = sub.add_parser("synthetic-health", help="Run and inspect deep synthetic user health checks")
     synthetic_sub = synthetic_parser.add_subparsers(dest="synthetic_action", required=True)
     synthetic_run = synthetic_sub.add_parser("run", help="Run the synthetic user corpus")
@@ -1029,6 +1082,26 @@ def main(argv: list[str] | None = None) -> int:
     schedule_install.add_argument("--json", action="store_true", dest="json_output")
     schedule_remove = schedule_sub.add_parser("remove")
     schedule_remove.add_argument("--json", action="store_true", dest="json_output")
+    intake_parser = sub.add_parser(
+        "provider-intake",
+        help="Validate, evaluate, or generate disabled provider-intake artifacts",
+    )
+    intake_sub = intake_parser.add_subparsers(dest="intake_action", required=True)
+    intake_sub.add_parser("schema", help="Print the provider-intake JSON Schema")
+    intake_context = intake_sub.add_parser("context", help="Print compact deterministic radar context")
+    intake_context.add_argument("--registry-dir", required=True)
+    intake_context.add_argument("--limit", type=int, default=200)
+    for action in ("validate", "evaluate"):
+        action_parser = intake_sub.add_parser(action)
+        action_parser.add_argument("record")
+    intake_generate = intake_sub.add_parser("generate")
+    intake_generate.add_argument("record")
+    intake_generate.add_argument("--output-dir", required=True)
+    intake_sync = intake_sub.add_parser("sync", help="Validate and synchronize one proposed record")
+    intake_sync.add_argument("record")
+    intake_sync.add_argument("--registry-dir", required=True)
+    intake_sync.add_argument("--dry-run", action="store_true")
+    intake_sync.add_argument("--expected-sha256")
     args = parser.parse_args(argv)
     if args.command == "serve":
         return router.main_args(["--serve"])
@@ -1059,8 +1132,10 @@ def main(argv: list[str] | None = None) -> int:
         return http_json("/v1/models")
     if args.command == "health":
         return http_json("/health")
-    if args.command == "export":
-        return http_json(f"/admin/export/{args.target}")
+    if args.command == "client-config":
+        return http_json("/admin/client-config")
+    if args.command == "connectors":
+        return cmd_connectors(args)
     if args.command == "demo":
         return cmd_demo(args)
     if args.command == "set-key":
@@ -1070,7 +1145,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_plaintext=bool(getattr(args, "allow_plaintext", False)),
         )
     if args.command == "remove-key":
-        return remove_key(args.provider, purge_legacy=bool(getattr(args, "purge_legacy", False)))
+        return remove_key(args.provider)
     if args.command == "license":
         return cmd_license(args)
     if args.command == "access-token":
@@ -1083,6 +1158,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_coding_certification(args)
     if args.command == "synthetic-health":
         return cmd_synthetic_health(args)
+    if args.command == "provider-intake":
+        return cmd_provider_intake(args)
     parser.print_help()
     return 0
 

@@ -3244,32 +3244,17 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const p = await r.json(); if (!r.ok) throw new Error([p?.error?.message, p?.error?.hint].filter(Boolean).join(" — ") || "failed"); if (input) input.value = ""; showToast(providerLabel(src) + " key saved."); await loadState();
       } catch (e) { showToast(e.message || String(e)); }
     }
-    // `purgeLegacy` is the opt-in second pass over the read-only legacy stores. It is never
-    // the first thing tried: the default remove stays scoped to Ficelle's own store, and the
-    // user is asked before anything owned by a previous install is touched.
-    async function removeProviderKey(src, { purgeLegacy = false } = {}) {
-      try { const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/key", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify(purgeLegacy ? { remove: true, purge_legacy: true } : { remove: true }) });
+    async function removeProviderKey(src) {
+      try { const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/key", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify({ remove: true }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed");
         const removed = Array.isArray(p.removed) ? p.removed : [];
-        const legacySources = Array.isArray(p.remaining_legacy_sources) ? p.remaining_legacy_sources : [];
-        // Recomputed by the server after the removal: the store a key still resolves from,
-        // or null when none does. `remaining_legacy_sources` cannot see a process
-        // environment variable or an external resolver, so this is what keeps the toast
-        // from reporting a success that left the provider configured.
         const stillResolvedFrom = p.auth?.key_source || null;
         // Places that could not confirm the delete. Without it the two signals above both
         // read as a clean removal on a host whose store refused, because they are answered
         // by the same store that refused.
         const unverified = Array.isArray(p.unverified) ? p.unverified : [];
-        const notice = providerKeyRemovalNotice(providerLabel(src), removed, legacySources, purgeLegacy, stillResolvedFrom, unverified);
-        if (notice.offerLegacyPurge) {
-          showToast(notice.message, notice.level, {
-            label: "Remove these too",
-            onClick: () => { if (window.confirm("Delete this key from the legacy store as well?\n\n" + legacySources.join("\n") + "\n\nOther tools reading these may lose access.")) removeProviderKey(src, { purgeLegacy: true }); },
-          });
-        } else {
-          showToast(notice.message, notice.level);
-        }
+        const notice = providerKeyRemovalNotice(providerLabel(src), removed, stillResolvedFrom, unverified);
+        showToast(notice.message, notice.level);
         await loadState();
       } catch (e) { showToast(e.message || String(e), "error"); }
     }
@@ -3279,7 +3264,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       } catch (e) { showToast(e.message || String(e)); }
     }
     async function exportConfig() {
-      const r = await fetch("/admin/export/generic"); const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "export failed");
+      const r = await fetch("/admin/client-config"); const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "export failed");
       $("configExport").value = JSON.stringify(p.config || {}, null, 2); showToast("Configuration ready.");
       // Spell out the same values the JSON below carries, from the same payload: the
       // server derives base_url from config.host/port, so deriving them here from

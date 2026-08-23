@@ -27,19 +27,17 @@ def make_paths(
     ficelle_home = tmp_path / ".ficelle"
     return ServicePaths(
         ficelle_home=ficelle_home,
-        runtime_dir=runtime_dir or ficelle_home,
         label="com.ficelle.router",
         plist=tmp_path / "Library" / "LaunchAgents" / "com.ficelle.router.plist",
         systemd_unit=tmp_path / ".config" / "systemd" / "user" / "com.ficelle.router.service",
         install_python=Path(sys.executable),
-        hermes_home=hermes_home,
         active_home_pointer=tmp_path / ".config" / "ficelle" / "active-home"
         if persist_home
         else None,
     )
 
 
-def test_active_service_context_roundtrip_preserves_optional_hermes_home(tmp_path):
+def test_active_service_context_roundtrip_persists_only_ficelle_home(tmp_path):
     ficelle_home = tmp_path / "custom-ficelle"
     runtime_dir = tmp_path / "custom-runtime"
     hermes_home = tmp_path / "custom-hermes"
@@ -47,20 +45,11 @@ def test_active_service_context_roundtrip_preserves_optional_hermes_home(tmp_pat
     runtime_dir.mkdir()
     pointer = tmp_path / ".config" / "ficelle" / "active-home"
 
-    assert persist_active_service_context(
-        ficelle_home,
-        pointer,
-        runtime_dir=runtime_dir,
-        hermes_home=hermes_home,
-    )
-    assert read_active_service_context(pointer) == (
-        ficelle_home,
-        runtime_dir,
-        hermes_home,
-    )
+    assert persist_active_service_context(ficelle_home, pointer)
+    assert read_active_service_context(pointer) == ficelle_home
 
 
-def test_active_service_context_defaults_legacy_pointer_runtime_to_ficelle_home(
+def test_active_service_context_reads_plain_home_pointer(
     tmp_path,
 ):
     ficelle_home = tmp_path / "custom-ficelle"
@@ -68,11 +57,7 @@ def test_active_service_context_defaults_legacy_pointer_runtime_to_ficelle_home(
     pointer = tmp_path / "active-home"
     pointer.write_text(str(ficelle_home), encoding="utf-8")
 
-    assert read_active_service_context(pointer) == (
-        ficelle_home,
-        ficelle_home,
-        None,
-    )
+    assert read_active_service_context(pointer) == ficelle_home
 
 
 def test_select_service_backend_uses_launchagent_on_darwin(tmp_path):
@@ -92,7 +77,7 @@ def test_select_service_backend_uses_launchagent_on_darwin(tmp_path):
     assert backend.install() == 0
     assert ["launchctl", "bootstrap", "gui/501", str(paths.plist)] in calls
     payload = backend.plist_payload()
-    assert payload["WorkingDirectory"] == str(paths.runtime_dir)
+    assert payload["WorkingDirectory"] == str(paths.ficelle_home)
     assert payload["EnvironmentVariables"] == {"FICELLE_HOME": str(paths.ficelle_home)}
     assert payload["StandardOutPath"] == str(paths.log_dir / "ficelle.log")
     assert "HERMES_HOME" not in payload["EnvironmentVariables"]
@@ -117,14 +102,14 @@ def test_select_service_backend_uses_systemd_user_on_linux(tmp_path):
     assert paths.systemd_unit.exists()
     unit = paths.systemd_unit.read_text(encoding="utf-8")
     assert "ExecStart=" + sys.executable + " -m ficelle.router --serve" in unit
-    assert f"WorkingDirectory={paths.runtime_dir}" in unit
+    assert f"WorkingDirectory={paths.ficelle_home}" in unit
     assert f'Environment="FICELLE_HOME={paths.ficelle_home}"' in unit
     assert "HERMES_HOME" not in unit
     assert ["systemctl", "--user", "daemon-reload"] in calls
     assert ["systemctl", "--user", "enable", "--now", paths.systemd_unit.name] in calls
 
 
-def test_launchagent_persists_custom_hermes_home_for_hermes_target(tmp_path):
+def test_launchagent_ignores_client_home_environment(tmp_path):
     hermes_home = tmp_path / "custom-hermes"
     paths = make_paths(tmp_path, hermes_home=hermes_home)
     backend = select_service_backend(
@@ -139,7 +124,6 @@ def test_launchagent_persists_custom_hermes_home_for_hermes_target(tmp_path):
 
     assert backend.plist_payload()["EnvironmentVariables"] == {
         "FICELLE_HOME": str(paths.ficelle_home),
-        "HERMES_HOME": str(hermes_home),
     }
 
 
@@ -225,17 +209,8 @@ def test_launchagent_boots_out_when_a_foreign_process_holds_the_port(tmp_path, c
     assert len(_launchctl_bootouts(calls)) == 2
 
 
-def test_launchagent_probes_the_canonical_port_not_the_legacy_one(tmp_path):
-    """The port the service binds comes from the canonical config, legacy root second.
-
-    A legacy install keeps `runtime_dir` as a read-only compatibility root. Reading the port
-    from there probes a port nobody holds, and the caller reads "no holder" as "the service
-    never bound" — then boots out a service that is listening on the canonical port.
-    """
-    runtime_dir = tmp_path / ".hermes" / "ficelle"
-    runtime_dir.mkdir(parents=True)
-    (runtime_dir / "config.json").write_text('{"port": 8646}\n', encoding="utf-8")
-    paths = make_paths(tmp_path, runtime_dir=runtime_dir)
+def test_launchagent_probes_the_canonical_configured_port(tmp_path):
+    paths = make_paths(tmp_path)
     paths.ficelle_home.mkdir(parents=True)
     (paths.ficelle_home / "config.json").write_text('{"port": 8700}\n', encoding="utf-8")
     calls = []
@@ -257,7 +232,7 @@ def test_launchagent_boots_out_when_nothing_holds_the_port(tmp_path, capsys):
     assert len(_launchctl_bootouts(calls)) == 2
 
 
-def test_systemd_persists_custom_hermes_home_for_hermes_target(tmp_path):
+def test_systemd_ignores_client_home_environment(tmp_path):
     hermes_home = tmp_path / "custom-hermes"
     paths = make_paths(tmp_path, hermes_home=hermes_home)
     backend = SystemdUserServiceBackend(
@@ -271,7 +246,7 @@ def test_systemd_persists_custom_hermes_home_for_hermes_target(tmp_path):
     unit = backend.unit_payload()
 
     assert f'Environment="FICELLE_HOME={paths.ficelle_home}"' in unit
-    assert f'Environment="HERMES_HOME={hermes_home}"' in unit
+    assert "HERMES_HOME" not in unit
 
 
 def test_systemd_persists_the_context_of_a_service_it_leaves_running(tmp_path, capsys):
@@ -289,11 +264,7 @@ def test_systemd_persists_the_context_of_a_service_it_leaves_running(tmp_path, c
 
     assert backend.install() == 1
     assert "left running" in capsys.readouterr().err
-    assert read_active_service_context(paths.active_home_pointer) == (
-        paths.ficelle_home,
-        paths.ficelle_home,
-        None,
-    )
+    assert read_active_service_context(paths.active_home_pointer) == paths.ficelle_home
 
 
 def test_systemd_quotes_complete_environment_assignments(tmp_path):
@@ -302,12 +273,10 @@ def test_systemd_quotes_complete_environment_assignments(tmp_path):
     hermes_home = tmp_path / 'Hermes "home" \\ config'
     paths = ServicePaths(
         ficelle_home=ficelle_home,
-        runtime_dir=runtime_dir,
         label="com.ficelle.router",
         plist=tmp_path / "router.plist",
         systemd_unit=tmp_path / "router.service",
         install_python=Path(sys.executable),
-        hermes_home=hermes_home,
     )
     backend = SystemdUserServiceBackend(
         paths=paths,
@@ -325,16 +294,16 @@ def test_systemd_quotes_complete_environment_assignments(tmp_path):
         return str(path).replace("\\", "\\\\").replace('"', '\\"')
 
     assert f'Environment="FICELLE_HOME={escaped(ficelle_home)}"' in unit
-    assert f'Environment="FICELLE_RUNTIME_DIR={escaped(runtime_dir)}"' in unit
-    assert f'Environment="HERMES_HOME={escaped(hermes_home)}"' in unit
+    assert "FICELLE_RUNTIME_DIR" not in unit
+    assert "HERMES_HOME" not in unit
 
 
-def test_service_reads_legacy_runtime_but_keeps_artifacts_canonical(tmp_path):
-    runtime_dir = tmp_path / ".hermes" / "ficelle"
-    runtime_dir.mkdir(parents=True)
-    state_path = runtime_dir / "state.json"
-    state_path.write_text('{"legacy": true}\n', encoding="utf-8")
-    paths = make_paths(tmp_path, runtime_dir=runtime_dir, persist_home=True)
+def test_service_keeps_all_artifacts_under_ficelle_home(tmp_path):
+    external_runtime = tmp_path / ".host" / "ficelle"
+    external_runtime.mkdir(parents=True)
+    state_path = external_runtime / "state.json"
+    state_path.write_text('{"external": true}\n', encoding="utf-8")
+    paths = make_paths(tmp_path, persist_home=True)
     backend = select_service_backend(
         platform_name="darwin",
         paths=paths,
@@ -353,36 +322,28 @@ def test_service_reads_legacy_runtime_but_keeps_artifacts_canonical(tmp_path):
     assert payload["StandardOutPath"] == str(
         paths.ficelle_home / "logs" / "ficelle.log"
     )
-    assert payload["EnvironmentVariables"] == {
-        "FICELLE_HOME": str(paths.ficelle_home),
-        "FICELLE_RUNTIME_DIR": str(runtime_dir),
-    }
+    assert payload["EnvironmentVariables"] == {"FICELLE_HOME": str(paths.ficelle_home)}
     assert backend.install() == 0
     assert paths.ficelle_home.is_dir()
     assert (paths.ficelle_home / "logs").is_dir()
-    assert not (runtime_dir / "logs").exists()
-    assert state_path.read_text(encoding="utf-8") == '{"legacy": true}\n'
-    assert read_active_service_context(paths.active_home_pointer) == (
-        paths.ficelle_home,
-        runtime_dir,
-        None,
-    )
+    assert not (external_runtime / "logs").exists()
+    assert state_path.read_text(encoding="utf-8") == '{"external": true}\n'
+    assert read_active_service_context(paths.active_home_pointer) == paths.ficelle_home
 
 
-def test_service_paths_reads_optional_hermes_target_context(monkeypatch, tmp_path):
+def test_service_paths_ignore_optional_client_context(monkeypatch, tmp_path):
     hermes_home = tmp_path / "custom-hermes"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     paths = ServicePaths(
         ficelle_home=tmp_path / ".ficelle",
-        runtime_dir=tmp_path / ".ficelle",
         label="com.ficelle.router",
         plist=tmp_path / "router.plist",
         systemd_unit=tmp_path / "router.service",
         install_python=Path(sys.executable),
     )
 
-    assert paths.hermes_home == hermes_home
+    assert not hasattr(paths, "hermes_home")
 
 
 def test_systemd_user_restart_reuses_existing_unit(tmp_path):
@@ -406,11 +367,7 @@ def test_systemd_user_restart_reuses_existing_unit(tmp_path):
     assert f'Environment="FICELLE_HOME={paths.ficelle_home}"' in paths.systemd_unit.read_text(
         encoding="utf-8"
     )
-    assert read_active_service_context(paths.active_home_pointer) == (
-        paths.ficelle_home,
-        paths.runtime_dir,
-        None,
-    )
+    assert read_active_service_context(paths.active_home_pointer) == paths.ficelle_home
 
 
 def test_systemd_user_uninstall_removes_unit_and_reloads(tmp_path):
@@ -488,7 +445,7 @@ def test_scheduled_task_install_registers_and_runs_the_task(tmp_path):
     assert "HERMES_HOME=" not in payload
 
 
-def test_scheduled_task_passes_runtime_and_hermes_context_as_assignments(tmp_path):
+def test_scheduled_task_passes_only_ficelle_context_as_assignment(tmp_path):
     hermes_home = tmp_path / "custom-hermes"
     runtime_dir = tmp_path / ".hermes" / "ficelle"
     runtime_dir.mkdir(parents=True)
@@ -499,8 +456,6 @@ def test_scheduled_task_passes_runtime_and_hermes_context_as_assignments(tmp_pat
         "-m",
         "ficelle.windows_entry",
         f"FICELLE_HOME={paths.ficelle_home}",
-        f"FICELLE_RUNTIME_DIR={runtime_dir}",
-        f"HERMES_HOME={hermes_home}",
     ]
 
 
@@ -542,11 +497,7 @@ def test_scheduled_task_install_persists_active_context(tmp_path):
     backend = _windows_backend(paths)
 
     assert backend.install() == 0
-    assert read_active_service_context(paths.active_home_pointer) == (
-        paths.ficelle_home,
-        paths.runtime_dir,
-        None,
-    )
+    assert read_active_service_context(paths.active_home_pointer) == paths.ficelle_home
 
 
 def test_windows_task_account_prefers_username_over_getpass_chain(monkeypatch):

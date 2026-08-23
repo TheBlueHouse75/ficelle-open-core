@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, sign, and verify Ficelle's central coding-certification manifest.
+"""Normalize coding benchmark results and build Ficelle's bundled qualification manifest.
 
 This tool consumes machine-readable output from official benchmark harnesses. It does not run or
 reimplement their tasks; ``coding-benchmark-runner.py`` pins and executes those upstream harnesses.
@@ -8,13 +8,11 @@ reimplement their tasks; ``coding-benchmark-runner.py`` pins and executes those 
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
-import os
-import subprocess
+import math
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -22,27 +20,24 @@ from urllib.parse import urlparse
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
-
 from ficelle.coding_certification import (  # noqa: E402
     COMPATIBILITY_CANARY_VERSION,
-    KEY_ID,
     POLICY_VERSION,
     REQUIRED_BENCHMARKS,
-    canonical_json,
     validate_manifest,
-    verify_envelope,
+)
+from ficelle.coding_benchmark_policy import (  # noqa: E402
+    MIN_QUALIFYING_PASS_AT_1,
+    CodingBenchmarkPolicyError,
+    canonical_repository,
+    validate_evidence_metadata,
+    validate_model_identity,
 )
 
 
 BENCHMARK_WEIGHTS = {
-    "aider-polyglot": 0.35,
-    "swe-rebench": 0.40,
-    "terminal-bench-2.1": 0.25,
+    "aider-polyglot": 1.0,
 }
-KEYCHAIN_SERVICE = "ai.ficelle.coding-certification"
-KEYCHAIN_ACCOUNT = "manifest-signing-key-v1"
-PRIVATE_KEY_ENV = "FICELLE_CODING_CERT_PRIVATE_KEY_B64"
 
 
 def read_json(path: Path) -> Any:
@@ -76,6 +71,33 @@ def _pass_summary(payload: dict[str, Any]) -> tuple[int, float]:
         score = payload.get("pass_rate")
     if score is None:
         score = payload.get("resolved_rate")
+    rows = payload.get("results") or payload.get("instances") or payload.get("tasks")
+    if isinstance(rows, list) and rows:
+        verdicts: list[bool] = []
+        has_explicit_outcomes = False
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("result rows must be objects")
+            status = str(row.get("status") or "").lower()
+            if status in {"provider_error", "harness_error"}:
+                has_explicit_outcomes = True
+                continue
+            if status in {"pass", "passed", "resolved", "success", "fail", "failed"}:
+                has_explicit_outcomes = True
+                verdicts.append(status in {"pass", "passed", "resolved", "success"})
+                continue
+            verdict = row.get("passed", row.get("resolved"))
+            if isinstance(verdict, bool):
+                verdicts.append(verdict)
+        if verdicts:
+            total = task_count if isinstance(task_count, int) and not isinstance(task_count, bool) else len(rows)
+            rate = sum(verdicts) / len(verdicts)
+            if has_explicit_outcomes and isinstance(score, (int, float)) and not isinstance(score, bool):
+                declared = float(score) / 100.0 if float(score) > 1 else float(score)
+                if not math.isclose(rate, declared, rel_tol=1e-9, abs_tol=1e-9):
+                    raise ValueError("declared pass_at_1 does not match model verdict rows")
+            return total, rate
+
     if (
         isinstance(task_count, int)
         and not isinstance(task_count, bool)
@@ -84,24 +106,49 @@ def _pass_summary(payload: dict[str, Any]) -> tuple[int, float]:
         and not isinstance(score, bool)
     ):
         rate = float(score)
-        if rate > 1:
-            rate /= 100.0
-        return task_count, rate
+        return task_count, rate / 100.0 if rate > 1 else rate
+    raise ValueError("official result must expose task_count/pass_at_1 or model verdict rows")
 
-    rows = payload.get("results") or payload.get("instances") or payload.get("tasks")
-    if not isinstance(rows, list) or not rows:
-        raise ValueError("official result must expose task_count/pass_at_1 or a non-empty result list")
-    passed = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            raise ValueError("result rows must be objects")
-        verdict = row.get("passed")
-        if verdict is None:
-            verdict = row.get("resolved")
-        if verdict is None:
-            verdict = str(row.get("status") or "").lower() in {"pass", "passed", "resolved", "success"}
-        passed += int(bool(verdict))
-    return len(rows), passed / len(rows)
+
+def _efficiency_summary(payload: dict[str, Any], task_count: int) -> dict[str, int | float] | None:
+    raw = payload.get("efficiency")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("efficiency must be an object")
+    measured = raw.get("measured_task_count")
+    token_fields = ("prompt_tokens", "completion_tokens", "total_tokens")
+    if isinstance(measured, bool) or not isinstance(measured, int) or not 0 <= measured <= task_count:
+        raise ValueError("efficiency measured_task_count is invalid")
+    tokens: dict[str, int] = {}
+    for field in token_fields:
+        value = raw.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"efficiency {field} must be a non-negative integer")
+        tokens[field] = value
+    if tokens["total_tokens"] != tokens["prompt_tokens"] + tokens["completion_tokens"]:
+        raise ValueError("efficiency total_tokens does not match its components")
+    duration = raw.get("duration_seconds")
+    mean = raw.get("mean_duration_seconds")
+    for field, value in (("duration_seconds", duration), ("mean_duration_seconds", mean)):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            raise ValueError(f"efficiency {field} must be a finite non-negative number")
+    expected_mean = float(duration) / measured if measured else 0.0
+    if measured == 0 and (float(duration) != 0 or any(tokens.values())):
+        raise ValueError("efficiency with zero measured tasks must contain only zero metrics")
+    if not math.isclose(float(mean), expected_mean, rel_tol=1e-9, abs_tol=1e-9):
+        raise ValueError("efficiency mean_duration_seconds does not match duration/task count")
+    return {
+        "measured_task_count": measured,
+        "duration_seconds": float(duration),
+        "mean_duration_seconds": float(mean),
+        **tokens,
+    }
 
 
 def normalize_result(args: argparse.Namespace) -> dict[str, Any]:
@@ -112,6 +159,18 @@ def normalize_result(args: argparse.Namespace) -> dict[str, Any]:
         payload = {"results": payload}
     if not isinstance(payload, dict):
         raise ValueError("official benchmark result must be an object or result array")
+    # Older adapter results did not expose the three outcome counters. Derive them only when every
+    # row has an explicit terminal status; the source artifact and its fingerprint stay unchanged.
+    result_rows = payload.get("results")
+    if isinstance(result_rows, list) and all(isinstance(item, dict) for item in result_rows):
+        statuses = [str(item.get("status") or "").lower() for item in result_rows]
+        if all(status in {"passed", "failed", "provider_error", "harness_error"} for status in statuses):
+            payload.setdefault("model_verdict_count", sum(status in {"passed", "failed"} for status in statuses))
+            payload.setdefault("provider_error_count", statuses.count("provider_error"))
+            payload.setdefault("harness_error_count", statuses.count("harness_error"))
+    policy = validate_evidence_metadata(payload, run_mode=args.run_mode)
+    if args.suite_version != policy.suite_version:
+        raise ValueError("--suite-version does not match pinned policy")
     task_count, pass_at_1 = _pass_summary(payload)
     if not 0 <= pass_at_1 <= 1:
         raise ValueError("normalized pass_at_1 must be between 0 and 1")
@@ -122,8 +181,10 @@ def normalize_result(args: argparse.Namespace) -> dict[str, Any]:
     settings = read_json(args.settings)
     if not isinstance(settings, dict):
         raise ValueError("benchmark settings must be an object")
-    settings_provider = str(settings.get("provider") or "").strip().lower()
-    settings_model = str(settings.get("upstream_model_id") or "").strip()
+    settings_provider, settings_model = validate_model_identity(
+        str(settings.get("provider") or ""),
+        str(settings.get("upstream_model_id") or ""),
+    )
     if settings_provider != args.provider.strip().lower() or settings_model != args.model.strip():
         raise ValueError("--provider and --model must match settings provider/upstream_model_id")
     settings_fingerprint = "sha256:" + hashlib.sha256(settings_bytes).hexdigest()
@@ -134,8 +195,13 @@ def normalize_result(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("run record must be an object")
     expected_record = {
         "benchmark": args.benchmark,
-        "harness_repository": args.harness_repository,
+        "harness_repository": canonical_repository(args.harness_repository),
         "harness_commit": commit,
+        "run_mode": args.run_mode,
+        "provider": settings_provider,
+        "upstream_model_id": settings_model,
+        "policy_fingerprint": payload["policy_fingerprint"],
+        "source_revisions": payload["source_revisions"],
         "settings_fingerprint": settings_fingerprint,
         "official_result_fingerprint": official_result_fingerprint,
         "exit_code": 0,
@@ -152,42 +218,69 @@ def normalize_result(args: argparse.Namespace) -> dict[str, Any]:
         "provider": args.provider.lower(),
         "upstream_model_id": args.model,
         "name": args.benchmark,
-        "suite_version": args.suite_version,
-        "harness_repository": args.harness_repository,
+        "suite_version": policy.suite_version,
+        "harness_repository": canonical_repository(args.harness_repository),
         "harness_commit": commit,
         "task_count": task_count,
         "pass_at_1": round(pass_at_1, 8),
+        "run_mode": args.run_mode,
+        "attempts_per_task": payload["attempts_per_task"],
+        "completed_count": payload.get("completed_count"),
+        "model_verdict_count": payload.get("model_verdict_count"),
+        "provider_error_count": payload.get("provider_error_count"),
+        "harness_error_count": payload.get("harness_error_count"),
+        "harness_exit_code": payload["harness_exit_code"],
+        "timed_out": payload["timed_out"],
+        "wall_clock_timeout_seconds": payload["wall_clock_timeout_seconds"],
+        "reference_agent": policy.reference_agent,
+        "reference_agent_commit": policy.reference_agent_commit,
+        "source_revisions": payload["source_revisions"],
+        "policy_fingerprint": payload["policy_fingerprint"],
+        "completion_token_budget": payload["completion_token_budget"],
+        "model_settings_fingerprint": payload["model_settings_fingerprint"],
         "settings_fingerprint": settings_fingerprint,
         "run_record_fingerprint": "sha256:" + hashlib.sha256(run_record_bytes).hexdigest(),
         "official_result_fingerprint": official_result_fingerprint,
         "command_fingerprint": command_fingerprint,
-        "evidence_kind": "central_run",
+        "evidence_kind": "central_run" if args.run_mode == "certification" else "calibration_run",
         "observed_at": datetime.now(UTC).isoformat(),
     }
     languages = payload.get("languages") or payload.get("language_breakdown")
     if isinstance(languages, dict):
         row["languages"] = languages
+    efficiency = _efficiency_summary(payload, task_count)
+    if efficiency is not None:
+        row["efficiency"] = efficiency
     return row
 
 
 def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for path in args.results:
         row = read_json(path)
         if not isinstance(row, dict):
             raise ValueError(f"normalized result must be an object: {path}")
-        identity = (str(row.get("provider") or "").lower(), str(row.get("upstream_model_id") or ""))
-        if not all(identity):
+        run_mode = str(row.get("run_mode") or "")
+        validate_evidence_metadata({**row, "benchmark": row.get("name")}, run_mode=run_mode)
+        if int(row.get("model_verdict_count") or 0) != int(row.get("task_count") or 0):
+            raise ValueError("qualification requires a model verdict for every task")
+        identity = str(row.get("upstream_model_id") or "")
+        if not identity or not str(row.get("provider") or ""):
             raise ValueError(f"normalized result is missing provider/model identity: {path}")
         grouped.setdefault(identity, []).append(row)
 
     certifications = []
     now = datetime.now(UTC)
-    for (provider, model_id), rows in sorted(grouped.items()):
+    for model_id, rows in sorted(grouped.items()):
         names = {str(row.get("name") or "") for row in rows}
         if names != REQUIRED_BENCHMARKS or len(rows) != len(REQUIRED_BENCHMARKS):
-            raise ValueError(f"{provider}/{model_id} does not have the exact required benchmark set")
+            raise ValueError(f"{model_id} does not have the exact required benchmark set")
+        provider = str(rows[0]["provider"]).lower()
         score = sum(float(row["pass_at_1"]) * 100 * BENCHMARK_WEIGHTS[row["name"]] for row in rows)
+        if score < MIN_QUALIFYING_PASS_AT_1 * 100:
+            raise ValueError(
+                f"{model_id} scored {score:.1f}, below the {MIN_QUALIFYING_PASS_AT_1 * 100:.0f} qualification floor"
+            )
         certifications.append(
             {
                 "provider": provider,
@@ -208,49 +301,11 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     manifest = {
         "schema_version": 1,
         "manifest_id": args.manifest_id or now.strftime("%Y-%m-%dT%H%M%SZ"),
-        "generated_at": now.isoformat(),
-        "expires_at": (now + timedelta(days=args.expires_days)).isoformat(),
         "policy_version": POLICY_VERSION,
         "certifications": certifications,
         "priors": priors,
     }
     return validate_manifest(manifest, require_complete_policy=True)
-
-
-def private_key_bytes() -> bytes:
-    raw = os.getenv(PRIVATE_KEY_ENV, "").strip()
-    if not raw and sys.platform == "darwin":
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            raw = result.stdout.strip()
-    if not raw:
-        raise ValueError(
-            f"signing key unavailable; set {PRIVATE_KEY_ENV} or install {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT}"
-        )
-    try:
-        key = base64.b64decode(raw, validate=True)
-    except ValueError as exc:
-        raise ValueError("signing key is not valid base64") from exc
-    if len(key) != 32:
-        raise ValueError("signing key must contain exactly 32 raw Ed25519 bytes")
-    return key
-
-
-def sign_manifest(payload: dict[str, Any]) -> dict[str, Any]:
-    validate_manifest(payload, require_complete_policy=True)
-    signature = Ed25519PrivateKey.from_private_bytes(private_key_bytes()).sign(canonical_json(payload))
-    envelope = {
-        "key_id": KEY_ID,
-        "manifest": payload,
-        "signature": base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii"),
-    }
-    verify_envelope(envelope)
-    return envelope
 
 
 def prior(args: argparse.Namespace) -> dict[str, Any]:
@@ -304,20 +359,13 @@ def parser() -> argparse.ArgumentParser:
     normalize.add_argument("--harness-commit", required=True)
     normalize.add_argument("--settings", type=Path, required=True)
     normalize.add_argument("--run-record", type=Path, required=True)
+    normalize.add_argument("--run-mode", choices=("calibration", "certification"), required=True)
 
-    build = commands.add_parser("build", help="Build a policy-complete unsigned manifest")
+    build = commands.add_parser("build", help="Build the bundled qualification manifest")
     build.add_argument("--results", type=Path, nargs="*", default=[])
     build.add_argument("--priors", type=Path, nargs="*", default=[])
     build.add_argument("--output", type=Path, required=True)
     build.add_argument("--manifest-id")
-    build.add_argument("--expires-days", type=int, default=30, choices=range(1, 91))
-
-    sign = commands.add_parser("sign", help="Sign an unsigned manifest")
-    sign.add_argument("--manifest", type=Path, required=True)
-    sign.add_argument("--output", type=Path, required=True)
-
-    verify = commands.add_parser("verify", help="Verify a signed envelope")
-    verify.add_argument("--envelope", type=Path, required=True)
 
     add_prior = commands.add_parser("prior", help="Create a provenance-only public benchmark prior")
     add_prior.add_argument("--source-url", required=True)
@@ -341,17 +389,10 @@ def main(argv: list[str] | None = None) -> int:
             write_json(args.output, normalize_result(args))
         elif args.command == "build":
             write_json(args.output, build_manifest(args))
-        elif args.command == "sign":
-            payload = read_json(args.manifest)
-            if not isinstance(payload, dict):
-                raise ValueError("unsigned manifest must be an object")
-            write_json(args.output, sign_manifest(payload))
-        elif args.command == "verify":
-            verify_envelope(read_json(args.envelope))
         elif args.command == "prior":
             write_json(args.output, prior(args))
         return 0
-    except (OSError, ValueError) as exc:
+    except (CodingBenchmarkPolicyError, OSError, ValueError) as exc:
         sys.stderr.write(f"coding-certification: {exc}\n")
         return 1
 

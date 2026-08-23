@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ficelle-router"
-version = "0.3.6"
+version = "0.3.7"
 description = "Local OpenAI-compatible strict-zero model router for AI agents"
 readme = "README.md"
 license = "BUSL-1.1"
@@ -25,7 +25,7 @@ ficelle-setup = "ficelle.install:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ficelle = ["assets/hermes-plugin/*/*", "assets/fonts/*", "assets/logos/*", "assets/admin/*", "assets/admin/**/*", "data/*.json", "data/benchmark/*"]
+ficelle = ["assets/auto-coding-manifest.json", "assets/hermes-plugin/*/*", "assets/fonts/*", "assets/logos/*", "assets/admin/*", "assets/admin/**/*", "data/*.json", "data/benchmark/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

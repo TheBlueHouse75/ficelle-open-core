@@ -298,6 +298,90 @@ def test_update_commands_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "timed out" in (result.stderr or "")
 
 
+def test_update_installs_wheels_without_dependency_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / "ficelle_router.whl"
+    wheel.write_bytes(b"wheel")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        update,
+        "_run_command",
+        lambda command: commands.append(command)
+        or subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    update._install_wheel(wheel)
+
+    assert commands == [[
+        update.sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--force-reinstall",
+        "--no-deps",
+        str(wheel),
+    ]]
+
+
+def test_update_dependency_check_falls_back_to_uv_without_pip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if command[:3] == [update.sys.executable, "-m", "pip"]:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "No module named pip",
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(update, "_run_command", fake_run)
+    monkeypatch.setattr(update, "_uv_executable", lambda: "/usr/local/bin/uv")
+
+    update._pip_check()
+
+    assert commands == [
+        [update.sys.executable, "-m", "pip", "check"],
+        [
+            "/usr/local/bin/uv",
+            "pip",
+            "check",
+            "--python",
+            update.sys.executable,
+        ],
+    ]
+
+
+def test_update_extracts_only_external_runtime_requirements(tmp_path: Path) -> None:
+    wheel = tmp_path / "ficelle_pro.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "ficelle_pro-0.3.7.dist-info/METADATA",
+            "\n".join(
+                (
+                    "Metadata-Version: 2.4",
+                    "Name: ficelle-pro",
+                    "Version: 0.3.7",
+                    "Requires-Dist: ficelle-router==0.3.7",
+                    "Requires-Dist: packaging>=24",
+                    "Requires-Dist: cryptography>=42; python_version >= '3.11'",
+                    "",
+                )
+            ),
+        )
+
+    assert update._wheel_runtime_requirements(wheel) == (
+        "packaging>=24",
+        "cryptography>=42; python_version >= '3.11'",
+    )
+
+
 def test_update_check_loop_retries_a_failed_check(monkeypatch: pytest.MonkeyPatch) -> None:
     sleeps: list[float] = []
     results = iter(({"status": "error"}, {"status": "up_to_date"}))

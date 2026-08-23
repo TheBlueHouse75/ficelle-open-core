@@ -4,10 +4,8 @@ Task Scheduler has no equivalent of LaunchAgent ``EnvironmentVariables`` or syst
 ``Environment=`` lines, and the console-less ``pythonw.exe`` interpreter starts with
 ``sys.stdout``/``sys.stderr`` set to ``None``, so a bare ``print()`` would crash the
 server. This entry point closes both gaps before the router loop starts: it receives
-the service environment as ``NAME=VALUE`` assignments (built by
-``WindowsScheduledTaskBackend.entry_arguments()`` from ``service_environment()``, the
-one definition of that contract), republishes them as environment variables, then
-points stdio at the same log files the LaunchAgent backend writes.
+the standalone ``FICELLE_HOME=VALUE`` assignment, publishes it, then points stdio at
+the same log files the LaunchAgent backend writes.
 """
 from __future__ import annotations
 
@@ -31,11 +29,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def service_environment_from_assignments(assignments: list[str]) -> dict[str, str]:
-    environment = {}
+    environment: dict[str, str] = {}
     for assignment in assignments:
         name, separator, value = assignment.partition("=")
         if not name or not separator or not value:
             raise SystemExit(f"invalid service environment assignment: {assignment!r}")
+        if name != "FICELLE_HOME":
+            raise SystemExit(f"unsupported service environment assignment: {name}")
         environment[name] = value
     if "FICELLE_HOME" not in environment:
         raise SystemExit("a FICELLE_HOME=... assignment is required")

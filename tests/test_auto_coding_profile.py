@@ -37,7 +37,7 @@ def test_auto_coding_is_exported_and_has_a_local_compatibility_probe():
     assert body["tools"][0]["function"]["name"] == "ficelle_open_file"
 
 
-def test_auto_coding_gate_is_exact_and_never_uses_anti_empty_fallback(monkeypatch):
+def test_auto_coding_gate_reuses_model_quality_across_providers_without_anti_empty_fallback(monkeypatch):
     certified = model("openrouter", "acme/code", "ficelle/openrouter/acme/code")
     same_model_elsewhere = model("nous", "acme/code", "ficelle/nous/acme/code")
     manifest = {
@@ -49,18 +49,40 @@ def test_auto_coding_gate_is_exact_and_never_uses_anti_empty_fallback(monkeypatc
             }
         ]
     }
-    monkeypatch.setattr(router.coding_certification, "cached_manifest", lambda _path: manifest)
+    monkeypatch.setattr(router.coding_certification, "cached_manifest", lambda: manifest)
 
     kept, fallback = router.route_competence_gate_result(
         "ficelle/auto-coding", [certified, same_model_elsewhere], {}
     )
-    assert kept == [certified]
+    assert kept == [certified, same_model_elsewhere]
     assert fallback is False
 
     kept, fallback = router.route_competence_gate_result(
         "ficelle/auto-coding", [same_model_elsewhere], {}
     )
+    assert kept == [same_model_elsewhere]
+    assert fallback is False
+
+    unqualified = model("nous", "acme/other", "ficelle/nous/acme/other")
+    kept, fallback = router.route_competence_gate_result(
+        "ficelle/auto-coding", [unqualified], {}
+    )
     assert kept == []
+    assert fallback is False
+
+
+def test_bundled_pool_routes_qualified_models_and_rejects_laguna():
+    ox_alpha = model(
+        "openrouter", "stealth/ox-alpha", "ficelle/openrouter/stealth/ox-alpha"
+    )
+    kimi_k3 = model("nvidia", "moonshotai/kimi-k3", "ficelle/nvidia/moonshotai/kimi-k3")
+    laguna = model("kilo", "laguna-s-2-1", "ficelle/kilo/laguna-s-2-1")
+
+    kept, fallback = router.route_competence_gate_result(
+        "ficelle/auto-coding", [ox_alpha, kimi_k3, laguna], {}
+    )
+
+    assert kept == [kimi_k3]
     assert fallback is False
 
 
@@ -70,7 +92,7 @@ def test_auto_coding_canary_selection_excludes_uncertified_models(monkeypatch):
     monkeypatch.setattr(
         router.coding_certification,
         "cached_manifest",
-        lambda _path: {
+        lambda: {
             "certifications": [
                 {"provider": "openrouter", "upstream_model_id": "acme/code", "quality_score": 80}
             ]
@@ -123,7 +145,7 @@ def test_auto_coding_order_uses_central_quality_before_local_transport(monkeypat
             {"provider": "openrouter", "upstream_model_id": "acme/higher", "quality_score": 90},
         ]
     }
-    monkeypatch.setattr(router.coding_certification, "cached_manifest", lambda _path: manifest)
+    monkeypatch.setattr(router.coding_certification, "cached_manifest", lambda: manifest)
     state = {
         "stats": {
             router.cooldown_key(lower): {"successes": 100, "failures": 0, "latency_ewma": 0.1},
@@ -141,7 +163,7 @@ def test_failed_local_compatibility_canary_blocks_but_cannot_certify(monkeypatch
             {"provider": "openrouter", "upstream_model_id": "acme/code", "quality_score": 80}
         ]
     }
-    monkeypatch.setattr(router.coding_certification, "cached_manifest", lambda _path: certified_manifest)
+    monkeypatch.setattr(router.coding_certification, "cached_manifest", lambda: certified_manifest)
     state = {
         "verified_capabilities": {
             router.cooldown_key(candidate): {
@@ -155,7 +177,7 @@ def test_failed_local_compatibility_canary_blocks_but_cannot_certify(monkeypatch
     }
     assert router.route_competence_gate_result("ficelle/auto-coding", [candidate], state)[0] == []
 
-    monkeypatch.setattr(router.coding_certification, "cached_manifest", lambda _path: {"certifications": []})
+    monkeypatch.setattr(router.coding_certification, "cached_manifest", lambda: {"certifications": []})
     success_state = {
         "verified_capabilities": {
             router.cooldown_key(candidate): {

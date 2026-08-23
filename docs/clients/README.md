@@ -13,6 +13,10 @@ list is served from public catalogs without credentials, so **a populated model
 list does not mean a completion can be served** — `ficelle doctor --text` tells
 you which providers actually can.
 
+These clients do not host Ficelle. Core always runs from its Ficelle-owned runtime. Most
+OpenAI-compatible clients need only this recipe; Hermes and OpenClaw use optional add-on connectors
+because they also need host-specific assets/configuration.
+
 Some clients want the base URL and append routes themselves; others want the full
 chat endpoint pasted verbatim. Both are valid:
 
@@ -21,13 +25,13 @@ base URL       http://127.0.0.1:8646/v1
 chat endpoint  http://127.0.0.1:8646/v1/chat/completions
 ```
 
-`ficelle export --target generic` prints both, plus the model list, as JSON.
+`ficelle client-config` prints both, plus the model list, as JSON.
 
 ## Which model id to use
 
 | Model | Use it for |
 |---|---|
-| `ficelle/auto-coding` | coding assistants; only centrally certified provider deployments |
+| `ficelle/auto-coding` | coding assistants; qualified models on locally available provider deployments |
 | `ficelle/auto-tools` | the general agent profile: tool calling without coding-quality certification |
 | `ficelle/auto-fast` | quick, low-stakes calls: titles, summaries, one-liners |
 | `ficelle/auto-json` | structured extraction, JSON output |
@@ -39,8 +43,9 @@ chat endpoint  http://127.0.0.1:8646/v1/chat/completions
 capability-specific profiles (reasoning, vision, audio, video).
 
 `auto-coding` may correctly return `503 no_certified_coding_model` even while other profiles
-work. That means the signed manifest has no current certification matching this install's live
-free provider deployments; Ficelle will not silently substitute a merely tool-capable model.
+work. That means the bundled pool has no qualification matching this install's live
+free provider deployments carrying a qualified model; Ficelle will not silently substitute a
+merely tool-capable model.
 
 ## Recipes
 
@@ -50,9 +55,9 @@ free provider deployments; Ficelle will not silently substitute a merely tool-ca
 - [Open WebUI](open-webui.md)
 - [OpenAI SDK and custom scripts](openai-sdk.md)
 - [Claude Code](claude-code.md) — protocol status and what works today
-- Hermes ships as a packaged first-class integration instead of a paste-in
-  recipe: `ficelle-setup --target hermes` installs the provider and compression
-  plugins, and `ficelle export --target hermes` prints the recommended YAML.
+- Hermes uses a packaged optional connector instead of a paste-in recipe. Run Ficelle standalone
+  first, then `ficelle connectors install hermes`. `ficelle connectors export hermes` prints the
+  recommended YAML.
 
 ## Verify any client in one request
 

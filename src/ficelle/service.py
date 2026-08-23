@@ -7,7 +7,7 @@ import os
 import plistlib
 import subprocess
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
 from xml.sax.saxutils import escape as xml_escape
@@ -42,8 +42,8 @@ def active_home_pointer_path() -> Path:
 
 def read_active_service_context(
     pointer: Path | None = None,
-) -> tuple[Path, Path, Path | None] | None:
-    """Read persisted credential, runtime, and optional Hermes roots."""
+) -> Path | None:
+    """Read the persisted Ficelle state root."""
     path = pointer or active_home_pointer_path()
     try:
         raw = path.read_text(encoding="utf-8").strip()
@@ -60,57 +60,23 @@ def read_active_service_context(
     ficelle_home = Path(str(payload.get("ficelle_home") or "")).expanduser()
     if not ficelle_home.is_absolute() or not ficelle_home.is_dir():
         return None
-    raw_runtime_dir = payload.get("runtime_dir")
-    runtime_dir = (
-        Path(str(raw_runtime_dir)).expanduser()
-        if isinstance(raw_runtime_dir, str) and raw_runtime_dir
-        else ficelle_home
-    )
-    if not runtime_dir.is_absolute() or not runtime_dir.is_dir():
-        return None
-    raw_hermes_home = payload.get("hermes_home")
-    hermes_home = (
-        Path(str(raw_hermes_home)).expanduser()
-        if isinstance(raw_hermes_home, str) and raw_hermes_home
-        else None
-    )
-    if hermes_home is not None and not hermes_home.is_absolute():
-        return None
-    return ficelle_home, runtime_dir, hermes_home
+    return ficelle_home
 
 
 def persist_active_service_context(
     ficelle_home: Path,
     pointer: Path | None = None,
-    *,
-    runtime_dir: Path | None = None,
-    hermes_home: Path | None = None,
 ) -> bool:
-    """Atomically persist the active service roots."""
+    """Atomically persist the active Ficelle state root."""
     path = pointer or active_home_pointer_path()
     home = ficelle_home.expanduser()
     if not home.is_absolute() or not home.is_dir():
-        return False
-    active_runtime_dir = runtime_dir.expanduser() if runtime_dir is not None else home
-    if not active_runtime_dir.is_absolute() or not active_runtime_dir.is_dir():
-        return False
-    expanded_hermes_home = hermes_home.expanduser() if hermes_home is not None else None
-    if expanded_hermes_home is not None and not expanded_hermes_home.is_absolute():
         return False
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary.write_text(
-            json.dumps(
-                {
-                    "ficelle_home": str(home),
-                    "runtime_dir": str(active_runtime_dir),
-                    "hermes_home": str(expanded_hermes_home)
-                    if expanded_hermes_home is not None
-                    else None,
-                },
-                sort_keys=True,
-            )
+            json.dumps({"ficelle_home": str(home)}, sort_keys=True)
             + "\n",
             encoding="utf-8",
         )
@@ -123,12 +89,6 @@ def persist_active_service_context(
             pass
         return False
     return True
-
-
-def hermes_home_from_environment() -> Path | None:
-    """Return the optional Hermes integration root passed by target-aware setup."""
-    value = os.getenv("HERMES_HOME")
-    return Path(value).expanduser() if value else None
 
 
 class ServiceBackend(Protocol):
@@ -173,12 +133,10 @@ class PortHolder:
 @dataclass(frozen=True)
 class ServicePaths:
     ficelle_home: Path
-    runtime_dir: Path
     label: str
     plist: Path
     systemd_unit: Path
     install_python: Path
-    hermes_home: Path | None = field(default_factory=hermes_home_from_environment)
     active_home_pointer: Path | None = None
 
     @property
@@ -187,12 +145,7 @@ class ServicePaths:
 
 
 def service_environment(paths: ServicePaths) -> dict[str, str]:
-    environment = {"FICELLE_HOME": str(paths.ficelle_home)}
-    if paths.runtime_dir != paths.ficelle_home:
-        environment["FICELLE_RUNTIME_DIR"] = str(paths.runtime_dir)
-    if paths.hermes_home is not None:
-        environment["HERMES_HOME"] = str(paths.hermes_home)
-    return environment
+    return {"FICELLE_HOME": str(paths.ficelle_home)}
 
 
 def _systemd_environment_line(name: str, value: str) -> str:
@@ -212,8 +165,6 @@ def persist_service_context(paths: ServicePaths) -> bool:
     if persist_active_service_context(
         paths.ficelle_home,
         paths.active_home_pointer,
-        runtime_dir=paths.runtime_dir,
-        hermes_home=paths.hermes_home,
     ):
         return True
     sys.stderr.write(
@@ -306,21 +257,12 @@ class LaunchAgentServiceBackend:
         return 0
 
     def configured_port(self) -> int:
-        """The port the service binds, resolved canonical-first like the runtime resolves it.
-
-        This used to read `runtime_dir/config.json` only, which is backwards on a legacy
-        install: `runtime_dir` is then the read-only compatibility root while the canonical
-        `FICELLE_HOME/config.json` is what the service binds from. Probing the wrong port
-        finds no holder — and the caller reads "no holder" as a service that never bound.
-        """
-        for directory in (self.paths.ficelle_home, self.paths.runtime_dir):
-            path = directory / "config.json"
-            if not path.exists():
-                continue
-            try:
-                return int(json.loads(path.read_text(encoding="utf-8")).get("port") or DEFAULT_ROUTER_PORT)
-            except (OSError, ValueError, TypeError, AttributeError):
-                break
+        """Return the port configured in Ficelle's canonical state root."""
+        path = self.paths.ficelle_home / "config.json"
+        try:
+            return int(json.loads(path.read_text(encoding="utf-8")).get("port") or DEFAULT_ROUTER_PORT)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
         return DEFAULT_ROUTER_PORT
 
     def port_holder(self) -> PortHolder | None:

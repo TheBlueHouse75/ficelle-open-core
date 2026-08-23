@@ -18,6 +18,10 @@ them overspend.** Point any OpenAI-compatible client at `http://127.0.0.1:8646/v
 (nothing to import, no account) and your agent fails over across providers and can never
 run up a surprise bill.
 
+Ficelle is the product, not a plugin for another agent. It owns its local runtime, service,
+state, credentials, updater, and Control Center. Hermes, OpenClaw, and future host integrations
+are optional add-on connectors to an already working Ficelle installation.
+
 Ficelle sells reliability, not "free AI": it routes to free LLM capacity, fails over when
 a provider rate-limits or breaks, and enforces a **strict-zero** wall so it never makes a
 paid call.
@@ -37,8 +41,9 @@ paid call.
 
 ## What to route to free models
 
-For coding assistants, use `ficelle/auto-coding`: it admits only exact provider deployments with
-a current Ficelle-signed coding certification and returns a local 503 rather than silently routing
+For coding assistants, use `ficelle/auto-coding`: it admits only models in the installed release's
+bundled coding pool and provider deployments that pass local availability checks,
+and returns a local 503 rather than silently routing
 to an unverified model. Public leaderboard data is used to choose what Ficelle should evaluate
 next, never as route proof.
 
@@ -61,19 +66,18 @@ raw numbers: [the benchmark write-up](https://ficelle-website.netlify.app/blog/f
 Install the versioned open Core from its GitHub Release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.6/scripts/bootstrap-ficelle.py | python3 -
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.7/scripts/bootstrap-ficelle.py | python3
 ~/.local/bin/ficelle doctor --text
 ```
 
-The installer uses an isolated runtime and auto-detects Hermes; Ficelle remains fully
-standalone when Hermes is absent. To install Pro after purchase without putting the
-key in shell history, enter it silently before running the same command:
+Core always installs standalone and connectors are explicit add-ons. To install Pro after purchase without putting the
+key in shell history, enter it silently before running the same safe command:
 
 ```bash
 (
   read -s FICELLE_LICENSE_KEY
   export FICELLE_LICENSE_KEY
-  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.6/scripts/bootstrap-ficelle.py | python3 -
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.7/scripts/bootstrap-ficelle.py | python3
 )
 ```
 
@@ -83,7 +87,7 @@ If you already manage Python environments, the same open Core is on PyPI:
 
 ```bash
 uv tool install ficelle-router      # or: pip install ficelle-router
-ficelle-setup --skip-package --target generic
+ficelle-setup --skip-package
 ```
 
 PyPI serves the exact wheel attached to the GitHub Release, so the two paths install identical
@@ -150,9 +154,8 @@ own line whichever number you use. It is an unedited capture of a real run again
 the free pool: re-running it gives different models, a different latency, and a
 different sentence back.
 
-`ficelle-setup --target auto` selects Hermes only when it detects a reliable local
-Hermes signal; otherwise it selects the same standalone generic target. The explicit
-launch targets are `generic` and `hermes`.
+The standard product install is complete at this point. Optional host connectors are installed
+only afterwards and never select or modify the Ficelle runtime.
 
 ## Updates
 
@@ -174,20 +177,23 @@ license service authorize the already-cached signed entitlement token; Core neve
 the user's license key or persists a new update secret. `authorization: "bearer"` is
 available for managed deployments through the short-lived `FICELLE_UPDATE_PRO_TOKEN`.
 
+The updater runs only inside the Ficelle-owned runtime and verifies dependencies before stopping
+the managed service.
+
 The default check source is the latest GitHub Release. A deployment can point the Core at
 its own HTTPS manifest with `FICELLE_UPDATE_MANIFEST_URL`. The compact manifest shape is:
 
 ```json
 {
-  "version": "0.3.6",
-  "release_url": "https://github.com/TheBlueHouse75/ficelle-open-core/releases/tag/v0.3.6",
+  "version": "0.3.7",
+  "release_url": "https://github.com/TheBlueHouse75/ficelle-open-core/releases/tag/v0.3.7",
   "core": {
-    "wheel_url": "https://downloads.example/ficelle_router-0.3.6-py3-none-any.whl",
+    "wheel_url": "https://downloads.example/ficelle_router-0.3.7-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>"
   },
   "pro": {
     "wheel_url": "https://install.ficelle.ai/api/releases/latest/wheel",
-    "filename": "ficelle_pro-0.3.6-py3-none-any.whl",
+    "filename": "ficelle_pro-0.3.7-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>",
     "authorization": "entitlement"
   }
@@ -223,10 +229,9 @@ OpenAI-compatible client  →  127.0.0.1:8646/v1  →  Ficelle router
 
 Runtime state lives under `~/.ficelle/`. Provider secrets resolve from the environment /
 Ficelle keychain (`~/.ficelle/ficelle-secrets.keychain-db` on macOS) and are never
-written to the repository. On first setup after an upgrade, legacy
-`~/.hermes/ficelle/` state is copied only when no Ficelle home was explicitly selected
-and `~/.ficelle/` has no runtime data (absent, empty, or credential-only). Existing
-credentials and the legacy source are preserved.
+written to the repository. Connector homes contain connector assets and host configuration
+only; they are never Ficelle runtime or state roots. Ficelle does not read or copy runtime state
+from a connector home.
 
 ## Open core & Ficelle Pro
 
@@ -246,20 +251,22 @@ stay free and open. The Pro pack is not part of this repository; the core runs f
 without it. [Pricing and purchase](https://ficelle-website.netlify.app/#pricing) live on
 the website.
 
-## Optional Hermes integration
+## Optional client connectors
 
-Hermes is not required. If you want the integration and Hermes is not installed yet, use
-its official installer, which launches the setup wizard:
+Hermes is not required to install, update, or use Ficelle. If you want the connector and Hermes is
+not installed yet, use its official installer, which launches the setup wizard:
 
 ```bash
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 ```
 
-Then `ficelle-setup --target hermes` installs the Ficelle provider and compression
-plugins with backups. Hermes config is still opt-in:
-`ficelle-setup --target hermes --configure-hermes`. To restore the latest available
-plugin/config backups, run `ficelle-setup --target hermes --rollback`; paths without
-backups are left untouched.
+Run the connector phase from the already installed Ficelle runtime:
+
+```bash
+ficelle connectors install hermes
+```
+
+This installs the provider and compression plugins with backups.
 
 The provider name is `ficelle`. Setup makes Ficelle the main Hermes route and also installs
 specialized auxiliary slots:
@@ -272,7 +279,10 @@ auxiliary:
   web_extract:      { provider: "ficelle", model: "ficelle/auto-json" }
 ```
 
-Export the recommended YAML with `ficelle export --target hermes`.
+Export the recommended YAML with `ficelle connectors export hermes`.
+
+OpenClaw is a separate experimental connector over the same local endpoint. It does not require
+Hermes and can coexist with or be removed independently from the Hermes connector.
 
 ## License
 

@@ -120,7 +120,7 @@ def test_openclaw_target_export_runs_with_ficelle_home_outside_hermes_home(tmp_p
     serialized = json.dumps(asdict(export), sort_keys=True).lower()
 
     assert paths.ficelle_home == ficelle_home
-    assert paths.hermes_home == hermes_home
+    assert not hasattr(paths, "hermes_home")
     assert str(hermes_home).lower() not in serialized
     assert str(ficelle_home).lower() not in serialized
     assert ".hermes" not in serialized

@@ -40,6 +40,8 @@ class _WheelResponse(io.BytesIO):
 
 
 def make_options(tmp_path, **overrides):
+    target = overrides.pop("target", None)
+    configure_hermes = overrides.pop("configure_hermes", False)
     values = {
         "core_wheel_url": str(
             tmp_path / "ficelle_router-0.1.2-py3-none-any.whl"
@@ -50,10 +52,9 @@ def make_options(tmp_path, **overrides):
         "sha256": None,
         "python": None,
         "venv": tmp_path / ".local" / "share" / "ficelle" / "venv",
-        "target": "generic",
+        "connectors": ("hermes",) if target == "hermes" or configure_hermes else (),
         "ficelle_home": tmp_path / ".ficelle",
         "hermes_home": tmp_path / ".hermes",
-        "configure_hermes": False,
         "backup_existing": True,
         "skip_service": False,
         "skip_smoke": False,
@@ -89,12 +90,11 @@ def test_setup_command_configures_hermes_only_when_requested(tmp_path):
     wheel = tmp_path / "ficelle_router-0.1.2-py3-none-any.whl"
     options = make_options(tmp_path, target="hermes", configure_hermes=True)
 
-    command = bootstrap.setup_command(options, Path("/tmp/hermes-python"), wheel, "hermes")
+    command = bootstrap.setup_command(options, Path("/tmp/ficelle-python"), wheel)
 
-    assert command[:3] == ["/tmp/hermes-python", "-m", "ficelle.install"]
+    assert command[:3] == ["/tmp/ficelle-python", "-m", "ficelle.install"]
     assert "--skip-package" in command
-    assert "--configure-hermes" in command
-    assert command[command.index("--target") + 1] == "hermes"
+    assert command[command.index("--connector") + 1] == "hermes"
     assert command[command.index("--ficelle-home") + 1] == str(tmp_path / ".ficelle")
     assert "--hermes-home" in command
     assert str(tmp_path / ".hermes") in command
@@ -104,7 +104,7 @@ def test_setup_command_can_disable_config_and_backups(tmp_path):
     wheel = tmp_path / "ficelle_router-0.1.2-py3-none-any.whl"
     options = make_options(tmp_path, configure_hermes=False, backup_existing=False, skip_service=True, skip_smoke=True, dry_run=True)
 
-    command = bootstrap.setup_command(options, Path("/tmp/hermes-python"), wheel, "generic")
+    command = bootstrap.setup_command(options, Path("/tmp/ficelle-python"), wheel)
 
     assert "--configure-hermes" not in command
     assert "--no-backup" in command
@@ -118,12 +118,11 @@ def test_setup_command_exposes_cli_only_when_requested(tmp_path):
     options = make_options(tmp_path, dry_run=True)
     python = Path("/tmp/isolated/bin/python")
 
-    command = bootstrap.setup_command(options, python, wheel, "generic")
+    command = bootstrap.setup_command(options, python, wheel, expose_cli=False)
     exposed_command = bootstrap.setup_command(
         options,
         python,
         wheel,
-        "generic",
         expose_cli=True,
     )
 
@@ -152,7 +151,6 @@ def test_implicit_home_is_omitted_from_setup_command_and_environment(
         options,
         Path("/tmp/ficelle-python"),
         wheel,
-        "generic",
     )
 
     assert "--ficelle-home" not in captured["command"]
@@ -179,7 +177,6 @@ def test_explicit_home_is_passed_to_setup_command_and_environment(
         options,
         Path("/tmp/ficelle-python"),
         wheel,
-        "generic",
     )
 
     home_index = captured["command"].index("--ficelle-home")
@@ -252,11 +249,11 @@ def test_install_wheel_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_pat
     monkeypatch.setattr(bootstrap, "run_command", fake_run)
     monkeypatch.setattr(bootstrap.shutil, "which", lambda name: "/opt/homebrew/bin/uv" if name == "uv" else None)
 
-    bootstrap.install_wheel(options, Path("/tmp/hermes-python"), wheel, "generic")
+    bootstrap.install_wheel(options, Path("/tmp/hermes-python"), wheel)
 
     assert calls == [
-        (["/tmp/hermes-python", "-m", "pip", "install", "--force-reinstall", str(wheel)], None, str(tmp_path / ".ficelle")),
-        (["uv", "pip", "install", "--python", "/tmp/hermes-python", "--reinstall", str(wheel)], None, str(tmp_path / ".ficelle")),
+        (["/tmp/hermes-python", "-m", "pip", "install", "--force-reinstall", "--no-deps", str(wheel)], None, str(tmp_path / ".ficelle")),
+        (["uv", "pip", "install", "--python", "/tmp/hermes-python", "--reinstall", "--no-deps", str(wheel)], None, str(tmp_path / ".ficelle")),
     ]
 
 
@@ -287,7 +284,6 @@ def test_pro_requirements_fall_back_to_uv_when_pip_is_missing(
     bootstrap.install_requirements(
         options,
         Path("/tmp/ficelle-python"),
-        "generic",
         bootstrap.PRO_RUNTIME_REQUIREMENTS,
     )
 
@@ -307,6 +303,35 @@ def test_pro_requirements_fall_back_to_uv_when_pip_is_missing(
             "/tmp/ficelle-python",
             "cryptography>=42",
         ],
+    ]
+
+
+def test_runtime_check_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_path):
+    calls = []
+    options = make_options(tmp_path)
+
+    def fake_run(command, *, dry_run, env=None):
+        calls.append(command)
+        if command[:3] == ["/tmp/ficelle-python", "-m", "pip"]:
+            return bootstrap.CommandResult(
+                command,
+                1,
+                stderr="/tmp/ficelle-python: No module named pip",
+            )
+        return bootstrap.CommandResult(command, 0)
+
+    monkeypatch.setattr(bootstrap, "run_command", fake_run)
+    monkeypatch.setattr(
+        bootstrap.shutil,
+        "which",
+        lambda name: "/opt/homebrew/bin/uv" if name == "uv" else None,
+    )
+
+    bootstrap.check_runtime(options, Path("/tmp/ficelle-python"))
+
+    assert calls == [
+        ["/tmp/ficelle-python", "-m", "pip", "check"],
+        ["uv", "pip", "check", "--python", "/tmp/ficelle-python"],
     ]
 
 
@@ -553,81 +578,12 @@ def test_pro_wheel_must_require_the_bootstrap_core_version(tmp_path):
         raise AssertionError("expected incompatible Pro wheel to be refused")
 
 
-def test_resolve_install_context_probes_explicit_python_once(monkeypatch, tmp_path):
-    explicit_python = Path("/tmp/hermes-python")
-    options = make_options(tmp_path, target="auto", python=str(explicit_python))
-    version_probes = []
-    runtime_probes = []
-    monkeypatch.setattr(
-        bootstrap,
-        "python_version_result",
-        lambda python: version_probes.append(python)
-        or bootstrap.CommandResult([str(python)], 0, "3.11.14\n"),
-    )
-    monkeypatch.setattr(
-        bootstrap,
-        "hermes_runtime_result",
-        lambda python: runtime_probes.append(python)
-        or bootstrap.CommandResult([str(python)], 0),
-    )
+def test_explicit_python_is_only_the_base_runtime(monkeypatch, tmp_path):
+    explicit_python = Path("/tmp/base-python")
+    options = make_options(tmp_path, python=str(explicit_python))
+    monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
 
-    target, python = bootstrap.resolve_install_context(options)
-
-    assert target == "hermes"
-    assert python == explicit_python
-    assert version_probes == [explicit_python]
-    assert runtime_probes == [explicit_python]
-
-
-def test_auto_target_uses_current_python_when_it_contains_hermes(
-    monkeypatch,
-    tmp_path,
-):
-    current_python = tmp_path / "current-venv" / "bin" / "python"
-    current_python.parent.mkdir(parents=True)
-    current_python.touch(mode=0o755)
-    options = make_options(tmp_path, target="auto")
-    version_probes = []
-    runtime_probes = []
-    monkeypatch.delenv("HERMES_PYTHON", raising=False)
-    monkeypatch.setattr(bootstrap.sys, "executable", str(current_python))
-    monkeypatch.setattr(
-        bootstrap.Path,
-        "home",
-        classmethod(lambda _cls: tmp_path / "isolated-home"),
-    )
-    monkeypatch.setattr(
-        bootstrap,
-        "python_version_result",
-        lambda python: version_probes.append(python)
-        or bootstrap.CommandResult([str(python)], 0, "3.11.14\n"),
-    )
-    monkeypatch.setattr(
-        bootstrap,
-        "hermes_runtime_result",
-        lambda python: runtime_probes.append(python)
-        or bootstrap.CommandResult([str(python)], 0),
-    )
-
-    target, python = bootstrap.resolve_install_context(options)
-
-    assert target == "hermes"
-    assert python == current_python
-    assert version_probes == [current_python]
-    assert runtime_probes == [current_python]
-
-
-def test_detect_hermes_python_skips_unusable_candidates(monkeypatch, tmp_path):
-    unusable = tmp_path / "not-an-executable"
-    unusable.mkdir()
-    options = make_options(tmp_path, target="auto")
-    monkeypatch.setattr(
-        bootstrap,
-        "candidate_hermes_pythons",
-        lambda _home: [unusable],
-    )
-
-    assert bootstrap.detect_hermes_python(options) is None
+    assert bootstrap.resolve_base_python(options) == explicit_python
 
 
 def test_python_probe_converts_execution_error_to_unusable(monkeypatch, tmp_path):
@@ -663,13 +619,8 @@ def test_generic_install_creates_an_isolated_runtime(
     monkeypatch.setattr(bootstrap, "run_command", fake_run)
     monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
 
-    python, isolated = bootstrap.prepare_target_python(
-        options,
-        "generic",
-        selected,
-    )
+    python = bootstrap.prepare_ficelle_python(options, selected)
 
-    assert isolated is True
     assert python == runtime
     assert created == [
         [str(selected), "-m", "venv", str(options.venv)]
@@ -698,11 +649,7 @@ def test_generic_install_falls_back_to_uv_venv(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
 
-    assert bootstrap.prepare_target_python(
-        options,
-        "generic",
-        selected,
-    ) == (runtime, True)
+    assert bootstrap.prepare_ficelle_python(options, selected) == runtime
     assert calls == [
         [str(selected), "-m", "venv", str(options.venv)],
         [
@@ -715,7 +662,7 @@ def test_generic_install_falls_back_to_uv_venv(monkeypatch, tmp_path):
     ]
 
 
-def test_explicit_python_is_never_replaced_by_an_isolated_runtime(tmp_path):
+def test_explicit_python_still_creates_an_isolated_runtime(monkeypatch, tmp_path):
     selected = Path("/custom/python")
     options = make_options(
         tmp_path,
@@ -723,11 +670,12 @@ def test_explicit_python_is_never_replaced_by_an_isolated_runtime(tmp_path):
         python=str(selected),
     )
 
-    assert bootstrap.prepare_target_python(
-        options,
-        "generic",
-        selected,
-    ) == (selected, False)
+    runtime = bootstrap.venv_python(options.venv)
+    runtime.parent.mkdir(parents=True)
+    runtime.touch()
+    monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
+
+    assert bootstrap.prepare_ficelle_python(options, selected) == runtime
 
 
 def test_run_license_activation_passes_key_via_env_not_argv(monkeypatch, tmp_path):
@@ -741,9 +689,9 @@ def test_run_license_activation_passes_key_via_env_not_argv(monkeypatch, tmp_pat
         return bootstrap.CommandResult(list(command), 0)
 
     monkeypatch.setattr(bootstrap, "run_command", fake_run)
-    bootstrap.run_license_activation(options, Path("/tmp/hermes-python"), "generic")
+    bootstrap.run_license_activation(options, Path("/tmp/ficelle-python"))
 
-    assert captured["command"] == [str(Path("/tmp/hermes-python")), "-m", "ficelle", "license", "activate"]
+    assert captured["command"] == [str(Path("/tmp/ficelle-python")), "-m", "ficelle", "license", "activate"]
     assert "SK-SECRET-999" not in " ".join(captured["command"])  # never on the command line (it is echoed)
     assert captured["env"]["FICELLE_LICENSE_KEY"] == "SK-SECRET-999"  # passed through the environment
     assert "FICELLE_RUNTIME_DIR" not in captured["env"]
@@ -765,7 +713,7 @@ def test_run_license_activation_skips_without_key(monkeypatch, tmp_path):
     options = make_options(tmp_path, license_key=None)
     calls = []
     monkeypatch.setattr(bootstrap, "run_command", lambda *a, **k: calls.append(1) or bootstrap.CommandResult([], 0))
-    bootstrap.run_license_activation(options, Path("/tmp/hermes-python"), "generic")
+    bootstrap.run_license_activation(options, Path("/tmp/ficelle-python"))
     assert calls == []  # no license key → nothing to activate
 
 
@@ -774,68 +722,16 @@ def test_run_license_activation_is_best_effort_on_failure(monkeypatch, tmp_path,
     monkeypatch.setattr(bootstrap, "run_command", lambda *a, **k: bootstrap.CommandResult([], 1))
     bootstrap.run_license_activation(
         options,
-        Path("/tmp/hermes-python"),
-        "generic",
+        Path("/tmp/ficelle-python"),
     )  # must not raise
     assert "activation did not complete" in capsys.readouterr().out
 
 
-def test_auto_target_uses_generic_without_hermes_signal(monkeypatch, tmp_path):
-    options = make_options(tmp_path, target="auto")
-    monkeypatch.setattr(bootstrap, "detect_hermes_python", lambda options: None)
-    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: None)
-    monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
-
-    target, python = bootstrap.resolve_install_context(options)
-
-    assert target == "generic"
-    assert python == Path(sys.executable)
-
-
-def test_resolve_install_context_probes_hermes_once(monkeypatch, tmp_path):
-    options = make_options(tmp_path, target="auto")
-    calls = []
-    monkeypatch.setattr(
-        bootstrap,
-        "detect_hermes_python",
-        lambda _options: calls.append("probe") or None,
-    )
-    monkeypatch.setattr(
-        bootstrap,
-        "non_python_hermes_installation_signal",
-        lambda _options: tmp_path / ".hermes" / "config.yaml",
-    )
-    monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
-
-    target, python = bootstrap.resolve_install_context(options)
-
-    assert target == "hermes"
-    assert python == Path(sys.executable)
-    assert calls == ["probe"]
-
-
-def test_auto_target_detects_hermes_from_cli_or_config(monkeypatch, tmp_path):
-    options = make_options(tmp_path, target="auto")
-    monkeypatch.setattr(bootstrap, "detect_hermes_python", lambda options: None)
-    monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
-    monkeypatch.setattr(
-        bootstrap.shutil,
-        "which",
-        lambda name: "/usr/local/bin/hermes" if name == "hermes" else None,
-    )
-    assert bootstrap.resolve_install_context(options)[0] == "hermes"
-
-    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: None)
-    options.hermes_home.mkdir()
-    (options.hermes_home / "config.yaml").write_text("model: {}\n")
-    assert bootstrap.resolve_install_context(options)[0] == "hermes"
-
-
-def test_generic_environment_removes_inherited_hermes_home(monkeypatch, tmp_path):
+def test_core_environment_removes_inherited_client_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", "/inherited/hermes")
     options = make_options(tmp_path, target="generic")
 
-    env = bootstrap.command_env(options, "generic")
+    env = bootstrap.command_env(options)
 
     assert env["FICELLE_HOME"] == str(tmp_path / ".ficelle")
     assert "HERMES_HOME" not in env
@@ -855,20 +751,14 @@ def test_keep_wheel_uses_ficelle_home_artifacts(monkeypatch, tmp_path):
     monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "verify_install", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "run_license_activation", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "check_runtime", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "wheel_runtime_requirements", lambda *args, **kwargs: ())
     monkeypatch.setattr(
         bootstrap,
         "verify_pro_core_compatibility",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(
-        bootstrap,
-        "install_requirements",
-        lambda *args: (_ for _ in ()).throw(
-            AssertionError(
-                "Pro dependencies must not be installed without a license key"
-            )
-        ),
-    )
+    monkeypatch.setattr(bootstrap, "install_requirements", lambda *args: None)
 
     assert bootstrap.run_bootstrap(options) == 0
 
@@ -892,22 +782,16 @@ def test_core_only_bootstrap_never_downloads_or_installs_pro(
     monkeypatch.setattr(
         bootstrap,
         "install_wheel",
-        lambda _options, _python, wheel, _target, **kwargs: installed.append(
+        lambda _options, _python, wheel, **kwargs: installed.append(
             (wheel, kwargs)
         ),
     )
     monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "verify_install", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "run_license_activation", lambda *args: None)
-    monkeypatch.setattr(
-        bootstrap,
-        "install_requirements",
-        lambda *args: (_ for _ in ()).throw(
-            AssertionError(
-                "Pro dependencies must not be installed without a license key"
-            )
-        ),
-    )
+    monkeypatch.setattr(bootstrap, "check_runtime", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "wheel_runtime_requirements", lambda *args, **kwargs: ())
+    monkeypatch.setattr(bootstrap, "install_requirements", lambda *args: None)
     monkeypatch.setattr(
         bootstrap,
         "download_wheel",
@@ -948,23 +832,31 @@ def test_pro_bootstrap_installs_core_then_pro_without_dependencies(
     monkeypatch.setattr(
         bootstrap,
         "install_wheel",
-        lambda _options, _python, wheel, _target, **kwargs: installed.append(
+        lambda _options, _python, wheel, **kwargs: installed.append(
             (wheel, kwargs)
         ),
     )
     monkeypatch.setattr(bootstrap, "run_packaged_setup", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "verify_install", lambda *args, **kwargs: None)
     monkeypatch.setattr(bootstrap, "run_license_activation", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "check_runtime", lambda *args: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "wheel_runtime_requirements",
+        lambda wheel, **kwargs: (
+            ("cryptography>=42",) if wheel.name.startswith("ficelle_pro") else ("requests>=2.31",)
+        ),
+    )
     monkeypatch.setattr(
         bootstrap,
         "install_requirements",
-        lambda _options, _python, _target, values: requirements.extend(values),
+        lambda _options, _python, values: requirements.extend(values),
     )
 
     assert bootstrap.run_bootstrap(options) == 0
 
     assert [(wheel.name, kwargs) for wheel, kwargs in installed] == [
         (core.name, {}),
-        (pro.name, {"no_deps": True}),
+        (pro.name, {}),
     ]
-    assert requirements == ["cryptography>=42"]
+    assert requirements == ["requests>=2.31", "cryptography>=42"]

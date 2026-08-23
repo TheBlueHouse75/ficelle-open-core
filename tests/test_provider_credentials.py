@@ -13,10 +13,8 @@ from ficelle.provider_credentials import (
     generic_provider_credential_aliases,
     generic_provider_credential_activation_fingerprint,
     is_usable_openrouter_key,
-    legacy_credential_sources,
     provider_credential_locations,
     provider_primary_service,
-    purge_legacy_credentials,
     remove_provider_key,
     resolve_provider_access,
     store_provider_key,
@@ -178,25 +176,9 @@ class WritableStore:
         self.writes: dict[str, str] = {}
         self.deletes: list[str] = []
         self.stored: dict[str, str] = {}
-        self.legacy: dict[str, str] = {}
 
     def get(self, service: str) -> str | None:
         return self.stored.get(service)
-
-    def get_legacy(self, service: str) -> str | None:
-        return self.legacy.get(service)
-
-    # A backend whose legacy tier is a second place, not just a second lookup — the macOS
-    # keychain shape. Its labels name that place, which is why they are not the read labels.
-    def probe_legacy(self, services) -> list[str]:
-        return [f"keychain:legacy:{service}" for service in services if service in self.legacy]
-
-    def delete_legacy(self, services) -> list[str]:
-        return [
-            f"keychain:legacy:{service}"
-            for service in services
-            if self.legacy.pop(service, None) is not None
-        ]
 
     def set(self, service: str, secret: str) -> bool:
         if not self.can_write:
@@ -310,12 +292,10 @@ class _Host:
     def __init__(self, tmp_path: Path, store: WritableStore | None = None) -> None:
         self.env: dict[str, str] = {}
         self.env_file = tmp_path / ".env"
-        self.legacy_env_file = tmp_path / "legacy.env"
-        self.files: dict[Path, dict[str, str]] = {self.env_file: {}, self.legacy_env_file: {}}
-        # Taken at construction, not assigned afterwards: `legacy_store` aliases the store's
-        # own dict, and a later `host.store = ...` would leave it pointing at the discarded one.
+        self.external_env_file = tmp_path / "external.env"
+        self.files: dict[Path, dict[str, str]] = {self.env_file: {}, self.external_env_file: {}}
         self.store = store if store is not None else WritableStore()
-        self.legacy_store: dict[str, str] = self.store.legacy
+        self.external_store: dict[str, str] = {}
         self.deleted_env: list[tuple[Path, str]] = []
 
     def _delete_env_key(self, path: Path, key: str) -> bool:
@@ -328,7 +308,6 @@ class _Host:
             parse_env_file=lambda path: dict(self.files[path]),
             env_file_delete_key=self._delete_env_key,
             credential_env_file=self.env_file,
-            legacy_credential_env_files=(self.legacy_env_file,),
             store=self.store,
         )
 
@@ -343,12 +322,10 @@ def test_credential_locations_follow_the_locked_resolution_order(tmp_path: Path)
     """Which copy of a key wins is decided by this order alone; it must not drift."""
     locations = _Host(tmp_path).locations("openrouter")
 
-    assert [(location.kind, location.legacy) for location in locations] == [
-        ("process_env", False),
-        ("env_file", False),
-        ("store", False),
-        ("env_file", True),
-        ("legacy_store", True),
+    assert [location.kind for location in locations] == [
+        "process_env",
+        "env_file",
+        "store",
     ]
 
 
@@ -362,8 +339,6 @@ def test_every_location_reports_and_clears_exactly_what_it_reads(tmp_path: Path)
     host.env["NIM_API_KEY"] = "from-process-env"
     host.files[host.env_file]["NVIDIA_NIM_API_KEY"] = "from-canonical-env-file"
     host.store.stored["nvidia-api-key"] = "from-canonical-store"
-    host.files[host.legacy_env_file]["NIM_API_KEY"] = "from-legacy-env-file"
-    host.legacy_store["nim-api-key"] = "from-legacy-store"
 
     for location in host.locations("nvidia"):
         read = list(location.read())
@@ -378,53 +353,6 @@ def test_every_location_reports_and_clears_exactly_what_it_reads(tmp_path: Path)
         assert location.delete() == probed, f"{location.kind} clears something other than it reports"
         assert list(location.read()) == []
         assert location.probe() == []
-
-
-class _PortableLegacyStore(WritableStore):
-    """A backend whose legacy tier is a second lookup, not a second keychain file.
-
-    Nothing macOS-shaped: what `SecretToolStore` or `WindowsCredentialStore` would look like
-    the day either learns to read a migration secret. It exists to prove that day needs no
-    host-side rewiring — the registry asks the store for all three legacy operations, so the
-    purge follows the backend instead of one platform's shape. Only the label and the two
-    listing/clearing shapes differ from the base double; everything else is a store like
-    any other, which is the point.
-    """
-
-    label = "secret-service"
-
-    def probe_legacy(self, services) -> list[str]:
-        return [f"{self.label}:{service}" for service in services if service in self.legacy]
-
-    def delete_legacy(self, services) -> list[str]:
-        return [
-            f"{self.label}:{service}"
-            for service in services
-            if self.legacy.pop(service, None) is not None
-        ]
-
-
-def test_a_non_keychain_legacy_tier_is_reported_and_purged_without_host_rewiring(tmp_path: Path) -> None:
-    """The debt this closes: readable, unreported, un-purgeable on any backend but macOS.
-
-    Listing and clearing the legacy tier used to be host callables addressing macOS keychain
-    files, while the read went through the store — so a key a second backend could read was
-    resolvable, absent from the remaining-sources line, and untouched by `--purge-legacy`.
-    Nothing here is macOS, and it is reported and cleared like any other place.
-    """
-    store = _PortableLegacyStore()
-    store.legacy["nvidia-api-key"] = "portable-legacy-secret-value"
-    locations = _Host(tmp_path, store=store).locations("nvidia")
-
-    reported = legacy_credential_sources(locations)
-    cleared = purge_legacy_credentials(locations)
-
-    # Pinned to the literal rather than checked for absence of the secret: equality to a
-    # label that plainly holds none is the stronger statement of the same thing.
-    assert reported == ["secret-service:nvidia-api-key"]
-    assert cleared == reported
-    assert legacy_credential_sources(locations) == []
-    assert store.legacy == {}
 
 
 def test_process_environment_is_the_only_location_ficelle_cannot_clear(tmp_path: Path) -> None:
@@ -510,24 +438,13 @@ def test_remove_provider_key_is_verified_when_the_store_only_held_nothing(tmp_pa
     assert removal.verified
 
 
-def test_remove_provider_key_never_touches_the_legacy_fallbacks(tmp_path: Path) -> None:
-    """A legacy store may still be owned by another install, so only the opt-in purge
-    clears it — but the purge must then reach everything resolution can read there."""
+def test_remove_provider_key_never_sees_external_install_stores(tmp_path: Path) -> None:
+    """Files and stores not registered by Ficelle remain completely out of scope."""
     host = _Host(tmp_path)
-    host.files[host.legacy_env_file]["OPENROUTER_API_KEY"] = "sk-or-legacy-file"
-    host.legacy_store["openrouter-api-key"] = "sk-or-legacy-store"
+    host.files[host.external_env_file]["OPENROUTER_API_KEY"] = "sk-or-external-file"
+    host.external_store["openrouter-api-key"] = "sk-or-external-store"
 
     assert remove_provider_key(host.locations("openrouter"), store=host.store).cleared == []
-    assert host.files[host.legacy_env_file] == {"OPENROUTER_API_KEY": "sk-or-legacy-file"}
-    assert legacy_credential_sources(host.locations("openrouter")) == [
-        f"{host.legacy_env_file}:OPENROUTER_API_KEY",
-        "keychain:legacy:openrouter-api-key",
-    ]
-
-    purged = purge_legacy_credentials(host.locations("openrouter"))
-
-    assert purged == [
-        f"{host.legacy_env_file}:OPENROUTER_API_KEY",
-        "keychain:legacy:openrouter-api-key",
-    ]
-    assert legacy_credential_sources(host.locations("openrouter")) == []
+    assert host.files[host.external_env_file] == {"OPENROUTER_API_KEY": "sk-or-external-file"}
+    assert all(location.kind != "external_store" for location in host.locations("openrouter"))
+    assert host.external_store == {"openrouter-api-key": "sk-or-external-store"}

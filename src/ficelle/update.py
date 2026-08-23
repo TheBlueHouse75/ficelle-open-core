@@ -35,6 +35,7 @@ from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlparse
 
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
 from ficelle import __version__ as CORE_VERSION
@@ -780,10 +781,15 @@ def _run_command(
         return subprocess.CompletedProcess(command, 1, stdout="", stderr=f"{type(exc).__name__}: {exc}")
 
 
-def _install_wheel(wheel: Path, *, no_deps: bool = False) -> None:
-    command = [sys.executable, "-m", "pip", "install", "--force-reinstall"]
-    if no_deps:
-        command.append("--no-deps")
+def _install_wheel(wheel: Path) -> None:
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--force-reinstall",
+        "--no-deps",
+    ]
     command.append(str(wheel))
     result = _run_command(command)
     if result.returncode == 0:
@@ -793,12 +799,59 @@ def _install_wheel(wheel: Path, *, no_deps: bool = False) -> None:
     if "No module named pip" not in combined or not uv:
         raise UpdateError("package installation failed")
     uv_command = [uv, "pip", "install", "--python", sys.executable, "--reinstall"]
-    if no_deps:
-        uv_command.append("--no-deps")
+    uv_command.append("--no-deps")
     uv_command.append(str(wheel))
     result = _run_command(uv_command)
     if result.returncode != 0:
         raise UpdateError("package installation failed")
+
+
+def _wheel_runtime_requirements(wheel: Path) -> tuple[str, ...]:
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            metadata_name = next(
+                name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+            )
+            metadata = Parser().parsestr(archive.read(metadata_name).decode("utf-8"))
+    except (OSError, UnicodeError, zipfile.BadZipFile, StopIteration) as exc:
+        raise UpdateError("wheel metadata could not be read") from exc
+    requirements: list[str] = []
+    for raw_requirement in metadata.get_all("Requires-Dist", []):
+        try:
+            requirement = Requirement(raw_requirement)
+        except InvalidRequirement as exc:
+            raise UpdateError("wheel contains an invalid runtime requirement") from exc
+        if requirement.name.lower().replace("_", "-") in {"ficelle-router", "ficelle-pro"}:
+            continue
+        requirements.append(raw_requirement)
+    return tuple(requirements)
+
+
+def _install_requirements(requirements: tuple[str, ...]) -> None:
+    if not requirements:
+        return
+    command = [sys.executable, "-m", "pip", "install", *requirements]
+    result = _run_command(command)
+    if result.returncode == 0:
+        return
+    combined = f"{result.stdout}\n{result.stderr}"
+    uv = _uv_executable()
+    if "No module named pip" not in combined or not uv:
+        raise UpdateError("runtime dependency installation failed")
+    result = _run_command([uv, "pip", "install", "--python", sys.executable, *requirements])
+    if result.returncode != 0:
+        raise UpdateError("runtime dependency installation failed")
+
+
+def _pip_check() -> None:
+    result = _run_command([sys.executable, "-m", "pip", "check"])
+    if result.returncode != 0:
+        combined = f"{result.stdout}\n{result.stderr}"
+        uv = _uv_executable()
+        if "No module named pip" in combined and uv:
+            result = _run_command([uv, "pip", "check", "--python", sys.executable])
+    if result.returncode != 0:
+        raise UpdateError("Ficelle runtime dependency check failed")
 
 
 def _download_artifact(
@@ -1180,6 +1233,13 @@ def _apply_update_locked(
         )
         if pro_wheel is not None:
             _verify_pro_core_compatibility(pro_wheel, core_version=target_version)
+        requirements = list(_wheel_runtime_requirements(core_wheel))
+        if pro_wheel is not None:
+            requirements.extend(_wheel_runtime_requirements(pro_wheel))
+        _install_requirements(tuple(dict.fromkeys(requirements)))
+        # Dependency preparation is allowed while the old service is still running because
+        # its imports are already resident. A broken environment must fail before service stop.
+        _pip_check()
         try:
             # A previous committed marker is normally cleaned during startup recovery. Clean
             # marker-less leftovers as a second guard before creating the next durable backup.
@@ -1196,6 +1256,7 @@ def _apply_update_locked(
             _install_wheel(core_wheel)
             if pro_wheel is not None:
                 _install_wheel(pro_wheel)
+            _pip_check()
             _verify_updated_runtime(expect_pro=pro_wheel is not None)
             if _installed_version() != target_version:
                 raise UpdateError("updated package version does not match the release")

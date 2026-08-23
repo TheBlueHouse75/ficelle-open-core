@@ -243,7 +243,6 @@ def deactivate() -> bool:
             )
         except (licensing.LicenseError, LicenseOperationError):
             service_ok = False
-    # An empty canonical cache is an explicit deactivation tombstone: read_path()
-    # must not resurrect an untouched legacy token after the local cache is cleared.
+    # Keep an explicit empty canonical cache so deactivation remains durable.
     licensing.store_entitlement_token(ENTITLEMENT_PATH, "")
     return service_ok
