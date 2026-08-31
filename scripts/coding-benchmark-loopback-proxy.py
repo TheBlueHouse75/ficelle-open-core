@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import http.client
+import json
 import os
 import secrets
 import subprocess
@@ -34,6 +35,24 @@ HOP_BY_HOP_HEADERS = {
 ALLOWED_REQUESTS = frozenset({("GET", "/v1/models"), ("POST", "/v1/chat/completions")})
 RELAY_TOKEN_ENV = "FICELLE_BENCHMARK_RELAY_TOKEN"
 MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+
+
+def _benchmark_response_status(status: int, body: bytes) -> int:
+    """Stop Aider retrying a Ficelle model verdict as provider infrastructure."""
+    if status != 502:
+        return status
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return status
+    error = payload.get("error") if isinstance(payload, dict) else None
+    reasons = error.get("reasons") if isinstance(error, dict) else None
+    if reasons in (
+        {"truncated_before_content": 1},
+        {"empty_assistant_message": 1},
+    ):
+        return 422
+    return status
 
 
 def _request_content_length(headers: object) -> int:
@@ -133,15 +152,28 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 connection.request(self.command, self.path, body=body, headers=headers)
                 response = connection.getresponse()
-                self.send_response(response.status, response.reason)
+                response_body = response.read() if response.status >= 400 else None
+                response_status = (
+                    _benchmark_response_status(response.status, response_body)
+                    if response_body is not None
+                    else response.status
+                )
+                self.send_response(
+                    response_status,
+                    response.reason if response_status == response.status else None,
+                )
                 for name, value in response.getheaders():
                     if name.lower() not in HOP_BY_HOP_HEADERS | {"content-length"}:
                         self.send_header(name, value)
                 self.end_headers()
                 response_started = True
-                while chunk := response.read(65536):
-                    self.wfile.write(chunk)
+                if response_body is not None:
+                    self.wfile.write(response_body)
                     self.wfile.flush()
+                else:
+                    while chunk := response.read(65536):
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
             except (OSError, http.client.HTTPException) as exc:
                 if not response_started and not self.wfile.closed:
                     self.send_error(502, "Ficelle relay failure")

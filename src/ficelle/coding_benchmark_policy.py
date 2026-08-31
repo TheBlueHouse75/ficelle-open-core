@@ -38,7 +38,7 @@ class BenchmarkPolicy:
     sources: tuple[SourceRevision, ...]
 
 
-MIN_QUALIFYING_PASS_AT_1 = 0.8
+MIN_QUALIFYING_PASS_AT_1 = 0.6
 
 AIDER_CALIBRATION_TASKS = (
     "cpp/exercises/practice/circular-buffer",

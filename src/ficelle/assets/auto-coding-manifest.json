@@ -8,6 +8,114 @@
           "completed_count": 5,
           "completion_token_budget": 12000,
           "efficiency": {
+            "completion_tokens": 42920,
+            "duration_seconds": 801.3327987194061,
+            "mean_duration_seconds": 200.33319967985153,
+            "measured_task_count": 4,
+            "prompt_tokens": 17020,
+            "total_tokens": 59940
+          },
+          "evidence_kind": "calibration_run",
+          "harness_commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+          "harness_error_count": 0,
+          "harness_exit_code": 124,
+          "harness_repository": "https://github.com/Aider-AI/aider",
+          "model_settings_fingerprint": "sha256:2b9125abf7530a112d7934a947d6f5e9d71482f798fff83f7ed1b1ae4c7bf56e",
+          "model_verdict_count": 5,
+          "name": "aider-polyglot",
+          "observed_at": "2026-08-23T08:12:42.584718+00:00",
+          "official_result_fingerprint": "sha256:aed0f99a973f1bf877b948d3008ccdd3512f044f285551de1f0753a407078aea",
+          "pass_at_1": 0.6,
+          "policy_fingerprint": "sha256:fdbe42687810465708faca0d27b1c387a881ad39e71d2e05795b6ff6642386ba",
+          "provider": "orcarouter",
+          "provider_error_count": 0,
+          "reference_agent": "aider",
+          "reference_agent_commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+          "run_mode": "calibration",
+          "run_record_fingerprint": "sha256:337a4b35d6549b7215ade3f1845b331c5ad6931dac42b170b01899c9fa226f82",
+          "settings_fingerprint": "sha256:be423e549053dac29a77e8ea2d447618b5698a618f6118ff58e4f7bfcd3d4390",
+          "source_revisions": [
+            {
+              "commit": "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f",
+              "name": "polyglot-benchmark",
+              "repository": "https://github.com/Aider-AI/polyglot-benchmark"
+            }
+          ],
+          "suite_version": "polyglot-2026-08-21",
+          "task_count": 5,
+          "timed_out": true,
+          "upstream_model_id": "deepseek/deepseek-v4-pro-free",
+          "wall_clock_timeout_seconds": 1800
+        }
+      ],
+      "certified_at": "2026-08-23T09:08:20.857002+00:00",
+      "compatibility_canary_version": "coding-compatibility-v1",
+      "provider": "orcarouter",
+      "quality_score": 60.0,
+      "upstream_model_id": "deepseek/deepseek-v4-pro-free"
+    },
+    {
+      "benchmarks": [
+        {
+          "attempts_per_task": 1,
+          "command_fingerprint": "sha256:c64d44e27fa10d5c656ddba38598422490ceec1d1f8de44bc6eb067ce592538b",
+          "completed_count": 5,
+          "completion_token_budget": 12000,
+          "efficiency": {
+            "completion_tokens": 4058,
+            "duration_seconds": 394.3713505268097,
+            "mean_duration_seconds": 78.87427010536194,
+            "measured_task_count": 5,
+            "prompt_tokens": 18269,
+            "total_tokens": 22327
+          },
+          "evidence_kind": "calibration_run",
+          "harness_commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+          "harness_error_count": 0,
+          "harness_exit_code": 0,
+          "harness_repository": "https://github.com/Aider-AI/aider",
+          "model_settings_fingerprint": "sha256:2b9125abf7530a112d7934a947d6f5e9d71482f798fff83f7ed1b1ae4c7bf56e",
+          "model_verdict_count": 5,
+          "name": "aider-polyglot",
+          "observed_at": "2026-08-23T09:08:20.824235+00:00",
+          "official_result_fingerprint": "sha256:1ef361976fb37acba18d3b8ba4d1ec1b46bfce6c1f75fa1a05ff4014635c2b49",
+          "pass_at_1": 0.6,
+          "policy_fingerprint": "sha256:fdbe42687810465708faca0d27b1c387a881ad39e71d2e05795b6ff6642386ba",
+          "provider": "gemini",
+          "provider_error_count": 0,
+          "reference_agent": "aider",
+          "reference_agent_commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+          "run_mode": "calibration",
+          "run_record_fingerprint": "sha256:e8950d8d6414b13eec2e1250d916b421f7499d117dfb4c203c3b615241147dcc",
+          "settings_fingerprint": "sha256:c97e154fac6abd1a58edeea3f3e6bc4ba0694d21d17b1538db07416951508207",
+          "source_revisions": [
+            {
+              "commit": "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f",
+              "name": "polyglot-benchmark",
+              "repository": "https://github.com/Aider-AI/polyglot-benchmark"
+            }
+          ],
+          "suite_version": "polyglot-2026-08-21",
+          "task_count": 5,
+          "timed_out": false,
+          "upstream_model_id": "models/gemini-3.6-flash",
+          "wall_clock_timeout_seconds": 1800
+        }
+      ],
+      "certified_at": "2026-08-23T09:08:20.857002+00:00",
+      "compatibility_canary_version": "coding-compatibility-v1",
+      "provider": "gemini",
+      "quality_score": 60.0,
+      "upstream_model_id": "models/gemini-3.6-flash"
+    },
+    {
+      "benchmarks": [
+        {
+          "attempts_per_task": 1,
+          "command_fingerprint": "sha256:c64d44e27fa10d5c656ddba38598422490ceec1d1f8de44bc6eb067ce592538b",
+          "completed_count": 5,
+          "completion_token_budget": 12000,
+          "efficiency": {
             "completion_tokens": 6082,
             "duration_seconds": 614.3217024803162,
             "mean_duration_seconds": 122.86434049606324,
@@ -48,15 +156,15 @@
           "wall_clock_timeout_seconds": 1800
         }
       ],
-      "certified_at": "2026-08-22T21:48:13.199928+00:00",
+      "certified_at": "2026-08-23T09:08:20.857002+00:00",
       "compatibility_canary_version": "coding-compatibility-v1",
       "provider": "nvidia",
       "quality_score": 100.0,
       "upstream_model_id": "moonshotai/kimi-k3"
     }
   ],
-  "manifest_id": "2026-08-22-kimi-k3-policy-v2",
-  "policy_version": "coding-v1",
+  "manifest_id": "2026-08-23-coding-pool-3",
+  "policy_version": "coding-v2",
   "priors": [],
   "schema_version": 1
 }

@@ -88,7 +88,10 @@ from ficelle.failures import (
     status_for_error_codes,
     upstream_failure_actions as upstream_failure_actions_result,
     upstream_failure_status,
+    upstream_retry_after_seconds,
 )
+from ficelle.retry_hints import retry_hint
+from ficelle.provider_admission import PROVIDER_ADMISSION_LEDGER, ProviderAdmissionRefused
 from ficelle.provider_credentials import (
     PROVIDER_ENV_ALIASES,
     PROVIDER_KEY_VALIDATORS,
@@ -1273,26 +1276,36 @@ CORE_PROVIDERS: dict[str, dict] = {
     },
 }
 
+LEGACY_REQUEST_TIMEOUT_SECONDS = 120
+LEGACY_REQUEST_DEADLINE_SECONDS = 300
+REQUEST_TIMEOUT_POLICY_VERSION = 3
+LEGACY_REQUEST_TIMEOUT_SECONDS_BY_PROFILE = {
+    "ficelle/auto-fast": 30,
+    "ficelle/auto-json": 45,
+    "ficelle/auto-compression": 45,
+    "ficelle/auto-tools": 60,
+    "ficelle/auto-orchestrator": 75,
+    "ficelle/auto-long": 90,
+}
+
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8646,
     "min_context_length": 64000,
     "catalog_ttl_seconds": 3600,
-    "request_timeout_seconds": 120,
-    "request_timeout_seconds_by_profile": {
-        "ficelle/auto-fast": 30,
-        "ficelle/auto-json": 45,
-        "ficelle/auto-compression": 45,
-        "ficelle/auto-tools": 60,
-        "ficelle/auto-orchestrator": 75,
-        "ficelle/auto-long": 90,
-    },
+    "request_timeout_policy_version": REQUEST_TIMEOUT_POLICY_VERSION,
+    # Read-inactivity budget, not a wall-clock target. Provider inference may legitimately spend
+    # several minutes before its first byte; the independent request deadline below still bounds
+    # the complete failover window.
+    "request_timeout_seconds": 600,
+    "request_timeout_seconds_by_profile": {},
     "max_attempts_per_request": 4,
-    # Total wall-clock budget for one request, across every attempt. Sized from 52 days of this
-    # install's own route log (2074 successful requests): p95 51 s, p99 110 s, slowest 281 s — so
-    # 300 s cuts none of them, while bounding the pathological case, which was 4 attempts × the
-    # 120 s profile timeout plus probes. It is a ceiling on failure, not a target for success.
-    "request_deadline_seconds": 300,
+    # Total wall-clock budget for one request, across every attempt. This remains the hard bound
+    # when a provider keeps the socket active or a sequence of fallbacks consumes multiple read
+    # budgets. It is deliberately larger than the read-inactivity timeout so a slow first attempt
+    # can still succeed and leave a useful fallback window.
+    "request_deadline_seconds": 900,
     "catalog_timeout_seconds": 30,
     "cooldown_seconds": {
         "rate_limited": 900,
@@ -1722,6 +1735,8 @@ def apply_chat_attempt_cooldown(
         status=cooldown.status,
         request_id=request_id,
         profile_id=profile_id,
+        retry_after_seconds=cooldown.retry_after_seconds,
+        retry_after_source=cooldown.retry_after_source,
     )
 
 
@@ -1820,6 +1835,32 @@ def normalize_fusion_config(
     )
 
 
+def migrate_legacy_request_timeouts(
+    existing: dict[str, Any],
+    config: dict[str, Any],
+) -> None:
+    """Upgrade recognizable pre-adaptive defaults while preserving real overrides.
+
+    Config files contain a full copy of the defaults, so changing ``DEFAULT_CONFIG`` alone would
+    leave existing installs at 30-120 seconds. Migrate each old default independently: one custom
+    profile value must not strand every unchanged profile at its legacy timeout.
+    """
+    if safe_int(existing.get("request_timeout_policy_version"), 0) >= REQUEST_TIMEOUT_POLICY_VERSION:
+        return
+    if existing.get("request_timeout_seconds") == LEGACY_REQUEST_TIMEOUT_SECONDS:
+        config["request_timeout_seconds"] = DEFAULT_CONFIG["request_timeout_seconds"]
+    if existing.get("request_deadline_seconds") == LEGACY_REQUEST_DEADLINE_SECONDS:
+        config["request_deadline_seconds"] = DEFAULT_CONFIG["request_deadline_seconds"]
+    profile_timeouts = existing.get("request_timeout_seconds_by_profile")
+    if isinstance(profile_timeouts, dict):
+        config["request_timeout_seconds_by_profile"] = {
+            profile_id: value
+            for profile_id, value in profile_timeouts.items()
+            if LEGACY_REQUEST_TIMEOUT_SECONDS_BY_PROFILE.get(profile_id) != value
+        }
+    config["request_timeout_policy_version"] = REQUEST_TIMEOUT_POLICY_VERSION
+
+
 def normalize_config_fusion(config: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:
     fusion = normalize_fusion_config(config.get("fusion"), strict=strict, allowed_profile_ids=set(configured_virtual_model_ids(config)))
     experimental = config.get("experimental") if isinstance(config.get("experimental"), dict) else {}
@@ -1838,7 +1879,20 @@ def runtime_config_store() -> ConfigStore:
 
 
 def load_config() -> dict[str, Any]:
-    return runtime_config_store().load()
+    store = runtime_config_store()
+    if not isinstance(store, ConfigStore):
+        return store.load()
+    stored = load_json(store.read_path(), {})
+    if (
+        isinstance(stored, dict)
+        and stored
+        and safe_int(stored.get("request_timeout_policy_version"), 0)
+        < REQUEST_TIMEOUT_POLICY_VERSION
+    ):
+        # Re-read under the write lock so a concurrent dashboard or CLI update made after this
+        # check is normalized in place instead of being overwritten by a stale copy.
+        return store.update_with_existing(migrate_legacy_request_timeouts)
+    return store.load()
 
 
 def effective_runtime_config(
@@ -4011,7 +4065,7 @@ def strict_zero_pricing(pricing: Any) -> tuple[bool, str, dict[str, Any]]:
         return False, f"missing pricing fields: {', '.join(missing)}", {"status": "unsafe", "checked_fields": sorted(pricing)}
     checked: dict[str, str] = {}
     for key, value in pricing.items():
-        if value in {None, ""}:
+        if value is None or value == "":
             return False, f"empty pricing field: {key}", {"status": "unsafe", "checked_fields": sorted(checked)}
         try:
             numeric = float(value)
@@ -4035,7 +4089,7 @@ def official_free_id_pricing(pricing: Any) -> tuple[bool, str, dict[str, Any]]:
         return True, "sparse official free id", {"status": "not_applicable", "checked_fields": []}
     checked: dict[str, str] = {}
     for key, value in pricing.items():
-        if value in {None, ""}:
+        if value is None or value == "":
             return False, f"empty pricing field: {key}", {"status": "unsafe", "checked_fields": sorted(checked)}
         try:
             numeric = float(value)
@@ -6126,6 +6180,7 @@ def buffer_bounded_upstream_response(response: Any, *, deadline_monotonic: float
         for chunk in deadline_guarded_chunks(iter_content(chunk_size=64 * 1024), deadline_monotonic):
             if not chunk:
                 continue
+            record_response_first_byte(response)
             total += len(chunk)
             if total > MAX_UPSTREAM_RESPONSE_BYTES:
                 raise UpstreamResponseTooLarge(
@@ -6145,6 +6200,21 @@ def buffer_bounded_upstream_response(response: Any, *, deadline_monotonic: float
     except (AttributeError, TypeError):
         pass
     return response
+
+
+def record_response_first_byte(response: Any) -> None:
+    if getattr(response, "_ficelle_first_byte_seconds", None) is not None:
+        return
+    started = getattr(response, "_ficelle_request_started_monotonic", None)
+    if isinstance(started, (int, float)):
+        response._ficelle_first_byte_seconds = max(0.0, time.monotonic() - float(started))
+
+
+def response_chunks_with_first_byte(response: Any, chunks: Iterable[bytes]) -> Iterable[bytes]:
+    for chunk in chunks:
+        if chunk:
+            record_response_first_byte(response)
+        yield chunk
 
 
 def _publish_catalog_unlocked(catalog: dict[str, Any]) -> None:
@@ -6626,6 +6696,49 @@ def provider_on_cooldown(source: str, state: dict[str, Any]) -> tuple[bool, str 
 
 def model_on_cooldown(model: dict[str, Any], state: dict[str, Any]) -> tuple[bool, str | None]:
     return model_on_cooldown_use_case(model, state, ports=cooldown_read_ports())
+
+
+def selection_retry_after_seconds(
+    selection: SelectionResult,
+    catalog: dict[str, Any],
+) -> int | None:
+    """Earliest known recovery among models excluded by active cooldown state."""
+    cooldown_exclusions = {
+        model_id: reason
+        for model_id, reason in selection.excluded_reasons.items()
+        if reason in {"cooldown", "provider_cooldown", "quota_cooldown"}
+    }
+    if not cooldown_exclusions:
+        return None
+    state = load_runtime_state()
+    now = time.time()
+    until_values: list[float] = []
+    provider_rows = state.get("provider_cooldowns") if isinstance(state.get("provider_cooldowns"), dict) else {}
+    model_rows = state.get("cooldowns") if isinstance(state.get("cooldowns"), dict) else {}
+    quota_rows = state.get("quota_cooldowns") if isinstance(state.get("quota_cooldowns"), dict) else {}
+    for model in catalog.get("models", []):
+        if not isinstance(model, dict):
+            continue
+        exclusion_reason = cooldown_exclusions.get(str(model.get("id") or ""))
+        if exclusion_reason is None:
+            continue
+        source = str(model.get("source") or "")
+        if exclusion_reason == "provider_cooldown":
+            matching_rows = (provider_rows.get(source),)
+        elif exclusion_reason == "cooldown":
+            matching_rows = (model_rows.get(cooldown_key(model)),)
+        else:
+            matching_rows = tuple(
+                row
+                for key, row in quota_rows.items()
+                if quota_cooldown_matches_model(str(key), model)
+            )
+        for row in matching_rows:
+            if isinstance(row, dict):
+                until = safe_float(row.get("until"), 0.0)
+                if until > now:
+                    until_values.append(until)
+    return max(1, int(math.ceil(min(until_values) - now))) if until_values else None
 
 
 def model_quarantine(model: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
@@ -7197,6 +7310,9 @@ def set_quota_cooldown_in_state(
     detail: str | None = None,
     *,
     probe_failed: bool = False,
+    probe_ambiguous: bool = False,
+    retry_after_seconds: int | None = None,
+    retry_after_source: str | None = None,
     cooldown_key_override: str | None = None,
 ) -> str:
     return set_quota_cooldown_in_state_use_case(
@@ -7206,6 +7322,9 @@ def set_quota_cooldown_in_state(
         detail,
         ports=cooldown_mutation_ports(),
         probe_failed=probe_failed,
+        probe_ambiguous=probe_ambiguous,
+        retry_after_seconds=retry_after_seconds,
+        retry_after_source=retry_after_source,
         cooldown_key_override=cooldown_key_override,
     )
 
@@ -7271,6 +7390,8 @@ def set_cooldown(
     status: int | str | None = None,
     request_id: str | None = None,
     profile_id: str | None = None,
+    retry_after_seconds: int | None = None,
+    retry_after_source: str | None = None,
 ) -> AppliedCooldown:
     return set_cooldown_use_case(
         model,
@@ -7281,6 +7402,8 @@ def set_cooldown(
         status=status,
         request_id=request_id,
         profile_id=profile_id,
+        retry_after_seconds=retry_after_seconds,
+        retry_after_source=retry_after_source,
     )
 
 
@@ -7496,76 +7619,184 @@ def fresh_runtime_state() -> dict[str, Any]:
 
 
 def probe_quota_cooldown(key: str, model: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    confirmed_capacity_reasons = {"quota_exhausted", "rate_limited", "no_free_quota"}
 
-    def record_failed_probe(
+    def record_confirmed_probe(
         reason: str,
         cooldown_detail: str,
         result_detail: str,
         apply_failure_guard: Callable[[dict[str, Any]], None] | None = None,
+        *,
+        hint_seconds: int | None = None,
+        hint_source: str | None = None,
     ) -> dict[str, Any]:
         def mutate(state: dict[str, Any]) -> None:
             if apply_failure_guard is not None:
                 apply_failure_guard(state)
-            set_quota_cooldown_in_state(state, model, config, cooldown_detail, probe_failed=True, cooldown_key_override=key)
+            set_quota_cooldown_in_state(
+                state,
+                model,
+                config,
+                cooldown_detail,
+                probe_failed=True,
+                retry_after_seconds=hint_seconds,
+                retry_after_source=hint_source,
+                cooldown_key_override=key,
+            )
             record_quota_probe_result(state, key, model, "fail", reason, result_detail)
 
         _STATE_STORE.update(mutate, reason=f"probe_quota_cooldown:{reason}")
         return {"status": "fail", "reason": reason, "key": key, "model_id": model.get("id")}
 
-    started = time.monotonic()
+    def record_inconclusive_probe(
+        reason: str,
+        detail: str,
+        apply_failure_guard: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        def mutate(state: dict[str, Any]) -> None:
+            if apply_failure_guard is not None:
+                apply_failure_guard(state)
+            set_quota_cooldown_in_state(
+                state,
+                model,
+                config,
+                detail,
+                probe_ambiguous=True,
+                cooldown_key_override=key,
+            )
+            record_quota_probe_result(state, key, model, "inconclusive", reason, detail)
+
+        _STATE_STORE.update(mutate, reason=f"probe_quota_cooldown:inconclusive:{reason}")
+        return {"status": "inconclusive", "reason": reason, "key": key, "model_id": model.get("id")}
+
+    def failure_guard(
+        reason: str,
+        detail: str,
+        status: int | None,
+    ) -> Callable[[dict[str, Any]], None] | None:
+        if reason == "no_free_quota":
+            return lambda state: set_no_free_quota_quarantine_in_state(state, model, detail, "quota_probe_guard")
+        if reason == "model_not_found":
+            return lambda state: set_model_not_found_quarantine_in_state(state, model, detail, "quota_probe_guard")
+        if reason == "billing_or_paid":
+            return lambda state: set_billing_quarantine_in_state(state, model, detail, "quota_probe_guard")
+        if reason == "auth_or_credit":
+            def apply_auth_guard(state: dict[str, Any]) -> None:
+                record_provider_error_in_state(state, model, reason, detail, status)
+                set_provider_cooldown_in_state(state, str(model.get("source") or ""), reason, config, detail)
+
+            return apply_auth_guard
+        return None
+
+    def record_access_restored(reason: str, detail: str) -> dict[str, Any]:
+        def mutate(state: dict[str, Any]) -> None:
+            clear_quota_cooldown_in_state(state, key, model)
+            record_quota_probe_result(state, key, model, "pass", reason, detail)
+
+        _STATE_STORE.update(mutate, reason="probe_quota_cooldown:pass")
+        return {"status": "pass", "reason": reason, "key": key, "model_id": model.get("id")}
+
+    def record_model_pool_limited(
+        detail: str,
+        status: int | None,
+        *,
+        hint_seconds: int | None = None,
+        hint_source: str | None = None,
+    ) -> dict[str, Any]:
+        result = record_access_restored("access_restored_model_rate_limited", detail)
+        set_cooldown(
+            model,
+            "rate_limited_upstream",
+            config,
+            detail=detail,
+            status=status,
+            retry_after_seconds=hint_seconds,
+            retry_after_source=hint_source,
+        )
+        return result
+
     try:
         timeout = max(1.0, safe_float(config.get("quota_probe_timeout_seconds"), 10.0))
         response = invoke_model(model, quota_probe_body(model, config), config, timeout_seconds=timeout)
-        latency = time.monotonic() - started
+    except ProviderAdmissionRefused as exc:
+        return {
+            "status": "skip",
+            "reason": "local_admission",
+            "retry_after_seconds": exc.retry_after_seconds,
+            "key": key,
+            "model_id": model.get("id"),
+        }
     except requests.exceptions.Timeout as exc:
-        return record_failed_probe("timeout", f"quota probe timeout: {type(exc).__name__}", f"{type(exc).__name__}: {exc}")
+        return record_inconclusive_probe("timeout", f"quota probe timeout: {type(exc).__name__}")
     except Exception as exc:
-        return record_failed_probe("unavailable", f"quota probe error: {type(exc).__name__}: {exc}", f"{type(exc).__name__}: {exc}")
+        return record_inconclusive_probe("unavailable", f"quota probe error: {type(exc).__name__}: {exc}")
 
     if 200 <= response.status_code < 300:
         try:
             payload = response.json()
         except ValueError as exc:
-            return record_failed_probe("unavailable", f"quota probe invalid JSON: {exc}", f"{type(exc).__name__}: {exc}")
-        if not has_deliverable_message(payload):
-            return record_failed_probe("unavailable", "quota probe returned no deliverable assistant message", "empty assistant response")
-        def mutate(state: dict[str, Any]) -> None:
-            clear_quota_cooldown_in_state(state, key, model)
-            record_quota_probe_result(state, key, model, "pass", "ok", "quota probe succeeded")
-            update_success_stats(state, model, latency)
-            source = str(model.get("source") or "").strip()
-            if source:
-                update_provider_success_stats(state, source, latency)
+            return record_access_restored(
+                "access_restored_invalid_json",
+                f"HTTP {response.status_code} restored access; invalid probe JSON: {type(exc).__name__}",
+            )
+        embedded_failure = success_error_payload_failure(payload, model)
+        if embedded_failure is not None:
+            reason, embedded_detail, embedded_status = embedded_failure
+            embedded_guard = failure_guard(reason, embedded_detail, embedded_status)
+            if reason == "rate_limited_upstream":
+                hint = retry_hint(getattr(response, "headers", None), payload)
+                return record_model_pool_limited(
+                    embedded_detail,
+                    embedded_status,
+                    hint_seconds=hint.seconds if hint else None,
+                    hint_source=hint.source if hint else None,
+                )
+            if reason in confirmed_capacity_reasons:
+                hint = retry_hint(getattr(response, "headers", None), payload)
+                return record_confirmed_probe(
+                    reason,
+                    f"quota probe HTTP {response.status_code} embedded error: {embedded_detail}",
+                    embedded_detail,
+                    embedded_guard,
+                    hint_seconds=hint.seconds if hint else None,
+                    hint_source=hint.source if hint else None,
+                )
+            return record_inconclusive_probe(
+                reason,
+                f"quota probe HTTP {response.status_code} embedded error: {embedded_detail}",
+                embedded_guard,
+            )
+        deliverable = has_deliverable_message(payload)
+        return record_access_restored(
+            "ok" if deliverable else "access_restored_semantic_empty",
+            "quota probe succeeded" if deliverable else "HTTP success restored access; probe response was semantically empty",
+        )
 
-        _STATE_STORE.update(mutate, reason="probe_quota_cooldown:pass")
-        return {"status": "pass", "reason": "ok", "key": key, "model_id": model.get("id")}
-
-    text = response.text
+    text = str(response.text)
     reason = classify_failure(response.status_code, text, model)
     detail = f"quota probe HTTP {response.status_code}: {text[:250]}"
-    apply_failure_guard: Callable[[dict[str, Any]], None] | None = None
-    if reason == "no_free_quota":
-        def apply_no_free_quota_guard(state: dict[str, Any]) -> None:
-            set_no_free_quota_quarantine_in_state(state, model, detail, "quota_probe_guard")
-
-        apply_failure_guard = apply_no_free_quota_guard
-    elif reason == "model_not_found":
-        def apply_model_not_found_guard(state: dict[str, Any]) -> None:
-            set_model_not_found_quarantine_in_state(state, model, detail, "quota_probe_guard")
-
-        apply_failure_guard = apply_model_not_found_guard
-    elif reason == "billing_or_paid":
-        def apply_billing_guard(state: dict[str, Any]) -> None:
-            set_billing_quarantine_in_state(state, model, detail, "quota_probe_guard")
-
-        apply_failure_guard = apply_billing_guard
-    elif reason == "auth_or_credit":
-        def apply_auth_guard(state: dict[str, Any]) -> None:
-            record_provider_error_in_state(state, model, reason, detail, response.status_code)
-            set_provider_cooldown_in_state(state, str(model.get("source") or ""), reason, config, detail)
-
-        apply_failure_guard = apply_auth_guard
-    return record_failed_probe(reason, detail, detail, apply_failure_guard)
+    apply_failure_guard = failure_guard(reason, detail, response.status_code)
+    if reason in {"bad_upstream_request", "bad_upstream_contract"}:
+        return record_access_restored("access_restored_probe_rejected", detail)
+    if reason == "rate_limited_upstream":
+        hint = retry_hint(getattr(response, "headers", None), text)
+        return record_model_pool_limited(
+            detail,
+            response.status_code,
+            hint_seconds=hint.seconds if hint else None,
+            hint_source=hint.source if hint else None,
+        )
+    if reason in confirmed_capacity_reasons:
+        hint = retry_hint(getattr(response, "headers", None), text)
+        return record_confirmed_probe(
+            reason,
+            detail,
+            detail,
+            apply_failure_guard,
+            hint_seconds=hint.seconds if hint else None,
+            hint_source=hint.source if hint else None,
+        )
+    return record_inconclusive_probe(reason, detail, apply_failure_guard)
 
 
 def reserve_quota_probe_in_state(state: dict[str, Any], key: str, row: dict[str, Any], config: dict[str, Any]) -> bool:
@@ -8084,7 +8315,9 @@ def success_error_payload_failure(payload: Any, model: dict[str, Any] | None = N
 
 
 def request_timeout_seconds_for_profile(requested_model: str, config: dict[str, Any]) -> float:
-    default_timeout = float(config.get("request_timeout_seconds") or 120)
+    default_timeout = float(
+        config.get("request_timeout_seconds") or DEFAULT_CONFIG["request_timeout_seconds"]
+    )
     per_profile = config.get("request_timeout_seconds_by_profile")
     if isinstance(per_profile, dict):
         raw_value = per_profile.get(canonical_virtual_model_id(requested_model))
@@ -8316,9 +8549,18 @@ def invoke_model(
         if budgeted < timeout:
             timeout = budgeted
             budget_constrained = True
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    admission = PROVIDER_ADMISSION_LEDGER.reserve(
+        source,
+        providers.get(source),
+        namespace=str(FICELLE_HOME),
+    )
+    if not admission.allowed:
+        raise ProviderAdmissionRefused(source, admission.retry_after_seconds or 1)
     record_upstream_spend(model)
     # `upstream_post` (pooled single exit for chat traffic) keeps main's connection reuse;
     # binding the result is what lets the trace be observed before the response is returned.
+    provider_request_started = time.monotonic()
     try:
         response = upstream_post(
             f"{base_url.rstrip('/')}/chat/completions",
@@ -8333,7 +8575,14 @@ def invoke_model(
             # before they enter memory. Logical downstream streaming remains controlled by the payload.
             stream=True,
         )
-        if not bool(payload.get("stream")):
+        PROVIDER_ADMISSION_LEDGER.observe(
+            source,
+            getattr(response, "headers", {}),
+            namespace=str(FICELLE_HOME),
+        )
+        response._ficelle_admission_source = admission.source
+        response._ficelle_request_started_monotonic = provider_request_started
+        if not bool(payload.get("stream")) or not (200 <= response.status_code < 300):
             response = buffer_bounded_upstream_response(response, deadline_monotonic=deadline_monotonic)
             observe_reasoning_trace(model, response)
     except requests.exceptions.Timeout as exc:
@@ -8849,7 +9098,11 @@ def run_fusion_chat_completion(
         record_last_route(FUSION_MODEL_ID, "fail", "upstream_failure", request_id, len(panel_candidates), len(panel_results), time.monotonic() - request_started, attempts=panel_attempts)
         panel_failure_status = upstream_failure_status(errors)
         write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": panel_failure_status, "final_reason": "insufficient_panel_success", "candidate_count": len(panel_candidates), "attempt_count": len(panel_results), "attempts": panel_attempts, "stream": False})
-        return panel_failure_status, build_upstream_failure_error(FUSION_MODEL_ID, request_id, len(panel_candidates), panel_attempts, errors), fusion_response_headers(request_id, None, len(panel_results), metadata)
+        headers = fusion_response_headers(request_id, None, len(panel_results), metadata)
+        retry_after_seconds = upstream_retry_after_seconds(errors, panel_failure_status)
+        if retry_after_seconds is not None:
+            headers["Retry-After"] = str(retry_after_seconds)
+        return panel_failure_status, build_upstream_failure_error(FUSION_MODEL_ID, request_id, len(panel_candidates), panel_attempts, errors), headers
 
     peer_ranking_config = fusion.get("peer_ranking") if isinstance(fusion.get("peer_ranking"), dict) else {}
     peer_ranking_enabled = bool(peer_ranking_config.get("enabled")) and bool(successes)
@@ -8993,7 +9246,11 @@ def run_fusion_chat_completion(
         synth_failure_status = upstream_failure_status(synth_failure_errors)
         record_last_route(FUSION_MODEL_ID, "fail", reason_code, request_id, len(panel_candidates), len(attempts), time.monotonic() - request_started, attempts=attempts)
         write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, "final_status": synth_failure_status, "final_reason": reason_code, "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
-        return synth_failure_status, build_upstream_failure_error(FUSION_MODEL_ID, request_id, synth_failure_candidate_count, synth_failure_errors, synth_failure_errors), fusion_response_headers(request_id, None, len(attempts), metadata)
+        headers = fusion_response_headers(request_id, None, len(attempts), metadata)
+        retry_after_seconds = upstream_retry_after_seconds(synth_failure_errors, synth_failure_status)
+        if retry_after_seconds is not None:
+            headers["Retry-After"] = str(retry_after_seconds)
+        return synth_failure_status, build_upstream_failure_error(FUSION_MODEL_ID, request_id, synth_failure_candidate_count, synth_failure_errors, synth_failure_errors), headers
     record_last_route(FUSION_MODEL_ID, "ok", "ok", request_id, len(panel_candidates), len(attempts), time.monotonic() - request_started, selected_synth, attempts)
     write_route_log({"request_id": request_id, "requested_model": FUSION_MODEL_ID, **fusion_route_log_selection(selected_synth), "final_status": 200, "final_reason": "ok", "candidate_count": len(panel_candidates), "attempt_count": len(attempts), "attempts": attempts, "fusion": metadata, "stream": False})
     return 200, fusion_openai_response(request_id, final_text), fusion_response_headers(request_id, selected_synth, len(attempts), metadata)
@@ -11717,6 +11974,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                     entitled=entitled,
                 ),
                 now=time.monotonic,
+                pause=time.sleep,
+                selection_retry_after=selection_retry_after_seconds,
             )
             def attempt_ports_factory(attempt_plan: ChatCompletionAttemptPlan) -> ChatCompletionAttemptPorts:
                 compression_metadata = attempt_plan.compression_metadata
@@ -11762,7 +12021,12 @@ class RouterHandler(BaseHTTPRequestHandler):
                     # the way past, to learn a thinking model's trace for the next turn. The
                     # deadline guard bounds a drip-feeding upstream to the request budget.
                     observed = observe_stream_chunks(
-                        deadline_guarded_chunks(response.iter_content(chunk_size=None), deadline_monotonic),
+                        response_chunks_with_first_byte(
+                            response,
+                            deadline_guarded_chunks(
+                                response.iter_content(chunk_size=None), deadline_monotonic
+                            ),
+                        ),
                         ReasoningStreamObserver(REASONING_REPLAY_STORE, str(model.get("id") or "")),
                         now_fn=time.time,
                     )

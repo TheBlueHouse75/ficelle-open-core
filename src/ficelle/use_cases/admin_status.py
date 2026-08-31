@@ -717,6 +717,8 @@ def safe_quota_cooldown_row(
         "probe_due": next_probe_at > 0 and next_probe_at <= now_ts,
         "probe_interval_seconds": safe_int(raw_value.get("probe_interval_seconds"), 0),
         "consecutive_probe_failures": safe_int(raw_value.get("consecutive_probe_failures"), 0),
+        "consecutive_ambiguous_probes": safe_int(raw_value.get("consecutive_ambiguous_probes"), 0),
+        "probe_outcome": safe_detail(raw_value.get("probe_outcome")) or "unknown",
         "detail": safe_detail(raw_value.get("detail")),
     }
     if include_active:

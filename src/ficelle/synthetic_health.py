@@ -558,7 +558,7 @@ def late_route_correlation_wait_seconds(router_config: dict[str, Any] | None, cl
     against it, plus a small margin for telemetry writes. A router with the deadline
     disabled has no bound to wait for — fall back to the shipped default."""
     deadline_instant = request_deadline(router_config, 0.0)
-    router_deadline = deadline_instant if deadline_instant is not None else 300.0
+    router_deadline = deadline_instant if deadline_instant is not None else 900.0
     return max(0.0, router_deadline - client_timeout_seconds) + 5.0
 
 

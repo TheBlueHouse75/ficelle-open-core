@@ -27,7 +27,7 @@ CODING_PROFILE_ID = "ficelle/auto-coding"
 MANIFEST_SCHEMA_VERSION = 1
 BUILTIN_MANIFEST_PATH = Path(__file__).with_name("assets") / "auto-coding-manifest.json"
 REQUIRED_BENCHMARKS = frozenset({"aider-polyglot"})
-POLICY_VERSION = "coding-v1"
+POLICY_VERSION = "coding-v2"
 COMPATIBILITY_CANARY_VERSION = "coding-compatibility-v1"
 
 

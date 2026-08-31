@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 REPOSITORY = "TheBlueHouse75/ficelle-open-core"
-VERSION = "0.3.7"
+VERSION = "0.3.8"
 CORE_WHEEL = f"ficelle_router-{VERSION}-py3-none-any.whl"
-CORE_SHA256 = "4475adef1ccfffbb03b1ff338b2b65bea5607813a92a7e2f414e3cbb47727f16"
+CORE_SHA256 = "a4f0991ae1218b559880e35fce3e218afe9e101c31b7582c0a69b2ee10c8f53f"
 BOOTSTRAP_PATH = f"/{REPOSITORY}/v{VERSION}/scripts/bootstrap-ficelle.py"
 
 

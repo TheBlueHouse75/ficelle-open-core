@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ficelle.provider_admission import ProviderAdmissionRefused
 from ficelle.use_cases.benchmark import (
     ROUTE_REJECTION_VERDICT_TTL_SECONDS,
     BenchmarkEvidencePorts,
@@ -304,6 +305,20 @@ def test_canary_helpers_build_state_from_result_rows_not_requested_profiles():
     assert state["canary"] == canary_state_payload(result, "fail")
     assert state["canary"]["profiles"] == ["ficelle/auto-fast", "ficelle/auto-tools"]
     assert state["canary"]["failed_profiles"] == ["ficelle/auto-tools", ""]
+
+
+def test_canary_with_only_operational_skips_is_not_pass_or_fail():
+    result = {
+        "ran_at": "2026-08-23T00:00:00+00:00",
+        "summary": {"total": 1, "passed": 0, "failed": 0, "skipped": 1},
+        "results": [{"profile_id": "ficelle/auto-tools", "status": "skip"}],
+    }
+
+    status = canary_status_from_benchmark_result(result, safe_int=lambda value, default: int(value or default))
+    payload = canary_state_payload(result, status)
+
+    assert status == "skip"
+    assert payload["failed_profiles"] == []
 
 
 def test_profile_ids_from_admin_body_accepts_legacy_key_and_rejects_non_strings():
@@ -636,6 +651,55 @@ def test_benchmark_runner_aggregates_run_summary_and_default_profiles():
     assert result["results"][0]["profile_id"] == "ficelle/auto-fast"
 
 
+def test_local_admission_skip_is_not_persisted_or_counted_as_a_failed_benchmark():
+    candidates = [{"id": "model-a", "upstream_id": "a", "source": "test"}]
+    events: list[str] = []
+
+    def refuse_admission(*_args: Any, **_kwargs: Any) -> Any:
+        raise ProviderAdmissionRefused("test", 12)
+
+    runner = BenchmarkRunner(
+        load_or_refresh_catalog=lambda _config: {"models": candidates},
+        select_models=lambda _profile_id, _catalog, _config, *, purpose: candidates,
+        order_benchmark_candidates=lambda _profile_id, models: models,
+        benchmark_body=lambda _profile_id, _config: ({}, "exact_text", "ok"),
+        invoke_model=refuse_admission,
+        classify_failure=lambda *_args: "unavailable",
+        set_cooldown=lambda *_args, **_kwargs: events.append("cooldown"),
+        record_benchmark_failure=lambda *_args, **_kwargs: events.append("failure"),
+        record_benchmark_result=lambda *_args, **_kwargs: events.append("result"),
+        record_success=lambda *_args, **_kwargs: events.append("success"),
+        record_verified_capability=lambda *_args, **_kwargs: events.append("verified"),
+        record_capability_discrepancy=lambda *_args, **_kwargs: events.append("discrepancy"),
+        extract_message_text=lambda _payload: "",
+        safe_detail=lambda value, *_args: str(value),
+        redact_sensitive_json=dict,
+        now_iso=lambda: "2026-08-23T00:00:00Z",
+        pacer=ProviderProbePacer(pause=lambda _seconds: None),
+        route_blocking_reasons=frozenset(),
+    )
+
+    result = runner.run_benchmarks(
+        ["ficelle/auto-fast"],
+        {},
+        known_profile_ids={"ficelle/auto-fast"},
+        default_profile_ids=["ficelle/auto-fast"],
+        safe_int=lambda value, default: int(value) if value is not None else default,
+        all_candidates=True,
+    )
+
+    assert result["summary"] == {
+        "total": 1,
+        "passed": 0,
+        "failed": 0,
+        "skipped": 1,
+        "candidates": {"tested": 0, "passed": 0, "failed": 0, "skipped": 1},
+    }
+    assert result["results"][0]["status"] == "skip"
+    assert result["results"][0]["tested_count"] == 0
+    assert events == []
+
+
 def test_capability_discovery_records_shape_rejection_without_cooldown():
     events: list[tuple[str, str, str | None]] = []
     model = {"id": "model-a", "upstream_id": "a", "source": "test"}
@@ -668,6 +732,33 @@ def test_capability_discovery_records_shape_rejection_without_cooldown():
     assert ("result", "model-a", "fail") in events
     assert ("verified", "model-a", "fail") in events
     assert not [event for event in events if event[0] == "cooldown"]
+
+
+def test_capability_discovery_local_admission_is_not_model_evidence():
+    events: list[str] = []
+    model = {"id": "model-a", "upstream_id": "a", "source": "test"}
+
+    def refuse_admission(*_args: Any, **_kwargs: Any) -> Any:
+        raise ProviderAdmissionRefused("test", 12)
+
+    job = CapabilityDiscoveryJob(
+        benchmark_body=lambda _profile_id, _config: ({}, "tool_call", "ficelle_probe:ok"),
+        invoke_model=refuse_admission,
+        classify_failure=lambda *_args: "unavailable",
+        set_cooldown=lambda *_args, **_kwargs: events.append("cooldown"),
+        record_benchmark_result=lambda *_args, **_kwargs: events.append("result"),
+        record_verified_capability=lambda *_args, **_kwargs: events.append("verified"),
+        record_success=lambda *_args, **_kwargs: events.append("success"),
+        extract_message_text=lambda _payload: "",
+        safe_detail=lambda value, *_args: str(value),
+        now_iso=lambda: "2026-08-23T00:00:00Z",
+        route_blocking_reasons=frozenset(),
+        pacer=ProviderProbePacer(pause=lambda _seconds: None),
+        registry=ProbeRegistry(),
+    )
+
+    assert job.probe_model_capability(model, "ficelle/auto-tools", {}) == "skip"
+    assert events == []
 
 
 def test_expected_probe_test_type_uses_canonical_profile_lookup():

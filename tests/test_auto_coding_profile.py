@@ -75,14 +75,26 @@ def test_bundled_pool_routes_qualified_models_and_rejects_laguna():
     ox_alpha = model(
         "openrouter", "stealth/ox-alpha", "ficelle/openrouter/stealth/ox-alpha"
     )
+    deepseek_v4_pro = model(
+        "orcarouter",
+        "deepseek/deepseek-v4-pro-free",
+        "ficelle/orcarouter/deepseek/deepseek-v4-pro-free",
+    )
+    gemini_3_6_flash = model(
+        "gemini",
+        "models/gemini-3.6-flash",
+        "ficelle/gemini/models/gemini-3.6-flash",
+    )
     kimi_k3 = model("nvidia", "moonshotai/kimi-k3", "ficelle/nvidia/moonshotai/kimi-k3")
     laguna = model("kilo", "laguna-s-2-1", "ficelle/kilo/laguna-s-2-1")
 
     kept, fallback = router.route_competence_gate_result(
-        "ficelle/auto-coding", [ox_alpha, kimi_k3, laguna], {}
+        "ficelle/auto-coding",
+        [ox_alpha, deepseek_v4_pro, gemini_3_6_flash, kimi_k3, laguna],
+        {},
     )
 
-    assert kept == [kimi_k3]
+    assert kept == [deepseek_v4_pro, gemini_3_6_flash, kimi_k3]
     assert fallback is False
 
 

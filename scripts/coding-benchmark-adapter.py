@@ -61,14 +61,15 @@ _PROVIDER_ERROR_PATTERN = re.compile(
     r"rate.?limit|cooldown|provider|upstream|connection|remote.?disconnect|timed?\s*out",
     re.IGNORECASE,
 )
-_MODEL_BUDGET_FAILURE_PATTERN = re.compile(
-    r"truncated_before_content|completion token budget ran out before .* emitted .* content",
+_MODEL_RESPONSE_FAILURE_PATTERN = re.compile(
+    r"truncated_before_content|empty_assistant_message|"
+    r"completion token budget ran out before .* emitted .* content",
     re.IGNORECASE,
 )
 _PROVIDER_RETRY_PATTERN = re.compile(
     r"litellm\.(?:APIConnectionError|BadGatewayError|RateLimitError|ServiceUnavailableError|Timeout)|"
     r"API provider's servers are down or overloaded|provider_cooldown|RemoteDisconnected|"
-    r"rate limit exceeded|upstream_failure",
+    r"rate limit exceeded|upstream_failure|RequestDeadlineExceeded|request_deadline_exceeded",
     re.IGNORECASE,
 )
 
@@ -237,7 +238,7 @@ def _aider_result_rows(
 ) -> tuple[list[dict[str, Any]], int]:
     rows: list[dict[str, Any]] = []
     completed = 0
-    model_failure_pending = bool(_MODEL_BUDGET_FAILURE_PATTERN.search(run_diagnostic))
+    model_failure_pending = bool(_MODEL_RESPONSE_FAILURE_PATTERN.search(run_diagnostic))
     provider_error_pending = bool(_PROVIDER_RETRY_PATTERN.search(run_diagnostic))
     for task_id in task_ids:
         result_path = run_dir / task_id / ".aider.results.json"
@@ -263,7 +264,7 @@ def _aider_result_rows(
                 completed += 1
             elif payload.get("exception"):
                 diagnostic = json.dumps(payload.get("exception"), ensure_ascii=False, default=str)
-                if _MODEL_BUDGET_FAILURE_PATTERN.search(diagnostic):
+                if _MODEL_RESPONSE_FAILURE_PATTERN.search(diagnostic):
                     row["status"] = "failed"
                     completed += 1
                     model_failure_pending = False

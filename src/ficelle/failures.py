@@ -909,7 +909,30 @@ def upstream_failure_status(errors: list[dict[str, Any]]) -> int:
     """
     if request_feature_incompatible(errors):
         return 422
-    return 400 if caller_rejected_request(errors) else 502
+    if caller_rejected_request(errors):
+        return 400
+    attempted_errors = [error for error in errors if error.get("attempted") is not False]
+    reasons = {str(error.get("reason") or "") for error in attempted_errors}
+    if reasons and reasons <= {"rate_limited", "rate_limited_upstream", "quota_exhausted"}:
+        return 429
+    if reasons and reasons <= {"timeout", "request_deadline_exceeded"}:
+        return 504
+    return 502
+
+
+def upstream_retry_after_seconds(errors: list[dict[str, Any]], status: int) -> int | None:
+    """Return a truthful client retry delay for a homogeneous capacity failure."""
+    if status != 429:
+        return None
+    delays = [
+        int(error["retry_after_seconds"])
+        for error in errors
+        if error.get("attempted") is not False
+        and isinstance(error.get("retry_after_seconds"), (int, float))
+        and not isinstance(error.get("retry_after_seconds"), bool)
+        and float(error["retry_after_seconds"]) > 0
+    ]
+    return min(delays) if delays else None
 
 
 def build_upstream_failure_error(

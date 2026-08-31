@@ -158,3 +158,15 @@ class ConfigStore:
             config = self.merged(existing)
             mutator(config)
             return self._save_locked(config)
+
+    def update_with_existing(
+        self,
+        mutator: Callable[[dict[str, Any], dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """Update merged config while retaining the persisted shape for one-time migrations."""
+        with advisory_file_lock(self.lock_path(), self.thread_lock):
+            loaded = load_json(self.read_path(), {})
+            existing = loaded if isinstance(loaded, dict) else {}
+            config = self.merged(existing)
+            mutator(existing, config)
+            return self._save_locked(config)

@@ -21,6 +21,7 @@ NowSeconds = Callable[[], float]
 NowIso = Callable[[], str]
 SafeInt = Callable[[Any, int], int]
 CanonicalProfileId = Callable[[str], str]
+TRANSIENT_QUOTA_PROBE_BACKOFF_SECONDS = (60, 300, 900)
 
 
 @dataclass(frozen=True)
@@ -545,6 +546,9 @@ def set_quota_cooldown_in_state(
     *,
     ports: CooldownMutationPorts,
     probe_failed: bool = False,
+    probe_ambiguous: bool = False,
+    retry_after_seconds: int | None = None,
+    retry_after_source: str | None = None,
     cooldown_key_override: str | None = None,
 ) -> str:
     """Cool a quota pool, and return the key that now blocks it.
@@ -556,7 +560,7 @@ def set_quota_cooldown_in_state(
     only the write knows it (`cooldown_key_override` included).
     """
     source = str(model.get("source") or "").strip()
-    if source:
+    if source and not probe_ambiguous:
         ports.update_provider_failure_stats(state, source, "quota_exhausted")
     cooldowns = state.setdefault("quota_cooldowns", {})
     key = cooldown_key_override or ports.quota_cooldown_key(model)
@@ -564,10 +568,21 @@ def set_quota_cooldown_in_state(
     previous = previous_raw if isinstance(previous_raw, dict) else {}
     previous_failures = ports.safe_int(previous.get("consecutive_probe_failures"), 0)
     consecutive_probe_failures = previous_failures + 1 if probe_failed else previous_failures
-    interval = quota_probe_backoff_seconds(config, consecutive_probe_failures, ports=ports)
+    previous_ambiguous = ports.safe_int(previous.get("consecutive_ambiguous_probes"), 0)
+    consecutive_ambiguous = previous_ambiguous + 1 if probe_ambiguous else 0
+    if retry_after_seconds is not None:
+        interval = max(1, min(86_400, ports.safe_int(retry_after_seconds, 1)))
+    elif probe_ambiguous:
+        index = min(len(TRANSIENT_QUOTA_PROBE_BACKOFF_SECONDS) - 1, max(0, consecutive_ambiguous - 1))
+        interval = TRANSIENT_QUOTA_PROBE_BACKOFF_SECONDS[index]
+    else:
+        interval = quota_probe_backoff_seconds(config, consecutive_probe_failures, ports=ports)
     now_ts = ports.now_seconds()
     set_at = ports.now_iso()
-    last_probe_at = set_at if probe_failed else previous.get("last_probe_at")
+    last_probe_at = set_at if probe_failed or probe_ambiguous else previous.get("last_probe_at")
+    stored_detail = detail
+    if retry_after_seconds is not None:
+        stored_detail = f"retry after {interval}s via {retry_after_source or 'provider'}; {detail or 'quota probe'}"
     cooldowns[key] = {
         "scope": ports.quota_cooldown_scope_from_key(key) if cooldown_key_override else ports.quota_cooldown_scope(model),
         "source": source,
@@ -580,7 +595,9 @@ def set_quota_cooldown_in_state(
         "next_probe_at": now_ts + interval,
         "probe_interval_seconds": interval,
         "consecutive_probe_failures": consecutive_probe_failures,
-        "detail": ports.safe_detail(detail),
+        "consecutive_ambiguous_probes": consecutive_ambiguous,
+        "probe_outcome": "ambiguous" if probe_ambiguous else "confirmed" if probe_failed else "initial",
+        "detail": ports.safe_detail(stored_detail),
     }
     return key
 
@@ -732,10 +749,21 @@ def set_cooldown(
     status: int | str | None = None,
     request_id: str | None = None,
     profile_id: str | None = None,
+    retry_after_seconds: int | None = None,
+    retry_after_source: str | None = None,
 ) -> AppliedCooldown:
     """Write the cooldown policy for this failure, and report what it blocked beyond this model."""
     provider_source = ""
     quota_key = ""
+    effective_config = config
+    if retry_after_seconds is not None and retry_after_seconds > 0:
+        seconds = max(1, min(86_400, int(retry_after_seconds)))
+        effective_config = {
+            **config,
+            "cooldown_seconds": {**(config.get("cooldown_seconds") or {}), reason: seconds},
+            "quota_probe_backoff_seconds": [seconds],
+        }
+        detail = f"retry after {seconds}s via {retry_after_source or 'provider'}; {detail or reason}"
 
     def mutate(state: dict[str, Any]) -> None:
         nonlocal provider_source, quota_key
@@ -749,10 +777,10 @@ def set_cooldown(
         if policy.record_provider_error:
             ports.record_provider_error_in_state(state, model, reason, detail, status, request_id)
         if policy.quota_cooldown:
-            quota_key = ports.set_quota_cooldown_in_state(state, model, config, detail) or ""
+            quota_key = ports.set_quota_cooldown_in_state(state, model, effective_config, detail) or ""
         if policy.provider_cooldown:
             provider_source = ports.set_provider_cooldown_in_state(
-                state, policy.provider_cooldown_source, reason, config, detail
+                state, policy.provider_cooldown_source, reason, effective_config, detail
             ) or ""
         quarantine = policy.quarantine
         if quarantine and quarantine.reason == "billing_or_paid":
@@ -782,7 +810,7 @@ def set_cooldown(
         if not policy.model_cooldown:
             return
         cooldowns = state.setdefault("cooldowns", {})
-        seconds_map = config.get("cooldown_seconds") or {}
+        seconds_map = effective_config.get("cooldown_seconds") or {}
         seconds = int(seconds_map.get(reason) or seconds_map.get("unavailable") or 600)
         cooldowns[ports.cooldown_key(model)] = {
             "until": ports.now_seconds() + seconds,
