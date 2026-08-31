@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from ficelle.failures import REQUEST_REJECTION_STATUSES
+from ficelle.provider_admission import ProviderAdmissionRefused
+from ficelle.retry_hints import retry_hint
 from ficelle.use_cases.capability_discovery import (
     MAX_VERDICT_STREAK,
     ROUTE_REJECTION_VERDICT,
@@ -294,7 +296,12 @@ def canary_status_from_benchmark_result(
     *,
     safe_int: Callable[[Any, int], int],
 ) -> str:
-    return "pass" if safe_int((result.get("summary") or {}).get("failed"), 0) == 0 else "fail"
+    summary = result.get("summary") or {}
+    if safe_int(summary.get("failed"), 0) > 0:
+        return "fail"
+    if safe_int(summary.get("passed"), 0) > 0:
+        return "pass"
+    return "skip"
 
 
 def canary_state_payload(result: dict[str, Any], status: str) -> dict[str, Any]:
@@ -309,7 +316,7 @@ def canary_state_payload(result: dict[str, Any], status: str) -> dict[str, Any]:
         "last_run_at": result.get("ran_at"),
         "profiles": result_profiles,
         "summary": result.get("summary"),
-        "failed_profiles": [row.get("profile_id") for row in result_rows if row.get("status") != "pass"],
+        "failed_profiles": [row.get("profile_id") for row in result_rows if row.get("status") == "fail"],
     }
 
 
@@ -359,13 +366,18 @@ def run_benchmark_profiles(
         "passed": sum(safe_int(result.get("passed_count"), 0) for result in results),
         "failed": sum(safe_int(result.get("failed_count"), 0) for result in results),
     } if all_candidates else None
+    skipped_profiles = sum(1 for result in results if result.get("status") == "skip")
+    skipped_candidates = sum(safe_int(result.get("skipped_count"), 0) for result in results)
+    if candidate_summary is not None and skipped_candidates:
+        candidate_summary["skipped"] = skipped_candidates
     return {
         "ran_at": now_iso(),
         "results": results,
         "summary": {
             "total": len(results),
             "passed": sum(1 for result in results if result.get("status") == "pass"),
-            "failed": sum(1 for result in results if result.get("status") != "pass"),
+            "failed": sum(1 for result in results if result.get("status") == "fail"),
+            **({"skipped": skipped_profiles} if skipped_profiles else {}),
             **({"candidates": candidate_summary} if candidate_summary is not None else {}),
         },
     }
@@ -1129,29 +1141,44 @@ class BenchmarkRunner:
             }
 
         last_result: dict[str, Any] | None = None
+        last_skip: dict[str, Any] | None = None
         candidate_results: list[dict[str, Any]] = []
         for model in candidates:
             result = self._benchmark_candidate(profile_id, model, body, test_type, expected, config)
             if all_candidates:
                 candidate_results.append(self.redact_sensitive_json(dict(result)))
-                last_result = result
+                if result.get("status") == "skip":
+                    last_skip = result
+                else:
+                    last_result = result
                 continue
             if result.get("status") == "pass":
                 return result
-            last_result = result
+            if result.get("status") == "skip":
+                last_skip = result
+            else:
+                last_result = result
 
         if all_candidates:
             passed_count = sum(1 for result in candidate_results if result.get("status") == "pass")
+            failed_count = sum(1 for result in candidate_results if result.get("status") == "fail")
+            skipped_count = sum(1 for result in candidate_results if result.get("status") == "skip")
+            aggregate_status = "pass" if passed_count else "fail" if failed_count else "skip"
             return {
                 "profile_id": profile_id,
-                "status": "pass" if passed_count else "fail",
+                "status": aggregate_status,
                 "test_type": test_type,
                 "ran_at": self.now_iso(),
-                "message": f"{passed_count}/{len(candidate_results)} candidates passed",
+                "message": (
+                    f"{passed_count}/{passed_count + failed_count} tested candidates passed"
+                    if passed_count + failed_count
+                    else "all candidates skipped before provider dispatch"
+                ),
                 "candidate_count": len(candidates),
-                "tested_count": len(candidate_results),
+                "tested_count": passed_count + failed_count,
                 "passed_count": passed_count,
-                "failed_count": len(candidate_results) - passed_count,
+                "failed_count": failed_count,
+                "skipped_count": skipped_count,
                 "candidate_results": candidate_results,
             }
 
@@ -1161,6 +1188,10 @@ class BenchmarkRunner:
                 f"all candidates failed; last failure: {last_result.get('message')}"
             )
             return self.redact_sensitive_json(last_result)
+        if last_skip is not None:
+            skipped = dict(last_skip)
+            skipped["message"] = "all candidates skipped before provider dispatch"
+            return self.redact_sensitive_json(skipped)
         return {
             "profile_id": profile_id,
             "status": "fail",
@@ -1218,6 +1249,15 @@ class BenchmarkRunner:
             self.record_capability_discrepancy(profile_id, model, False)
             return result
         except Exception as exc:
+            if isinstance(exc, ProviderAdmissionRefused):
+                result.update(
+                    {
+                        "status": "skip",
+                        "message": "provider request budget reserved for live traffic",
+                        "retry_after_seconds": exc.retry_after_seconds,
+                    }
+                )
+                return result
             self.set_cooldown(
                 model,
                 "unavailable",
@@ -1237,16 +1277,26 @@ class BenchmarkRunner:
         config: dict[str, Any],
         result: dict[str, Any],
     ) -> dict[str, Any]:
-        reason = self.classify_failure(response.status_code, response.text, model)
-        detail = f"benchmark HTTP {response.status_code}: {response.text[:250]}"
+        response_text = str(response.text)
+        reason = self.classify_failure(response.status_code, response_text, model)
+        detail = f"benchmark HTTP {response.status_code}: {response_text[:250]}"
+        hint = retry_hint(getattr(response, "headers", None), response_text) if response.status_code in {429, 503} else None
         if reason in self.route_blocking_reasons:
-            self.set_cooldown(model, reason, config, detail=detail, profile_id=profile_id)
+            self.set_cooldown(
+                model,
+                reason,
+                config,
+                detail=detail,
+                profile_id=profile_id,
+                retry_after_seconds=hint.seconds if hint else None,
+                retry_after_source=hint.source if hint else None,
+            )
         else:
             self.record_benchmark_failure(model, reason, profile_id=profile_id, detail=detail)
         result.update({
             "status": "fail",
             "message": f"HTTP {response.status_code}: {reason}",
-            "text_preview": self.safe_detail(response.text, 160),
+            "text_preview": self.safe_detail(response_text, 160),
         })
         self.record_benchmark_result(profile_id, model, result)
         if (

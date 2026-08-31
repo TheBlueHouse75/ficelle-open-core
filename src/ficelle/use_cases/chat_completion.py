@@ -39,15 +39,19 @@ from ficelle.failures import (
     caller_rejected_request,
     status_for_error_codes,
     upstream_failure_status,
+    upstream_retry_after_seconds,
 )
+from ficelle.provider_admission import ProviderAdmissionRefused
 from ficelle.coding_certification import CODING_PROFILE_ID
 from ficelle.domain_models import SelectionResult
 from ficelle.use_cases.cooldowns import AppliedCooldown
 from ficelle.redaction import redact_sensitive_json, sanitize_error_detail
+from ficelle.retry_hints import retry_hint
 from ficelle.use_cases.benchmark import finish_reason_is_truncation
 
 
 DEFAULT_CHAT_COMPLETION_MODEL = "ficelle/auto-tools"
+MAX_INLINE_RETRY_AFTER_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -180,6 +184,8 @@ class UpstreamFailureDecision:
     cooldown_reason: str
     cooldown_detail: str
     cooldown_status: CooldownStatus
+    retry_after_seconds: int | None = None
+    retry_after_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -280,6 +286,8 @@ class AttemptCooldownRequest:
     reason: str
     detail: str | None
     status: CooldownStatus
+    retry_after_seconds: int | None = None
+    retry_after_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1094,25 +1102,28 @@ def evaluate_upstream_failure_response(
     except Exception as exc:
         text = f"<unreadable response body: {type(exc).__name__}>"
     reason = classify(status_code, text, model)
+    hint = retry_hint(getattr(response, "headers", None), text) if status_code in {429, 503} else None
+    attempt_update = {"status": status_code, "reason": reason, "latency_seconds": round(latency_seconds, 4)}
+    error = {
+        "model": model.get("id"),
+        "upstream": model.get("upstream_id"),
+        "source": model.get("source"),
+        "status": status_code,
+        "reason": reason,
+        "detail": text[:UPSTREAM_DETAIL_LIMIT],
+    }
+    if hint is not None:
+        attempt_update.update({"retry_after_seconds": hint.seconds, "retry_after_source": hint.source})
+        error.update({"retry_after_seconds": hint.seconds, "retry_after_source": hint.source})
     return UpstreamFailureDecision(
         outcome="retryable_failure" if _should_retry(reason, requested_model_is_virtual) else "terminal_failure",
-        attempt_update={"status": status_code, "reason": reason, "latency_seconds": round(latency_seconds, 4)},
-        error={
-            "model": model.get("id"),
-            "upstream": model.get("upstream_id"),
-            "source": model.get("source"),
-            "status": status_code,
-            "reason": reason,
-            # Wider than the cooldown detail below on purpose: this one is what the caller reads.
-            # Relays nest their wrappers ahead of the real message, so the sentence that names the
-            # problem sits at the end — a 250 cut on the OpenCode Zen rejection landed five
-            # characters short of "...passed back to the API.". The cooldown detail stays bounded
-            # because it is written to state, once per cooled model, and only ever read for triage.
-            "detail": text[:UPSTREAM_DETAIL_LIMIT],
-        },
+        attempt_update=attempt_update,
+        error=error,
         cooldown_reason=reason,
         cooldown_detail=f"HTTP {status_code}: {text[:250]}",
         cooldown_status=status_code,
+        retry_after_seconds=hint.seconds if hint is not None else None,
+        retry_after_source=hint.source if hint is not None else None,
     )
 
 
@@ -1173,6 +1184,11 @@ def build_success_route_log(row: SuccessRouteLogInput) -> dict[str, Any]:
     }
     if row.stream_started is not None:
         route_log["stream_started"] = row.stream_started
+    selected_attempt = row.attempts[-1] if row.attempts else {}
+    if isinstance(selected_attempt.get("first_byte_seconds"), (int, float)):
+        route_log["first_byte_seconds"] = selected_attempt["first_byte_seconds"]
+    if selected_attempt.get("admission_source") in {"declared_rpm", "provider_headers"}:
+        route_log["admission_source"] = selected_attempt["admission_source"]
     if row.usage is not None:
         route_log["usage"] = row.usage
         # Recorded with the request, not joined at read time: the model's catalog row
@@ -1243,7 +1259,7 @@ def build_failure_route_telemetry(row: FailureRouteLogInput) -> ChatCompletionRo
 
 
 def build_mid_stream_failure_route_log(row: MidStreamFailureRouteLogInput) -> dict[str, Any]:
-    return {
+    route_log = {
         "request_id": row.request_id,
         "requested_model": row.safe_requested_model,
         "selected_model": row.selected_model.get("id"),
@@ -1259,6 +1275,10 @@ def build_mid_stream_failure_route_log(row: MidStreamFailureRouteLogInput) -> di
         "stream_started": True,
         "compression": row.compression,
     }
+    selected_attempt = row.attempts[-1] if row.attempts else {}
+    if isinstance(selected_attempt.get("first_byte_seconds"), (int, float)):
+        route_log["first_byte_seconds"] = selected_attempt["first_byte_seconds"]
+    return route_log
 
 
 def build_mid_stream_failure_route_telemetry(row: MidStreamFailureRouteLogInput) -> ChatCompletionRouteTelemetry:
@@ -1285,10 +1305,15 @@ def build_upstream_failure_response(
     build_error: UpstreamFailureErrorBuilder,
     build_headers: FailureResponseHeadersBuilder,
 ) -> ChatCompletionResponse:
+    headers = build_headers(row.request_id, row.safe_requested_model, len(row.attempts), row.compression)
+    status = upstream_failure_status(row.errors)
+    retry_after_seconds = upstream_retry_after_seconds(row.errors, status)
+    if retry_after_seconds is not None:
+        headers["Retry-After"] = str(retry_after_seconds)
     return ChatCompletionResponse(
-        status=upstream_failure_status(row.errors),
+        status=status,
         payload=build_error(row.requested_model, row.request_id, row.candidate_count, row.attempts, row.errors),
-        headers=build_headers(row.request_id, row.safe_requested_model, len(row.attempts), row.compression),
+        headers=headers,
     )
 
 
@@ -1319,7 +1344,14 @@ def build_attempt_cooldown_request(
     detail = decision.cooldown_detail
     if detail is None and fallback_detail is not None:
         detail = str(fallback_detail)
-    return AttemptCooldownRequest(model=model, reason=str(reason), detail=detail, status=status)
+    return AttemptCooldownRequest(
+        model=model,
+        reason=str(reason),
+        detail=detail,
+        status=status,
+        retry_after_seconds=getattr(decision, "retry_after_seconds", None),
+        retry_after_source=getattr(decision, "retry_after_source", None),
+    )
 
 
 def build_non_streaming_success_response(
@@ -1361,6 +1393,15 @@ def build_streaming_response_start(
     )
 
 
+def add_first_byte_telemetry(attempt_update: dict[str, Any], response: Any) -> None:
+    raw = getattr(response, "_ficelle_first_byte_seconds", None)
+    if isinstance(raw, (int, float)) and math.isfinite(float(raw)) and float(raw) >= 0:
+        attempt_update["first_byte_seconds"] = round(float(raw), 4)
+    admission_source = getattr(response, "_ficelle_admission_source", None)
+    if admission_source in {"declared_rpm", "provider_headers"}:
+        attempt_update["admission_source"] = admission_source
+
+
 class ChatCompletionRouter:
     def __init__(
         self,
@@ -1376,7 +1417,9 @@ class ChatCompletionRouter:
         max_attempts_for_request: MaxAttemptsCalculator,
         prepare_compression_route_body: CompressionPlanner,
         now: Clock,
+        pause: Callable[[float], None] | None = None,
         select_result: ResultSelector | None = None,
+        selection_retry_after: Callable[[SelectionResult, dict[str, Any]], int | None] | None = None,
     ) -> None:
         self.config = config
         self.load_catalog = load_catalog
@@ -1389,7 +1432,9 @@ class ChatCompletionRouter:
         self.max_attempts_for_request = max_attempts_for_request
         self.prepare_compression_route_body = prepare_compression_route_body
         self.now = now
+        self.pause = pause or (lambda _seconds: None)
         self.select_result = select_result
+        self.selection_retry_after = selection_retry_after
 
     def start(
         self,
@@ -1573,6 +1618,21 @@ class ChatCompletionRouter:
         # Set when a provider named a sampling knob it refuses: the same model is asked again,
         # once, with that knob removed. It reuses its window slot rather than taking a new one.
         retry_same_model: dict[str, Any] | None = None
+        capacity_retried_ids: set[str] = set()
+
+        def inline_capacity_retry_delay(model: dict[str, Any], seconds: int | None) -> int | None:
+            if seconds is None or not (1 <= seconds <= MAX_INLINE_RETRY_AFTER_SECONDS):
+                return None
+            model_id = str(model.get("id") or "")
+            if model_id in capacity_retried_ids:
+                return None
+            if plan.requested_model_is_virtual and pending:
+                return None
+            if deadline is not None and deadline - self.now() <= seconds + 1:
+                return None
+            capacity_retried_ids.add(model_id)
+            return seconds
+
         while pending or retry_same_model is not None:
             is_retry = retry_same_model is not None
             if is_retry:
@@ -1641,6 +1701,7 @@ class ChatCompletionRouter:
                     "upstream": model.get("upstream_id"),
                     "source": model.get("source"),
                     "reason": "request_deadline_exceeded",
+                    "attempted": False,
                 })
                 break
             if not is_retry:
@@ -1669,6 +1730,44 @@ class ChatCompletionRouter:
                 )
             except Exception as exc:
                 latency = self.now() - started
+                if isinstance(exc, ProviderAdmissionRefused):
+                    retry_after = exc.retry_after_seconds
+                    retry_delay = inline_capacity_retry_delay(model, retry_after)
+                    attempt_update = {
+                        "status": 429,
+                        "reason": "rate_limited",
+                        "latency_seconds": round(latency, 4),
+                        "retry_after_seconds": retry_after,
+                        "retry_after_source": "local_admission",
+                        "admission": "deferred",
+                    }
+                    if retry_delay is not None:
+                        attempt_update["inline_retry_after_seconds"] = retry_delay
+                    record_attempt_failure(
+                        AttemptFailureRecordInput(
+                            attempt=attempt,
+                            attempt_update=attempt_update,
+                            attempts=attempts,
+                            errors=errors,
+                            error={
+                                "model": model.get("id"),
+                                "upstream": model.get("upstream_id"),
+                                "source": model.get("source"),
+                                "status": 429,
+                                "reason": "rate_limited",
+                                "detail": "local provider request budget is temporarily full",
+                                "retry_after_seconds": retry_after,
+                                "retry_after_source": "local_admission",
+                            },
+                        )
+                    )
+                    if retry_delay is not None:
+                        self.pause(float(retry_delay))
+                        retry_same_model = model
+                    elif str(model.get("source") or "") not in ruled_out_sources:
+                        ruled_out_sources.add(str(model.get("source") or ""))
+                        divert_pending = True
+                    continue
                 exception_decision = evaluate_invocation_exception(
                     exc,
                     model,
@@ -1701,6 +1800,7 @@ class ChatCompletionRouter:
                         detect_success_error=ports.detect_success_error,
                         has_deliverable=ports.has_deliverable,
                     )
+                    add_first_byte_telemetry(success_decision.attempt_update, response)
                     if success_decision.outcome != "success":
                         rule_out(
                             ports.apply_cooldown(
@@ -1786,6 +1886,7 @@ class ChatCompletionRouter:
                     requested_model_is_virtual=plan.requested_model_is_virtual,
                     classify=ports.classify_failure,
                 )
+                add_first_byte_telemetry(stream_decision.attempt_update, response)
                 record_attempt_result(
                     AttemptResultRecordInput(
                         attempt=attempt,
@@ -1860,6 +1961,7 @@ class ChatCompletionRouter:
                 requested_model_is_virtual=plan.requested_model_is_virtual,
                 classify=ports.classify_failure,
             )
+            add_first_byte_telemetry(upstream_failure.attempt_update, response)
             # A provider that rejects a sampling knob by name is telling us how to succeed:
             # drop that knob and ask the SAME model again, once. Only distribution-shaping
             # parameters qualify (never messages, tools, schemas or budgets), the retry is
@@ -1888,15 +1990,28 @@ class ChatCompletionRouter:
                 retry_same_model = model
                 continue
             rule_out(ports.apply_cooldown(build_attempt_cooldown_request(model, upstream_failure)))
+            retry_delay = inline_capacity_retry_delay(
+                model,
+                upstream_failure.retry_after_seconds
+                if upstream_failure.cooldown_reason in {"rate_limited", "rate_limited_upstream"}
+                else None,
+            )
+            attempt_update = dict(upstream_failure.attempt_update)
+            if retry_delay is not None:
+                attempt_update["inline_retry_after_seconds"] = retry_delay
             record_attempt_failure(
                 AttemptFailureRecordInput(
                     attempt=attempt,
-                    attempt_update=upstream_failure.attempt_update,
+                    attempt_update=attempt_update,
                     attempts=attempts,
                     errors=errors,
                     error=upstream_failure.error,
                 )
             )
+            if retry_delay is not None:
+                self.pause(float(retry_delay))
+                retry_same_model = model
+                continue
             if upstream_failure.outcome == "terminal_failure":
                 break
 
@@ -1944,6 +2059,7 @@ class ChatCompletionRouter:
         error_type: str,
         message: str,
         refusal_details: dict[str, Any] | None = None,
+        retry_after_seconds: int | None = None,
     ) -> ChatCompletionResponse:
         """A refusal Ficelle owns, logged like any other route so the Requests page shows it.
 
@@ -1969,11 +2085,15 @@ class ChatCompletionRouter:
         if refusal_details:
             route_row["refusal"] = dict(refusal_details)
             error_payload.update(refusal_details)
+        headers = self.response_headers(request_id, request.safe_requested_model)
+        if retry_after_seconds is not None and retry_after_seconds > 0:
+            headers["Retry-After"] = str(retry_after_seconds)
+            route_row["retry_after_seconds"] = retry_after_seconds
         self.write_route_log(route_row)
         return ChatCompletionResponse(
             status=status,
             payload={"error": error_payload},
-            headers=self.response_headers(request_id, request.safe_requested_model),
+            headers=headers,
         )
 
     def _malformed_tool_call_response(
@@ -2036,6 +2156,11 @@ class ChatCompletionRouter:
         request — it never claims "tool-capable" for a plain text request."""
         requested = request.requested_model
         safe_requested = request.safe_requested_model
+        retry_after_seconds = (
+            self.selection_retry_after(selection, catalog)
+            if self.selection_retry_after is not None
+            else None
+        )
         if not self.is_virtual_model(requested):
             row = next(
                 (
@@ -2071,6 +2196,7 @@ class ChatCompletionRouter:
                     f"not selectable ({block_reason}, scope: {scope})"
                 ),
                 refusal_details={"scope": scope, "block_reason": block_reason},
+                retry_after_seconds=retry_after_seconds,
             )
         excluded_counts = Counter(selection.excluded_reasons.values())
         bounded = dict(sorted(excluded_counts.items(), key=lambda item: (-item[1], item[0]))[:8])
@@ -2088,6 +2214,7 @@ class ChatCompletionRouter:
                     f"available for {safe_requested}"
                 ),
                 refusal_details={"excluded": bounded},
+                retry_after_seconds=retry_after_seconds,
             )
         capability = "tool-capable model" if body.get("tools") else "model"
         return self._refusal_response(
@@ -2100,4 +2227,5 @@ class ChatCompletionRouter:
             error_type="no_available_model",
             message=f"no invokable free {capability} available for {safe_requested}",
             refusal_details={"excluded": bounded} if bounded else None,
+            retry_after_seconds=retry_after_seconds,
         )

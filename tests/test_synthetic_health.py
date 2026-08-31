@@ -1304,8 +1304,8 @@ def test_late_route_correlation_waits_only_for_the_bounded_router_deadline():
     assert synthetic_health.late_route_correlation_wait_seconds({"request_deadline_seconds": 300}, 45.0) == 260.0
     # A router deadline shorter than the client timeout leaves only the margin.
     assert synthetic_health.late_route_correlation_wait_seconds({"request_deadline_seconds": 30}, 45.0) == 5.0
-    # Unconfigured: the 300 s default applies.
-    assert synthetic_health.late_route_correlation_wait_seconds({}, 100.0) == 205.0
+    # Unconfigured: the 900 s default applies.
+    assert synthetic_health.late_route_correlation_wait_seconds({}, 100.0) == 805.0
 
 
 def test_find_route_rows_correlates_by_synthetic_case_id(tmp_path):

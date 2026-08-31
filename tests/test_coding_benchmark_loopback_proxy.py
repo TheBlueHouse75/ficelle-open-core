@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from email.message import Message
 from pathlib import Path
 
@@ -38,3 +39,48 @@ def test_relay_bounds_request_bodies_before_reading_them():
         proxy._request_content_length(headers(Transfer_Encoding="chunked"))
     with pytest.raises(ValueError, match="invalid content length"):
         proxy._request_content_length(headers(Content_Length="not-a-number"))
+
+
+def test_relay_makes_truncated_before_content_non_retryable_for_benchmark():
+    body = json.dumps(
+        {
+            "error": {
+                "type": "upstream_failure",
+                "reasons": {"truncated_before_content": 1},
+            }
+        }
+    ).encode()
+
+    assert proxy._benchmark_response_status(502, body) == 422
+    assert proxy._benchmark_response_status(503, body) == 503
+
+
+def test_relay_makes_empty_model_response_non_retryable_for_benchmark():
+    body = json.dumps(
+        {
+            "error": {
+                "type": "upstream_failure",
+                "reasons": {"empty_assistant_message": 1},
+            }
+        }
+    ).encode()
+
+    assert proxy._benchmark_response_status(502, body) == 422
+
+
+def test_relay_keeps_real_or_mixed_provider_failures_retryable():
+    provider_error = json.dumps(
+        {"error": {"type": "upstream_failure", "reasons": {"timeout": 1}}}
+    ).encode()
+    mixed_error = json.dumps(
+        {
+            "error": {
+                "type": "upstream_failure",
+                "reasons": {"truncated_before_content": 1, "timeout": 1},
+            }
+        }
+    ).encode()
+
+    assert proxy._benchmark_response_status(502, provider_error) == 502
+    assert proxy._benchmark_response_status(502, mixed_error) == 502
+    assert proxy._benchmark_response_status(502, b"not-json") == 502

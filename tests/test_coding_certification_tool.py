@@ -223,7 +223,7 @@ def test_pass_summary_excludes_provider_and_harness_errors():
 
 def test_builder_refuses_incomplete_or_weak_results_and_weights_complete_results(tmp_path):
     paths = []
-    scores = {"aider-polyglot": 0.8}
+    scores = {"aider-polyglot": 0.6}
     for name, score in scores.items():
         policy = coding_benchmark_policy.BENCHMARK_POLICIES[name]
         path = tmp_path / f"{name}.json"
@@ -278,13 +278,13 @@ def test_builder_refuses_incomplete_or_weak_results_and_weights_complete_results
     args.results = paths
     manifest = tool.build_manifest(args)
     row = manifest["certifications"][0]
-    assert row["quality_score"] == pytest.approx(80.0)
+    assert row["quality_score"] == pytest.approx(60.0)
     assert {item["name"] for item in row["benchmarks"]} == coding_certification.REQUIRED_BENCHMARKS
 
     weak = json.loads(paths[0].read_text(encoding="utf-8"))
-    weak["pass_at_1"] = 0.6
+    weak["pass_at_1"] = 0.4
     paths[0].write_text(json.dumps(weak), encoding="utf-8")
-    with pytest.raises(ValueError, match="below the 80 qualification floor"):
+    with pytest.raises(ValueError, match="below the 60 qualification floor"):
         tool.build_manifest(args)
 
 
@@ -318,6 +318,8 @@ def test_bundled_manifest_is_valid():
     )
 
     assert [row["upstream_model_id"] for row in manifest["certifications"]] == [
+        "deepseek/deepseek-v4-pro-free",
+        "models/gemini-3.6-flash",
         "moonshotai/kimi-k3",
     ]
     assert manifest["priors"] == []

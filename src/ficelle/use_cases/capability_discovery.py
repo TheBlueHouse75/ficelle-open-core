@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from ficelle.failures import REQUEST_REJECTION_STATUSES as FAILURE_REQUEST_REJECTION_STATUSES
+from ficelle.provider_admission import ProviderAdmissionRefused
+from ficelle.retry_hints import retry_hint
 
 
 class ProbeResponseValidator(Protocol):
@@ -295,13 +297,23 @@ class CapabilityDiscoveryJob:
         *,
         detail: str,
         profile_id: str,
+        retry_after_seconds: int | None = None,
+        retry_after_source: str | None = None,
     ) -> ProbeVerdict:
         """Bench the model and stop probing it — one call so the two cannot drift apart.
 
         A benched model cannot answer the capabilities queued behind the one that just failed, so
         every probe fired at it is a wasted call into a limit already recorded.
         """
-        self.set_cooldown(model, reason, config, detail=detail, profile_id=profile_id)
+        self.set_cooldown(
+            model,
+            reason,
+            config,
+            detail=detail,
+            profile_id=profile_id,
+            retry_after_seconds=retry_after_seconds,
+            retry_after_source=retry_after_source,
+        )
         return "blocked"
 
     def probe_model_capability(self, model: dict[str, Any], profile_id: str, config: dict[str, Any]) -> ProbeVerdict:
@@ -315,6 +327,8 @@ class CapabilityDiscoveryJob:
         try:
             response = self.invoke_model(model, body, config)
         except Exception as exc:
+            if isinstance(exc, ProviderAdmissionRefused):
+                return "skip"
             return self._cool_and_stop(
                 model,
                 "unavailable",
@@ -364,7 +378,8 @@ class CapabilityDiscoveryJob:
         response: Any,
         result: dict[str, Any],
     ) -> ProbeVerdict:
-        reason = self.classify_failure(response.status_code, response.text, model)
+        response_text = str(response.text)
+        reason = self.classify_failure(response.status_code, response_text, model)
         blocking = reason in self.route_blocking_reasons
         # A rejected probe is a verdict on the capability, not on the model, so it must NOT bench the
         # model globally. Route rejections still defer to a provider-wide block: strict-zero means a
@@ -381,12 +396,15 @@ class CapabilityDiscoveryJob:
             self.record_benchmark_result(profile_id, model, result)
             self.record_verified_capability(profile_id, model, result)
             return "failed"
+        hint = retry_hint(getattr(response, "headers", None), response_text) if response.status_code in {429, 503} else None
         return self._cool_and_stop(
             model,
             reason,
             config,
             detail=f"discovery HTTP {response.status_code}: {reason}",
             profile_id=profile_id,
+            retry_after_seconds=hint.seconds if hint else None,
+            retry_after_source=hint.source if hint else None,
         )
 
     def run_auto_benchmark_cycle(

@@ -114,6 +114,26 @@ def test_aider_result_rows_attributes_provider_timeout_to_in_flight_task(tmp_pat
     assert rows[2]["status"] == "harness_error"
 
 
+def test_aider_result_rows_attributes_ficelle_request_deadline_to_provider(tmp_path):
+    run_dir = tmp_path / "run"
+    completed = run_dir / AIDER_CALIBRATION_TASKS[0] / ".aider.results.json"
+    completed.parent.mkdir(parents=True)
+    completed.write_text(json.dumps({"tests_outcomes": [True]}), encoding="utf-8")
+
+    rows, completed_count = adapter._aider_result_rows(
+        run_dir,
+        AIDER_CALIBRATION_TASKS,
+        run_diagnostic=(
+            "litellm.InternalServerError: upstream request failed: "
+            "RequestDeadlineExceeded request_deadline_exceeded"
+        ),
+    )
+
+    assert completed_count == 1
+    assert rows[1]["status"] == "provider_error"
+    assert rows[2]["status"] == "harness_error"
+
+
 def test_aider_result_rows_does_not_infer_provider_incident_from_model_text(tmp_path):
     rows, completed_count = adapter._aider_result_rows(
         tmp_path / "run",
@@ -136,6 +156,29 @@ def test_aider_result_rows_treats_exhausted_output_budget_as_model_failure(tmp_p
             "the model emitted any content"
         ),
     )
+
+    assert completed_count == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[1]["status"] == "harness_error"
+
+
+def test_aider_result_rows_treats_empty_assistant_response_as_model_failure(tmp_path):
+    run_dir = tmp_path / "run"
+    result = run_dir / AIDER_CALIBRATION_TASKS[0] / ".aider.results.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "exception": (
+                    "litellm.BadRequestError: HTTP 422 upstream_failure "
+                    "empty_assistant_message"
+                )
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows, completed_count = adapter._aider_result_rows(run_dir, AIDER_CALIBRATION_TASKS)
 
     assert completed_count == 1
     assert rows[0]["status"] == "failed"

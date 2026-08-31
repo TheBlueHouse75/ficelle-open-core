@@ -20,6 +20,12 @@ def test_bundled_manifest_qualifies_models_across_providers():
     assert coding_certification.certification_for_model(
         {"source": "ollama", "upstream_id": "moonshotai/kimi-k3"}, manifest
     )["quality_score"] == 100
+    assert coding_certification.certification_for_model(
+        {"source": "openrouter", "upstream_id": "deepseek/deepseek-v4-pro-free"}, manifest
+    )["quality_score"] == 60
+    assert coding_certification.certification_for_model(
+        {"source": "gemini", "upstream_id": "models/gemini-3.6-flash"}, manifest
+    )["quality_score"] == 60
 
 
 def test_bundled_manifest_rejects_an_unqualified_model():
@@ -35,8 +41,8 @@ def test_manifest_rejects_weak_or_inconsistent_qualification_scores():
     assert manifest is not None
 
     weak = copy.deepcopy(manifest)
-    weak["certifications"][0]["benchmarks"][0]["pass_at_1"] = 0.6
-    weak["certifications"][0]["quality_score"] = 60
+    weak["certifications"][0]["benchmarks"][0]["pass_at_1"] = 0.4
+    weak["certifications"][0]["quality_score"] = 40
     with pytest.raises(coding_certification.CodingCertificationError, match="qualification floor"):
         coding_certification.validate_manifest(weak, require_complete_policy=True)
 
@@ -46,12 +52,12 @@ def test_manifest_rejects_weak_or_inconsistent_qualification_scores():
         coding_certification.validate_manifest(inconsistent, require_complete_policy=True)
 
 
-def test_bundled_status_reports_one_model():
+def test_bundled_status_reports_three_models():
     status = coding_certification.public_status()
 
     assert status["status"] == "bundled"
-    assert status["certification_count"] == 1
-    assert status["manifest_id"] == "2026-08-22-kimi-k3-policy-v2"
+    assert status["certification_count"] == 3
+    assert status["manifest_id"] == "2026-08-23-coding-pool-3"
 
 
 def test_strict_parser_rejects_duplicate_keys_and_non_finite_numbers():
