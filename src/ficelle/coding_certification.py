@@ -1,8 +1,7 @@
 """Bundled coding qualifications for the ``ficelle/auto-coding`` routing lane.
 
-Public benchmark results are deliberately represented as priors in the manifest but are never
-indexed by the route helpers below. Only an exact bundled Ficelle qualification can make a model
-eligible; provider availability and compatibility remain separate runtime gates.
+Ficelle-verified benchmark results and explicitly reviewed provisional evidence are separate
+tiers. Provider availability and compatibility remain deployment-specific runtime gates.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ from urllib.parse import urlparse
 
 from ficelle.coding_benchmark_policy import (
     MIN_QUALIFYING_PASS_AT_1,
+    MIN_QUALIFYING_RESOLVED_RATE,
     CodingBenchmarkPolicyError,
     validate_evidence_metadata,
     validate_model_identity,
@@ -24,10 +24,11 @@ from ficelle.coding_benchmark_policy import (
 
 
 CODING_PROFILE_ID = "ficelle/auto-coding"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 BUILTIN_MANIFEST_PATH = Path(__file__).with_name("assets") / "auto-coding-manifest.json"
-REQUIRED_BENCHMARKS = frozenset({"aider-polyglot"})
-POLICY_VERSION = "coding-v2"
+REQUIRED_BENCHMARKS = frozenset({"aider-practical"})
+LEGACY_VERIFIED_BENCHMARKS = frozenset({"aider-polyglot"})
+POLICY_VERSION = "coding-v3"
 COMPATIBILITY_CANARY_VERSION = "coding-compatibility-v1"
 
 
@@ -133,6 +134,49 @@ def _validate_benchmark(row: Any) -> dict[str, Any]:
     return result
 
 
+def _model_ids(row: Mapping[str, Any], provider: str) -> tuple[str, ...]:
+    primary = _required_text(row, "upstream_model_id", limit=240)
+    raw_aliases = row.get("aliases", [])
+    if not isinstance(raw_aliases, list) or any(not isinstance(alias, str) for alias in raw_aliases):
+        raise CodingCertificationError("aliases must be an array of model ids")
+    aliases = [alias.strip() for alias in raw_aliases]
+    if any(not alias or len(alias) > 240 for alias in aliases):
+        raise CodingCertificationError("aliases must contain non-empty model ids")
+    values = [primary, *aliases]
+    if len(set(values)) != len(values):
+        raise CodingCertificationError("qualification model ids must be unique")
+    try:
+        return tuple(validate_model_identity(provider, value)[1] for value in values)
+    except CodingBenchmarkPolicyError as exc:
+        raise CodingCertificationError(f"qualification identity is outside pinned policy: {exc}") from exc
+
+
+def _benchmark_quality_rate(row: Mapping[str, Any]) -> float:
+    value = row.get("resolved_rate", row.get("pass_at_1"))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CodingCertificationError("benchmark must expose pass_at_1 or resolved_rate")
+    rate = float(value)
+    if not math.isfinite(rate) or not 0 <= rate <= 1:
+        raise CodingCertificationError("benchmark quality rate must be between 0 and 1")
+    return rate
+
+
+def _validate_provisional_evidence(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        raise CodingCertificationError("provisional evidence rows must be objects")
+    source_url = _required_text(row, "source_url", limit=500)
+    parsed = urlparse(source_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise CodingCertificationError("provisional evidence source_url must use HTTPS")
+    _required_text(row, "benchmark", limit=120)
+    _parse_timestamp(row.get("observed_at"), "observed_at")
+    provenance = _required_text(row, "provenance", limit=40)
+    if provenance not in {"vendor", "independent"}:
+        raise CodingCertificationError("provisional evidence provenance is unsupported")
+    _bounded_score(row, "score")
+    return dict(row)
+
+
 def validate_manifest(
     manifest: Any,
     *,
@@ -147,27 +191,29 @@ def validate_manifest(
         raise CodingCertificationError("unsupported coding certification policy")
 
     raw_certifications = manifest.get("certifications")
+    raw_provisionals = manifest.get("provisionals")
     raw_priors = manifest.get("priors")
-    if not isinstance(raw_certifications, list) or not isinstance(raw_priors, list):
-        raise CodingCertificationError("certifications and priors must be arrays")
+    if (
+        not isinstance(raw_certifications, list)
+        or not isinstance(raw_provisionals, list)
+        or not isinstance(raw_priors, list)
+    ):
+        raise CodingCertificationError("certifications, provisionals and priors must be arrays")
     identities: set[str] = set()
     certifications: list[dict[str, Any]] = []
     for raw in raw_certifications:
         if not isinstance(raw, dict):
             raise CodingCertificationError("certification rows must be objects")
-        try:
-            provider, upstream_model_id = validate_model_identity(
-                _required_text(raw, "provider", limit=80),
-                _required_text(raw, "upstream_model_id", limit=240),
-            )
-        except CodingBenchmarkPolicyError as exc:
-            raise CodingCertificationError(f"certification identity is outside pinned policy: {exc}") from exc
+        provider = _required_text(raw, "provider", limit=80).lower()
+        model_ids = _model_ids(raw, provider)
+        upstream_model_id = model_ids[0]
         # Quality belongs to the model, not to the route used to measure it. ``provider`` is kept
         # as provenance; per-provider compatibility remains a separate local canary gate.
-        identity = upstream_model_id
-        if identity in identities:
+        if any(identity in identities for identity in model_ids):
             raise CodingCertificationError("duplicate model certification")
-        identities.add(identity)
+        identities.update(model_ids)
+        if raw.get("tier") != "verified":
+            raise CodingCertificationError("certification tier must be verified")
         declared_score = _bounded_score(raw, "quality_score")
         _parse_timestamp(raw.get("certified_at"), "certified_at")
         if _required_text(raw, "compatibility_canary_version", limit=80) != COMPATIBILITY_CANARY_VERSION:
@@ -181,19 +227,57 @@ def validate_manifest(
         benchmark_names = {item["name"] for item in benchmarks}
         if len(benchmark_names) != len(benchmarks):
             raise CodingCertificationError("duplicate benchmark in certification")
-        if require_complete_policy and benchmark_names != REQUIRED_BENCHMARKS:
-            raise CodingCertificationError("certification does not contain the exact required benchmark set")
+        accepted_sets = {REQUIRED_BENCHMARKS, LEGACY_VERIFIED_BENCHMARKS}
+        if require_complete_policy and benchmark_names not in accepted_sets:
+            raise CodingCertificationError("certification does not contain an accepted complete benchmark set")
         measured_score = round(
-            sum(float(item["pass_at_1"]) for item in benchmarks) * 100 / len(benchmarks),
+            sum(_benchmark_quality_rate(item) for item in benchmarks) * 100 / len(benchmarks),
             4,
         )
-        if measured_score < MIN_QUALIFYING_PASS_AT_1 * 100:
+        floor = (
+            MIN_QUALIFYING_RESOLVED_RATE
+            if benchmark_names == REQUIRED_BENCHMARKS
+            else MIN_QUALIFYING_PASS_AT_1
+        )
+        if measured_score < floor * 100:
             raise CodingCertificationError("certification score is below the qualification floor")
         if not math.isclose(declared_score, measured_score, abs_tol=0.0001):
             raise CodingCertificationError("quality_score does not match benchmark evidence")
         row = dict(raw)
-        row.update({"provider": provider, "upstream_model_id": upstream_model_id, "benchmarks": benchmarks})
+        row.update(
+            {
+                "provider": provider,
+                "upstream_model_id": upstream_model_id,
+                "aliases": list(model_ids[1:]),
+                "benchmarks": benchmarks,
+            }
+        )
         certifications.append(row)
+    provisionals: list[dict[str, Any]] = []
+    for raw in raw_provisionals:
+        if not isinstance(raw, dict):
+            raise CodingCertificationError("provisional rows must be objects")
+        provider = _required_text(raw, "provider", limit=80).lower()
+        model_ids = _model_ids(raw, provider)
+        if any(identity in identities for identity in model_ids):
+            raise CodingCertificationError("duplicate model qualification")
+        identities.update(model_ids)
+        if raw.get("tier") != "provisional":
+            raise CodingCertificationError("provisional tier must be provisional")
+        _parse_timestamp(raw.get("admitted_at"), "admitted_at")
+        evidence = raw.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            raise CodingCertificationError("provisional qualification requires evidence")
+        row = dict(raw)
+        row.update(
+            {
+                "provider": provider,
+                "upstream_model_id": model_ids[0],
+                "aliases": list(model_ids[1:]),
+                "evidence": [_validate_provisional_evidence(item) for item in evidence],
+            }
+        )
+        provisionals.append(row)
     for prior in raw_priors:
         if not isinstance(prior, dict):
             raise CodingCertificationError("prior rows must be objects")
@@ -216,6 +300,7 @@ def validate_manifest(
             raise CodingCertificationError("public benchmark evidence_kind must be prior")
     result = dict(manifest)
     result["certifications"] = certifications
+    result["provisionals"] = provisionals
     return result
 
 
@@ -226,14 +311,21 @@ def certification_identity(model: Mapping[str, Any]) -> str:
 def certification_index(manifest: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
     if not isinstance(manifest, Mapping):
         return {}
-    rows = manifest.get("certifications")
-    if not isinstance(rows, list):
-        return {}
-    return {
-        str(row.get("upstream_model_id") or ""): dict(row)
-        for row in rows
-        if isinstance(row, dict)
-    }
+    certifications = manifest.get("certifications")
+    provisionals = manifest.get("provisionals")
+    rows = [
+        *(certifications if isinstance(certifications, list) else []),
+        *(provisionals if isinstance(provisionals, list) else []),
+    ]
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized = dict(row)
+        for model_id in [row.get("upstream_model_id"), *(row.get("aliases") or [])]:
+            if isinstance(model_id, str) and model_id:
+                result[model_id] = normalized
+    return result
 
 
 def certification_for_model(model: Mapping[str, Any], manifest: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -256,6 +348,12 @@ def public_status() -> dict[str, Any]:
         "status": "bundled" if manifest is not None else "unavailable",
         "manifest_id": manifest.get("manifest_id") if manifest else None,
         "certification_count": len(manifest.get("certifications") or []) if manifest else 0,
+        "provisional_count": len(manifest.get("provisionals") or []) if manifest else 0,
+        "qualification_count": (
+            len(manifest.get("certifications") or []) + len(manifest.get("provisionals") or [])
+            if manifest
+            else 0
+        ),
         "prior_count": len(manifest.get("priors") or []) if manifest else 0,
         "message": "" if manifest else "bundled coding qualifications unavailable",
     }

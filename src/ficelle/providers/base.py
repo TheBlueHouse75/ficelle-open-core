@@ -10,7 +10,22 @@ from ficelle.redaction import sanitize_error_detail
 
 CredentialResolver = Callable[[str, dict[str, Any]], tuple[str | None, str]]
 ExternalCredentialResolver = Callable[[str, str], tuple[str | None, str | None, str]]
+ProviderParameterResolver = Callable[[str], str | None]
 HttpGet = Callable[..., Any]
+
+
+def missing_provider_parameter(_name: str) -> str | None:
+    return None
+
+
+def suppress_implicit_http_auth(request: Any) -> Any:
+    """Keep Requests from consulting ``.netrc`` for an explicitly anonymous call.
+
+    Requests only performs its ambient ``.netrc`` lookup when the request has no explicit
+    auth handler. This no-op handler is therefore a security boundary: it changes no headers,
+    while preventing credentials outside Ficelle's resolver from entering an anonymous lane.
+    """
+    return request
 
 FREE_ACCESS_MODES = {"catalog_free", "quota_free", "local_free", "paid", "unknown"}
 FREE_ACCESS_SCOPES = {"model", "provider", "account", "shared_account"}
@@ -93,6 +108,7 @@ class ProviderAccess:
 class ProviderAccessContext:
     resolve_credentials: CredentialResolver
     resolve_external_credentials: ExternalCredentialResolver
+    resolve_provider_parameter: ProviderParameterResolver = missing_provider_parameter
 
 
 @dataclass(frozen=True)
@@ -100,6 +116,7 @@ class CatalogFetchContext:
     timeout_seconds: float
     http_get: HttpGet
     resolve_credentials: CredentialResolver
+    resolve_provider_parameter: ProviderParameterResolver = missing_provider_parameter
 
 
 @dataclass(frozen=True)

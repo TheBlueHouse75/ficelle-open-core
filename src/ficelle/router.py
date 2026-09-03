@@ -506,6 +506,7 @@ from ficelle.providers.base import (
     free_access_payload,
     normalized_free_access_status,
     CatalogFetchContext,
+    suppress_implicit_http_auth,
 )
 from ficelle.providers.openai_compatible import NOUS_DEFAULT_BASE_URL, OPENCODE_ZEN_USER_AGENT
 try:
@@ -514,6 +515,10 @@ try:
         from ficelle_pro.provider_pack import PROVIDER_PACK_KEY_VALIDATORS
     except ImportError:  # pragma: no cover - compatibility with an older installed Pro pack
         PROVIDER_PACK_KEY_VALIDATORS: dict[str, Any] = {}
+    try:
+        from ficelle_pro.provider_pack import RETIRED_PROVIDER_IDS
+    except ImportError:  # pragma: no cover - compatibility with an older installed Pro pack
+        RETIRED_PROVIDER_IDS: tuple[str, ...] = ()
 except ImportError:  # pragma: no cover - core-only install without the closed pack
     # The curated provider pack (incl. the grey-market relays and their key URLs) ships
     # only in the closed Pro package. Absent → DEFAULT_CONFIG["providers"] is
@@ -525,7 +530,22 @@ except ImportError:  # pragma: no cover - core-only install without the closed p
     PROVIDER_PACK_KEY_URLS: dict[str, str] = {}
     PROVIDER_PACK_KEY_VALIDATORS: dict[str, Any] = {}
     PROVIDER_PACK_LABELS: dict[str, str] = {}
+    RETIRED_PROVIDER_IDS: tuple[str, ...] = ()
 PROVIDER_KEY_VALIDATORS.update(PROVIDER_PACK_KEY_VALIDATORS)
+
+# Opaque tombstones let a Core-only reinstall retire provider definitions left in a Pro
+# FICELLE_HOME without publishing the closed provider names. The Pro-only retirement test
+# verifies these SHA-256 values against RETIRED_PROVIDER_IDS so the two registries cannot drift.
+RETIRED_PROVIDER_ID_HASHES: frozenset[str] = frozenset(
+    {
+        "11f7f578870a8ef4ed7ef97fc6650f3c1ef7755722a6ec4a36a12ca661bfbe45",
+        "1606916196539677fd6590ee8373dc3b3177358b7b27fd57c4191fe9316f4c85",
+        "70ceb23463cc1fdbbe775af67dd742ff054f11c35977f0fac9a075b8e3d93cf4",
+        "c287f920bc9a5832b8d3ad424db6b18da533586795be147c27842db7a97268d0",
+        "e5c85af4345fe430e39a0d93cc4ff3f2cbf463cfcb50611f9ebb8cf9bd8c4828",
+        "fa29cd01d19046f7edbb7ae0c7236275fc728be4637e970910cdeca1fe98232f",
+    }
+)
 from ficelle.providers.registry import provider_catalog_adapter
 from ficelle.reasoning_replay import (
     ReasoningReplayStore,
@@ -900,6 +920,30 @@ def configured_virtual_profile_policy_id(profile_id: str, config: dict[str, Any]
     return virtual_profile_policy_id(canonical, profile if isinstance(profile, dict) else None)
 
 
+STREAM_COMMIT_POLICIES = {"immediate", "first_complete_event", "first_substantive_delta"}
+
+
+def default_stream_commit_policy(profile_id: str) -> str:
+    return (
+        "first_substantive_delta"
+        if canonical_virtual_model_id(profile_id) == "ficelle/auto-compression"
+        else "first_complete_event"
+    )
+
+
+def stream_commit_policy_for_profile(profile_id: str, config: dict[str, Any]) -> str:
+    profiles = normalized_virtual_profiles(config)
+    canonical = canonical_virtual_model_id(profile_id)
+    profile = profiles.get(canonical)
+    if isinstance(profile, dict) and profile.get("stream_commit_policy") in STREAM_COMMIT_POLICIES:
+        return str(profile["stream_commit_policy"])
+    policy_profile_id = virtual_profile_policy_id(canonical, profile)
+    inherited_profile = profiles.get(policy_profile_id)
+    if isinstance(inherited_profile, dict) and inherited_profile.get("stream_commit_policy") in STREAM_COMMIT_POLICIES:
+        return str(inherited_profile["stream_commit_policy"])
+    return default_stream_commit_policy(policy_profile_id)
+
+
 def canonical_virtual_model_id(model_id: str) -> str:
     return str(model_id or "").strip()
 
@@ -950,6 +994,7 @@ DEFAULT_VIRTUAL_PROFILES = {
         "models": [],
         "excluded_models": [],
         "auto_tail": True,
+        "stream_commit_policy": default_stream_commit_policy(model_id),
         "requirements": {**DEFAULT_PROFILE_REQUIREMENTS, **VIRTUAL_MODEL_REQUIREMENTS.get(canonical_virtual_model_id(model_id), {})},
     }
     for model_id in sorted(VIRTUAL_MODELS)
@@ -1869,11 +1914,31 @@ def normalize_config_fusion(config: dict[str, Any], *, strict: bool = False) -> 
     return config
 
 
+def is_retired_provider_id(provider_id: object) -> bool:
+    if not isinstance(provider_id, str):
+        return False
+    return (
+        provider_id in RETIRED_PROVIDER_IDS
+        or hashlib.sha256(provider_id.encode("utf-8")).hexdigest() in RETIRED_PROVIDER_ID_HASHES
+    )
+
+
+def normalize_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        config["providers"] = {
+            provider_id: provider
+            for provider_id, provider in providers.items()
+            if not is_retired_provider_id(provider_id)
+        }
+    return normalize_config_fusion(config, strict=False)
+
+
 def runtime_config_store() -> ConfigStore:
     return ConfigStore(
         CONFIG_PATH,
         DEFAULT_CONFIG,
-        normalize=lambda config: normalize_config_fusion(config, strict=False),
+        normalize=normalize_runtime_config,
         fallback_config_path=CONFIG_PATH,
     )
 
@@ -1883,11 +1948,22 @@ def load_config() -> dict[str, Any]:
     if not isinstance(store, ConfigStore):
         return store.load()
     stored = load_json(store.read_path(), {})
+    stored_providers = (
+        stored.get("providers")
+        if isinstance(stored, dict) and isinstance(stored.get("providers"), dict)
+        else {}
+    )
+    has_retired_providers = any(
+        is_retired_provider_id(provider_id) for provider_id in stored_providers
+    )
     if (
         isinstance(stored, dict)
         and stored
-        and safe_int(stored.get("request_timeout_policy_version"), 0)
-        < REQUEST_TIMEOUT_POLICY_VERSION
+        and (
+            safe_int(stored.get("request_timeout_policy_version"), 0)
+            < REQUEST_TIMEOUT_POLICY_VERSION
+            or has_retired_providers
+        )
     ):
         # Re-read under the write lock so a concurrent dashboard or CLI update made after this
         # check is normalized in place instead of being overwritten by a stale copy.
@@ -2112,6 +2188,14 @@ def normalize_virtual_profile(
         "auto_tail": bool(profile.get("auto_tail", True)),
         "requirements": requirements,
     }
+    if "stream_commit_policy" in profile:
+        raw_stream_commit_policy = profile.get("stream_commit_policy")
+        stream_commit_policy = str(raw_stream_commit_policy)
+        if stream_commit_policy not in STREAM_COMMIT_POLICIES:
+            raise ValueError(f"unsupported stream_commit_policy for {profile_id}: {stream_commit_policy}")
+        normalized["stream_commit_policy"] = stream_commit_policy
+    elif not custom:
+        normalized["stream_commit_policy"] = default_stream_commit_policy(profile_id)
     if custom:
         default_label = profile_id.removeprefix(CUSTOM_VIRTUAL_PROFILE_PREFIX).replace("-", " ").replace("/", " ").title()
         label = str(profile.get("label") or default_label).strip()
@@ -3966,6 +4050,12 @@ def generic_provider_credential_activation_fingerprint(source: str, provider_cfg
     fingerprint["credential_digest"] = (
         hashlib.sha256(credential.encode("utf-8")).hexdigest() if credential else None
     )
+    parameter_env = str(provider_cfg.get("account_id_env") or "").strip()
+    if parameter_env:
+        parameter = resolve_provider_parameter(parameter_env)
+        fingerprint["provider_parameter_digest"] = (
+            hashlib.sha256(parameter.encode("utf-8")).hexdigest() if parameter else None
+        )
     return fingerprint
 
 
@@ -3981,6 +4071,9 @@ def provider_credential_identities(config: dict[str, Any]) -> dict[str, str | No
     identities: dict[str, str | None] = {}
     for source, provider_cfg in providers.items():
         if not isinstance(provider_cfg, dict):
+            continue
+        if str(provider_cfg.get("auth_mode") or "") == "anonymous":
+            identities[str(source)] = None
             continue
         credential, _credential_source = resolve_generic_provider_credentials(str(source), provider_cfg)
         identities[str(source)] = (
@@ -4703,6 +4796,7 @@ def provider_catalog_ports() -> ProviderCatalogPorts:
         resolve_credentials=resolve_generic_provider_credentials,
         resolve_external_credentials=resolve_via_external_resolvers,
         http_get=requests.get,
+        resolve_provider_parameter=resolve_provider_parameter,
     )
 
 
@@ -4733,6 +4827,23 @@ def resolve_generic_provider_credentials(source: str, provider_cfg: dict[str, An
     return resolve_credentials(env_names, services, validator=PROVIDER_KEY_VALIDATORS.get(source))
 
 
+def resolve_provider_parameter(name: str) -> str | None:
+    """Resolve a non-secret provider parameter from process env or Ficelle's `.env`.
+
+    Provider adapters pass a fixed, provider-owned variable name; this is not a general
+    environment expansion facility. Keeping the lookup out of the secret-store cascade avoids
+    presenting account identifiers as API keys while still making them available to launchd.
+    """
+    value = os.getenv(name)
+    if value:
+        return value.strip() or None
+    for env_file in _credential_env_file_paths():
+        value = parse_env_file(env_file).get(name)
+        if value:
+            return value.strip() or None
+    return None
+
+
 def provider_primary_service(source: str, config: dict[str, Any]) -> str:
     """The canonical service name a provider's key is written under — its primary env
     alias (e.g. ``OPENROUTER_API_KEY``). Reads pick it up as the first service tried."""
@@ -4760,6 +4871,10 @@ def store_provider_key(
     ``store`` defaults to ``default_secret_store()`` (the interactive/CLI target — the
     macOS login Keychain). The server-side write path passes a non-interactive store
     so the launchd daemon never touches the login keychain (R9)."""
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    provider_cfg = providers.get(source) if isinstance(providers.get(source), dict) else {}
+    if str(provider_cfg.get("auth_mode") or "") == "anonymous":
+        raise ValueError(f"provider {source} uses anonymous access and does not accept an API key")
     store = store if store is not None else default_secret_store()
     target = store_provider_key_use_case(
         source,
@@ -7533,6 +7648,12 @@ def sort_available_for_virtual_model(requested_model: str, available: list[dict[
         ordered = list(available)
         ordered.sort(
             key=lambda model: (
+                0
+                if certifications.get(
+                    coding_certification.certification_identity(model), {}
+                ).get("tier")
+                == "verified"
+                else 1,
                 -float(
                     certifications.get(coding_certification.certification_identity(model), {}).get("quality_score")
                     or 0.0
@@ -8037,9 +8158,12 @@ def model_route_competence(profile_id: str, model: dict[str, Any], state: dict[s
     canonical = canonical_virtual_model_id(profile_id)
     if canonical == coding_certification.CODING_PROFILE_ID:
         manifest = coding_certification.cached_manifest()
-        if coding_certification.certification_for_model(model, manifest) is None:
+        qualification = coding_certification.certification_for_model(model, manifest)
+        if qualification is None:
             return "uncertified"
-        return "failed_compatibility" if model_failed_profile_evidence(canonical, model, state) else "certified"
+        if model_failed_profile_evidence(canonical, model, state):
+            return "failed_compatibility"
+        return str(qualification.get("tier") or "verified")
     return policy_competence_label(
         canonical,
         model,
@@ -8516,6 +8640,8 @@ def invoke_model(
     payload.pop("_ficelle_timeout_seconds", None)
     payload.pop("_ficelle_extra_headers", None)
     payload["model"] = model["upstream_id"]
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    provider_cfg = providers.get(source) if isinstance(providers.get(source), dict) else {}
     # Restore a thinking model's own trace on replayed tool calls. A no-op for every model
     # that has not been seen emitting one, which is nearly all of them. See
     # `ficelle.reasoning_replay` for why this is the one body rewrite Ficelle performs.
@@ -8524,7 +8650,7 @@ def invoke_model(
     # adapter installed a live-proven lossless transform. Generic mechanism here, provider
     # policy in the adapter — never a silent rewrite of the client's schemas.
     payload = provider_catalog_adapter(source).adapt_chat_request(
-        payload, model, (config.get("providers") or {}).get(source)
+        payload, model, provider_cfg
     )
     headers = {
         "Content-Type": "application/json",
@@ -8549,11 +8675,16 @@ def invoke_model(
         if budgeted < timeout:
             timeout = budgeted
             budget_constrained = True
-    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    admission_scope_key = (
+        str(model.get("upstream_id") or "")
+        if str(provider_cfg.get("rate_limit_scope") or "") == "model"
+        else ""
+    )
     admission = PROVIDER_ADMISSION_LEDGER.reserve(
         source,
         providers.get(source),
         namespace=str(FICELLE_HOME),
+        scope_key=admission_scope_key,
     )
     if not admission.allowed:
         raise ProviderAdmissionRefused(source, admission.retry_after_seconds or 1)
@@ -8562,23 +8693,27 @@ def invoke_model(
     # binding the result is what lets the trace be observed before the response is returned.
     provider_request_started = time.monotonic()
     try:
-        response = upstream_post(
-            f"{base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
+        request_kwargs: dict[str, Any] = {
+            "headers": headers,
+            "json": payload,
             # Separate, short connect timeout so a black-holed provider endpoint fails over in
             # seconds instead of holding the whole profile timeout at connect — the same policy the
             # catalog fetch already applies (providers/openai_compatible.py). A model that is simply
             # slow to *answer* still gets the full read budget.
-            timeout=(min(CONNECT_TIMEOUT_SECONDS, timeout), timeout),
+            "timeout": (min(CONNECT_TIMEOUT_SECONDS, timeout), timeout),
             # Always stream at the HTTP transport layer so provider-controlled bytes can be bounded
             # before they enter memory. Logical downstream streaming remains controlled by the payload.
-            stream=True,
-        )
+            "stream": True,
+        }
+        if str(provider_cfg.get("auth_mode") or "") == "anonymous":
+            request_kwargs["auth"] = suppress_implicit_http_auth
+            request_kwargs["allow_redirects"] = False
+        response = upstream_post(f"{base_url.rstrip('/')}/chat/completions", **request_kwargs)
         PROVIDER_ADMISSION_LEDGER.observe(
             source,
             getattr(response, "headers", {}),
             namespace=str(FICELLE_HOME),
+            scope_key=admission_scope_key,
         )
         response._ficelle_admission_source = admission.source
         response._ficelle_request_started_monotonic = provider_request_started
@@ -9367,6 +9502,34 @@ def sse_data_objects(text: str) -> Iterator[dict[str, Any]]:
             yield parsed
 
 
+def structured_stream_error_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a normalized OpenAI-compatible error payload, if present."""
+    error = payload.get("error")
+    if isinstance(error, (dict, str)):
+        return error if isinstance(error, dict) else {"message": error}
+    payload_type = str(payload.get("type") or "").strip().lower()
+    return payload if payload_type in {"error", "stream_error"} else None
+
+
+def sse_event_error_payload(event: bytes) -> dict[str, Any] | None:
+    """Return a structured provider error carried by one SSE event, if any."""
+    event_type = ""
+    text = event.decode("utf-8", errors="replace")
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        field, delimiter, value = raw_line.partition(":")
+        if delimiter and field.strip().lower() == "event":
+            event_type = value.strip().lower()
+            break
+    if event_type in {"error", "stream_error"}:
+        return {"type": event_type, "message": f"upstream SSE {event_type} event"}
+
+    for parsed in sse_data_objects(text):
+        error = structured_stream_error_payload(parsed)
+        if error is not None:
+            return error
+    return None
+
+
 def upstream_stream_error_payload(chunk: bytes) -> dict[str, Any] | None:
     """The error object a provider put in its first streamed chunk, or None.
 
@@ -9384,22 +9547,21 @@ def upstream_stream_error_payload(chunk: bytes) -> dict[str, Any] | None:
         return None
     if not text:
         return None
-    parsed_objects: Iterable[dict[str, Any]]
-    if text.startswith("data:"):
-        parsed_objects = sse_data_objects(text)
-    elif text.startswith("{"):
+    if text.startswith("{"):
         # Some providers drop the SSE framing entirely and answer with a bare JSON error.
         try:
             bare = json.loads(text)
         except ValueError:
             return None
-        parsed_objects = [bare] if isinstance(bare, dict) else []
-    else:
-        return None
-    for parsed in parsed_objects:
-        if isinstance(parsed.get("error"), (dict, str)):
-            error = parsed["error"]
-            return error if isinstance(error, dict) else {"message": error}
+        if not isinstance(bare, dict):
+            return None
+        return structured_stream_error_payload(bare)
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    for event in normalized.split("\n\n"):
+        error = sse_event_error_payload(event.encode("utf-8"))
+        if error is not None:
+            return error
     return None
 
 
@@ -9414,6 +9576,44 @@ DELIVERABLE_FIELD_MARKERS = (
     # The audio-output modality answers with `content: null` and the turn in `audio`.
     b'"audio"',
 )
+
+# Policies that classify beyond a transport fragment keep a small initial SSE prefix private.
+# The bound prevents an unfamiliar or incomplete stream dialect from accumulating without limit.
+STREAM_PRECOMMIT_MAX_BYTES = 64 * 1024
+
+
+def sse_payload_carries_assistant_output(
+    payload: dict[str, Any],
+    *,
+    include_reasoning: bool,
+) -> bool:
+    """Whether one parsed SSE payload carries caller-visible assistant output."""
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        # A streamed turn carries `delta`; a provider that frames a whole non-streamed
+        # choice into one SSE event carries `message`. Both spell the same fields.
+        for holder_key in ("delta", "message"):
+            holder = choice.get(holder_key)
+            if not isinstance(holder, dict):
+                continue
+            content = holder.get("content")
+            if isinstance(content, (str, list)) and content:
+                return True
+            refusal = holder.get("refusal")
+            if isinstance(refusal, str) and refusal:
+                return True
+            if holder.get("tool_calls") or holder.get("function_call") or holder.get("audio"):
+                return True
+            if include_reasoning:
+                for field in ("reasoning", "reasoning_content"):
+                    value = holder.get(field)
+                    if isinstance(value, (str, list)) and value:
+                        return True
+    return False
 
 
 def sse_chunk_carries_deliverable(chunk: bytes) -> bool:
@@ -9438,28 +9638,44 @@ def sse_chunk_carries_deliverable(chunk: bytes) -> bool:
     """
     if not any(marker in chunk for marker in DELIVERABLE_FIELD_MARKERS):
         return False
-    for parsed in sse_data_objects(chunk.decode("utf-8", errors="replace")):
-        choices = parsed.get("choices")
-        if not isinstance(choices, list):
-            continue
-        for choice in choices:
-            if not isinstance(choice, dict):
-                continue
-            # A streamed turn carries `delta`; a provider that frames a whole non-streamed
-            # choice into one SSE event carries `message`. Both spell the same fields.
-            for holder_key in ("delta", "message"):
-                holder = choice.get(holder_key)
-                if not isinstance(holder, dict):
-                    continue
-                content = holder.get("content")
-                if isinstance(content, (str, list)) and content:
-                    return True
-                refusal = holder.get("refusal")
-                if isinstance(refusal, str) and refusal:
-                    return True
-                if holder.get("tool_calls") or holder.get("function_call") or holder.get("audio"):
-                    return True
-    return False
+    return any(
+        sse_payload_carries_assistant_output(parsed, include_reasoning=False)
+        for parsed in sse_data_objects(chunk.decode("utf-8", errors="replace"))
+    )
+
+
+def compression_stream_precommit_event_decision(event: bytes) -> tuple[str, dict[str, Any] | None]:
+    """Classify one complete SSE event as ``commit``, ``retry`` or ``wait``."""
+    error = sse_event_error_payload(event)
+    if error is not None:
+        return "retry", error
+
+    for parsed in sse_data_objects((event + b"\n\n").decode("utf-8", errors="replace")):
+        if sse_payload_carries_assistant_output(parsed, include_reasoning=True):
+            return "commit", None
+    return "wait", None
+
+
+def stream_precommit_event_decision(
+    event: bytes,
+    stream_commit_policy: str,
+) -> tuple[str, dict[str, Any] | None]:
+    error = sse_event_error_payload(event)
+    if error is not None:
+        return "retry", error
+    if stream_commit_policy == "first_complete_event":
+        return "commit", None
+    return compression_stream_precommit_event_decision(event)
+
+
+def normalize_incremental_sse_fragment(chunk: bytes, pending_cr: bool) -> tuple[bytes, bool]:
+    """Normalize one SSE fragment without rescanning bytes from earlier fragments."""
+    if pending_cr:
+        chunk = b"\r" + chunk
+    next_pending_cr = chunk.endswith(b"\r")
+    if next_pending_cr:
+        chunk = chunk[:-1]
+    return chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n"), next_pending_cr
 
 
 def finish_reason_from_sse_tail(tail: bytes) -> str:
@@ -9693,7 +9909,10 @@ def stream_chunks_to_writer(
     *,
     expect_sse_done: bool = True,
     expected_choice_count: int = 1,
+    stream_commit_policy: str = "immediate",
 ) -> dict[str, Any]:
+    if stream_commit_policy not in STREAM_COMMIT_POLICIES:
+        raise ValueError(f"unsupported stream_commit_policy: {stream_commit_policy}")
     response_committed = False
     # True only while a call into `write_chunk`/`flush` is in flight — the delivery side. An
     # exception raised under this flag never came from the upstream, which is what matters here: a
@@ -9707,6 +9926,10 @@ def stream_chunks_to_writer(
     stream_tail = b""
     normalization_carry = b""
     normalization_valid = True
+    precommit_buffer = bytearray()
+    precommit_scan_buffer = bytearray()
+    precommit_scan_offset = 0
+    precommit_pending_cr = False
 
     def emit_terminal_error(reason: str, detail: str | None) -> None:
         # Best-effort — the client may already be gone (broken pipe); the failure is still
@@ -9724,6 +9947,65 @@ def stream_chunks_to_writer(
         except Exception:
             pass
 
+    def relay_chunk(outbound_chunk: bytes) -> None:
+        nonlocal response_committed
+        nonlocal writing_to_client
+        nonlocal chunk_count
+        nonlocal bytes_sent
+        nonlocal deliverable_sent
+        nonlocal deliverable_carry
+        nonlocal stream_tail
+        nonlocal normalization_valid
+        nonlocal normalization_carry
+
+        # The writer may emit HTTP headers before attempting the first body write. Mark
+        # the response as committed before calling it so a body failure cannot trigger a
+        # fallback on an already-started HTTP 200; update byte/tail metrics only after the
+        # chunk itself was accepted.
+        response_committed = True
+        writing_to_client = True
+        write_chunk(outbound_chunk)
+        chunk_count += 1
+        bytes_sent += len(outbound_chunk)
+        if expect_sse_done and not deliverable_sent:
+            try:
+                buffered = deliverable_carry + outbound_chunk
+                trailing_cr = b""
+                if buffered.endswith(b"\r"):
+                    buffered, trailing_cr = buffered[:-1], b"\r"
+                buffered = buffered.replace(b"\r\n", b"\n").replace(b"\r", b"\n") + trailing_cr
+                scan, _, deliverable_carry = buffered.rpartition(b"\n\n")
+                if scan and sse_chunk_carries_deliverable(scan):
+                    deliverable_sent = True
+                elif len(deliverable_carry) > SSE_TERMINAL_TAIL_BYTES:
+                    # One frame wider than the carry window cannot be parsed here. Calling
+                    # it empty would bench a model that may well have answered, so the
+                    # check gives up in the model's favour and the attempt stands.
+                    deliverable_sent = True
+            except Exception:
+                # This runs inside the write window, where any throw is classified as
+                # `client_disconnected`, truncates a healthy relay and appends a bogus
+                # error frame. Scoring must never cost the response -- the same rule the
+                # reasoning observer follows by swallowing its own parse errors.
+                deliverable_sent = True
+                deliverable_carry = b""
+        stream_tail = (stream_tail + outbound_chunk)[-SSE_TERMINAL_TAIL_BYTES:]
+        if expect_sse_done and normalization_valid:
+            try:
+                normalization_valid, normalization_carry = consume_sse_normalization_events(
+                    normalization_carry + outbound_chunk
+                )
+                if len(normalization_carry) > SSE_TERMINAL_TAIL_BYTES:
+                    normalization_valid = False
+                if not normalization_valid:
+                    normalization_carry = b""
+            except Exception:
+                # Validation can withhold normalization, but must never interrupt the relay.
+                normalization_valid = False
+                normalization_carry = b""
+        flush()
+        writing_to_client = False
+
     # Observed on the chunks already on their way past, never by buffering: the answer to
     # "did this stream deliver anything usable" is only final at `[DONE]`, and by then the
     # bytes are long gone. It decides how the attempt is *scored*, never whether it is retried.
@@ -9736,16 +10018,67 @@ def stream_chunks_to_writer(
         for chunk in chunks:
             if not chunk:
                 continue
-            if bytes_sent + len(chunk) > MAX_UPSTREAM_RESPONSE_BYTES:
+            if bytes_sent + len(precommit_buffer) + len(chunk) > MAX_UPSTREAM_RESPONSE_BYTES:
                 # Check before delivery: a provider can yield one arbitrarily large chunk, so a
                 # post-write check would still send an unbounded response to the client.
                 # This remains outside the delivery window and therefore is an upstream failure.
                 raise UpstreamResponseTooLarge(
                     f"upstream streamed past the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
                 )
-            if not response_committed:
-                # Inspecting only the FIRST chunk keeps the first-byte rule intact and bounds the
-                # added TTFB to one already-received chunk: nothing is buffered or waited for.
+            outbound_chunks = [chunk]
+            if stream_commit_policy != "immediate" and expect_sse_done and not response_committed:
+                decision = "wait"
+                stream_error = None
+                if not precommit_buffer and chunk[:64].lstrip().startswith(b"{"):
+                    stream_error = upstream_stream_error_payload(chunk)
+                    if stream_error is not None:
+                        decision = "retry"
+                remaining_guard_bytes = STREAM_PRECOMMIT_MAX_BYTES - len(precommit_buffer)
+                current_chunk_fits_guard = len(chunk) <= remaining_guard_bytes
+                guarded_fragment = chunk if current_chunk_fits_guard else chunk[:remaining_guard_bytes]
+                if current_chunk_fits_guard:
+                    precommit_buffer.extend(chunk)
+                normalized_chunk, precommit_pending_cr = normalize_incremental_sse_fragment(
+                    guarded_fragment,
+                    precommit_pending_cr,
+                )
+                precommit_scan_buffer.extend(normalized_chunk)
+                while decision == "wait":
+                    separator = precommit_scan_buffer.find(b"\n\n", precommit_scan_offset)
+                    if separator < 0:
+                        break
+                    event = bytes(precommit_scan_buffer[precommit_scan_offset:separator])
+                    precommit_scan_offset = separator + 2
+                    decision, stream_error = stream_precommit_event_decision(event, stream_commit_policy)
+                    if decision != "wait":
+                        break
+                if decision == "retry" and stream_error is not None:
+                    return {
+                        "status": "error",
+                        "reason": "pre_stream_failure",
+                        "stream_started": False,
+                        "chunk_count": 0,
+                        "bytes_sent": 0,
+                        "error_type": str(stream_error.get("type") or stream_error.get("code") or "upstream_error"),
+                        "message": safe_detail(str(stream_error.get("message") or stream_error)),
+                    }
+                if (
+                    decision == "wait"
+                    and current_chunk_fits_guard
+                    and len(precommit_buffer) < STREAM_PRECOMMIT_MAX_BYTES
+                ):
+                    continue
+                if current_chunk_fits_guard:
+                    outbound_chunks = [bytes(precommit_buffer)]
+                else:
+                    held_chunks = bytes(precommit_buffer)
+                    outbound_chunks = ([held_chunks] if held_chunks else []) + [chunk]
+                precommit_buffer.clear()
+                precommit_scan_buffer.clear()
+            elif not response_committed:
+                # The normal low-latency path inspects only the first received chunk. Compression
+                # uses the ordered pre-commit decision above instead, because one transport chunk
+                # can contain both substantive output and a later error event.
                 stream_error = upstream_stream_error_payload(chunk)
                 if stream_error is not None:
                     return {
@@ -9757,55 +10090,8 @@ def stream_chunks_to_writer(
                         "error_type": str(stream_error.get("type") or stream_error.get("code") or "upstream_error"),
                         "message": safe_detail(str(stream_error.get("message") or stream_error)),
                     }
-            # The writer may emit HTTP headers before attempting the first body write. Mark
-            # the response as committed before calling it so a body failure cannot trigger a
-            # fallback on an already-started HTTP 200; update byte/tail metrics only after the
-            # chunk itself was accepted.
-            response_committed = True
-            writing_to_client = True
-            write_chunk(chunk)
-            chunk_count += 1
-            bytes_sent += len(chunk)
-            if expect_sse_done and not deliverable_sent:
-                try:
-                    buffered = deliverable_carry + chunk
-                    trailing_cr = b""
-                    if buffered.endswith(b"\r"):
-                        buffered, trailing_cr = buffered[:-1], b"\r"
-                    buffered = (
-                        buffered.replace(b"\r\n", b"\n").replace(b"\r", b"\n") + trailing_cr
-                    )
-                    scan, _, deliverable_carry = buffered.rpartition(b"\n\n")
-                    if scan and sse_chunk_carries_deliverable(scan):
-                        deliverable_sent = True
-                    elif len(deliverable_carry) > SSE_TERMINAL_TAIL_BYTES:
-                        # One frame wider than the carry window cannot be parsed here. Calling
-                        # it empty would bench a model that may well have answered, so the
-                        # check gives up in the model's favour and the attempt stands.
-                        deliverable_sent = True
-                except Exception:
-                    # This runs inside the write window, where any throw is classified as
-                    # `client_disconnected`, truncates a healthy relay and appends a bogus
-                    # error frame. Scoring must never cost the response -- the same rule the
-                    # reasoning observer follows by swallowing its own parse errors.
-                    deliverable_sent = True
-                    deliverable_carry = b""
-            stream_tail = (stream_tail + chunk)[-SSE_TERMINAL_TAIL_BYTES:]
-            if expect_sse_done and normalization_valid:
-                try:
-                    normalization_valid, normalization_carry = consume_sse_normalization_events(
-                        normalization_carry + chunk
-                    )
-                    if len(normalization_carry) > SSE_TERMINAL_TAIL_BYTES:
-                        normalization_valid = False
-                    if not normalization_valid:
-                        normalization_carry = b""
-                except Exception:
-                    # Validation can withhold normalization, but must never interrupt the relay.
-                    normalization_valid = False
-                    normalization_carry = b""
-            flush()
-            writing_to_client = False
+            for outbound_chunk in outbound_chunks:
+                relay_chunk(outbound_chunk)
     except Exception as exc:
         if writing_to_client:
             reason = "client_disconnected"
@@ -11586,9 +11872,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 provider = providers.get(source) if isinstance(providers, dict) else None
                 if not isinstance(provider, dict):
                     raise ValueError(f"unknown provider: {source}")
-                # Validated against the configured registry, not the enabled-filtered catalog:
-                # a disabled provider is absent from the latter, so re-enabling one would be
-                # rejected as unknown.
+                # Validate against the configured registry rather than a possibly missing or
+                # stale catalog row.
                 enabled = action == "enable"
                 before_enabled = bool(provider.get("enabled", True))
 
@@ -12017,6 +12302,16 @@ class RouterHandler(BaseHTTPRequestHandler):
                             headers_sent = True
                         self.wfile.write(chunk)
 
+                    # The [DONE] contract applies to SSE bodies; a provider answering a stream
+                    # request with a plain JSON body (no SSE framing) has no terminator to demand.
+                    upstream_content_type = str(response.headers.get("Content-Type") or "text/event-stream")
+                    expect_sse_done = "event-stream" in upstream_content_type.lower()
+                    stream_commit_policy = stream_commit_policy_for_profile(requested_model, effective_config)
+                    # A bounded transport read preserves incremental delivery and ensures the
+                    # first-chunk error probe never materializes an entire long SSE body. Each
+                    # profile's bounded commit policy decides only when the first bytes become
+                    # safe to expose to the client.
+                    upstream_chunk_size = 64 * 1024
                     # The chunks reach the writer untouched; the observer only reads them on
                     # the way past, to learn a thinking model's trace for the next turn. The
                     # deadline guard bounds a drip-feeding upstream to the request budget.
@@ -12024,26 +12319,25 @@ class RouterHandler(BaseHTTPRequestHandler):
                         response_chunks_with_first_byte(
                             response,
                             deadline_guarded_chunks(
-                                response.iter_content(chunk_size=None), deadline_monotonic
+                                response.iter_content(chunk_size=upstream_chunk_size),
+                                deadline_monotonic,
                             ),
                         ),
                         ReasoningStreamObserver(REASONING_REPLAY_STORE, str(model.get("id") or "")),
                         now_fn=time.time,
                     )
-                    # The [DONE] contract applies to SSE bodies; a provider answering a stream
-                    # request with a plain JSON body (no SSE framing) has no terminator to demand.
-                    upstream_content_type = str(response.headers.get("Content-Type") or "text/event-stream")
                     try:
                         return stream_chunks_to_writer(
                             observed,
                             write_stream_chunk,
                             self.wfile.flush,
-                            expect_sse_done="event-stream" in upstream_content_type.lower(),
+                            expect_sse_done=expect_sse_done,
                             expected_choice_count=(
                                 body.get("n")
                                 if type(body.get("n")) is int and body["n"] > 0
                                 else 1
                             ),
+                            stream_commit_policy=stream_commit_policy,
                         )
                     finally:
                         # The guard may have abandoned the upstream mid-body; close so the

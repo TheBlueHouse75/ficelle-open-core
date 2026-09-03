@@ -1,21 +1,19 @@
 {
-  "attempts_per_task": 1,
+  "attempts_per_task": 2,
   "base_url": "http://host.docker.internal:8646/v1",
-  "benchmark": "aider-polyglot",
+  "benchmark": "aider-practical",
   "edit_format": "whole",
   "ficelle_model_id": "ficelle/PROVIDER/EXACT_MODEL_ID",
   "provider": "PROVIDER",
   "run_mode": "calibration",
-  "task_count": 5,
+  "task_count": 3,
   "tasks": [
-    "cpp/exercises/practice/circular-buffer",
     "go/exercises/practice/crypto-square",
     "java/exercises/practice/bank-account",
-    "python/exercises/practice/affine-cipher",
-    "rust/exercises/practice/doubly-linked-list"
+    "python/exercises/practice/affine-cipher"
   ],
   "temperature": 0,
   "threads": 1,
-  "wall_clock_timeout_seconds": 1800,
+  "wall_clock_timeout_seconds": 2700,
   "upstream_model_id": "EXACT_MODEL_ID"
 }

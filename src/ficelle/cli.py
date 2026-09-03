@@ -470,8 +470,13 @@ def doctor(*, json_output: bool = True) -> int:
 
 def set_key(provider: str, *, from_stdin: bool = False, allow_plaintext: bool = False) -> int:
     config = router.load_config()
-    if provider not in (config.get("providers") or {}):
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    if provider not in providers:
         print(f"Unknown provider: {provider}", file=sys.stderr)
+        return 2
+    provider_cfg = providers.get(provider) if isinstance(providers.get(provider), dict) else {}
+    if str(provider_cfg.get("auth_mode") or "") == "anonymous":
+        print(f"{provider} uses anonymous access and does not accept an API key.", file=sys.stderr)
         return 2
     if from_stdin:
         # One line piped by a wrapper (ficelle-setup's inline key capture, scripts): the

@@ -81,6 +81,269 @@ def test_aider_result_rows_preserve_missing_and_failed_tasks(tmp_path):
     assert rows[2]["status"] == "harness_error"
 
 
+def test_aider_result_rows_distinguish_first_pass_from_repaired_success(tmp_path):
+    run_dir = tmp_path / "run"
+    result = run_dir / AIDER_CALIBRATION_TASKS[0] / ".aider.results.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(json.dumps({"tests_outcomes": [False, True]}), encoding="utf-8")
+
+    rows, completed = adapter._aider_result_rows(run_dir, AIDER_CALIBRATION_TASKS)
+
+    assert completed == 1
+    assert rows[0]["first_passed"] is False
+    assert rows[0]["passed"] is True
+    assert rows[0]["attempt_count"] == 2
+    assert rows[0]["status"] == "passed"
+
+
+def test_aider_result_rows_do_not_score_a_zero_token_http_failure(tmp_path):
+    run_dir = tmp_path / "run"
+    result = run_dir / AIDER_CALIBRATION_TASKS[0] / ".aider.results.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "tests_outcomes": [False, False],
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows, completed = adapter._aider_result_rows(run_dir, AIDER_CALIBRATION_TASKS)
+
+    assert completed == 0
+    assert rows[0]["status"] == "harness_error"
+    assert rows[0]["diagnostic"] == "no_measured_generation"
+
+
+def test_relay_audit_maps_retries_and_repairs_to_explicit_tasks(tmp_path):
+    audit = tmp_path / "relay-audit.jsonl"
+    task_one = AIDER_CALIBRATION_TASKS[0]
+    task_two = AIDER_CALIBRATION_TASKS[1]
+    events = [
+        {
+            "schema_version": 1,
+            "event_index": 1,
+            "request_fingerprint": "a" * 64,
+            "task_id": task_one,
+            "response_status": 429,
+            "outcome": "provider_error",
+        },
+        {
+            "schema_version": 1,
+            "event_index": 2,
+            "request_fingerprint": "a" * 64,
+            "task_id": task_one,
+            "response_status": 200,
+            "outcome": "success",
+        },
+        {
+            "schema_version": 1,
+            "event_index": 3,
+            "request_fingerprint": "b" * 64,
+            "task_id": task_one,
+            "response_status": 429,
+            "outcome": "provider_error",
+        },
+        {
+            "schema_version": 1,
+            "event_index": 4,
+            "request_fingerprint": "c" * 64,
+            "task_id": task_two,
+            "response_status": 502,
+            "outcome": "model_failure",
+        },
+    ]
+    audit.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    incidents, summary = adapter._relay_audit_by_task(audit, AIDER_CALIBRATION_TASKS)
+
+    assert incidents == {
+        AIDER_CALIBRATION_TASKS[0]: {"provider_error"},
+        AIDER_CALIBRATION_TASKS[1]: {"model_failure"},
+    }
+    assert summary == {
+        "schema_version": 1,
+        "chat_completion_count": 4,
+        "task_count": 2,
+        "provider_incident_count": 2,
+        "model_failure_incident_count": 1,
+        "unresolved_provider_error_count": 1,
+        "unresolved_model_failure_count": 1,
+    }
+
+
+def test_relay_audit_separates_standard_and_extended_budget_incidents(tmp_path):
+    audit = tmp_path / "relay-audit.jsonl"
+    task = AIDER_CALIBRATION_TASKS[0]
+    events = [
+        {
+            "schema_version": 2,
+            "event_index": 1,
+            "request_fingerprint": "a" * 64,
+            "task_id": task,
+            "response_status": 502,
+            "outcome": "model_failure",
+            "failure_reason": "truncated_before_content",
+            "completion_token_budget": 12_000,
+        },
+        {
+            "schema_version": 2,
+            "event_index": 2,
+            "request_fingerprint": "b" * 64,
+            "task_id": task,
+            "response_status": 200,
+            "outcome": "success",
+            "failure_reason": None,
+            "completion_token_budget": 24_000,
+        },
+    ]
+    audit.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    standard, standard_summary = adapter._relay_audit_by_task(
+        audit,
+        (task,),
+        completion_token_budget=12_000,
+    )
+    extended, extended_summary = adapter._relay_audit_by_task(
+        audit,
+        (task,),
+        completion_token_budget=24_000,
+    )
+
+    assert standard == {task: {"truncated_before_content"}}
+    assert standard_summary["model_failure_incident_count"] == 1
+    assert extended == {}
+    assert extended_summary["chat_completion_count"] == 1
+
+
+def test_relay_audit_reclassifies_contaminated_repair_and_empty_model_response(tmp_path):
+    run_dir = tmp_path / "run"
+    provider_result = run_dir / AIDER_CALIBRATION_TASKS[0] / ".aider.results.json"
+    provider_result.parent.mkdir(parents=True)
+    provider_result.write_text(
+        json.dumps(
+            {
+                "tests_outcomes": [False, False],
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_result = run_dir / AIDER_CALIBRATION_TASKS[1] / ".aider.results.json"
+    model_result.parent.mkdir(parents=True)
+    model_result.write_text(
+        json.dumps(
+            {
+                "tests_outcomes": [False, False],
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows, completed = adapter._aider_result_rows(
+        run_dir,
+        AIDER_CALIBRATION_TASKS,
+        relay_incidents={
+            AIDER_CALIBRATION_TASKS[0]: {"provider_error"},
+            AIDER_CALIBRATION_TASKS[1]: {"model_failure"},
+        },
+    )
+
+    assert completed == 1
+    assert rows[0]["status"] == "provider_error"
+    assert rows[0]["diagnostic"] == "unresolved_provider_request"
+    assert rows[1]["status"] == "failed"
+    assert rows[1]["diagnostic"] == "unresolved_model_response"
+
+
+def test_exact_truncation_reason_is_preserved_for_extended_diagnostic_trigger(tmp_path):
+    rows, completed = adapter._aider_result_rows(
+        tmp_path / "run",
+        (AIDER_CALIBRATION_TASKS[0],),
+        relay_incidents={AIDER_CALIBRATION_TASKS[0]: {"truncated_before_content"}},
+    )
+
+    assert completed == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["diagnostic"] == "truncated_before_content"
+    assert adapter._extended_diagnostic_task_ids(rows) == (AIDER_CALIBRATION_TASKS[0],)
+
+
+def test_mixed_model_failure_reasons_do_not_trigger_extended_diagnostic(tmp_path):
+    task = AIDER_CALIBRATION_TASKS[0]
+    rows, completed = adapter._aider_result_rows(
+        tmp_path / "run",
+        (task,),
+        relay_incidents={
+            task: {"truncated_before_content", "empty_assistant_message"}
+        },
+    )
+
+    assert completed == 1
+    assert rows[0]["diagnostic"] == "unresolved_model_response"
+    assert adapter._extended_diagnostic_task_ids(rows) == ()
+
+
+def test_repair_truncation_remains_visible_after_measured_first_attempt(tmp_path):
+    task = AIDER_CALIBRATION_TASKS[0]
+    result = tmp_path / "run" / task / ".aider.results.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "tests_outcomes": [False, False],
+                "prompt_tokens": 100,
+                "completion_tokens": 80,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows, completed = adapter._aider_result_rows(
+        tmp_path / "run",
+        (task,),
+        relay_incidents={task: {"truncated_before_content"}},
+    )
+
+    assert completed == 1
+    assert rows[0]["diagnostic"] == "truncated_before_content"
+    assert adapter._extended_diagnostic_task_ids(rows) == (task,)
+
+
+def test_extended_diagnostic_does_not_run_for_other_or_mixed_failures():
+    assert adapter._extended_diagnostic_task_ids(
+        [{"task_id": "go/task", "status": "failed", "diagnostic": "test_failure"}]
+    ) == ()
+    assert adapter._extended_diagnostic_task_ids(
+        [
+            {
+                "task_id": "go/task",
+                "status": "failed",
+                "diagnostic": "truncated_before_content",
+            },
+            {"task_id": "java/task", "status": "provider_error"},
+        ]
+    ) == ()
+
+
+def test_extended_diagnostic_classification_keeps_quality_and_availability_separate():
+    assert adapter._extended_diagnostic_classification([{"status": "passed"}]) == (
+        "capable_but_output_hungry"
+    )
+    assert adapter._extended_diagnostic_classification([{"status": "failed"}]) == (
+        "failed_at_extended_budget"
+    )
+    assert adapter._extended_diagnostic_classification([{"status": "provider_error"}]) == (
+        "inconclusive"
+    )
+
+
 def test_aider_result_rows_separate_provider_and_harness_errors(tmp_path):
     run_dir = tmp_path / "run"
     provider = run_dir / AIDER_CALIBRATION_TASKS[0] / ".aider.results.json"
@@ -338,6 +601,14 @@ def test_aider_build_cache_stages_the_pinned_java_task(tmp_path):
 def test_aider_calibration_harness_pins_task_order_and_process_exit(monkeypatch):
     official = (
         b"before\n    random.shuffle(test_dnames)\nafter\n"
+        b"    LONG_TIMEOUT = 24 * 60 * 60\n"
+        b"    main_model = models.Model(\n"
+        b"        model_name,\n"
+        b"        weak_model=weak_model_name,\n"
+        b"        editor_model=editor_model,\n"
+        b"        editor_edit_format=editor_edit_format,\n"
+        b"        verbose=verbose,\n"
+        b"    )\n"
         b"    summarize_results(dirname)\n\n    return 0\n\n"
         b'if __name__ == "__main__":\n    app()\n'
     )
@@ -351,6 +622,8 @@ def test_aider_calibration_harness_pins_task_order_and_process_exit(monkeypatch)
 
     assert "random.shuffle" not in harness
     assert "test_dnames.sort()" in harness
+    assert "LONG_TIMEOUT = 0" in harness
+    assert '"X-Ficelle-Benchmark-Task": "/".join(testdir.parts[-4:])' in harness
     assert "    sys.stdout.flush()\n    sys.stderr.flush()\n    os._exit(0)\n" in harness
     assert fingerprint.startswith("sha256:")
     with pytest.raises(ValueError, match="fingerprint"):
@@ -366,3 +639,19 @@ def test_aider_model_settings_give_every_candidate_the_same_completion_budget():
         "    max_tokens: 12000\n"
     )
     assert fingerprint == "sha256:" + hashlib.sha256(model_settings.encode("utf-8")).hexdigest()
+
+
+def test_aider_model_settings_allow_only_the_pinned_extended_diagnostic_budget():
+    model_settings, _ = adapter._aider_model_settings(
+        24_000,
+        "aider-practical",
+        extended_diagnostic=True,
+    )
+
+    assert "max_tokens: 24000" in model_settings
+    with pytest.raises(ValueError, match="does not match pinned policy"):
+        adapter._aider_model_settings(
+            20_000,
+            "aider-practical",
+            extended_diagnostic=True,
+        )

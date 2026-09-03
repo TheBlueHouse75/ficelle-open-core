@@ -417,12 +417,20 @@ def filter_cached_catalog_to_enabled_providers(
         for source, provider in configured.items()
         if isinstance(provider, dict) and provider.get("enabled", True)
     }
+    # A registered provider stays visible even while disabled: its Control Center card is the
+    # operator's path to review the policy and explicitly enable it. Disabled sources remain
+    # outside enabled_sources, so their cached models cannot route or appear as available.
+    visible_sources = {
+        source
+        for source, provider in configured.items()
+        if isinstance(provider, dict)
+    }
     # Models stay off the routing surfaces until a configured_credentials
     # provider is actually invokable. Provider *cards* do not: the admin
     # Providers list is how an operator pastes the first key, so dropping
     # an unkeyed enabled row hides the only UI that can make it invokable.
     current_auth: dict[str, dict[str, Any]] = {}
-    for source in enabled_sources:
+    for source in visible_sources:
         source_name = str(source)
         auth_row = provider_auth_row(source_name, config)
         current_auth[source_name] = {**auth_row, "auth_reason": auth_row.get("reason")}
@@ -443,7 +451,7 @@ def filter_cached_catalog_to_enabled_providers(
     providers = {
         source: {**provider, **current_auth[str(source)]}
         for source, provider in raw_catalog_providers.items()
-        if source in enabled_sources
+        if source in visible_sources
     }
     return {**catalog, "providers": providers, "models": models}
 

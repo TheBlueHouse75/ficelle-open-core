@@ -662,8 +662,6 @@ def evaluate_automation_readiness(record: ProviderIntakeRecord) -> AutomationDec
         )
 
     runtime_blockers: list[str] = []
-    if record.account_key_posture == "not_required" and record.auth_env == "none":
-        runtime_blockers.append("runtime:keyless_remote")
     if record.canonical_chat_path != "/chat/completions":
         runtime_blockers.append("runtime:nonstandard_chat_path")
     if record.catalog_path != "/models":
@@ -780,37 +778,45 @@ def build_integration_scaffold(record: ProviderIntakeRecord) -> dict[str, Any]:
         "generic_config_with_allowlist": "provider_free_model_allowlist",
         "generic_config_only": "provider_free_endpoint",
     }[record.adapter_fit]
+    anonymous = record.account_key_posture == "not_required" and record.auth_env == "none"
+    provider_config = {
+        "display_name": record.name,
+        "enabled": False,
+        "base_url": record.claimed_base_url,
+        "catalog_path": record.catalog_path,
+        "chat_path": record.canonical_chat_path,
+        "activation_policy": "always" if anonymous else "configured_credentials",
+        "provider_class": provider_class,
+        "free_scope": "model" if record.free_mechanism in {"strict_zero_catalog", "free_model"} else "provider",
+        "free_access_proof": free_access_proof,
+        "auth_env": record.auth_env,
+    }
+    if anonymous:
+        provider_config["auth_mode"] = "anonymous"
+
+    required_gates = [
+        "targeted_tests",
+        "simplify",
+        "review_code",
+        "catalog_identity_smoke",
+        "chat_smoke",
+        "tool_smoke",
+        "streaming_smoke",
+        "context_smoke",
+        "billing_cap_readback",
+    ]
+    if not anonymous:
+        required_gates.insert(3, "credential_presence")
+
     return {
         "schema_version": 1,
         "provider_id": record.provider_id,
         "state": "generated_disabled",
         "apply_automatically": False,
         "requires_live_smoke": True,
-        "provider_config": {
-            "display_name": record.name,
-            "enabled": False,
-            "base_url": record.claimed_base_url,
-            "catalog_path": record.catalog_path,
-            "chat_path": record.canonical_chat_path,
-            "activation_policy": "configured_credentials" if record.auth_env != "none" else "always",
-            "provider_class": provider_class,
-            "free_scope": "model" if record.free_mechanism in {"strict_zero_catalog", "free_model"} else "provider",
-            "free_access_proof": free_access_proof,
-            "auth_env": record.auth_env,
-        },
+        "provider_config": provider_config,
         "candidate_model_ids": sorted(record.model_ids),
-        "required_gates": [
-            "targeted_tests",
-            "simplify",
-            "review_code",
-            "credential_presence",
-            "catalog_identity_smoke",
-            "chat_smoke",
-            "tool_smoke",
-            "streaming_smoke",
-            "context_smoke",
-            "billing_cap_readback",
-        ],
+        "required_gates": required_gates,
     }
 
 

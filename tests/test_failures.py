@@ -36,12 +36,37 @@ def catalog_free_access():
 
 def test_quota_free_failures_classify_quota_reasons():
     exhausted = classify_failure(429, "quota exceeded: credits exhausted", normalized_free_access=quota_free_access())
+    structurally_exhausted = classify_failure(
+        429,
+        '{"error":{"code":"insufficient_quota","message":"Rate limit exceeded."}}',
+        normalized_free_access=quota_free_access("model"),
+    )
+    structurally_unallocated = classify_failure(
+        429,
+        '{"error":{"code":"insufficient_quota","message":"Quota exceeded, limit: 0"}}',
+        normalized_free_access=quota_free_access("model"),
+    )
     zero_allocation = classify_failure(402, "Quota exceeded for metric: generate_content_free_tier_requests, limit: 0", normalized_free_access=quota_free_access("model"))
     upstream_error = classify_failure(500, "upstream error while quota exceeded", normalized_free_access=quota_free_access())
 
     assert exhausted == "quota_exhausted"
+    assert structurally_exhausted == "quota_exhausted"
+    assert structurally_unallocated == "no_free_quota"
     assert zero_allocation == "no_free_quota"
     assert upstream_error == "server_error"
+
+
+def test_insufficient_quota_in_caller_prose_is_not_a_quota_verdict():
+    echoed = json.dumps(
+        {
+            "error": {
+                "code": "invalid_request_error",
+                "message": "Invalid schema for function 'insufficient_quota'",
+            }
+        }
+    )
+
+    assert classify_failure(400, echoed, normalized_free_access=quota_free_access("model")) == "bad_upstream_request"
 
 
 def test_false_free_and_not_found_failures_return_blocking_reasons():

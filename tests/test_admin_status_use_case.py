@@ -522,7 +522,7 @@ def test_cached_catalog_stale_reason_preserves_fingerprint_and_ttl_contracts():
     assert expired == "ttl_expired"
 
 
-def test_filter_cached_catalog_to_enabled_providers_keeps_only_invokable_sources():
+def test_filter_cached_catalog_keeps_configured_cards_but_only_invokable_models():
     config = {
         "providers": {
             "openrouter": {"enabled": True},
@@ -555,6 +555,7 @@ def test_filter_cached_catalog_to_enabled_providers_keeps_only_invokable_sources
     assert filtered["providers"] == {
         "openrouter": {"accepted_count": 1, "invokable": False, "auth_reason": None},
         "nvidia": {"accepted_count": 1, "invokable": True, "auth_reason": None},
+        "groq": {"accepted_count": 1, "invokable": False, "auth_reason": None},
     }
     assert [model["source"] for model in filtered["models"]] == ["openrouter", "nvidia"]
 
@@ -589,11 +590,58 @@ def test_filter_cached_catalog_keeps_unkeyed_enabled_provider_cards():
         provider_auth_row=lambda source, _config: {"invokable": source == "openrouter"},
     )
 
-    assert set(filtered["providers"]) == {"openrouter", "orcarouter", "hetzner"}
+    assert set(filtered["providers"]) == {"openrouter", "orcarouter", "hetzner", "groq"}
     assert filtered["providers"]["openrouter"]["invokable"] is True
     assert filtered["providers"]["orcarouter"]["invokable"] is False
     assert filtered["providers"]["hetzner"]["invokable"] is False
     assert [model["source"] for model in filtered["models"]] == ["openrouter"]
+
+
+def test_filter_cached_catalog_keeps_disabled_provider_cards_without_models():
+    config = {
+        "providers": {
+            "ovhcloud": {"enabled": False, "auth_mode": "anonymous", "activation_policy": "always"},
+            "groq": {"enabled": False, "activation_policy": "configured_credentials"},
+        }
+    }
+    catalog = {
+        "providers": {
+            "ovhcloud": {"accepted_count": 0, "enabled": False, "auth_mode": "anonymous"},
+            "groq": {"accepted_count": 0, "enabled": False},
+        },
+        "models": [
+            {"id": "ficelle/ovhcloud/gpt-oss-120b", "source": "ovhcloud"},
+            {"id": "ficelle/groq/model", "source": "groq"},
+        ],
+    }
+
+    filtered = filter_cached_catalog_to_enabled_providers(
+        catalog,
+        config,
+        provider_auth_row=lambda source, _config: {
+            "invokable": False,
+            "reason": "disabled" if source == "ovhcloud" else "missing credentials",
+        },
+    )
+
+    assert filtered["providers"] == {
+        "ovhcloud": {
+            "accepted_count": 0,
+            "enabled": False,
+            "auth_mode": "anonymous",
+            "invokable": False,
+            "reason": "disabled",
+            "auth_reason": "disabled",
+        },
+        "groq": {
+            "accepted_count": 0,
+            "enabled": False,
+            "invokable": False,
+            "reason": "missing credentials",
+            "auth_reason": "missing credentials",
+        },
+    }
+    assert filtered["models"] == []
 
 
 def test_catalog_refresh_summary_preserves_refresh_contract_shape():

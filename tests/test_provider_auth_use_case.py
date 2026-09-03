@@ -136,6 +136,76 @@ def test_provider_auth_row_requires_key_and_base_url_unless_adapter_marks_invoka
     assert calls[0] == ("nvidia", {"base_url": "https://nvidia.example/v1"}, False)
 
 
+def test_provider_auth_row_never_marks_a_disabled_provider_invokable() -> None:
+    config = {
+        "providers": {
+            "ovhcloud": {
+                "base_url": "https://ovh.example/v1",
+                "enabled": False,
+            }
+        }
+    }
+    ports = ports_for(
+        {
+            "ovhcloud": ProviderAccess(
+                None,
+                "https://ovh.example/v1",
+                "disabled",
+            )
+        },
+        [],
+    )
+
+    row = provider_auth_row("ovhcloud", config, ports=ports)
+
+    assert row == {
+        "invokable": False,
+        "reason": "disabled",
+        "key_source": None,
+        "base_url": "https://ovh.example/v1",
+    }
+    assert unconfigured_provider_sources({"ovhcloud": row}) == []
+
+
+def test_provider_auth_row_keeps_a_disabled_providers_residual_key_source() -> None:
+    calls: list[tuple[str, dict[str, Any], bool]] = []
+    config = {
+        "providers": {
+            "nvidia": {
+                "base_url": "https://nvidia.example/v1",
+                "enabled": False,
+            }
+        }
+    }
+    ports = ports_for(
+        {
+            "nvidia": ProviderAccess(
+                "secret-key",
+                "https://nvidia.example/v1",
+                "env:NVIDIA_API_KEY",
+            )
+        },
+        calls,
+    )
+
+    row = provider_auth_row("nvidia", config, ports=ports)
+
+    assert row == {
+        "invokable": False,
+        "reason": "disabled",
+        "key_source": "env",
+        "base_url": "https://nvidia.example/v1",
+    }
+    assert calls == [
+        (
+            "nvidia",
+            {"base_url": "https://nvidia.example/v1", "enabled": True},
+            False,
+        )
+    ]
+    assert "secret-key" not in json.dumps(row)
+
+
 def test_provider_auth_row_names_the_store_of_a_key_the_adapter_cannot_use() -> None:
     """The adapter spends `reason` on the diagnostic, so `key_reason` carries the store.
 

@@ -24,8 +24,14 @@ def test_bundled_manifest_qualifies_models_across_providers():
         {"source": "openrouter", "upstream_id": "deepseek/deepseek-v4-pro-free"}, manifest
     )["quality_score"] == 60
     assert coding_certification.certification_for_model(
+        {"source": "nvidia", "upstream_id": "deepseek-ai/deepseek-v4-pro-0813"}, manifest
+    )["tier"] == "verified"
+    assert coding_certification.certification_for_model(
+        {"source": "ollama", "upstream_id": "deepseek-v4-pro:0813"}, manifest
+    )["tier"] == "verified"
+    assert coding_certification.certification_for_model(
         {"source": "gemini", "upstream_id": "models/gemini-3.6-flash"}, manifest
-    )["quality_score"] == 60
+    )["quality_score"] == 100
 
 
 def test_bundled_manifest_rejects_an_unqualified_model():
@@ -52,12 +58,47 @@ def test_manifest_rejects_weak_or_inconsistent_qualification_scores():
         coding_certification.validate_manifest(inconsistent, require_complete_policy=True)
 
 
-def test_bundled_status_reports_three_models():
+def test_bundled_status_reports_verified_and_provisional_models():
     status = coding_certification.public_status()
 
     assert status["status"] == "bundled"
-    assert status["certification_count"] == 3
-    assert status["manifest_id"] == "2026-08-23-coding-pool-3"
+    assert status["certification_count"] == 9
+    assert status["provisional_count"] == 0
+    assert status["qualification_count"] == 9
+    assert status["manifest_id"] == "2026-09-03-coding-pool-v3"
+
+
+def test_bundled_manifest_verifies_qwen_aliases():
+    manifest = coding_certification.cached_manifest()
+
+    assert manifest is not None
+    for upstream_id in ("qwen/qwen3.8-27b", "qwen/qwen3.8-27b-free"):
+        row = coding_certification.certification_for_model(
+            {"source": "provider", "upstream_id": upstream_id}, manifest
+        )
+        assert row is not None
+        assert row["tier"] == "verified"
+        assert row["benchmarks"][0]["pass_at_1"] == pytest.approx(2 / 3)
+        assert row["benchmarks"][0]["resolved_rate"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("upstream_id", "expected_primary"),
+    [
+        ("google/gemma-4-26b-a4b-it:free", "models/gemma-4-26b-a4b-it"),
+        ("tencent/hy3:free", "tencent/hy3-free"),
+    ],
+)
+def test_bundled_manifest_verifies_candidate_wave_aliases(upstream_id, expected_primary):
+    manifest = coding_certification.cached_manifest()
+
+    assert manifest is not None
+    row = coding_certification.certification_for_model(
+        {"source": "provider", "upstream_id": upstream_id}, manifest
+    )
+    assert row is not None
+    assert row["upstream_model_id"] == expected_primary
+    assert row["tier"] == "verified"
 
 
 def test_strict_parser_rejects_duplicate_keys_and_non_finite_numbers():
