@@ -1556,7 +1556,15 @@ class ChatCompletionRouter:
         # failure here never writes back into the plan.
         errors: list[dict[str, Any]] = list(plan.excluded_errors)
         attempts: list[dict[str, Any]] = []
-        deadline = request_deadline(self.config, request_started)
+        # The wall-clock budget exists to bound a virtual route's sequence of fallbacks. An exact
+        # model request has no alternate attempt to contain, so imposing that budget would make
+        # Ficelle terminate an otherwise healthy long generation. Exact routes retain the generous
+        # provider read-idle timeout and the downstream client remains free to cancel.
+        deadline = (
+            request_deadline(self.config, request_started)
+            if plan.requested_model_is_virtual
+            else None
+        )
         # The body actually sent, and the sampling knobs removed from it. Both are scoped to
         # the CURRENT candidate: a knob one model refuses says nothing about the next one, so
         # every candidate starts from the caller's full request minus only what it is itself

@@ -80,21 +80,41 @@ def test_bundled_pool_routes_qualified_models_and_rejects_laguna():
         "deepseek/deepseek-v4-pro-free",
         "ficelle/orcarouter/deepseek/deepseek-v4-pro-free",
     )
+    renamed_deepseek_v4_pro = model(
+        "nvidia",
+        "deepseek-ai/deepseek-v4-pro-0813",
+        "ficelle/nvidia/deepseek-ai/deepseek-v4-pro-0813",
+    )
     gemini_3_6_flash = model(
         "gemini",
         "models/gemini-3.6-flash",
         "ficelle/gemini/models/gemini-3.6-flash",
     )
     kimi_k3 = model("nvidia", "moonshotai/kimi-k3", "ficelle/nvidia/moonshotai/kimi-k3")
+    qwen_3_8 = model("groq", "qwen/qwen3.8-27b", "ficelle/groq/qwen/qwen3.8-27b")
     laguna = model("kilo", "laguna-s-2-1", "ficelle/kilo/laguna-s-2-1")
 
     kept, fallback = router.route_competence_gate_result(
         "ficelle/auto-coding",
-        [ox_alpha, deepseek_v4_pro, gemini_3_6_flash, kimi_k3, laguna],
+        [
+            ox_alpha,
+            deepseek_v4_pro,
+            renamed_deepseek_v4_pro,
+            gemini_3_6_flash,
+            kimi_k3,
+            qwen_3_8,
+            laguna,
+        ],
         {},
     )
 
-    assert kept == [deepseek_v4_pro, gemini_3_6_flash, kimi_k3]
+    assert kept == [
+        deepseek_v4_pro,
+        renamed_deepseek_v4_pro,
+        gemini_3_6_flash,
+        kimi_k3,
+        qwen_3_8,
+    ]
     assert fallback is False
 
 
@@ -166,6 +186,39 @@ def test_auto_coding_order_uses_central_quality_before_local_transport(monkeypat
     }
 
     assert router.sort_available_for_virtual_model("ficelle/auto-coding", [lower, higher], state) == [higher, lower]
+
+
+def test_auto_coding_orders_verified_models_before_provisional_models(monkeypatch):
+    verified = model("alpha", "acme/verified", "ficelle/alpha/acme/verified")
+    provisional = model("beta", "acme/provisional", "ficelle/beta/acme/provisional")
+    monkeypatch.setattr(
+        router.coding_certification,
+        "cached_manifest",
+        lambda: {
+            "certifications": [
+                {
+                    "provider": "alpha",
+                    "upstream_model_id": "acme/verified",
+                    "quality_score": 67,
+                    "tier": "verified",
+                }
+            ],
+            "provisionals": [
+                {
+                    "provider": "beta",
+                    "upstream_model_id": "acme/provisional",
+                    "tier": "provisional",
+                }
+            ],
+        },
+    )
+
+    ordered = router.sort_available_for_virtual_model(
+        "ficelle/auto-coding", [provisional, verified], {}
+    )
+
+    assert ordered == [verified, provisional]
+    assert router.model_route_competence("ficelle/auto-coding", provisional, {}) == "provisional"
 
 
 def test_failed_local_compatibility_canary_blocks_but_cannot_certify(monkeypatch):

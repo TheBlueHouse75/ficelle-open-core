@@ -22,12 +22,14 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from ficelle.coding_certification import (  # noqa: E402
     COMPATIBILITY_CANARY_VERSION,
+    LEGACY_VERIFIED_BENCHMARKS,
     POLICY_VERSION,
     REQUIRED_BENCHMARKS,
     validate_manifest,
 )
 from ficelle.coding_benchmark_policy import (  # noqa: E402
     MIN_QUALIFYING_PASS_AT_1,
+    MIN_QUALIFYING_RESOLVED_RATE,
     CodingBenchmarkPolicyError,
     canonical_repository,
     validate_evidence_metadata,
@@ -37,6 +39,7 @@ from ficelle.coding_benchmark_policy import (  # noqa: E402
 
 BENCHMARK_WEIGHTS = {
     "aider-polyglot": 1.0,
+    "aider-practical": 1.0,
 }
 
 
@@ -81,6 +84,11 @@ def _pass_summary(payload: dict[str, Any]) -> tuple[int, float]:
             status = str(row.get("status") or "").lower()
             if status in {"provider_error", "harness_error"}:
                 has_explicit_outcomes = True
+                continue
+            first_passed = row.get("first_passed")
+            if isinstance(first_passed, bool):
+                has_explicit_outcomes = True
+                verdicts.append(first_passed)
                 continue
             if status in {"pass", "passed", "resolved", "success", "fail", "failed"}:
                 has_explicit_outcomes = True
@@ -152,7 +160,7 @@ def _efficiency_summary(payload: dict[str, Any], task_count: int) -> dict[str, i
 
 
 def normalize_result(args: argparse.Namespace) -> dict[str, Any]:
-    if args.benchmark not in REQUIRED_BENCHMARKS:
+    if args.benchmark not in REQUIRED_BENCHMARKS | LEGACY_VERIFIED_BENCHMARKS:
         raise ValueError(f"unsupported benchmark: {args.benchmark}")
     payload = read_json(args.input)
     if isinstance(payload, list):
@@ -237,6 +245,10 @@ def normalize_result(args: argparse.Namespace) -> dict[str, Any]:
         "source_revisions": payload["source_revisions"],
         "policy_fingerprint": payload["policy_fingerprint"],
         "completion_token_budget": payload["completion_token_budget"],
+        "relay_timeout_seconds": payload.get(
+            "relay_timeout_seconds",
+            policy.relay_timeout_seconds,
+        ),
         "model_settings_fingerprint": payload["model_settings_fingerprint"],
         "settings_fingerprint": settings_fingerprint,
         "run_record_fingerprint": "sha256:" + hashlib.sha256(run_record_bytes).hexdigest(),
@@ -245,6 +257,37 @@ def normalize_result(args: argparse.Namespace) -> dict[str, Any]:
         "evidence_kind": "central_run" if args.run_mode == "certification" else "calibration_run",
         "observed_at": datetime.now(UTC).isoformat(),
     }
+    resolved_rate = payload.get("resolved_rate")
+    if isinstance(resolved_rate, (int, float)) and not isinstance(resolved_rate, bool):
+        normalized_resolved_rate = float(resolved_rate)
+        if not math.isfinite(normalized_resolved_rate) or not 0 <= normalized_resolved_rate <= 1:
+            raise ValueError("resolved_rate must be between 0 and 1")
+        if isinstance(result_rows, list):
+            final_verdicts = [
+                bool(item["passed"])
+                for item in result_rows
+                if isinstance(item, dict)
+                and str(item.get("status") or "").lower() in {"passed", "failed"}
+                and isinstance(item.get("passed"), bool)
+            ]
+            if final_verdicts:
+                measured_resolved_rate = sum(final_verdicts) / len(final_verdicts)
+                if not math.isclose(
+                    normalized_resolved_rate,
+                    measured_resolved_rate,
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                ):
+                    raise ValueError("declared resolved_rate does not match final model verdict rows")
+        row["resolved_rate"] = round(normalized_resolved_rate, 8)
+    if isinstance(result_rows, list):
+        row["results"] = result_rows
+    relay_audit = payload.get("relay_audit")
+    if isinstance(relay_audit, dict):
+        row["relay_audit"] = relay_audit
+    extended_token_diagnostic = payload.get("extended_token_diagnostic")
+    if isinstance(extended_token_diagnostic, dict):
+        row["extended_token_diagnostic"] = extended_token_diagnostic
     languages = payload.get("languages") or payload.get("language_breakdown")
     if isinstance(languages, dict):
         row["languages"] = languages
@@ -276,15 +319,27 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         if names != REQUIRED_BENCHMARKS or len(rows) != len(REQUIRED_BENCHMARKS):
             raise ValueError(f"{model_id} does not have the exact required benchmark set")
         provider = str(rows[0]["provider"]).lower()
-        score = sum(float(row["pass_at_1"]) * 100 * BENCHMARK_WEIGHTS[row["name"]] for row in rows)
-        if score < MIN_QUALIFYING_PASS_AT_1 * 100:
+        score = sum(
+            float(row.get("resolved_rate", row["pass_at_1"]))
+            * 100
+            * BENCHMARK_WEIGHTS[row["name"]]
+            for row in rows
+        )
+        floor = (
+            MIN_QUALIFYING_RESOLVED_RATE
+            if names == REQUIRED_BENCHMARKS
+            else MIN_QUALIFYING_PASS_AT_1
+        )
+        if score < floor * 100:
             raise ValueError(
-                f"{model_id} scored {score:.1f}, below the {MIN_QUALIFYING_PASS_AT_1 * 100:.0f} qualification floor"
+                f"{model_id} scored {score:.1f}, below the {floor * 100:.1f} qualification floor"
             )
         certifications.append(
             {
                 "provider": provider,
                 "upstream_model_id": model_id,
+                "aliases": [],
+                "tier": "verified",
                 "quality_score": round(score, 4),
                 "certified_at": now.isoformat(),
                 "compatibility_canary_version": COMPATIBILITY_CANARY_VERSION,
@@ -298,11 +353,18 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise ValueError(f"prior file must contain an object: {path}")
         priors.append(value)
+    provisionals: list[dict[str, Any]] = []
+    for path in getattr(args, "provisionals", []):
+        value = read_json(path)
+        if not isinstance(value, dict):
+            raise ValueError(f"provisional file must contain an object: {path}")
+        provisionals.append(value)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "manifest_id": args.manifest_id or now.strftime("%Y-%m-%dT%H%M%SZ"),
         "policy_version": POLICY_VERSION,
         "certifications": certifications,
+        "provisionals": provisionals,
         "priors": priors,
     }
     return validate_manifest(manifest, require_complete_policy=True)
@@ -349,7 +411,11 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
 
     normalize = commands.add_parser("normalize", help="Normalize official harness JSON")
-    normalize.add_argument("--benchmark", required=True, choices=sorted(REQUIRED_BENCHMARKS))
+    normalize.add_argument(
+        "--benchmark",
+        required=True,
+        choices=sorted(REQUIRED_BENCHMARKS | LEGACY_VERIFIED_BENCHMARKS),
+    )
     normalize.add_argument("--input", type=Path, required=True)
     normalize.add_argument("--output", type=Path, required=True)
     normalize.add_argument("--provider", required=True)
@@ -364,6 +430,7 @@ def parser() -> argparse.ArgumentParser:
     build = commands.add_parser("build", help="Build the bundled qualification manifest")
     build.add_argument("--results", type=Path, nargs="*", default=[])
     build.add_argument("--priors", type=Path, nargs="*", default=[])
+    build.add_argument("--provisionals", type=Path, nargs="*", default=[])
     build.add_argument("--output", type=Path, required=True)
     build.add_argument("--manifest-id")
 

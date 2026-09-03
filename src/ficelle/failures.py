@@ -691,6 +691,21 @@ def classify_failure(
     # status remains stronger; only an absent or request-rejection code lets the typed location win.
     resolved_error_codes = error_codes or provider_error_codes(text)
     named_status = status_for_error_codes(*resolved_error_codes)
+    access = normalized_free_access if isinstance(normalized_free_access, dict) else {}
+    lower = text[:PROSE_SCAN_LIMIT].lower()
+    # `insufficient_quota` is the provider's structured verdict, not prose that may echo a caller's
+    # tool or field name. On a quota-free route it therefore means the declared quota pool is empty,
+    # at whatever model/provider/account scope the provider configured. This also handles gateways
+    # that wrap the named 429 inside another HTTP status without widening text-marker matching.
+    if (
+        "insufficient_quota" in resolved_error_codes
+        and named_status == 429
+        and access.get("eligible") is True
+        and access.get("mode") == "quota_free"
+    ):
+        if any(marker in lower for marker in marker_set.free_tier_zero_allocation):
+            return "no_free_quota"
+        return "quota_exhausted"
     # A free-only virtual route can exhaust while the account key remains valid. The provider's
     # stable code is stronger than the otherwise generic HTTP 403 auth verdict, and creates a
     # recoverable quota cooldown without trusting mutable prose.
@@ -702,10 +717,8 @@ def classify_failure(
         and _forbids_nonstandard_assistant_field(text)
     ):
         return "bad_upstream_contract"
-    lower = text[:PROSE_SCAN_LIMIT].lower()
     lower_without_urls = _URL_PATTERN.sub(" ", lower)
     has_quota_marker = any(marker in lower for marker in marker_set.quota_exhausted)
-    access = normalized_free_access if isinstance(normalized_free_access, dict) else {}
     if has_quota_marker and access.get("eligible") is True and access.get("mode") == "quota_free":
         if status_code in {402, 429}:
             if any(marker in lower for marker in marker_set.free_tier_zero_allocation):

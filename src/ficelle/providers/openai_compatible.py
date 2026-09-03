@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlencode
 
 from ficelle.config_store import deep_merge
 from ficelle.domain_models import ProviderBudget
@@ -14,10 +16,12 @@ from ficelle.providers.base import (
     ProviderAccessContext,
     ProviderCatalogPolicy,
     ProviderNormalizedCatalogModel,
+    ProviderParameterResolver,
     TRUSTED_FREE_PROVIDER_CLASSES_BY_MODE,
     TRUSTED_PROVIDER_MODEL_FIELDS,
     free_access_payload,
     normalized_free_access_status,
+    suppress_implicit_http_auth,
 )
 from ficelle.redaction import redact_sensitive_json, sanitize_error_detail
 
@@ -40,6 +44,10 @@ OPENCODE_ZEN_USER_AGENT = (
 )
 NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 CONTEXT_LENGTH_CATALOG_ALIASES = ("context_window", "max_context_length")
+CLOUDFLARE_ACCOUNT_ID_ENV = "CLOUDFLARE_ACCOUNT_ID"
+CLOUDFLARE_ACCOUNT_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
+CLOUDFLARE_MAX_CATALOG_PAGES = 100
+CLOUDFLARE_CATALOG_PAGE_SIZE = 100
 
 
 @dataclass(frozen=True)
@@ -74,6 +82,23 @@ class OpenAICompatibleCatalogAdapter:
         return headers
 
     def failure_markers(self) -> FailureMarkers:
+        if self.source == "cloudflare":
+            return DEFAULT_FAILURE_MARKERS.with_extra(
+                false_free=(
+                    "this model requires a workers paid plan",
+                    "not available through standard workers free billing",
+                ),
+                quota_exhausted=(
+                    "used up your daily free allocation of 10,000 neurons",
+                ),
+            )
+        if self.source == "ovhcloud":
+            # OVH's anonymous cap is per IP/model. Its terse 429 body does not name the model,
+            # so classify the provider-specific wording as quota exhaustion and let
+            # free_scope=model select the correct cooldown instead of pausing the provider.
+            return DEFAULT_FAILURE_MARKERS.with_extra(
+                quota_exhausted=("api rate limit exceeded",),
+            )
         if self.source == "ollama":
             # Ollama's cloud catalog can list a model that later requires a subscription. Its live
             # 403 uses account-like status semantics, so these provider-specific words must win
@@ -160,11 +185,12 @@ class OpenAICompatibleCatalogAdapter:
         return {
             "adapter": "openai_compatible",
             "source": self.source,
-            "catalog_url": provider_cfg.get("catalog_url"),
+            "catalog_url": provider_cfg.get("catalog_url") or provider_cfg.get("catalog_url_template"),
             "source_type": provider_cfg.get("source_type"),
             "provider_class": provider_cfg.get("provider_class"),
             "free_mode": provider_cfg.get("free_mode"),
             "free_scope": provider_cfg.get("free_scope"),
+            "auth_mode": provider_cfg.get("auth_mode"),
             "activation_policy": provider_cfg.get("activation_policy"),
             "quota_reset_policy": provider_cfg.get("quota_reset_policy"),
         }
@@ -194,7 +220,15 @@ class OpenAICompatibleCatalogAdapter:
         model: dict[str, Any],
         policy: ProviderCatalogPolicy,
     ) -> ProviderNormalizedCatalogModel:
-        normalized_model = self._catalog_row_with_normalized_context(model)
+        if self.source == "requesty":
+            normalized_model = self._normalize_requesty_catalog_model(model)
+        elif self.source == "cloudflare":
+            normalized_model = self._normalize_cloudflare_catalog_model(model)
+        elif self.source == "routeway":
+            normalized_model = self._normalize_routeway_catalog_model(model)
+        else:
+            normalized_model = model
+        normalized_model = self._catalog_row_with_normalized_limits(normalized_model)
         # A matching family override replaces the provider-wide guess for this row only, so
         # a correction never widens beyond the ids it names.
         defaults = self._model_defaults_for_row(policy, normalized_model)
@@ -208,6 +242,283 @@ class OpenAICompatibleCatalogAdapter:
         # Raw provider free_access claims are not trusted; config-derived free_access is added later.
         trusted_model.pop("free_access", None)
         return ProviderNormalizedCatalogModel(normalized_model=normalized_model, trusted_model=trusted_model)
+
+    def _normalize_cloudflare_catalog_model(self, model: dict[str, Any]) -> dict[str, Any]:
+        """Translate Workers AI's native catalog without curating model ids.
+
+        Cloudflare's row id is an internal UUID; ``name`` is the invocation model id. A valid
+        ``properties`` list is also the provider-owned billing contract: every standard Workers
+        model shares the free allocation unless ``require_workers_paid`` is true. Malformed or
+        contradictory properties fail closed instead of inheriting that default.
+        """
+        normalized = dict(model)
+        normalized["id"] = str(model.get("name") or "").strip()
+        properties, properties_valid = self._cloudflare_properties(model.get("properties"))
+        has_paid_marker = "require_workers_paid" in properties
+        paid_marker = properties.get("require_workers_paid")
+        free_paid_marker = not has_paid_marker or paid_marker is False or paid_marker == "false"
+        normalized["workers_free_eligible"] = properties_valid and free_paid_marker
+
+        task = model.get("task")
+        task_name = str(task.get("name") or "") if isinstance(task, dict) else ""
+        schema = model.get("schema") if isinstance(model.get("schema"), dict) else {}
+        input_schema = schema.get("input") if isinstance(schema, dict) else None
+        supports_chat = self._json_schema_declares_property(input_schema, "messages")
+        capabilities = model.get("capabilities")
+        normalized_capabilities = dict(capabilities) if isinstance(capabilities, dict) else {}
+        normalized_capabilities["completion_chat"] = supports_chat
+        normalized["capabilities"] = normalized_capabilities
+
+        context_length = self._safe_optional_int(properties.get("context_window"))
+        if context_length is not None:
+            normalized["context_length"] = context_length
+
+        supported_parameters: list[str] = []
+        if properties.get("function_calling") in (True, "true") or self._json_schema_declares_property(
+            input_schema,
+            "tools",
+        ):
+            supported_parameters.extend(("tools", "tool_choice"))
+        if self._json_schema_declares_property(input_schema, "response_format"):
+            supported_parameters.append("response_format")
+        if properties.get("reasoning") in (True, "true"):
+            supported_parameters.append("reasoning")
+        normalized["supported_parameters"] = supported_parameters
+
+        input_modalities = ["text"]
+        task_lower = task_name.lower()
+        if (
+            properties.get("vision") in (True, "true")
+            or "image" in task_lower
+            or self._json_schema_declares_property(input_schema, "image_url")
+        ):
+            input_modalities.append("image")
+        normalized["architecture"] = {
+            "input_modalities": input_modalities,
+            "output_modalities": ["text"],
+        }
+        normalized["pricing"] = self._cloudflare_pricing(properties.get("price"))
+        return normalized
+
+    @staticmethod
+    def _cloudflare_properties(raw_properties: Any) -> tuple[dict[str, Any], bool]:
+        if not isinstance(raw_properties, list) or not raw_properties:
+            return {}, False
+        properties: dict[str, Any] = {}
+        valid = True
+        for row in raw_properties:
+            if not isinstance(row, dict):
+                valid = False
+                continue
+            key = str(row.get("property_id") or "").strip()
+            if not key or "value" not in row:
+                valid = False
+                continue
+            value = row["value"]
+            if key in properties and properties[key] != value:
+                valid = False
+                continue
+            properties[key] = value
+        return properties, valid
+
+    @staticmethod
+    def _cloudflare_pricing(raw_prices: Any) -> dict[str, float]:
+        if not isinstance(raw_prices, list):
+            return {}
+        pricing: dict[str, float] = {}
+        for row in raw_prices:
+            if not isinstance(row, dict) or str(row.get("currency") or "").upper() != "USD":
+                continue
+            unit = str(row.get("unit") or "").lower()
+            price = _price_per_token(row.get("price"))
+            if price is None:
+                continue
+            if "per m input tokens" in unit and "cached" not in unit:
+                pricing["prompt"] = price / 1_000_000
+            elif "per m output tokens" in unit:
+                pricing["completion"] = price / 1_000_000
+            elif "per m cached input tokens" in unit:
+                pricing["cached"] = price / 1_000_000
+        return pricing
+
+    @staticmethod
+    def _json_schema_declares_property(schema: Any, needle: str) -> bool:
+        """Find an actual JSON Schema property declaration, not a word in prose or examples."""
+        stack = [schema]
+        visited = 0
+        while stack and visited < 10_000:
+            current = stack.pop()
+            visited += 1
+            if isinstance(current, dict):
+                properties = current.get("properties")
+                required = current.get("required")
+                if isinstance(properties, dict) and needle in properties:
+                    return True
+                if isinstance(required, list) and needle in required:
+                    return True
+                if isinstance(properties, dict):
+                    stack.extend(properties.values())
+                for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
+                    nested = current.get(keyword)
+                    if isinstance(nested, list):
+                        stack.extend(nested)
+                for keyword in ("items", "additionalProperties", "not", "if", "then", "else"):
+                    nested = current.get(keyword)
+                    if isinstance(nested, (dict, list)):
+                        stack.append(nested)
+                for keyword in ("$defs", "definitions", "patternProperties", "dependentSchemas"):
+                    nested = current.get(keyword)
+                    if isinstance(nested, dict):
+                        stack.extend(nested.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+        return False
+
+    def _normalize_routeway_catalog_model(self, model: dict[str, Any]) -> dict[str, Any]:
+        """Translate Routeway's public catalog without turning it into an allowlist.
+
+        Routeway marks free rows twice: an official ``:free`` id suffix and nested
+        ``price_per_million_t`` rates. The suffix gate lives in provider config; this
+        normalizer preserves the independent pricing proof and the row-level routing facts.
+        Missing, contradictory, unavailable, or newly shaped data stays ineligible.
+        """
+        normalized = dict(model)
+        normalized["pricing"] = self._routeway_flat_pricing(model.get("pricing"))
+
+        endpoints = model.get("endpoints")
+        capabilities = model.get("capabilities")
+        normalized_capabilities = dict(capabilities) if isinstance(capabilities, dict) else {}
+        normalized_capabilities["completion_chat"] = (
+            model.get("available") is True
+            and isinstance(endpoints, list)
+            and "/v1/chat/completions" in endpoints
+        )
+        normalized["capabilities"] = normalized_capabilities
+
+        params = self._safe_string_list(model.get("supported_parameters"))
+        if not isinstance(capabilities, dict) or capabilities.get("function_call") is not True:
+            params = [param for param in params if param not in {"tools", "tool_choice"}]
+        normalized["supported_parameters"] = params
+
+        vision = capabilities.get("vision") if isinstance(capabilities, dict) else None
+        if isinstance(vision, bool):
+            normalized["architecture"] = {
+                "input_modalities": ["text", "image"] if vision else ["text"],
+                "output_modalities": ["text"],
+            }
+        return normalized
+
+    @classmethod
+    def _routeway_flat_pricing(cls, raw_pricing: Any) -> dict[str, Any]:
+        """Flatten every documented Routeway token rate for the strict-zero guard."""
+        if not isinstance(raw_pricing, dict) or not {"input", "output"} <= set(raw_pricing):
+            return {}
+        if set(raw_pricing) - {"input", "output", "caching"}:
+            return {}
+
+        flattened: dict[str, Any] = {}
+        for source_field, target_field in (("input", "prompt"), ("output", "completion")):
+            rate = cls._routeway_rate_value(raw_pricing.get(source_field))
+            if rate is None:
+                return {}
+            flattened[target_field] = rate
+
+        if "caching" in raw_pricing:
+            caching_rates: dict[str, Any] = {}
+            if not cls._routeway_collect_rates(raw_pricing.get("caching"), "caching", caching_rates):
+                return {}
+            flattened.update(caching_rates)
+        return flattened
+
+    @staticmethod
+    def _routeway_rate_value(value: Any) -> Any | None:
+        if not isinstance(value, dict) or "price_per_million_t" not in value:
+            return None
+        if set(value) - {"unit", "price_per_million_t"}:
+            return None
+        rate = value.get("price_per_million_t")
+        if isinstance(rate, bool) or rate in (None, ""):
+            return None
+        return rate
+
+    @classmethod
+    def _routeway_collect_rates(
+        cls,
+        value: Any,
+        path: str,
+        flattened: dict[str, Any],
+    ) -> bool:
+        if not isinstance(value, dict) or not value:
+            return False
+        if "price_per_million_t" in value:
+            rate = cls._routeway_rate_value(value)
+            if rate is None:
+                return False
+            flattened[path] = rate
+            return True
+        for key, child in value.items():
+            if not cls._routeway_collect_rates(child, f"{path}.{key}", flattened):
+                return False
+        return True
+
+    def _normalize_requesty_catalog_model(self, model: dict[str, Any]) -> dict[str, Any]:
+        """Translate Requesty's public catalog fields into Ficelle's generic contract.
+
+        Every mapped field remains fail-closed: absent prices stay absent, explicit false
+        capabilities become an empty parameter list, and a non-chat ``api`` marker is preserved as
+        a negative capability. No account response or inferred model-family metadata is involved.
+        """
+        normalized = dict(model)
+        pricing: dict[str, Any] = {}
+        for source_field, target_field in (
+            ("input_price", "prompt"),
+            ("output_price", "completion"),
+            ("cached_price", "cached"),
+            ("caching_price", "caching"),
+        ):
+            if source_field in model:
+                value = model[source_field]
+                pricing[target_field] = None if isinstance(value, bool) else value
+        if "pricing" in model and not self._requesty_pricing_tiers_are_strict_zero(model.get("pricing")):
+            pricing = {}
+        normalized["pricing"] = pricing
+
+        capability_fields = {
+            "supports_tool_calling",
+            "supports_output_json_object",
+            "supports_output_json_schema",
+        }
+        if capability_fields.intersection(model):
+            supported_parameters: list[str] = []
+            if model.get("supports_tool_calling") is True:
+                supported_parameters.extend(("tools", "tool_choice"))
+            if model.get("supports_output_json_object") is True or model.get("supports_output_json_schema") is True:
+                supported_parameters.append("response_format")
+            normalized["supported_parameters"] = supported_parameters
+
+        capabilities = model.get("capabilities")
+        normalized_capabilities = dict(capabilities) if isinstance(capabilities, dict) else {}
+        normalized_capabilities["completion_chat"] = model.get("api") == "chat"
+        normalized["capabilities"] = normalized_capabilities
+        return normalized
+
+    @staticmethod
+    def _requesty_pricing_tiers_are_strict_zero(raw_tiers: Any) -> bool:
+        if not isinstance(raw_tiers, list) or not raw_tiers:
+            return False
+        for tier in raw_tiers:
+            if not isinstance(tier, dict) or not {"input_price", "output_price"} <= set(tier):
+                return False
+            exposed_prices = (value for key, value in tier.items() if str(key).endswith("_price"))
+            try:
+                if any(
+                    isinstance(value, bool) or value in (None, "") or float(value) != 0.0
+                    for value in exposed_prices
+                ):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
 
     def excludes_catalog_model(
         self,
@@ -243,6 +554,15 @@ class OpenAICompatibleCatalogAdapter:
             return None
         if not upstream_id:
             return None
+        if self.source == "cloudflare" and model.get("workers_free_eligible") is not True:
+            return free_access_payload(
+                False,
+                mode,
+                sanitize_error_detail(provider_cfg.get("free_access_proof"), 250) or "provider_free_endpoint",
+                "provider",
+                "unavailable",
+                "Cloudflare catalog row requires Workers Paid or has ambiguous billing metadata",
+            )
         if (
             policy.requires_model_allowlist
             and not self._has_official_free_id_gate(policy)
@@ -304,8 +624,15 @@ class OpenAICompatibleCatalogAdapter:
     ) -> ProviderAccess:
         if self.source == "nous":
             return self._nous_access(provider_cfg, context)
+        base_url = self._base_url(provider_cfg, context.resolve_provider_parameter)
+        if self._uses_anonymous_auth(provider_cfg):
+            if not base_url:
+                return ProviderAccess(None, None, self._missing_base_url_reason())
+            # Anonymous remote access is an explicit provider contract, not a fallback after
+            # credential resolution. Skipping the resolver is load-bearing: an ambient key must
+            # never turn a structurally no-spend endpoint into that provider's paid auth lane.
+            return ProviderAccess(None, base_url, "anonymous_remote", auth_status_invokable=True)
         key, reason = context.resolve_credentials(self.source, provider_cfg)
-        base_url = self._base_url(provider_cfg)
         if not base_url:
             # No base URL means nothing can be sent, whoever is asking. openrouter and mistral
             # used to be exempted here so a key alone read as "configured" — harmless back when
@@ -318,7 +645,7 @@ class OpenAICompatibleCatalogAdapter:
                 return ProviderAccess(
                     key,
                     None,
-                    f"missing base_url for provider {self.source}",
+                    self._missing_base_url_reason(),
                     key_reason=reason,
                 )
             return ProviderAccess(None, None, reason)
@@ -351,8 +678,38 @@ class OpenAICompatibleCatalogAdapter:
         provider_class = str(provider_cfg.get("provider_class") or provider_cfg.get("source_type") or "")
         return provider_class == "local" and str(provider_cfg.get("free_mode") or "") == "local_free"
 
-    def _base_url(self, provider_cfg: dict[str, Any]) -> str:
+    def _uses_anonymous_auth(self, provider_cfg: dict[str, Any]) -> bool:
+        return str(provider_cfg.get("auth_mode") or "") == "anonymous"
+
+    def _base_url(
+        self,
+        provider_cfg: dict[str, Any],
+        resolve_provider_parameter: ProviderParameterResolver | None = None,
+    ) -> str:
+        if self.source == "cloudflare":
+            return self._cloudflare_url(provider_cfg, "base_url_template", resolve_provider_parameter)
         return str(provider_cfg.get("base_url") or "").strip().rstrip("/")
+
+    def _missing_base_url_reason(self) -> str:
+        if self.source == "cloudflare":
+            return f"missing or invalid {CLOUDFLARE_ACCOUNT_ID_ENV} for provider cloudflare"
+        return f"missing base_url for provider {self.source}"
+
+    def _cloudflare_url(
+        self,
+        provider_cfg: dict[str, Any],
+        template_key: str,
+        resolve_provider_parameter: ProviderParameterResolver | None,
+    ) -> str:
+        raw_account_id = str(provider_cfg.get("account_id") or "").strip()
+        if not raw_account_id and callable(resolve_provider_parameter):
+            raw_account_id = str(resolve_provider_parameter(CLOUDFLARE_ACCOUNT_ID_ENV) or "").strip()
+        if not CLOUDFLARE_ACCOUNT_ID_PATTERN.fullmatch(raw_account_id):
+            return ""
+        template = str(provider_cfg.get(template_key) or "").strip()
+        if "{account_id}" not in template:
+            return ""
+        return template.replace("{account_id}", raw_account_id).rstrip("/")
 
     def _has_trusted_free_access_config(self, provider_cfg: dict[str, Any]) -> bool:
         mode = str(provider_cfg.get("free_mode") or "")
@@ -412,17 +769,25 @@ class OpenAICompatibleCatalogAdapter:
         provider_class = str(provider_cfg.get("provider_class") or provider_cfg.get("source_type") or "")
         return provider_class == "free_model" or bool(provider_cfg.get("require_model_id_allowlist"))
 
-    def _catalog_row_with_normalized_context(self, model: dict[str, Any]) -> dict[str, Any]:
-        """Map provider context aliases before defaults can mask sparse rows."""
-        if model.get("context_length") not in (None, ""):
-            return model
-        for alias in CONTEXT_LENGTH_CATALOG_ALIASES:
-            value = self._safe_optional_int(model.get(alias))
-            if value is not None:
-                normalized = dict(model)
-                normalized["context_length"] = value
-                return normalized
-        return model
+    def _catalog_row_with_normalized_limits(self, model: dict[str, Any]) -> dict[str, Any]:
+        """Map provider limit aliases before defaults can mask explicit row values."""
+        normalized = model
+        if model.get("context_length") in (None, ""):
+            for alias in CONTEXT_LENGTH_CATALOG_ALIASES:
+                value = self._safe_optional_int(model.get(alias))
+                if value is not None:
+                    normalized = {**model, "context_length": value}
+                    break
+
+        top_provider = normalized.get("top_provider")
+        nested_limits = dict(top_provider) if isinstance(top_provider, dict) else {}
+        output_limit = self._safe_optional_int(normalized.get("max_completion_tokens"))
+        if output_limit is not None and nested_limits.get("max_completion_tokens") in (None, ""):
+            normalized = {
+                **normalized,
+                "top_provider": {**nested_limits, "max_completion_tokens": output_limit},
+            }
+        return normalized
 
     def _catalog_row_declares_non_chat(self, model: dict[str, Any]) -> bool:
         """True when the catalog explicitly marks a row as not chat-capable."""
@@ -494,22 +859,37 @@ class OpenAICompatibleCatalogAdapter:
         provider_cfg: dict[str, Any],
         context: CatalogFetchContext,
     ) -> tuple[list[dict[str, Any]], str | None]:
+        if self.source == "cloudflare":
+            return self._fetch_cloudflare_catalog(provider_cfg, context)
         url = provider_cfg["catalog_url"]
         timeout = context.timeout_seconds
         headers = {"Accept": "application/json", **self.request_headers()}
-        if self.source == "mistral":
-            key, reason = context.resolve_credentials(self.source, provider_cfg)
-            if not key:
-                return [], reason
-            headers["Authorization"] = f"Bearer {key}"
-        elif self.source not in {"openrouter", "nous"}:
-            key, _reason = context.resolve_credentials(self.source, provider_cfg)
-            if key:
+        if not self._uses_anonymous_auth(provider_cfg):
+            if self.source == "mistral":
+                key, reason = context.resolve_credentials(self.source, provider_cfg)
+                if not key:
+                    return [], reason
                 headers["Authorization"] = f"Bearer {key}"
+            elif self.source not in {"openrouter", "nous"}:
+                key, _reason = context.resolve_credentials(self.source, provider_cfg)
+                if key:
+                    headers["Authorization"] = f"Bearer {key}"
+        # Anonymous catalog access deliberately skips this whole credential branch: a stray
+        # environment variable must never silently add the provider's paid auth posture.
         # Separate, short connect timeout so an unreachable / black-holing provider
         # endpoint fails fast at connect instead of stalling for the full read timeout.
         connect_timeout = min(5.0, timeout)
-        response = context.http_get(url, timeout=(connect_timeout, timeout), headers=headers)
+        request_kwargs: dict[str, Any] = {
+            "timeout": (connect_timeout, timeout),
+            "headers": headers,
+        }
+        if self._uses_anonymous_auth(provider_cfg):
+            request_kwargs["auth"] = suppress_implicit_http_auth
+            # Requests re-applies .netrc credentials while following redirects, even when the
+            # original request had an explicit no-op auth handler. Refuse redirects so an
+            # anonymous lane cannot cross that transport boundary.
+            request_kwargs["allow_redirects"] = False
+        response = context.http_get(url, **request_kwargs)
         if response.status_code != 200:
             return [], f"HTTP {response.status_code}"
         payload = response.json()
@@ -517,3 +897,64 @@ class OpenAICompatibleCatalogAdapter:
         if not isinstance(data, list):
             return [], "invalid catalog shape"
         return data, None
+
+    def _fetch_cloudflare_catalog(
+        self,
+        provider_cfg: dict[str, Any],
+        context: CatalogFetchContext,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        base_catalog_url = self._cloudflare_url(
+            provider_cfg,
+            "catalog_url_template",
+            context.resolve_provider_parameter,
+        )
+        if not base_catalog_url:
+            return [], f"missing or invalid {CLOUDFLARE_ACCOUNT_ID_ENV}"
+        key, reason = context.resolve_credentials(self.source, provider_cfg)
+        if not key:
+            return [], reason
+
+        timeout = context.timeout_seconds
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {key}",
+            **self.request_headers(),
+        }
+        models: list[dict[str, Any]] = []
+        for page in range(1, CLOUDFLARE_MAX_CATALOG_PAGES + 1):
+            query = urlencode(
+                {
+                    "page": page,
+                    "per_page": CLOUDFLARE_CATALOG_PAGE_SIZE,
+                    "include_deprecated": "false",
+                }
+            )
+            response = context.http_get(
+                f"{base_catalog_url}?{query}",
+                timeout=(min(5.0, timeout), timeout),
+                headers=headers,
+            )
+            if response.status_code != 200:
+                return [], f"HTTP {response.status_code}"
+            payload = response.json()
+            result = payload.get("result") if isinstance(payload, dict) else None
+            if not isinstance(result, list) or payload.get("success") is not True:
+                return [], "invalid Cloudflare catalog shape"
+            if not all(isinstance(row, dict) for row in result):
+                return [], "invalid Cloudflare catalog row"
+            models.extend(result)
+
+            result_info = payload.get("result_info") if isinstance(payload.get("result_info"), dict) else {}
+            total_count = self._safe_optional_int(result_info.get("total_count"))
+            current_page = self._safe_optional_int(result_info.get("page")) or page
+            per_page = self._safe_optional_int(result_info.get("per_page")) or len(result)
+            if current_page != page or per_page <= 0:
+                return [], "invalid Cloudflare catalog pagination"
+            if total_count is not None:
+                if len(models) == total_count:
+                    return models, None
+                if len(models) > total_count or not result:
+                    return [], "incomplete Cloudflare catalog pagination"
+            elif not result or len(result) < per_page:
+                return models, None
+        return [], "Cloudflare catalog pagination exceeded safety limit"

@@ -172,6 +172,7 @@ class CatalogRefreshRunner:
                     "provider_class": provider_diagnostics.get("provider_class"),
                     "free_mode": provider_diagnostics.get("free_mode"),
                     "free_scope": provider_diagnostics.get("free_scope"),
+                    "auth_mode": provider_diagnostics.get("auth_mode"),
                     "provider_account_id": self.ports.safe_detail(provider_policy.model_defaults.get("provider_account_id")),
                     "activation_policy": provider_diagnostics.get("activation_policy"),
                     "quota_reset_policy": provider_diagnostics.get("quota_reset_policy"),

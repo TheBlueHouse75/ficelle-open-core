@@ -63,6 +63,14 @@
               </div>
               <div class="card-body">
                 <div class="hint" id="profileHint"></div>
+                <div class="stream-policy-setting">
+                  <div class="stream-policy-head">
+                    <label for="streamCommitPolicy">Stream commit policy</label>
+                    <span class="badge" id="streamCommitPolicyState"></span>
+                  </div>
+                  <select id="streamCommitPolicy"></select>
+                  <p>Controls how much of a new stream Ficelle checks before committing it to the client.</p>
+                </div>
                 <div class="editor-bar">
                   <div class="segmented" role="group" aria-label="Selection mode">
                     <button type="button" id="autoModeBtn">Automatic</button>

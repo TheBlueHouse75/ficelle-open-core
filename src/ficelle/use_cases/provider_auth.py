@@ -16,18 +16,23 @@ class ProviderAuthPorts:
 def provider_auth_row(source: str, config: dict[str, Any], *, ports: ProviderAuthPorts) -> dict[str, Any]:
     providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
     provider_cfg = providers.get(source) if isinstance(providers.get(source), dict) else {}
-    access = ports.provider_access(source, provider_cfg, False)
+    enabled = bool(provider_cfg.get("enabled", True))
+    # A disabled provider must remain impossible to invoke, but its credential provenance is
+    # still needed by removal/rotation diagnostics. Resolve access as if enabled, then keep the
+    # disabled verdict below. Anonymous adapters still bypass credential resolution themselves.
+    access_cfg = provider_cfg if enabled else {**provider_cfg, "enabled": True}
+    access = ports.provider_access(source, access_cfg, False)
     # The record's own verdict, not a second copy of it: this row and `invoke_model` must
     # answer the same question, and every time each composed its own predicate they drifted.
-    invokable = access.can_invoke
+    invokable = enabled and access.can_invoke
     base_url_for_row = access.base_url or provider_cfg.get("base_url")
     return auth_row(
         invokable,
         access.key,
-        access.reason,
+        access.reason if enabled else "disabled",
         base_url_for_row,
         credential_source_label=ports.credential_source_label,
-        key_reason=access.key_reason,
+        key_reason=access.key_reason or (access.reason if access.key else None),
     )
 
 
@@ -88,7 +93,10 @@ def unusable_key_provider_reasons(auth: Mapping[str, Any]) -> dict[str, str]:
     return {
         str(source): str(row.get("reason") or "the stored key cannot be used")
         for source, row in auth.items()
-        if isinstance(row, dict) and not row.get("invokable") and row.get("key_source")
+        if isinstance(row, dict)
+        and not row.get("invokable")
+        and row.get("key_source")
+        and row.get("reason") != "disabled"
     }
 
 
@@ -119,6 +127,11 @@ def unconfigured_provider_sources(auth: Mapping[str, Any]) -> list[str]:
         set(invokable_provider_sources(auth))
         | set(unusable_key_provider_reasons(auth))
         | set(unreadable_provider_reasons(auth))
+        | {
+            str(source)
+            for source, row in auth.items()
+            if isinstance(row, dict) and row.get("reason") == "disabled"
+        }
     )
     return [str(source) for source in auth if str(source) not in accounted]
 

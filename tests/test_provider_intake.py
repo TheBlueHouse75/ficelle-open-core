@@ -748,17 +748,21 @@ def test_manual_adapter_generation_writes_sheet_only(tmp_path):
     assert not (tmp_path / "teamorouter.integration.json").exists()
 
 
-def test_remote_keyless_provider_requires_runtime_code():
+def test_remote_keyless_provider_uses_the_anonymous_generic_contract():
     record = ProviderIntakeRecord.from_dict(
         ready_record(account_key_posture="not_required", auth_env="none")
     )
 
     decision = evaluate_automation_readiness(record)
+    scaffold = build_integration_scaffold(record)
 
-    assert decision.action == "manual_code_required"
+    assert decision.action == "scaffold_ready"
     assert decision.sheet_ready is True
-    assert decision.scaffold_ready is False
-    assert decision.blockers == ("runtime:keyless_remote",)
+    assert decision.scaffold_ready is True
+    assert decision.blockers == ()
+    assert scaffold["provider_config"]["auth_mode"] == "anonymous"
+    assert scaffold["provider_config"]["activation_policy"] == "always"
+    assert "credential_presence" not in scaffold["required_gates"]
 
 
 @pytest.mark.parametrize(

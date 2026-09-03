@@ -68,8 +68,8 @@ class ProviderAdmissionLedger:
     """
 
     monotonic: Callable[[], float] = time.monotonic
-    _requests: dict[tuple[str, str], deque[float]] = field(default_factory=dict)
-    _observed: dict[tuple[str, str], ObservedRequestLimit] = field(default_factory=dict)
+    _requests: dict[tuple[str, str, str], deque[float]] = field(default_factory=dict)
+    _observed: dict[tuple[str, str, str], ObservedRequestLimit] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     @staticmethod
@@ -89,8 +89,9 @@ class ProviderAdmissionLedger:
         provider_cfg: Any,
         *,
         namespace: str = "",
+        scope_key: str = "",
     ) -> AdmissionDecision:
-        key = (str(namespace or ""), str(source or ""))
+        key = (str(namespace or ""), str(source or ""), str(scope_key or ""))
         now = self.monotonic()
         with self._lock:
             observed = self._observed.get(key)
@@ -143,6 +144,7 @@ class ProviderAdmissionLedger:
         headers: Any,
         *,
         namespace: str = "",
+        scope_key: str = "",
     ) -> None:
         if not hasattr(headers, "items"):
             return
@@ -158,7 +160,7 @@ class ProviderAdmissionLedger:
         )
         if limit <= 0 or remaining < 0 or reset_seconds is None:
             return
-        key = (str(namespace or ""), str(source or ""))
+        key = (str(namespace or ""), str(source or ""), str(scope_key or ""))
         with self._lock:
             self._observed[key] = ObservedRequestLimit(
                 limit=limit,

@@ -37,6 +37,29 @@ def test_provider_budgets_are_independent() -> None:
     assert ledger.reserve("b", config).allowed is True
 
 
+def test_model_scoped_budgets_and_observed_headers_are_independent() -> None:
+    ledger = ProviderAdmissionLedger(monotonic=lambda: 0.0)
+    config = {"rate_limit_rpm": 1}
+
+    assert ledger.reserve("provider", config, scope_key="model-a").allowed is True
+    assert ledger.reserve("provider", config, scope_key="model-a").allowed is False
+    assert ledger.reserve("provider", config, scope_key="model-b").allowed is True
+
+    ledger.observe(
+        "provider",
+        {
+            "X-RateLimit-Limit-Requests": "20",
+            "X-RateLimit-Remaining-Requests": "0",
+            "X-RateLimit-Reset-Requests": "60s",
+        },
+        scope_key="model-a",
+    )
+
+    assert ledger.reserve("provider", config, scope_key="model-a").allowed is False
+    assert ledger.reserve("provider", config, scope_key="model-b").allowed is False
+    assert ledger.reserve("provider", config, scope_key="model-c").allowed is True
+
+
 def test_provider_headers_override_a_stale_or_unknown_declaration() -> None:
     now = [10.0]
     ledger = ProviderAdmissionLedger(monotonic=lambda: now[0])

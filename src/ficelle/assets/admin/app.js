@@ -69,6 +69,20 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     function customProfileIds() { return Object.keys(draftProfiles || {}).filter(isCustomProfileId).sort(); }
     function customProfileLocked(profileId) { return (state?.locked_custom_profile_ids || []).includes(profileId); }
+    function defaultStreamCommitPolicy(profileId) {
+      return profileId === "ficelle/auto-compression" ? "first_substantive_delta" : "first_complete_event";
+    }
+    const streamCommitPolicies = [
+      { value: "immediate", label: "Immediate" },
+      { value: "first_complete_event", label: "First complete event" },
+      { value: "first_substantive_delta", label: "First substantive delta" },
+    ];
+    function effectiveStreamCommitPolicy(profileId, profile) {
+      if (profile?.stream_commit_policy) return profile.stream_commit_policy;
+      const baseProfileId = profile?.base_profile || profileId;
+      return draftProfiles?.[baseProfileId]?.stream_commit_policy || defaultStreamCommitPolicy(baseProfileId);
+    }
+    const streamCommitPolicyLabel = (policy) => streamCommitPolicies.find((item) => item.value === policy)?.label || policy;
     const modelStats = (m) => state?.state?.stats?.[runtimeKey(m)] || null;
     function modelCooldown(m) { const c = state?.state?.cooldowns?.[runtimeKey(m)] || null; return c?.active ? c : null; }
     function providerCooldown(s) { const c = state?.state?.provider_cooldowns?.[s] || null; return c?.active ? c : null; }
@@ -215,6 +229,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         label: profile?.label || "",
         description: profile?.description || "",
         base_profile: profile?.base_profile || "",
+        stream_commit_policy: Object.prototype.hasOwnProperty.call(profile || {}, "stream_commit_policy")
+          ? profile.stream_commit_policy
+          : null,
       });
     }
     function unsavedProfileIds() {
@@ -721,6 +738,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const p = currentProfile();
       const custom = isCustomProfileId(activeProfile);
       const locked = customProfileLocked(activeProfile);
+      const explicitStreamPolicy = Object.prototype.hasOwnProperty.call(p, "stream_commit_policy");
+      const effectiveStreamPolicy = effectiveStreamCommitPolicy(activeProfile, p);
       $("activeProfileName").textContent = lab[0];
       $("activeProfileId").textContent = activeProfile;
       $("eligibleBadge").textContent = locked ? "Locked" : eligibleCount(activeProfile) + " usable";
@@ -761,6 +780,16 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("autoNote").style.display = manual ? "none" : "flex";
       $("autoTailWrap").style.display = manual ? "" : "none";
       $("clearProfileBtn").style.display = manual ? "" : "none";
+      const streamPolicy = $("streamCommitPolicy");
+      const streamPolicyOptions = custom
+        ? [{ value: "", label: "Inherit from base profile" }, ...streamCommitPolicies]
+        : streamCommitPolicies;
+      streamPolicy.innerHTML = streamPolicyOptions.map(({ value, label }) => '<option value="' + value + '">' + label + '</option>').join("");
+      streamPolicy.value = custom && !explicitStreamPolicy ? "" : effectiveStreamPolicy;
+      $("streamCommitPolicyState").textContent = custom
+        ? (explicitStreamPolicy ? "Custom · " : "Inherited · ") + streamCommitPolicyLabel(effectiveStreamPolicy)
+        : (effectiveStreamPolicy === defaultStreamCommitPolicy(activeProfile) ? "Default · " : "Custom · ") + streamCommitPolicyLabel(effectiveStreamPolicy);
+      streamPolicy.disabled = locked;
       $("customProfileActions").hidden = !custom;
       ["editCustomProfileBtn", "duplicateCustomProfileBtn"].forEach((id) => { $(id).disabled = locked; });
       ["autoModeBtn", "manualModeBtn", "autoTailToggle", "clearProfileBtn"].forEach((id) => { $(id).disabled = locked; });
@@ -1337,7 +1366,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       // Manual on/off toggle (mirrors the per-model Disable/Re-enable): holds the whole provider
       // out of routing until re-enabled, independent of automatic cooldowns and the config flag.
       const manuallyDisabled = !!providerManuallyDisabled(src);
-      const toggleBtn = manuallyDisabled
+      const providerDisabled = p.enabled === false || manuallyDisabled;
+      const toggleBtn = providerDisabled
         ? '<button class="btn ghost sm" data-enable-provider="' + esc(src) + '">' + ic(ICONS.restore) + "Enable provider</button>"
         : '<button class="btn ghost sm" data-disable-provider="' + esc(src) + '">' + ic(ICONS.disable) + "Disable provider</button>";
       const actions = (cd ? '<button class="btn ghost sm" data-clear-provider="' + esc(src) + '">Resume now</button>' : "")
@@ -1351,18 +1381,24 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           + '<span class="comp-sub">' + accepted + " usable &middot; " + comp.raw + " returned</span></div>"
           + '<div class="comp-bar">' + shownBuckets.map((b) => '<span style="width:' + pct(b.count, comp.raw) + "%;background:" + b.color + '" title="' + b.count + " " + b.label + '"></span>').join("") + "</div>"
           + '<div class="comp-legend">' + shownBuckets.map((b) => '<span class="comp-legend-item"><span class="sw" style="background:' + b.color + '"></span>' + b.count + " " + esc(b.label) + "</span>").join("") + "</div></div>"
-        : '<div class="provider-note">No catalogue loaded' + (p.invokable
-          ? ""
-          : (credentialsUnreadable(p.auth_reason)
-            ? " — the credential store could not be read"
-            : " — add a key to fetch this provider's models")) + ".</div>";
+        : '<div class="provider-note">No catalogue loaded' + (p.enabled === false
+          ? " — enable this provider to fetch its models"
+          : p.invokable
+            ? ""
+            : (credentialsUnreadable(p.auth_reason)
+              ? " — the credential store could not be read"
+              : p.auth_mode === "anonymous"
+                ? " — the anonymous endpoint is unavailable"
+                : " — add a key to fetch this provider's models")) + ".</div>";
       // A stored key (key_source set) shows a redacted preview (first/last chars only, never the
       // full value) plus where it lives; Replace reveals the hidden paste box to rotate it. Gate on
       // key_source, not p.invokable: a keyless_local provider is invokable with no stored key
       // and must keep the plain paste box rather than a false mask.
       const storeChip = p.key_source ? '<span class="badge mono" title="Where Ficelle keeps this key">' + esc(p.key_source) + "</span>" : "";
       const keyMask = p.key_preview || "•".repeat(16);
-      const keyForm = p.key_source
+      const keyForm = p.auth_mode === "anonymous"
+        ? ""
+        : p.key_source
         ? '<div class="provider-chips key-form">' +
             '<span class="key-mask mono" title="Stored key — only the first and last characters are shown">' + esc(keyMask) + "</span>" +
             storeChip +
@@ -3092,6 +3128,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         requirements: { ...defaultReq(), ...(requirements || {}) },
       };
       const created = !editingCustomProfileId;
+      if (created) delete draftProfiles[profileId].stream_commit_policy;
       setActiveProfile(profileId);
       closeCustomProfileDialog();
       render();
@@ -3317,6 +3354,17 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("autoModeBtn").addEventListener("click", () => setProfile({ mode: "auto" }));
       $("manualModeBtn").addEventListener("click", () => setProfile({ mode: "manual_order" }));
       $("autoTailToggle").addEventListener("change", (e) => setProfile({ auto_tail: e.target.checked }));
+      $("streamCommitPolicy").addEventListener("change", (e) => {
+        const p = currentProfile();
+        if (isCustomProfileId(activeProfile) && !e.target.value) {
+          const next = { ...p };
+          delete next.stream_commit_policy;
+          draftProfiles[activeProfile] = next;
+          render();
+          return;
+        }
+        setProfile({ stream_commit_policy: e.target.value });
+      });
       $("clearProfileBtn").addEventListener("click", () => setProfile({ mode: "auto", models: [], excluded_models: [] }));
       $("newCustomProfileBtn").addEventListener("click", () => openCustomProfileDialog());
       $("editCustomProfileBtn").addEventListener("click", () => openCustomProfileDialog(activeProfile));
