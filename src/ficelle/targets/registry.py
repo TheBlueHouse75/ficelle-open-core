@@ -14,8 +14,14 @@ def get_target_adapter(registry: Mapping[str, TargetAdapter], target_id: str) ->
     return registry.get(target_id.strip().lower())
 
 
-def target_export(registry: Mapping[str, TargetAdapter], target_id: str, config: Mapping[str, Any]) -> TargetExport | None:
+def target_export(
+    registry: Mapping[str, TargetAdapter],
+    target_id: str,
+    config: Mapping[str, Any],
+    *,
+    api_token: str | None = None,
+) -> TargetExport | None:
     adapter = get_target_adapter(registry, target_id)
     if adapter is None:
         return None
-    return adapter.export_config(TargetExportContext(config=config))
+    return adapter.export_config(TargetExportContext(config=config, api_token=api_token))

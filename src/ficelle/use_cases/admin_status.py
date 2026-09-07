@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -633,6 +634,8 @@ def active_cooldown_rows_from_map(
             until = float(raw.get("until") or 0)
         except Exception:
             continue
+        if not math.isfinite(until):
+            continue
         if until <= now_ts:
             continue
         row = {
@@ -823,6 +826,9 @@ def failed_profile_evidence_row(
                 "test_type": verified.get("test_type"),
                 "failed_at": verified.get("failed_at"),
                 "evidence_source": "verified_capability",
+                # Which state section the row came from is not where the verdict came from: a
+                # `verified_capabilities` row is written by a probe or by a real request.
+                "verdict_origin": safe_detail(verified.get("verdict_origin")) or "probe",
             }
         )
 
@@ -840,6 +846,7 @@ def failed_profile_evidence_row(
                 "test_type": benchmark.get("test_type"),
                 "failed_at": benchmark.get("ran_at"),
                 "evidence_source": "benchmark_result",
+                "verdict_origin": safe_detail(benchmark.get("verdict_origin")) or "probe",
             }
         )
 
@@ -880,6 +887,15 @@ def model_history_row(
         "score": rank_row.get("score"),
         "score_base": rank_row.get("score_base"),
         "score_adjustment": rank_row.get("score_adjustment"),
+        "score_total_without_quality": rank_row.get("score_total_without_quality"),
+        "score_total_with_quality": rank_row.get("score_total_with_quality"),
+        "quality_adjustment": rank_row.get("quality_adjustment"),
+        "quality_sample_count": rank_row.get("quality_sample_count"),
+        "quality_last_reason": rank_row.get("quality_last_reason"),
+        "quality_last_severity": rank_row.get("quality_last_severity"),
+        "quality_last_recorded_at": rank_row.get("quality_last_recorded_at"),
+        "quality_status": rank_row.get("quality_status"),
+        "quality_routing_enabled": rank_row.get("quality_routing_enabled"),
         "benchmark_bonus": rank_row.get("benchmark_bonus"),
         "verified_bonus": rank_row.get("verified_bonus"),
         "score_decay_factor": rank_row.get("score_decay_factor"),
@@ -894,7 +910,6 @@ def model_history_row(
         "requests": safe_int(stats.get("requests"), 0),
         "successes": safe_int(stats.get("successes"), 0),
         "failures": safe_int(stats.get("failures"), 0),
-        "consecutive_failures": safe_int(stats.get("consecutive_failures"), 0),
         "latency_ewma": stats.get("latency_ewma"),
         "last_success_at": stats.get("last_success_at"),
         "last_failure_at": stats.get("last_failure_at"),
@@ -963,6 +978,15 @@ def candidate_rank_rows(
                 "score": score["score_total"],
                 "score_base": score["score_base"],
                 "score_adjustment": score["score_adjustment"],
+                "score_total_without_quality": score.get("score_total_without_quality"),
+                "score_total_with_quality": score.get("score_total_with_quality"),
+                "quality_adjustment": score.get("quality_adjustment"),
+                "quality_sample_count": score.get("quality_sample_count"),
+                "quality_last_reason": score.get("quality_last_reason"),
+                "quality_last_severity": score.get("quality_last_severity"),
+                "quality_last_recorded_at": score.get("quality_last_recorded_at"),
+                "quality_status": score.get("quality_status"),
+                "quality_routing_enabled": score.get("quality_routing_enabled"),
                 "benchmark_bonus": score["benchmark_bonus"],
                 "verified_bonus": score["verified_bonus"],
                 "score_decay_factor": score["score_decay_factor"],

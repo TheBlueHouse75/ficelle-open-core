@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from ficelle.domain_models import CatalogModel, SelectionPurpose, SelectionRequest, SelectionResult
-from ficelle.use_cases.cooldowns import cooldown_block_scope
+from ficelle.use_cases.cooldowns import cooldown_block_scope, failure_penalty_weight
 
 
 @dataclass(frozen=True)
@@ -46,12 +47,22 @@ def sort_available_for_virtual_model(
     safe_int: Callable[[Any, int], int],
     safe_float: Callable[[Any, float], float],
     cooldown_key: Callable[[dict[str, Any]], str],
+    now_epoch: Callable[[], float] = time.time,
 ) -> list[dict[str, Any]]:
+    """Rank a profile's candidates by score, then by the tie-breaks below.
+
+    An expired `failed` verdict is handled by the score alone (`model_scoring`: its penalty does
+    not decay), not by a demotion key here — one mechanism, so nothing has to be cancelled out
+    elsewhere.
+    """
+    stats = state.get("stats") if isinstance(state.get("stats"), dict) else {}
+    now = now_epoch()
     ordered = list(available)
     ordered.sort(
         key=lambda model: (
             -model_auto_score(requested_model, model, state),
-            safe_int(((state.get("stats") or {}).get(cooldown_key(model)) or {}).get("consecutive_failures"), 0),
+            # The same recency-weighted count the score already subtracts, read from the ledger.
+            failure_penalty_weight(stats.get(cooldown_key(model)), now),
             -safe_int(model.get("context_length"), 0),
             safe_float(model.get("burn_weight"), 1.0),
             str(model.get("id") or ""),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from ficelle.service import (
@@ -370,6 +371,69 @@ def test_systemd_user_restart_reuses_existing_unit(tmp_path):
     assert read_active_service_context(paths.active_home_pointer) == paths.ficelle_home
 
 
+def test_systemd_user_restart_reuses_the_interpreter_recorded_in_the_unit(tmp_path, capsys):
+    installed_python = tmp_path / "venv-A" / "bin" / "python"
+    installed_python.parent.mkdir(parents=True)
+    installed_python.write_text("", encoding="utf-8")
+    current_python = tmp_path / "venv-B" / "bin" / "python"
+    current_python.parent.mkdir(parents=True)
+    current_python.write_text("", encoding="utf-8")
+    paths = make_paths(tmp_path)
+
+    installed = SystemdUserServiceBackend(
+        paths=replace(paths, install_python=installed_python),
+        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+    assert installed.install() == 0
+
+    restarted = SystemdUserServiceBackend(
+        paths=replace(paths, install_python=current_python),
+        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+    assert restarted.restart() == 0
+
+    unit = paths.systemd_unit.read_text(encoding="utf-8")
+    assert f"ExecStart={installed_python} -m ficelle.router --serve" in unit
+    assert "reusing the interpreter" in capsys.readouterr().out
+
+
+def test_systemd_user_restart_repoints_when_recorded_interpreter_is_unusable(tmp_path):
+    broken_python = tmp_path / "venv-A" / "bin" / "python"
+    current_python = tmp_path / "venv-B" / "bin" / "python"
+    broken_python.parent.mkdir(parents=True)
+    broken_python.write_text("", encoding="utf-8")
+    current_python.parent.mkdir(parents=True)
+    current_python.write_text("", encoding="utf-8")
+    paths = make_paths(tmp_path)
+    paths.systemd_unit.parent.mkdir(parents=True)
+    paths.systemd_unit.write_text(
+        f"ExecStart={broken_python} -m ficelle.router --serve\n", encoding="utf-8"
+    )
+
+    def run_command(command):
+        if command[:2] == [str(broken_python), "-c"]:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="broken")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    restarted = SystemdUserServiceBackend(
+        paths=replace(paths, install_python=current_python),
+        run_command=run_command,
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+    assert restarted.restart() == 0
+    assert f"ExecStart={current_python} -m ficelle.router --serve" in paths.systemd_unit.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_systemd_user_uninstall_removes_unit_and_reloads(tmp_path):
     calls = []
     paths = make_paths(tmp_path)
@@ -471,6 +535,65 @@ def test_scheduled_task_stop_and_uninstall_use_schtasks(tmp_path):
     assert backend.uninstall() == 0
     assert ["schtasks", "/Delete", "/TN", paths.label, "/F"] in calls
     assert not backend.task_xml.exists()
+
+
+def test_scheduled_task_restart_reuses_the_interpreter_recorded_in_xml(tmp_path, capsys):
+    installed_python = tmp_path / "venv-A" / "python.exe"
+    installed_python.parent.mkdir(parents=True)
+    installed_python.write_text("", encoding="utf-8")
+    current_python = tmp_path / "venv-B" / "python.exe"
+    current_python.parent.mkdir(parents=True)
+    current_python.write_text("", encoding="utf-8")
+    paths = make_paths(tmp_path)
+
+    installed = _windows_backend(replace(paths, install_python=installed_python))
+    assert installed.install() == 0
+
+    restarted = _windows_backend(replace(paths, install_python=current_python))
+    assert restarted.restart() == 0
+
+    payload = paths.ficelle_home.joinpath(f"{paths.label}.task.xml").read_text(encoding="utf-16")
+    assert f"<Command>{installed_python}</Command>" in payload
+    assert "reusing the interpreter" in capsys.readouterr().out
+
+
+def test_scheduled_task_restart_repoints_when_recorded_interpreter_is_unusable(tmp_path):
+    broken_python = tmp_path / "venv-A" / "python.exe"
+    current_python = tmp_path / "venv-B" / "python.exe"
+    broken_python.parent.mkdir(parents=True)
+    broken_python.write_text("", encoding="utf-8")
+    current_python.parent.mkdir(parents=True)
+    current_python.write_text("", encoding="utf-8")
+    paths = make_paths(tmp_path)
+    paths.ficelle_home.mkdir(parents=True)
+    paths.ficelle_home.joinpath(f"{paths.label}.task.xml").write_text(
+        WindowsScheduledTaskBackend(
+            paths=replace(paths, install_python=broken_python),
+            run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+            wait_for_ready=lambda: True,
+            terminate_stale_servers=lambda: [],
+            report_stale_servers=lambda _pids: None,
+            account_provider=lambda: "EXAMPLE\\cyril",
+        ).task_payload(),
+        encoding="utf-16",
+    )
+
+    def run_command(command):
+        if command[:2] == [str(broken_python), "-c"]:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="broken")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    restarted = WindowsScheduledTaskBackend(
+        paths=replace(paths, install_python=current_python),
+        run_command=run_command,
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+        account_provider=lambda: "EXAMPLE\\cyril",
+    )
+    assert restarted.restart() == 0
+    payload = paths.ficelle_home.joinpath(f"{paths.label}.task.xml").read_text(encoding="utf-16")
+    assert f"<Command>{current_python}</Command>" in payload
 
 
 def test_scheduled_task_leaves_a_slow_service_registered(tmp_path, capsys):

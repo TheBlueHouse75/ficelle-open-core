@@ -6,9 +6,10 @@ Every recipe below ends at the same place: an OpenAI-compatible client talking t
 http://127.0.0.1:8646/v1
 ```
 
-with any non-empty API key (the conventional placeholder is `ficelle-local` — the
-router serves loopback callers and ignores the key's value). Install and start
-Ficelle first, and store a provider key (`ficelle set-key openrouter`): the model
+with the owner API token returned locally by `ficelle access-token api`. The router
+authenticates loopback and non-loopback clients alike. Install and start Ficelle
+first, load `export FICELLE_API_KEY="$(ficelle access-token api)"`, and store a
+provider key (`ficelle set-key openrouter`): the model
 list is served from public catalogs without credentials, so **a populated model
 list does not mean a completion can be served** — `ficelle doctor --text` tells
 you which providers actually can.
@@ -64,6 +65,7 @@ merely tool-capable model.
 ```bash
 curl -s http://127.0.0.1:8646/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $FICELLE_API_KEY" \
   -d '{"model":"ficelle/auto-fast","messages":[{"role":"user","content":"Reply exactly: ficelle-ok"}],"temperature":0}'
 ```
 

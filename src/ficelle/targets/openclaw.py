@@ -55,12 +55,15 @@ class OpenClawTargetAdapter:
     supports_health_check: bool = True
 
     def export_config(self, context: TargetExportContext) -> TargetExport:
+        api_token = (context.api_token or "").strip()
+        if not api_token:
+            raise ValueError("an owner API token is required to export a usable OpenClaw configuration")
         config = dict(context.config)
         base_url = target_base_url(config)
         model_ids = self._model_ids(config)
         primary = "ficelle/auto-orchestrator" if "ficelle/auto-orchestrator" in model_ids else model_ids[0]
         fallbacks = tuple(model_id for model_id in model_ids if model_id != primary)
-        payload = self._openclaw_config(base_url, primary, fallbacks)
+        payload = self._openclaw_config(base_url, primary, fallbacks, api_token=api_token)
         return TargetExport(
             target_id=self.target_id,
             base_url=base_url,
@@ -81,6 +84,7 @@ class OpenClawTargetAdapter:
                 ("ficelle", "models"),
                 ("openclaw", "models", "list"),
             ),
+            redaction_status="contains_ficelle_access_token",
         )
 
     def install_assets(self, context: TargetInstallContext) -> TargetInstallResult:
@@ -124,7 +128,14 @@ class OpenClawTargetAdapter:
             self.virtual_models, self.fusion_model_id, self.fusion_visible_in_model_list, config
         )
 
-    def _openclaw_config(self, base_url: str, primary: str, fallbacks: Sequence[str]) -> dict[str, Any]:
+    def _openclaw_config(
+        self,
+        base_url: str,
+        primary: str,
+        fallbacks: Sequence[str],
+        *,
+        api_token: str | None = None,
+    ) -> dict[str, Any]:
         ordered_model_ids = (primary, *fallbacks)
         policy_ids = self.model_policy_ids or {}
         allowlist = {
@@ -155,7 +166,7 @@ class OpenClawTargetAdapter:
                 "providers": {
                     self.provider_id: {
                         "baseUrl": base_url,
-                        "apiKey": "ficelle-local",
+                        "apiKey": api_token or "",
                         "api": "openai-completions",
                         "timeoutSeconds": 300,
                         "models": provider_models,

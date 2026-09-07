@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+import errno
 import hashlib
 import hmac
 import json
@@ -26,15 +27,18 @@ import socket
 import subprocess
 import sys
 import threading
+import functools
+import tempfile
 import time
 import uuid
+import weakref
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _StdThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ficelle import coding_certification, license_ops, request_log, update as update_service
 from ficelle.build_identity import package_build_identity
@@ -76,6 +80,7 @@ from ficelle.domain_models import (
 from ficelle.failures import (
     DROPPABLE_SAMPLING_PARAMETERS,
     BENCHMARK_ROUTE_BLOCKING_REASONS,
+    PRODUCTION_PROFILE_FAILURE_REASONS,
     PROVIDER_ERROR_REASONS,
     PROVIDER_SCOPED_COOLDOWN_REASONS,
     bad_request_body as bad_request_body_result,
@@ -84,11 +89,14 @@ from ficelle.failures import (
     cooldown_policy_for_reason,
     error_body as error_body_result,
     error_object_codes,
+    first_exception_errno,
+    model_not_found_body,
     safe_error_body as safe_error_body_result,
     status_for_error_codes,
     upstream_failure_actions as upstream_failure_actions_result,
     upstream_failure_status,
     upstream_retry_after_seconds,
+    walk_exception_chain,
 )
 from ficelle.retry_hints import retry_hint
 from ficelle.provider_admission import PROVIDER_ADMISSION_LEDGER, ProviderAdmissionRefused
@@ -189,9 +197,11 @@ from ficelle.use_cases.capability_discovery import (
     ProviderProbePacer,
     consecutive_verdict_count,
     clear_background_job_error_in_state,
+    DiscoveryPriorityPorts,
     discovery_eligible_models as discovery_eligible_models_use_case,
     model_due_capabilities as model_due_capabilities_use_case,
     models_needing_discovery as models_needing_discovery_use_case,
+    recently_routed_profile_ids as recently_routed_profile_ids_use_case,
     probeable_capability_profiles as probeable_capability_profiles_use_case,
     record_background_job_error_in_state,
 )
@@ -219,6 +229,7 @@ from ficelle.use_cases.chat_completion import (
     ChatCompletionRouter,
     CompressionRoutePlan,
     StreamingResponseStartInput,
+    build_no_attempt_route_log,
     build_streaming_response_start,
     normalize_chat_completion_request,
     prepare_compression_route_body as prepare_chat_compression_route_body,
@@ -273,6 +284,8 @@ from ficelle.use_cases.admin_security import (
 )
 from ficelle.url_security import connectable_http_url
 from ficelle.use_cases.cooldowns import (
+    FAILURE_ORIGIN_PROBE,
+    FAILURE_ORIGIN_REQUEST,
     AppliedCooldown,
     CooldownMutationPorts,
     CooldownReadPorts,
@@ -287,7 +300,9 @@ from ficelle.use_cases.cooldowns import (
     clear_provider_error_in_state as clear_provider_error_in_state_use_case,
     clear_quota_cooldown_in_state as clear_quota_cooldown_in_state_use_case,
     clear_quota_model_errors_for_source_in_state as clear_quota_model_errors_for_source_in_state_use_case,
+    completion_tokens_per_second,
     cooldown_key as cooldown_key_use_case,
+    failure_ledger_summary,
     model_is_quarantined as model_is_quarantined_use_case,
     model_on_cooldown as model_on_cooldown_use_case,
     model_quarantine as model_quarantine_use_case,
@@ -304,6 +319,7 @@ from ficelle.use_cases.cooldowns import (
     quota_cooldown_scope_from_key as quota_cooldown_scope_from_key_use_case,
     set_billing_quarantine_in_state as set_billing_quarantine_in_state_use_case,
     set_cooldown as set_cooldown_use_case,
+    set_cooldown_in_state as set_cooldown_in_state_use_case,
     set_provider_cooldown_in_state as set_provider_cooldown_in_state_use_case,
     set_quota_cooldown_in_state as set_quota_cooldown_in_state_use_case,
     set_model_not_found_quarantine_in_state as set_model_not_found_quarantine_in_state_use_case,
@@ -314,6 +330,7 @@ from ficelle.use_cases.cooldowns import (
     update_provider_failure_stats as update_provider_failure_stats_use_case,
     update_provider_success_stats as update_provider_success_stats_use_case,
     update_success_stats as update_success_stats_use_case,
+    update_throughput_stats as update_throughput_stats_use_case,
 )
 # Fusion is NOT yet optional: its config layer (FusionConfigPorts,
 # normalize_fusion_config, fusion_visible_in_model_list, fusion_call_multiplier,
@@ -442,7 +459,15 @@ from ficelle.use_cases.model_scoring import (
     score_evidence_for_model as score_evidence_for_model_use_case,
     score_row_reason as score_row_reason_use_case,
     score_row_status as score_row_status_use_case,
+    stale_failed_profile_evidence as stale_failed_profile_evidence_use_case,
     success_rate_for_model as success_rate_for_model_use_case,
+)
+from ficelle.use_cases.quality_feedback import (
+    QualityFeedbackError,
+    parse_quality_feedback_payload,
+    quality_feedback_scoring_state as quality_feedback_scoring_state_use_case,
+    quality_feedback_status as quality_feedback_status_use_case,
+    record_quality_feedback as record_quality_feedback_use_case,
 )
 from ficelle.use_cases.provider_auth import (
     ProviderAuthPorts,
@@ -484,6 +509,7 @@ from ficelle.use_cases.router_settings import (
     normalize_router_settings as normalize_router_settings_use_case,
     normalize_settings_backoff as normalize_settings_backoff_use_case,
     route_on_capability_reference as route_on_capability_reference_use_case,
+    router_config_warnings,
     router_settings_payload as router_settings_payload_use_case,
     save_router_settings as save_router_settings_use_case,
     settings_bool as settings_bool_use_case,
@@ -557,6 +583,7 @@ from ficelle.redaction import redact_sensitive_json, redact_sensitive_text, sani
 
 try:
     import requests
+    import urllib3
 except Exception as exc:  # pragma: no cover - startup guard
     raise SystemExit(f"Missing dependency: requests ({exc})")
 
@@ -582,6 +609,10 @@ LOG_CONTROL_CHAR_TABLE[ord("\\")] = r"\\"
 # Bound the product of request size and concurrency while retaining normal agent fan-out.
 MAX_ACTIVE_CHAT_REQUESTS = 32
 MAX_AGGREGATE_CHAT_REQUEST_BYTES = 128 * 1024 * 1024
+# Non-streaming responses are retained until the downstream response is written. Reserve the
+# individual upstream ceiling for each such request so concurrent callers cannot multiply the
+# 256 MiB per-response allowance into an unbounded process-wide allocation.
+MAX_AGGREGATE_UPSTREAM_RESPONSE_BYTES = 512 * 1024 * 1024
 MAX_ACTIVE_HTTP_HANDLERS = 64
 
 
@@ -589,8 +620,20 @@ class RequestBodyTooLarge(ValueError):
     """Raised when a caller declares a body past ``MAX_REQUEST_BODY_BYTES`` (answered as 413)."""
 
 
+class RequestBodyUnavailable(Exception):
+    """Raised when the caller stopped sending its declared body (socket timeout or reset).
+
+    Distinct from a malformed body: nothing is wrong with Ficelle or with the request, the
+    client simply never finished it. Answered as 408, never as a 500.
+    """
+
+
 class UpstreamResponseTooLarge(Exception):
     """Raised when a provider's response passes ``MAX_UPSTREAM_RESPONSE_BYTES``."""
+
+
+class UpstreamResponseBudgetExceeded(Exception):
+    """Raised when no process-wide non-streaming response retention slot is available."""
 
 
 class ChatRequestLease:
@@ -643,6 +686,62 @@ class ChatRequestAdmission:
                 raise RuntimeError("chat request admission released without a matching lease")
             self._active -= 1
             self._reserved_bytes -= reserved_bytes
+
+
+class OutputRetentionLease:
+    def __init__(self, admission: "OutputRetentionAdmission") -> None:
+        self._admission = admission
+        self._reserved_bytes = 0
+        self._released = False
+
+    def try_reserve(self, additional_bytes: int) -> bool:
+        if self._released:
+            raise RuntimeError("cannot reserve bytes on a released output-retention lease")
+        additional = max(0, int(additional_bytes))
+        if not self._admission.try_reserve(additional):
+            return False
+        self._reserved_bytes += additional
+        return True
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._admission.release(self._reserved_bytes)
+
+
+class OutputRetentionAdmission:
+    """Non-blocking process-wide budget for retained non-streaming upstream responses."""
+
+    def __init__(self, max_reserved_bytes: int) -> None:
+        self.max_reserved_bytes = max(1, int(max_reserved_bytes))
+        self._reserved_bytes = 0
+        self._lock = threading.Lock()
+
+    @property
+    def reserved_bytes(self) -> int:
+        with self._lock:
+            return self._reserved_bytes
+
+    def acquire(self) -> OutputRetentionLease:
+        return OutputRetentionLease(self)
+
+    def try_reserve(self, reserved_bytes: int) -> bool:
+        reserved = max(0, int(reserved_bytes))
+        with self._lock:
+            if self._reserved_bytes + reserved > self.max_reserved_bytes:
+                return False
+            self._reserved_bytes += reserved
+        return True
+
+    def release(self, reserved_bytes: int) -> None:
+        with self._lock:
+            if reserved_bytes > self._reserved_bytes:
+                raise RuntimeError("output retention budget released without a matching lease")
+            self._reserved_bytes -= reserved_bytes
+
+
+OUTPUT_RETENTION_ADMISSION = OutputRetentionAdmission(MAX_AGGREGATE_UPSTREAM_RESPONSE_BYTES)
 
 
 RUNTIME_STATE_HISTORY_KEYS = state_store_module.RUNTIME_STATE_HISTORY_KEYS
@@ -1229,14 +1328,21 @@ def verified_capability_ttl_seconds() -> int:
     return _active_verified_capability_ttl_seconds
 
 
+# Frozen dataclass of module-level function references: identical on every call, so it is built
+# once instead of per evidence read. Same for the scoring/evidence port sets further down.
+_BENCHMARK_EVIDENCE_PORTS = BenchmarkEvidencePorts(
+    expected_test_type=expected_benchmark_test_type,
+    active_ttl_seconds=verified_capability_ttl_seconds,
+    evidence_timestamp_value=runtime_evidence_timestamp_value,
+    parse_timestamp=parse_iso_timestamp,
+    # Called through a lambda, not bound here: the module-level build would otherwise freeze the
+    # clock these ports read, and tests (and `freeze`-style helpers) patch `time.time` in place.
+    now_seconds=lambda: time.time(),
+)
+
+
 def benchmark_evidence_ports() -> BenchmarkEvidencePorts:
-    return BenchmarkEvidencePorts(
-        expected_test_type=expected_benchmark_test_type,
-        active_ttl_seconds=verified_capability_ttl_seconds,
-        evidence_timestamp_value=runtime_evidence_timestamp_value,
-        parse_timestamp=parse_iso_timestamp,
-        now_seconds=time.time,
-    )
+    return _BENCHMARK_EVIDENCE_PORTS
 
 
 def benchmark_result_is_aged(
@@ -1323,7 +1429,11 @@ CORE_PROVIDERS: dict[str, dict] = {
 
 LEGACY_REQUEST_TIMEOUT_SECONDS = 120
 LEGACY_REQUEST_DEADLINE_SECONDS = 300
-REQUEST_TIMEOUT_POLICY_VERSION = 3
+# 4 adds the `auto-fast` read-inactivity cap below; 5 replaces a stored `max_attempts_per_request:
+# 0`. Bumping the version is what re-runs `migrate_legacy_config_defaults` over configs that already
+# carry a full copy of the defaults. The stored key keeps its historical name: renaming it would
+# read as version 0 on every install and re-run every migration.
+REQUEST_TIMEOUT_POLICY_VERSION = 5
 LEGACY_REQUEST_TIMEOUT_SECONDS_BY_PROFILE = {
     "ficelle/auto-fast": 30,
     "ficelle/auto-json": 45,
@@ -1344,7 +1454,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # several minutes before its first byte; the independent request deadline below still bounds
     # the complete failover window.
     "request_timeout_seconds": 600,
-    "request_timeout_seconds_by_profile": {},
+    # `auto-fast` is the one profile whose promise is latency: waiting out the global 600s of
+    # read inactivity on a silent provider costs ten minutes before the first fallback even
+    # starts. 120s is above every observed successful `auto-fast` answer on this install and
+    # still bounds a mute upstream. Every other profile inherits the global budget.
+    "request_timeout_seconds_by_profile": {"ficelle/auto-fast": 120},
     "max_attempts_per_request": 4,
     # Total wall-clock budget for one request, across every attempt. This remains the hard bound
     # when a provider keeps the socket active or a sequence of fallbacks consumes multiple read
@@ -1363,6 +1477,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "auth_or_credit": 3600,
         "billing_or_paid": 86400,
         "server_error": 180,
+        # A failed TLS handshake is a provider-wide transport fault, but usually a short one (an
+        # expired intermediate, a proxy hiccup); short enough that a provider recovering inside a
+        # minute is not benched for the 3600s an auth failure earns.
+        "tls_error": 180,
         "timeout": 300,
         "unavailable": 600,
     },
@@ -1761,8 +1879,11 @@ def build_upstream_failure_error(
     candidate_count: int,
     attempts: list[dict[str, Any]],
     errors: list[dict[str, Any]],
+    terminal_reason: str | None = None,
 ) -> dict[str, Any]:
-    return build_upstream_failure_error_result(requested_model, request_id, candidate_count, attempts, errors)
+    return build_upstream_failure_error_result(
+        requested_model, request_id, candidate_count, attempts, errors, terminal_reason
+    )
 
 
 def apply_chat_attempt_cooldown(
@@ -1772,17 +1893,41 @@ def apply_chat_attempt_cooldown(
     request_id: str,
     profile_id: str,
 ) -> AppliedCooldown:
-    return set_cooldown(
-        cooldown.model,
-        cooldown.reason,
-        config,
-        detail=cooldown.detail,
-        status=cooldown.status,
-        request_id=request_id,
-        profile_id=profile_id,
-        retry_after_seconds=cooldown.retry_after_seconds,
-        retry_after_source=cooldown.retry_after_source,
-    )
+    """Write everything one failed attempt owes the state, in a single state cycle.
+
+    The cooldown policy and the production capability verdict are two writes about the same attempt.
+    Applied through one `update` because each one takes the state lock, re-parses the file, deep-copies
+    it and writes it back, and a failing attempt is already on a request's critical path.
+    """
+    applied = AppliedCooldown()
+
+    def mutate(state: dict[str, Any]) -> None:
+        nonlocal applied
+        applied = set_cooldown_in_state_use_case(
+            state,
+            cooldown.model,
+            cooldown.reason,
+            config,
+            ports=cooldown_write_ports(),
+            detail=cooldown.detail,
+            status=cooldown.status,
+            request_id=request_id,
+            profile_id=profile_id,
+            retry_after_seconds=cooldown.retry_after_seconds,
+            retry_after_source=cooldown.retry_after_source,
+            attempt_reason=cooldown.attempt_reason,
+        )
+        record_production_profile_failure(
+            state,
+            profile_id,
+            cooldown.model,
+            cooldown.attempt_reason,
+            request_id=request_id,
+            detail=cooldown.detail,
+        )
+
+    _STATE_STORE.update(mutate, reason=f"set_cooldown:{cooldown.reason}")
+    return applied
 
 
 def apply_chat_route_telemetry(telemetry: ChatCompletionRouteTelemetry) -> None:
@@ -1880,7 +2025,7 @@ def normalize_fusion_config(
     )
 
 
-def migrate_legacy_request_timeouts(
+def migrate_legacy_config_defaults(
     existing: dict[str, Any],
     config: dict[str, Any],
 ) -> None:
@@ -1889,9 +2034,19 @@ def migrate_legacy_request_timeouts(
     Config files contain a full copy of the defaults, so changing ``DEFAULT_CONFIG`` alone would
     leave existing installs at 30-120 seconds. Migrate each old default independently: one custom
     profile value must not strand every unchanged profile at its legacy timeout.
+
+    Per-profile caps are rebuilt as *new defaults first, stored values second*, so a version bump
+    that introduces a profile cap (v4: `auto-fast`) reaches installs whose stored map predates it,
+    while an operator's own entry for that profile still overrides it. Rebuilding from the stored
+    map alone would have dropped the new default on every upgrade instead.
     """
     if safe_int(existing.get("request_timeout_policy_version"), 0) >= REQUEST_TIMEOUT_POLICY_VERSION:
         return
+    # `0` used to mean "try every eligible candidate", which on a live `auto-fast` pool was 171
+    # attempts for one request. Rewritten here rather than reinterpreted at every read, so the
+    # stored value and the behavior say the same thing (the settings validator rejects it too).
+    if safe_int(existing.get("max_attempts_per_request"), 0) < 1:
+        config["max_attempts_per_request"] = DEFAULT_CONFIG["max_attempts_per_request"]
     if existing.get("request_timeout_seconds") == LEGACY_REQUEST_TIMEOUT_SECONDS:
         config["request_timeout_seconds"] = DEFAULT_CONFIG["request_timeout_seconds"]
     if existing.get("request_deadline_seconds") == LEGACY_REQUEST_DEADLINE_SECONDS:
@@ -1899,9 +2054,12 @@ def migrate_legacy_request_timeouts(
     profile_timeouts = existing.get("request_timeout_seconds_by_profile")
     if isinstance(profile_timeouts, dict):
         config["request_timeout_seconds_by_profile"] = {
-            profile_id: value
-            for profile_id, value in profile_timeouts.items()
-            if LEGACY_REQUEST_TIMEOUT_SECONDS_BY_PROFILE.get(profile_id) != value
+            **DEFAULT_CONFIG["request_timeout_seconds_by_profile"],
+            **{
+                profile_id: value
+                for profile_id, value in profile_timeouts.items()
+                if LEGACY_REQUEST_TIMEOUT_SECONDS_BY_PROFILE.get(profile_id) != value
+            },
         }
     config["request_timeout_policy_version"] = REQUEST_TIMEOUT_POLICY_VERSION
 
@@ -1921,6 +2079,22 @@ def is_retired_provider_id(provider_id: object) -> bool:
         provider_id in RETIRED_PROVIDER_IDS
         or hashlib.sha256(provider_id.encode("utf-8")).hexdigest() in RETIRED_PROVIDER_ID_HASHES
     )
+
+
+# Config warnings already printed by this process. Reported at service startup and after an admin
+# settings save — the two moments an operator is looking — rather than from the config normalizer,
+# which runs on every load: a line repeated on every request is a line nobody reads.
+_REPORTED_CONFIG_WARNINGS: set[str] = set()
+
+
+def report_config_warnings(config: dict[str, Any]) -> list[str]:
+    """Print each silently-ignored config setting once per process, and return them."""
+    warnings = router_config_warnings(config)
+    for warning in warnings:
+        if warning not in _REPORTED_CONFIG_WARNINGS:
+            _REPORTED_CONFIG_WARNINGS.add(warning)
+            print(f"ficelle: config warning: {warning}", flush=True)
+    return warnings
 
 
 def normalize_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -1967,7 +2141,7 @@ def load_config() -> dict[str, Any]:
     ):
         # Re-read under the write lock so a concurrent dashboard or CLI update made after this
         # check is normalized in place instead of being overwritten by a stale copy.
-        return store.update_with_existing(migrate_legacy_request_timeouts)
+        return store.update_with_existing(migrate_legacy_config_defaults)
     return store.load()
 
 
@@ -2027,6 +2201,36 @@ def configured_virtual_model_ids(config: dict[str, Any]) -> list[str]:
 # Returned by every /admin/license* route when the closed pack is absent (the free open core
 # has no license to manage). One constant since four handlers share the exact body.
 _LICENSE_PRO_ONLY_404 = {"error": {"message": "License management is a Ficelle Pro feature", "type": "not_found"}}
+
+
+class ProEntitlementRequired(Exception):
+    """Raised before a Pro-only route can mutate state when entitlement is inactive."""
+
+
+def require_pro_feature(feature: str, component: Any, *, entitled: bool | None = None) -> None:
+    """Enforce pack integrity and an active entitlement at every Pro feature boundary."""
+    license_ops.require_pro_component(feature, component)
+    # A loaded engine with a missing/broken licensing module is still a partial pack, not an
+    # expired license. Keep that distinction visible to HTTP and CLI callers.
+    license_ops.ensure_installed()
+    if not (license_ops.is_entitled() if entitled is None else entitled):
+        raise ProEntitlementRequired(
+            f"Ficelle Pro entitlement is required for {feature}; activate or refresh the license"
+        )
+
+
+def pro_feature_error(exc: Exception) -> tuple[int, dict[str, Any]]:
+    if isinstance(exc, license_ops.LicenseNotInstalled):
+        return 404, {
+            "error": {
+                "code": "not_found",
+                "message": "Ficelle Pro is not installed",
+                "type": "not_found",
+            }
+        }
+    if isinstance(exc, ProEntitlementRequired):
+        return 402, {"error": {"code": "license_required", "message": str(exc), "type": "license_required"}}
+    return 503, {"error": {"code": "pro_pack_unavailable", "message": str(exc), "type": "service_unavailable"}}
 
 
 def fusion_visible_in_model_list(
@@ -2974,8 +3178,14 @@ def validate_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return validate_settings_payload_use_case(payload, policy=router_settings_policy())
 
 
+def compression_settings_changed(before: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    return before.get("compression") != candidate.get("compression")
+
+
 def router_settings_payload(config: dict[str, Any]) -> dict[str, Any]:
-    return router_settings_payload_use_case(config, policy=router_settings_policy())
+    payload = router_settings_payload_use_case(config, policy=router_settings_policy())
+    payload["runtime_timeout_policy"] = runtime_timeout_policy_payload(config)
+    return payload
 
 
 def apply_verified_capability_ttl(config: dict[str, Any]) -> int:
@@ -3032,7 +3242,7 @@ def auto_benchmark_models_per_cycle(config: dict[str, Any]) -> int:
 
 
 def save_router_settings(config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
-    return save_router_settings_use_case(
+    saved = save_router_settings_use_case(
         config,
         settings,
         policy=router_settings_policy(),
@@ -3042,6 +3252,10 @@ def save_router_settings(config: dict[str, Any], settings: dict[str, Any]) -> di
             apply_route_on_capability_reference=apply_route_on_capability_reference,
         ),
     )
+    # The other moment an operator is looking at the config: a setting that is silently doing
+    # nothing should be named now, not only at the next service start.
+    report_config_warnings(config)
+    return saved
 
 
 def rollback_router_settings_from_audit(audit_id: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -4142,10 +4356,7 @@ def resolve_via_external_resolvers(provider: str, fallback_reason: str) -> tuple
 
 
 def is_zero_price(value: Any) -> bool:
-    try:
-        return float(value or 0) == 0.0
-    except Exception:
-        return False
+    return safe_float(value, 1.0) == 0.0
 
 
 def strict_zero_pricing(pricing: Any) -> tuple[bool, str, dict[str, Any]]:
@@ -4160,9 +4371,8 @@ def strict_zero_pricing(pricing: Any) -> tuple[bool, str, dict[str, Any]]:
     for key, value in pricing.items():
         if value is None or value == "":
             return False, f"empty pricing field: {key}", {"status": "unsafe", "checked_fields": sorted(checked)}
-        try:
-            numeric = float(value)
-        except Exception:
+        numeric = safe_float(value, math.nan)
+        if not math.isfinite(numeric):
             return False, f"non numeric pricing field: {key}", {"status": "unsafe", "checked_fields": sorted(checked)}
         checked[str(key)] = str(value)
         if numeric != 0.0:
@@ -4184,9 +4394,8 @@ def official_free_id_pricing(pricing: Any) -> tuple[bool, str, dict[str, Any]]:
     for key, value in pricing.items():
         if value is None or value == "":
             return False, f"empty pricing field: {key}", {"status": "unsafe", "checked_fields": sorted(checked)}
-        try:
-            numeric = float(value)
-        except Exception:
+        numeric = safe_float(value, math.nan)
+        if not math.isfinite(numeric):
             return False, f"non numeric pricing field: {key}", {"status": "unsafe", "checked_fields": sorted(checked)}
         checked[str(key)] = str(value)
         if numeric != 0.0:
@@ -4202,11 +4411,9 @@ def pricing_has_non_zero_numeric(pricing: Any) -> bool:
     if not isinstance(pricing, dict):
         return False
     for value in pricing.values():
-        try:
-            if float(value) != 0.0:
-                return True
-        except Exception:
-            continue
+        numeric = safe_float(value, math.nan)
+        if math.isfinite(numeric) and numeric != 0.0:
+            return True
     return False
 
 
@@ -4581,7 +4788,7 @@ def refresh_capability_oracle_if_stale(config: dict[str, Any]) -> dict[str, Any]
     cache = load_runtime_json(CAPABILITY_ORACLE_CACHE_PATH, {})
     if not capability_oracle_is_stale(cache):
         return cache if isinstance(cache, dict) else {}
-    timeout = float(config.get("catalog_timeout_seconds") or 30)
+    timeout = max(1.0, safe_float(config.get("catalog_timeout_seconds"), 30.0))
     fresh, _error = fetch_capability_oracle(timeout)
     if not fresh:
         return cache if isinstance(cache, dict) else {}
@@ -4958,7 +5165,7 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
     for key, raw_value in (source.get("cooldowns") or {}).items():
         if not isinstance(raw_value, dict):
             continue
-        until = float(raw_value.get("until") or 0)
+        until = safe_float(raw_value.get("until"), 0.0)
         cooldowns[safe_state_key(key)] = {
             "reason": safe_detail(raw_value.get("reason")) or "cooldown",
             "set_at": raw_value.get("set_at"),
@@ -4971,7 +5178,7 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
     for key, raw_value in (source.get("provider_cooldowns") or {}).items():
         if not isinstance(raw_value, dict):
             continue
-        until = float(raw_value.get("until") or 0)
+        until = safe_float(raw_value.get("until"), 0.0)
         provider_cooldowns[safe_state_key(key)] = {
             "reason": safe_detail(raw_value.get("reason")) or "cooldown",
             "set_at": raw_value.get("set_at"),
@@ -5018,8 +5225,10 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
             "requests": safe_int(raw_value.get("requests"), 0),
             "successes": safe_int(raw_value.get("successes"), 0),
             "failures": safe_int(raw_value.get("failures"), 0),
-            "consecutive_failures": safe_int(raw_value.get("consecutive_failures"), 0),
+            **failure_ledger_summary(raw_value, now),
             "latency_ewma": raw_value.get("latency_ewma"),
+            # Telemetry only (never scored): wall-clock latency conflates queueing with generation.
+            "completion_tokens_per_second": raw_value.get("completion_tokens_per_second"),
             "last_success_at": raw_value.get("last_success_at"),
             "last_failure_at": raw_value.get("last_failure_at"),
             "last_failure_reason": safe_detail(raw_value.get("last_failure_reason")),
@@ -5038,7 +5247,7 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
             "requests": safe_int(raw_value.get("requests"), 0),
             "successes": safe_int(raw_value.get("successes"), 0),
             "failures": safe_int(raw_value.get("failures"), 0),
-            "consecutive_failures": safe_int(raw_value.get("consecutive_failures"), 0),
+            **failure_ledger_summary(raw_value, now),
             "latency_ewma": raw_value.get("latency_ewma"),
             "last_success_at": raw_value.get("last_success_at"),
             "last_failure_at": raw_value.get("last_failure_at"),
@@ -5188,6 +5397,8 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
                 row[VERDICT_STREAK_KEY] = raw_value[VERDICT_STREAK_KEY]
             safe_profiles[safe_state_key(profile_id)] = redacted_benchmark_row(str(profile_id), row)
 
+    quality_feedback = quality_feedback_status_use_case(source, now_epoch=lambda: now)
+
     return {
         "last_catalog_refresh_at": source.get("last_catalog_refresh_at"),
         "cooldowns": cooldowns,
@@ -5205,6 +5416,7 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
         "quarantine": quarantine,
         "benchmark_results": benchmark_results,
         "verified_capabilities": verified_capabilities,
+        "quality_feedback": quality_feedback,
         "admin_jobs": active_admin_jobs(source),
         "canary": redact_sensitive_json(source.get("canary")) if isinstance(source.get("canary"), dict) else {},
         "auto_benchmark": redact_sensitive_json(source.get("auto_benchmark")) if isinstance(source.get("auto_benchmark"), dict) else {},
@@ -5342,7 +5554,7 @@ def catalog_with_auto_scores(catalog: dict[str, Any], config: dict[str, Any], st
     return catalog_with_auto_scores_use_case(
         catalog,
         config,
-        state,
+        quality_feedback_scoring_state(state, config),
         apply_verified_capability_ttl=apply_verified_capability_ttl,
         normalized_virtual_profiles=normalized_virtual_profiles,
         normalized_free_access=normalized_free_access,
@@ -5433,13 +5645,13 @@ CRITICAL_PROFILE_IDS = [
 
 
 def epoch_to_iso(value: Any) -> str | None:
-    try:
-        timestamp = float(value)
-    except Exception:
-        return None
+    timestamp = safe_float(value, 0.0)
     if timestamp <= 0:
         return None
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def active_model_cooldown_rows(state: dict[str, Any], now: float | None = None) -> list[dict[str, Any]]:
@@ -5834,6 +6046,51 @@ def request_log_filters(path: str) -> dict[str, str | None]:
     return {key: first(key) for key in ("profile", "source", "reason", "status", "q")}
 
 
+def quality_feedback_scoring_state(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Carry the read-only quality-routing switch alongside a scoring snapshot only."""
+    return quality_feedback_scoring_state_use_case(
+        state,
+        config,
+        canonical_profile_id=canonical_virtual_model_id,
+    )
+
+
+def quality_feedback_attribution(request_id: str) -> dict[str, Any]:
+    """Resolve trusted, canonical provenance from the request-log index or fail closed."""
+    with _REQUEST_LOG_LOCK:
+        attribution = request_log.resolve_quality_feedback_attribution(
+            request_id,
+            store_path=REQUEST_LOG_STORE_PATH,
+            source_path=runtime_read_path(ROUTE_LOG_PATH),
+        )
+    if not isinstance(attribution, dict):
+        raise QualityFeedbackError("feedback_request_unattributable", 422)
+    profile = canonical_virtual_model_id(str(attribution.get("profile") or ""))
+    if not profile:
+        raise QualityFeedbackError("feedback_request_unattributable", 422)
+    return {**attribution, "profile": profile}
+
+
+def record_quality_feedback(body: Any) -> dict[str, Any]:
+    """Atomically record one operator verdict against a proven successful final route."""
+    feedback = parse_quality_feedback_payload(body)
+    attribution = quality_feedback_attribution(feedback.request_id)
+    result: dict[str, Any] = {}
+
+    def mutate(state: dict[str, Any]) -> None:
+        result.update(
+            record_quality_feedback_use_case(
+                state,
+                feedback,
+                attribution,
+                now_epoch=time.time,
+            )
+        )
+
+    _STATE_STORE.update(mutate, reason="record_quality_feedback")
+    return result
+
+
 def request_log_query_payload(path: str) -> dict[str, Any]:
     """Filtered list of recent routed requests from the derived index."""
     try:
@@ -5941,7 +6198,7 @@ def build_admin_status_builder() -> AdminStatusBuilder:
 
 
 def build_admin_status(catalog: dict[str, Any], config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    return build_admin_status_builder().build(catalog, config, state)
+    return build_admin_status_builder().build(catalog, config, quality_feedback_scoring_state(state, config))
 
 
 def load_cached_catalog_for_admin_status(config: dict[str, Any]) -> dict[str, Any]:
@@ -6082,7 +6339,7 @@ def admin_status(config: dict[str, Any], *, run_quota_probes: bool = True) -> di
     return status
 
 
-def admin_page_html(*, embed_token: bool = True) -> str:
+def admin_page_html() -> str:
     """Return the admin dashboard shell.
 
     The dashboard HTML/CSS/JS live as static files under ``assets/admin`` and are
@@ -6092,14 +6349,11 @@ def admin_page_html(*, embed_token: bool = True) -> str:
     if asset is None:
         return "<!doctype html><meta charset=utf-8><title>Ficelle</title><body>admin assets missing</body>"
     html = asset[0].decode("utf-8")
-    token_meta = (
-        f'<meta name="ficelle-admin-token" content="{admin_token()}">' if embed_token else ""
-    )
     html = (
         html
         .replace('/admin/static/admin.css"', f'/admin/static/admin.css?v={admin_asset_version("admin.css")}"')
         .replace('/admin/static/app.js"', f'/admin/static/app.js?v={admin_asset_version("app.js")}"')
-        .replace("</head>", f"{token_meta}\n</head>", 1)
+        .replace("</head>", "\n</head>", 1)
     )
     # Inject the closed pack's Fusion/Compression views only when ficelle_pro ships them.
     # On a core-only install the script is absent and the core renders upsell placeholders.
@@ -6146,23 +6400,23 @@ def admin_token() -> str:
 
 
 def api_token() -> str:
-    """Return the distinct owner-only credential for exposed OpenAI-compatible clients."""
+    """Return the distinct owner-only credential for OpenAI-compatible clients."""
     return _runtime_access_token("api-token")
 
 
-def ensure_exposed_access_tokens() -> None:
-    """Fail closed when an exposed listener cannot persist two independently scoped tokens."""
+def ensure_access_tokens() -> None:
+    """Fail closed when the router cannot persist two independently scoped tokens."""
     tokens = {"admin-token": admin_token(), "api-token": api_token()}
     if tokens["admin-token"] == tokens["api-token"]:
-        raise RuntimeError("admin-token and api-token must be distinct for a non-loopback bind")
+        raise RuntimeError("admin-token and api-token must be distinct for every bind")
     for filename, expected in tokens.items():
         path = ROUTER_DIR / filename
         try:
             persisted = path.read_text(encoding="utf-8").strip()
         except OSError as exc:
-            raise RuntimeError(f"non-loopback bind requires a persistent owner-only {filename}") from exc
+            raise RuntimeError(f"router requires a persistent owner-only {filename}") from exc
         if persisted != expected or path.stat().st_mode & 0o077:
-            raise RuntimeError(f"non-loopback bind requires a persistent owner-only {filename}")
+            raise RuntimeError(f"router requires a persistent owner-only {filename}")
 
 
 def is_loopback_origin(origin: str) -> bool:
@@ -6230,6 +6484,86 @@ def _build_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, Any
 _UPSTREAM_SESSION: Any = None
 _UPSTREAM_SESSION_LOCK = threading.Lock()
 
+# How long a pooled keep-alive connection may sit unused before Ficelle stops trusting it. A
+# middlebox drops an idle flow without telling either end, so the socket still looks open here
+# and the next send into it fails much later as a read timeout the model gets blamed for. 60s
+# stays under the idle gaps that preceded those failures in production route logs, and under
+# the 75s default `TCP_KEEPINTVL` that made keepalive probes the weaker option. See
+# docs/components/router.md.
+UPSTREAM_POOL_IDLE_MAX_SECONDS = 60.0
+
+# The errnos a dropped keep-alive connection surfaces as, once the cause chain is unwrapped.
+STALE_CONNECTION_ERRNOS = frozenset({errno.ETIMEDOUT, errno.ECONNRESET, errno.EPIPE})
+# A transport timeout that carries no errno is only blamed on the socket when it fired well
+# before its own read budget: a provider that is genuinely silent for the whole budget must not
+# earn a second send. Kernel retransmission gives up long before either budget in production.
+STALE_CONNECTION_MAX_LATENCY_SECONDS = 30.0
+
+# Monotonic stamp written on a connection when it is returned to its pool.
+_POOLED_AT_ATTRIBUTE = "_ficelle_pooled_at_monotonic"
+# Per-thread provenance of the connection the last send was handed. `requests` is synchronous,
+# so the pool that served a send and the send itself run on the same thread.
+_UPSTREAM_CONNECTION_STATE = threading.local()
+
+
+class IdleExpiringConnectionPoolMixin:
+    """Age pooled connections one by one, and record how the last one was obtained.
+
+    urllib3 drops a pooled connection only when the peer already announced the close, which a
+    silently dropped flow never does. Stamping a connection on its way into the pool and
+    closing it on the way out once the stamp is older than `UPSTREAM_POOL_IDLE_MAX_SECONDS`
+    expires each connection on its own idle time instead of on a process-wide clock. Closing is
+    enough, and the pooled object is deliberately kept: urllib3 reconnects a connection whose
+    socket is `None`.
+    """
+
+    def _get_conn(self, timeout: float | None = None) -> Any:
+        conn = super()._get_conn(timeout)  # type: ignore[misc]
+        pooled_at = getattr(conn, _POOLED_AT_ATTRIBUTE, None)
+        if isinstance(pooled_at, float) and time.monotonic() - pooled_at > UPSTREAM_POOL_IDLE_MAX_SECONDS:
+            conn.close()
+        # A live socket at this point means the send is about to reuse a connection — the only
+        # case a stale-socket replay may claim. A fresh handshake has no dead socket to blame.
+        _UPSTREAM_CONNECTION_STATE.reused = getattr(conn, "sock", None) is not None
+        return conn
+
+    def _put_conn(self, conn: Any) -> None:
+        if conn is not None:
+            setattr(conn, _POOLED_AT_ATTRIBUTE, time.monotonic())
+        super()._put_conn(conn)  # type: ignore[misc]
+
+
+class IdleExpiringHTTPConnectionPool(IdleExpiringConnectionPoolMixin, urllib3.HTTPConnectionPool):
+    pass
+
+
+class IdleExpiringHTTPSConnectionPool(IdleExpiringConnectionPoolMixin, urllib3.HTTPSConnectionPool):
+    pass
+
+
+_IDLE_EXPIRING_POOL_CLASSES = {
+    "http": IdleExpiringHTTPConnectionPool,
+    "https": IdleExpiringHTTPSConnectionPool,
+}
+
+
+class IdleExpiringHTTPAdapter(requests.adapters.HTTPAdapter):
+    """A `requests` adapter whose connection pools apply Ficelle's idle expiry.
+
+    `PoolManager` reads `pool_classes_by_scheme` from the instance, so the override reaches
+    every pool this adapter builds and no other `requests` user in the process. Proxied traffic
+    goes through a separate manager, which needs the same treatment.
+    """
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = dict(_IDLE_EXPIRING_POOL_CLASSES)
+
+    def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
+        manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+        manager.pool_classes_by_scheme = dict(_IDLE_EXPIRING_POOL_CLASSES)
+        return manager
+
 
 def upstream_session() -> Any:
     """One pooled HTTPS session for provider traffic.
@@ -6245,19 +6579,87 @@ def upstream_session() -> Any:
     with _UPSTREAM_SESSION_LOCK:
         if _UPSTREAM_SESSION is None:
             session = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=32)
+            adapter = IdleExpiringHTTPAdapter(pool_connections=16, pool_maxsize=32)
             session.mount("https://", adapter)
             session.mount("http://", adapter)
             _UPSTREAM_SESSION = session
         return _UPSTREAM_SESSION
 
 
-def upstream_post(url: str, **kwargs: Any) -> Any:
-    """Single exit for chat traffic, so pooling (and any future policy) has one place to live."""
-    return upstream_session().post(url, **kwargs)
+def stale_upstream_connection(exc: BaseException, *, elapsed_seconds: float) -> bool:
+    """Whether a send failure carries the signature of a connection the network already dropped.
+
+    Two shapes, one cause: the original ``OSError`` errno survives somewhere in the chain, or
+    urllib3 turned a socket error whose message says "timed out" into a read timeout — which
+    reaches the router as a `ReadTimeout`, or wrapped inside a `ConnectionError`. The errno is
+    conclusive on its own. A timeout without one is accepted only when it fired early — under
+    `STALE_CONNECTION_MAX_LATENCY_SECONDS` — because a provider that stayed silent for its whole
+    budget is a slow model, not a dead socket, and must not be sent the request twice. The caller
+    supplies the rest of the verdict: only a send on a reused connection, failing before any
+    response object exists, can be blamed on a stale socket.
+
+    A connect timeout is excluded on purpose: a fresh connection that never came up is a
+    black-holed endpoint, and it must keep its fast-failover attribution.
+    """
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return False
+    if first_exception_errno(exc) in STALE_CONNECTION_ERRNOS:
+        return True
+    if not exception_chain_contains_timeout(exc):
+        return False
+    return elapsed_seconds < STALE_CONNECTION_MAX_LATENCY_SECONDS
 
 
-def buffer_bounded_upstream_response(response: Any, *, deadline_monotonic: float | None = None) -> Any:
+def upstream_post(
+    url: str,
+    *,
+    replay_allowed: Callable[[], bool] | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Single exit for chat traffic: connection pooling, and one replay on a dead socket.
+
+    A failure raised here happened before any response object existed, so nothing was received
+    from the provider and nothing was written to the client. When such a send also ran on a
+    connection taken warm from the pool and carries a dropped-connection signature, the socket
+    is the suspect rather than the model: the same request goes out exactly once more. It cannot
+    land on the suspect socket, because urllib3 closes the connection whose `urlopen` raised
+    before returning it to the pool — it comes back with `sock=None` and is reconnected on reuse,
+    and any other pooled connection is aged out by `UPSTREAM_POOL_IDLE_MAX_SECONDS`. A send on a
+    fresh connection is never replayed — there is no stale socket to blame — and `replay_allowed`
+    lets the caller refuse a replay its own budget can no longer pay for.
+
+    The discarded first send is reported as `_ficelle_stale_latency_seconds`, on the returned
+    response or on the exception the replay raises. Turning that into route telemetry, and
+    deciding what the failure means for the model, stay with the caller.
+    """
+    session = upstream_session()
+    _UPSTREAM_CONNECTION_STATE.reused = False
+    started_monotonic = time.monotonic()
+    try:
+        return session.post(url, **kwargs)
+    except Exception as exc:
+        discarded_latency = time.monotonic() - started_monotonic
+        if not getattr(_UPSTREAM_CONNECTION_STATE, "reused", False):
+            raise
+        if not stale_upstream_connection(exc, elapsed_seconds=discarded_latency):
+            raise
+        if replay_allowed is not None and not replay_allowed():
+            raise
+    try:
+        response = session.post(url, **kwargs)
+    except Exception as replay_failure:
+        replay_failure._ficelle_stale_latency_seconds = discarded_latency
+        raise
+    response._ficelle_stale_latency_seconds = discarded_latency
+    return response
+
+
+def buffer_bounded_upstream_response(
+    response: Any,
+    *,
+    deadline_monotonic: float | None = None,
+    retention_leases: list[OutputRetentionLease] | None = None,
+) -> Any:
     """Buffer a logical non-streaming response without trusting its size metadata.
 
     ``deadline_monotonic`` bounds a drip-feeding body to the request budget (L2-R2): a
@@ -6275,6 +6677,7 @@ def buffer_bounded_upstream_response(response: Any, *, deadline_monotonic: float
                 f"upstream declared {declared_length} bytes, above the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
             )
 
+    lease = OUTPUT_RETENTION_ADMISSION.acquire()
     iter_content = getattr(response, "iter_content", None)
     if not callable(iter_content):
         content = bytes(getattr(response, "content", b""))
@@ -6285,27 +6688,47 @@ def buffer_bounded_upstream_response(response: Any, *, deadline_monotonic: float
             raise UpstreamResponseTooLarge(
                 f"upstream response passed the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
             )
+        if not lease.try_reserve(len(content)):
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            raise UpstreamResponseBudgetExceeded(
+                "upstream response capacity is exhausted; retry later"
+            )
+        if retention_leases is not None:
+            retention_leases.append(lease)
+        else:
+            weakref.finalize(response, lease.release)
         return response
 
-    chunks: list[bytes] = []
     total = 0
     try:
         # Same deadline guard as the streaming path: one definition of "the budget ended
         # this body" for both buffered and streamed responses.
-        for chunk in deadline_guarded_chunks(iter_content(chunk_size=64 * 1024), deadline_monotonic):
-            if not chunk:
-                continue
-            record_response_first_byte(response)
-            total += len(chunk)
-            if total > MAX_UPSTREAM_RESPONSE_BYTES:
-                raise UpstreamResponseTooLarge(
-                    f"upstream response passed the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
-                )
-            chunks.append(chunk)
+        # A temporary file keeps the transport path from holding both a list of chunks and the
+        # final joined bytes. The request-level lease bounds the bytes retained by concurrent
+        # non-streaming calls before the final response content is materialized.
+        with tempfile.TemporaryFile() as spool:
+            for chunk in deadline_guarded_chunks(iter_content(chunk_size=64 * 1024), deadline_monotonic):
+                if not chunk:
+                    continue
+                record_response_first_byte(response)
+                total += len(chunk)
+                if total > MAX_UPSTREAM_RESPONSE_BYTES:
+                    raise UpstreamResponseTooLarge(
+                        f"upstream response passed the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
+                    )
+                if not lease.try_reserve(len(chunk)):
+                    raise UpstreamResponseBudgetExceeded(
+                        "upstream response capacity is exhausted; retry later"
+                    )
+                spool.write(chunk)
+            spool.seek(0)
+            content = spool.read()
     except Exception:
         response.close()
+        lease.release()
         raise
-    content = b"".join(chunks)
     # `requests.Response.content` reads these private transport fields. Test doubles generally use
     # a plain attribute, so update it as well when writable.
     response._content = content
@@ -6314,6 +6737,10 @@ def buffer_bounded_upstream_response(response: Any, *, deadline_monotonic: float
         response.content = content
     except (AttributeError, TypeError):
         pass
+    if retention_leases is not None:
+        retention_leases.append(lease)
+    else:
+        weakref.finalize(response, lease.release)
     return response
 
 
@@ -6322,7 +6749,7 @@ def record_response_first_byte(response: Any) -> None:
         return
     started = getattr(response, "_ficelle_request_started_monotonic", None)
     if isinstance(started, (int, float)):
-        response._ficelle_first_byte_seconds = max(0.0, time.monotonic() - float(started))
+        response._ficelle_first_byte_seconds = max(0.0, time.monotonic() - safe_float(started, 0.0))
 
 
 def response_chunks_with_first_byte(response: Any, chunks: Iterable[bytes]) -> Iterable[bytes]:
@@ -6576,7 +7003,10 @@ def _refresh_catalog_for_effective_config_or_previous(config: dict[str, Any]) ->
 
 
 def _load_or_refresh_catalog_for_effective_config(config: dict[str, Any], force: bool = False) -> dict[str, Any]:
-    previous = load_runtime_json(CATALOG_PATH, {})
+    # Same file and same `{}` fallback as a direct read, served from the parse cache: this runs on
+    # every routing request and every model listing, and re-parsing 778 KB of catalog just to read
+    # one key off the previous generation is the single most expensive thing on that path.
+    previous = load_catalog_document()
     current_identities = provider_credential_identities(config)
     previous_identities = previous.get("credential_identities") if isinstance(previous, dict) else None
     changed_sources = (
@@ -6721,14 +7151,55 @@ def load_or_refresh_catalog(
     force: bool = False,
     *,
     entitled: bool | None = None,
+    effective_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    effective_config = effective_runtime_config(config, entitled=entitled)
+    # `effective_runtime_config` deep-copies the whole config. A caller that already holds the
+    # effective view passes it in rather than paying for a second identical copy.
+    if effective_config is None:
+        effective_config = effective_runtime_config(config, entitled=entitled)
     if force:
         return _load_or_refresh_catalog_for_effective_config(effective_config, force=True)
     cached_transition = _cached_catalog_for_license_transition(config, effective_config)
     if cached_transition is not None:
         return cached_transition
     return _load_or_refresh_catalog_for_effective_config(effective_config)
+
+
+def iter_listed_model_objects(config: dict[str, Any], *, entitled: bool) -> Iterator[dict[str, Any]]:
+    """The `/v1/models` entries, in listing order: virtual profiles first, then catalog models.
+
+    One generator for both routes, so `GET /v1/models/{id}` can never disagree with the list it is
+    supposed to be a projection of: a client that discovers a model in the list must be able to
+    fetch it, and a profile hidden from the list must stay hidden from the lookup. `/v1/models`
+    wraps it in `list()`; the by-id lookup stops at the first match instead of materializing every
+    catalog entry to then throw all but one away.
+    """
+    effective_config = effective_runtime_config(config, entitled=entitled)
+    catalog = load_or_refresh_catalog(config, entitled=entitled, effective_config=effective_config)
+    now = int(time.time())
+    profiles = normalized_virtual_profiles(effective_config)
+    for mid in listed_virtual_model_ids(effective_config, entitled=entitled):
+        yield {
+            "id": mid,
+            "object": "model",
+            "created": now,
+            "owned_by": "ficelle",
+            **virtual_model_listing_metadata(mid, profiles, effective_config),
+        }
+    for model in catalog.get("models", []):
+        if not isinstance(model, dict):
+            continue
+        yield {
+            "id": model.get("id"),
+            "object": "model",
+            "created": now,
+            "owned_by": f"ficelle/{model.get('source')}",
+            "context_length": model.get("context_length"),
+            "upstream_id": model.get("upstream_id"),
+            "invokable": model.get("invokable"),
+            "supports_tools": model.get("supports_tools"),
+            "supports_structured_outputs": model.get("supports_structured_outputs"),
+        }
 
 
 _QUOTA_PROBES_IN_FLIGHT: set[str] = set()
@@ -7050,8 +7521,17 @@ def cooldown_stats_ports() -> CooldownStatsPorts:
     )
 
 
-def update_failure_stats(state: dict[str, Any], model: dict[str, Any], reason: str) -> None:
-    update_failure_stats_use_case(state, model, reason, ports=cooldown_stats_ports())
+def update_failure_stats(
+    state: dict[str, Any],
+    model: dict[str, Any],
+    reason: str,
+    *,
+    attempt_reason: str = "",
+    origin: str = FAILURE_ORIGIN_REQUEST,
+) -> None:
+    update_failure_stats_use_case(
+        state, model, reason, ports=cooldown_stats_ports(), attempt_reason=attempt_reason, origin=origin
+    )
 
 
 def update_success_stats(
@@ -7059,14 +7539,14 @@ def update_success_stats(
     model: dict[str, Any],
     latency_seconds: float,
     *,
-    representative_latency: bool = True,
+    origin: str = FAILURE_ORIGIN_REQUEST,
 ) -> None:
     update_success_stats_use_case(
         state,
         model,
         latency_seconds,
         ports=cooldown_stats_ports(),
-        representative_latency=representative_latency,
+        origin=origin,
     )
 
 
@@ -7380,8 +7860,19 @@ def record_success_with_telemetry(
         last_route.compression,
     )
 
+    route_log = telemetry.route_log if isinstance(telemetry.route_log, dict) else {}
+    usage = route_log.get("usage") if isinstance(route_log.get("usage"), dict) else {}
+    # Generation throughput, measured only where the answer reported its own token count. Telemetry
+    # only: nothing scores on it yet, and a provider that reports no usage must not look slow.
+    tokens_per_second = completion_tokens_per_second(
+        usage.get("completion_tokens"),
+        latency_seconds,
+        route_log.get("first_byte_seconds"),
+    )
+
     def mutate(state: dict[str, Any]) -> None:
         record_success_in_state_use_case(state, model, latency_seconds, ports=cooldown_success_ports())
+        update_throughput_stats_use_case(state, model, tokens_per_second, ports=cooldown_stats_ports())
         apply_last_route(state)
 
     _STATE_STORE.update(mutate, reason="record_success_with_telemetry")
@@ -7507,6 +7998,8 @@ def set_cooldown(
     profile_id: str | None = None,
     retry_after_seconds: int | None = None,
     retry_after_source: str | None = None,
+    attempt_reason: str = "",
+    origin: str = FAILURE_ORIGIN_REQUEST,
 ) -> AppliedCooldown:
     return set_cooldown_use_case(
         model,
@@ -7519,6 +8012,8 @@ def set_cooldown(
         profile_id=profile_id,
         retry_after_seconds=retry_after_seconds,
         retry_after_source=retry_after_source,
+        attempt_reason=attempt_reason,
+        origin=origin,
     )
 
 
@@ -7536,10 +8031,17 @@ def cooldown_success_ports() -> CooldownSuccessPorts:
     )
 
 
-def record_success(model: dict[str, Any], latency_seconds: float, *, representative_latency: bool = True) -> None:
-    """Record a successful call. Probe callers pass ``representative_latency=False``: their
-    completions are a handful of tokens, so their timing must not steer the latency score that
-    ranks models for real requests."""
+def record_success(
+    model: dict[str, Any],
+    latency_seconds: float,
+    *,
+    origin: str = FAILURE_ORIGIN_REQUEST,
+) -> None:
+    """Record a successful call. Probe jobs get ``origin=FAILURE_ORIGIN_PROBE`` bound into their
+    ports (`probe_record_success`): a handful of tokens on a private body must not steer the
+    latency score, must not lift a route-blocking cooldown a real request earned, and only
+    partially answers that request's failures (AGENTS.md: benchmark/canary results affect scoring
+    and verified-capability state, not route-blocking cooldowns)."""
 
     def mutate(state: dict[str, Any]) -> None:
         record_success_in_state_use_case(
@@ -7547,14 +8049,19 @@ def record_success(model: dict[str, Any], latency_seconds: float, *, representat
             model,
             latency_seconds,
             ports=cooldown_success_ports(),
-            representative_latency=representative_latency,
+            origin=origin,
         )
 
     _STATE_STORE.update(mutate, reason="record_success")
 
 
+_MODEL_SCORING_PORTS = ModelScoringPorts(
+    cooldown_key=cooldown_key, safe_int=safe_int, now_epoch=lambda: time.time()
+)
+
+
 def model_scoring_ports() -> ModelScoringPorts:
-    return ModelScoringPorts(cooldown_key=cooldown_key, safe_int=safe_int)
+    return _MODEL_SCORING_PORTS
 
 
 def success_rate_for_model(model: dict[str, Any], state: dict[str, Any]) -> float:
@@ -7565,17 +8072,20 @@ def latency_score_for_model(model: dict[str, Any], state: dict[str, Any]) -> flo
     return latency_score_for_model_use_case(model, state, ports=model_scoring_ports())
 
 
+_MODEL_EVIDENCE_PORTS = ModelEvidencePorts(
+    cooldown_key=cooldown_key,
+    canonical_virtual_model_id=canonical_virtual_model_id,
+    benchmark_result_matches_current_test=benchmark_result_matches_current_test,
+    benchmark_result_test_type_matches=benchmark_result_test_type_matches,
+    benchmark_result_is_aged=benchmark_result_is_aged,
+    runtime_evidence_timestamp_value=runtime_evidence_timestamp_value,
+    parse_iso_timestamp=parse_iso_timestamp,
+    stale_score_decay_factor=stale_score_decay_factor,
+)
+
+
 def model_evidence_ports() -> ModelEvidencePorts:
-    return ModelEvidencePorts(
-        cooldown_key=cooldown_key,
-        canonical_virtual_model_id=canonical_virtual_model_id,
-        benchmark_result_matches_current_test=benchmark_result_matches_current_test,
-        benchmark_result_test_type_matches=benchmark_result_test_type_matches,
-        benchmark_result_is_aged=benchmark_result_is_aged,
-        runtime_evidence_timestamp_value=runtime_evidence_timestamp_value,
-        parse_iso_timestamp=parse_iso_timestamp,
-        stale_score_decay_factor=stale_score_decay_factor,
-    )
+    return _MODEL_EVIDENCE_PORTS
 
 
 def profile_benchmark_adjustment(requested_model: str, model: dict[str, Any], state: dict[str, Any]) -> float:
@@ -7613,6 +8123,11 @@ def score_evidence_for_model(profile_id: str, model: dict[str, Any], state: dict
 
 def benchmark_adjustment_parts(profile_id: str, model: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     return benchmark_adjustment_parts_use_case(profile_id, model, state, ports=model_evidence_ports())
+
+
+def stale_failed_profile_evidence(profile_id: str, model: dict[str, Any], state: dict[str, Any]) -> bool:
+    """This pair's only verdict is an expired `failed` one: still routable, but ranked last."""
+    return stale_failed_profile_evidence_use_case(profile_id, model, state, ports=model_evidence_ports())
 
 
 def model_auto_score(requested_model: str, model: dict[str, Any], state: dict[str, Any]) -> float:
@@ -7654,9 +8169,9 @@ def sort_available_for_virtual_model(requested_model: str, available: list[dict[
                 ).get("tier")
                 == "verified"
                 else 1,
-                -float(
-                    certifications.get(coding_certification.certification_identity(model), {}).get("quality_score")
-                    or 0.0
+                -safe_float(
+                    certifications.get(coding_certification.certification_identity(model), {}).get("quality_score"),
+                    0.0,
                 ),
                 -model_auto_score("ficelle/auto-tools", model, state),
                 str(model.get("id") or ""),
@@ -7671,6 +8186,7 @@ def sort_available_for_virtual_model(requested_model: str, available: list[dict[
         safe_int=safe_int,
         safe_float=safe_float,
         cooldown_key=cooldown_key,
+        now_epoch=time.time,
     )
 
 
@@ -7833,6 +8349,7 @@ def probe_quota_cooldown(key: str, model: dict[str, Any], config: dict[str, Any]
             status=status,
             retry_after_seconds=hint_seconds,
             retry_after_source=hint_source,
+            origin=FAILURE_ORIGIN_PROBE,
         )
         return result
 
@@ -8243,7 +8760,7 @@ def unsupported_parameters_for_model(
         parameter
         for parameter, learned_at in sorted(row.items())
         if isinstance(learned_at, (int, float))
-        and now - float(learned_at) < ttl
+        and now - safe_float(learned_at, 0.0) < ttl
         and (not body or parameter in present)
     )
 
@@ -8300,6 +8817,7 @@ def model_selection_runner() -> ModelSelectionRunner:
             apply_verified_capability_ttl=apply_verified_capability_ttl,
             apply_route_on_capability_reference=apply_route_on_capability_reference,
             selection_policy=selection_policy,
+            quality_feedback_scoring_state=quality_feedback_scoring_state,
         )
     )
 
@@ -8438,37 +8956,63 @@ def success_error_payload_failure(payload: Any, model: dict[str, Any] | None = N
     return reason, message, status_code
 
 
-def request_timeout_seconds_for_profile(requested_model: str, config: dict[str, Any]) -> float:
-    default_timeout = float(
-        config.get("request_timeout_seconds") or DEFAULT_CONFIG["request_timeout_seconds"]
+def request_timeout_policy_for_profile(
+    requested_model: str,
+    config: dict[str, Any],
+) -> tuple[float, str]:
+    default_timeout = max(
+        1.0,
+        safe_float(config.get("request_timeout_seconds"), DEFAULT_CONFIG["request_timeout_seconds"]),
     )
     per_profile = config.get("request_timeout_seconds_by_profile")
     if isinstance(per_profile, dict):
-        raw_value = per_profile.get(canonical_virtual_model_id(requested_model))
+        profile_id = canonical_virtual_model_id(requested_model)
+        raw_value = per_profile.get(profile_id)
         if raw_value is not None:
-            try:
-                return max(1.0, float(raw_value))
-            except Exception:
-                return default_timeout
-        profile = normalized_virtual_profiles(config).get(canonical_virtual_model_id(requested_model))
+            parsed = safe_float(raw_value, -1.0)
+            if parsed >= 0:
+                return max(1.0, parsed), "profile_override"
+            return default_timeout, "global"
+        profile = normalized_virtual_profiles(config).get(profile_id)
         base_profile = virtual_profile_policy_id(requested_model, profile)
-        if base_profile != canonical_virtual_model_id(requested_model):
+        if base_profile != profile_id:
             raw_value = per_profile.get(base_profile)
             if raw_value is not None:
-                try:
-                    return max(1.0, float(raw_value))
-                except Exception:
-                    return default_timeout
-    return default_timeout
+                parsed = safe_float(raw_value, -1.0)
+                if parsed >= 0:
+                    return max(1.0, parsed), "base_profile_override"
+                return default_timeout, "global"
+    return default_timeout, "global"
+
+
+def request_timeout_seconds_for_profile(requested_model: str, config: dict[str, Any]) -> float:
+    return request_timeout_policy_for_profile(requested_model, config)[0]
+
+
+def runtime_timeout_policy_payload(config: dict[str, Any]) -> dict[str, Any]:
+    """The effective, read-only timeout policy used by live chat attempts."""
+    profiles = {}
+    for profile_id in configured_virtual_model_ids(config):
+        seconds, source = request_timeout_policy_for_profile(profile_id, config)
+        profiles[profile_id] = {"read_timeout_seconds": seconds, "source": source}
+    raw_deadline = safe_float(config.get("request_deadline_seconds"), 0.0)
+    return {
+        "connect_timeout_seconds": CONNECT_TIMEOUT_SECONDS,
+        "request_deadline_seconds": raw_deadline if raw_deadline > 0 else None,
+        "request_budget_margin_seconds": REQUEST_BUDGET_MARGIN_SECONDS,
+        "profiles": profiles,
+    }
 
 
 def max_attempts_for_request(requested_model: str, config: dict[str, Any], candidate_count: int) -> int:
     if canonical_virtual_model_id(requested_model) not in configured_virtual_model_ids(config):
         return candidate_count
-    configured = safe_int(config.get("max_attempts_per_request"), candidate_count)
-    if configured <= 0:
-        return candidate_count
-    return max(1, min(candidate_count, configured))
+    # No `<= 0` branch: the settings validator rejects a saved value below 1 and
+    # `migrate_legacy_config_defaults` rewrites a stored one, so the bound is simply the setting.
+    return min(
+        candidate_count,
+        safe_int(config.get("max_attempts_per_request"), DEFAULT_CONFIG["max_attempts_per_request"]),
+    )
 
 
 def benchmark_media_ports() -> BenchmarkMediaPorts:
@@ -8629,6 +9173,7 @@ def invoke_model(
     extra_headers: dict[str, str] | None = None,
     remaining_budget_seconds: float | None = None,
     deadline_monotonic: float | None = None,
+    retention_leases: list[OutputRetentionLease] | None = None,
 ) -> requests.Response:
     source = str(model.get("source"))
     access = provider_access_for(source, config)
@@ -8661,10 +9206,16 @@ def invoke_model(
         headers["Authorization"] = f"Bearer {key}"
     if isinstance(extra_headers, dict):
         headers.update({str(key): str(value) for key, value in extra_headers.items()})
-    try:
-        timeout = float(timeout_seconds) if timeout_seconds is not None else request_timeout_seconds_for_profile(requested_model, config)
-    except Exception:
-        timeout = request_timeout_seconds_for_profile(requested_model, config)
+    if timeout_seconds is not None:
+        try:
+            timeout = safe_float(timeout_seconds, -1.0)
+            if timeout < 0:
+                raise ValueError("invalid timeout")
+            timeout_source = "explicit"
+        except (TypeError, ValueError):
+            timeout, timeout_source = request_timeout_policy_for_profile(requested_model, config)
+    else:
+        timeout, timeout_source = request_timeout_policy_for_profile(requested_model, config)
     # The profile read budget never exceeds what remains of the request deadline (L2-R2):
     # an in-flight attempt is constrained by the smaller of the two, minus a bounded margin
     # for writing the response. A timeout raised under that constraint is the request
@@ -8674,7 +9225,35 @@ def invoke_model(
         budgeted = max(REQUEST_BUDGET_FLOOR_SECONDS, remaining_budget_seconds - REQUEST_BUDGET_MARGIN_SECONDS)
         if budgeted < timeout:
             timeout = budgeted
+            timeout_source = "request_deadline"
             budget_constrained = True
+    connect_timeout = min(CONNECT_TIMEOUT_SECONDS, timeout)
+
+    def annotate_timeout(subject: Any, source: Any, phase: str | None = None) -> None:
+        """Write this attempt's timeout policy onto what the caller will see.
+
+        `source` is what the transport itself returned or raised, always passed: when the two are
+        the same object the copy below is a no-op, and when they differ — a `RequestDeadlineExceeded`
+        raised over a `ReadTimeout` — it is the only way the replay marker reaches the exception the
+        caller actually gets. Naming it at every call site beats a default that silently means
+        "whatever `subject` happens to carry".
+        """
+        subject._ficelle_read_timeout_seconds = timeout
+        subject._ficelle_connect_timeout_seconds = connect_timeout
+        subject._ficelle_read_timeout_source = timeout_source
+        if remaining_budget_seconds is not None:
+            subject._ficelle_request_budget_remaining_seconds = max(0.0, remaining_budget_seconds)
+        if phase is not None:
+            subject._ficelle_timeout_phase = phase
+        # A stale-socket replay is marked by the transport on what it returns or raises; carry
+        # the marker onto the exception the caller will actually see.
+        discarded_latency = getattr(source, "_ficelle_stale_latency_seconds", None)
+        if discarded_latency is not None:
+            subject._ficelle_stale_latency_seconds = discarded_latency
+
+    def replay_budget_remains() -> bool:
+        """Whether the request budget can still pay for a stale-socket replay (L2-R2)."""
+        return deadline_monotonic is None or deadline_monotonic - time.monotonic() > REQUEST_BUDGET_FLOOR_SECONDS
     admission_scope_key = (
         str(model.get("upstream_id") or "")
         if str(provider_cfg.get("rate_limit_scope") or "") == "model"
@@ -8689,26 +9268,33 @@ def invoke_model(
     if not admission.allowed:
         raise ProviderAdmissionRefused(source, admission.retry_after_seconds or 1)
     record_upstream_spend(model)
-    # `upstream_post` (pooled single exit for chat traffic) keeps main's connection reuse;
-    # binding the result is what lets the trace be observed before the response is returned.
+    # `upstream_post` (pooled single exit for chat traffic) keeps main's connection reuse and
+    # owns the stale-socket replay; binding the result is what lets the trace be observed before
+    # the response is returned.
     provider_request_started = time.monotonic()
+    response: requests.Response | None = None
+    request_kwargs: dict[str, Any] = {
+        "headers": headers,
+        "json": payload,
+        # Separate, short connect timeout so a black-holed provider endpoint fails over in
+        # seconds instead of holding the whole profile timeout at connect — the same policy the
+        # catalog fetch already applies (providers/openai_compatible.py). A model that is simply
+        # slow to *answer* still gets the full read budget.
+        "timeout": (connect_timeout, timeout),
+        # Always stream at the HTTP transport layer so provider-controlled bytes can be bounded
+        # before they enter memory. Logical downstream streaming remains controlled by the payload.
+        "stream": True,
+    }
+    if str(provider_cfg.get("auth_mode") or "") == "anonymous":
+        request_kwargs["auth"] = suppress_implicit_http_auth
+        request_kwargs["allow_redirects"] = False
+    upstream_url = f"{base_url.rstrip('/')}/chat/completions"
     try:
-        request_kwargs: dict[str, Any] = {
-            "headers": headers,
-            "json": payload,
-            # Separate, short connect timeout so a black-holed provider endpoint fails over in
-            # seconds instead of holding the whole profile timeout at connect — the same policy the
-            # catalog fetch already applies (providers/openai_compatible.py). A model that is simply
-            # slow to *answer* still gets the full read budget.
-            "timeout": (min(CONNECT_TIMEOUT_SECONDS, timeout), timeout),
-            # Always stream at the HTTP transport layer so provider-controlled bytes can be bounded
-            # before they enter memory. Logical downstream streaming remains controlled by the payload.
-            "stream": True,
-        }
-        if str(provider_cfg.get("auth_mode") or "") == "anonymous":
-            request_kwargs["auth"] = suppress_implicit_http_auth
-            request_kwargs["allow_redirects"] = False
-        response = upstream_post(f"{base_url.rstrip('/')}/chat/completions", **request_kwargs)
+        # A replayed send is one logical upstream call that had to change socket: the discarded
+        # first send earns no attempt row, no cooldown, no second admission reservation and no
+        # second spend record, because it never reached the model.
+        response = upstream_post(upstream_url, replay_allowed=replay_budget_remains, **request_kwargs)
+        annotate_timeout(response, response)
         PROVIDER_ADMISSION_LEDGER.observe(
             source,
             getattr(response, "headers", {}),
@@ -8716,18 +9302,57 @@ def invoke_model(
             scope_key=admission_scope_key,
         )
         response._ficelle_admission_source = admission.source
+        # The model's own latency starts at the send that reached it: a replay's discarded wait
+        # is reported on its own field instead of inflating the score of a healthy model.
+        discarded_latency = getattr(response, "_ficelle_stale_latency_seconds", None)
+        if isinstance(discarded_latency, float):
+            provider_request_started += discarded_latency
         response._ficelle_request_started_monotonic = provider_request_started
         if not bool(payload.get("stream")) or not (200 <= response.status_code < 300):
-            response = buffer_bounded_upstream_response(response, deadline_monotonic=deadline_monotonic)
+            response = buffer_bounded_upstream_response(
+                response,
+                deadline_monotonic=deadline_monotonic,
+                retention_leases=retention_leases,
+            )
             observe_reasoning_trace(model, response)
+    except RequestDeadlineExceeded as exc:
+        annotate_timeout(exc, exc, "response_body")
+        raise
     except requests.exceptions.Timeout as exc:
+        phase = (
+            "connect"
+            if isinstance(exc, requests.exceptions.ConnectTimeout)
+            else "response_body" if response is not None else "response_headers"
+        )
+        annotate_timeout(exc, exc, phase)
         # A connect timeout is never the request budget's doing: the connect phase is
         # capped at CONNECT_TIMEOUT_SECONDS regardless of the budget, and a black-holed
         # endpoint must keep its fast-failover attribution (and its provider penalty).
         if budget_constrained and not isinstance(exc, requests.exceptions.ConnectTimeout):
-            raise RequestDeadlineExceeded(
+            deadline_error = RequestDeadlineExceeded(
                 f"request deadline expired during the provider call ({safe_detail(exc)})"
-            ) from exc
+            )
+            annotate_timeout(deadline_error, exc, phase)
+            raise deadline_error from exc
+        raise
+    except Exception as exc:
+        # A transport timeout does not always arrive as `requests.exceptions.Timeout`: a bare
+        # `TimeoutError` from the socket layer, or a urllib3 `ReadTimeoutError` wrapped in a
+        # connection error, lands here instead. Before the response object exists that used to
+        # fall through to the generic branch and be cooled down as `unavailable` (600s) rather
+        # than `timeout` (300s), so the phase is derived instead of the branch being skipped.
+        if exception_chain_contains_timeout(exc):
+            timeout_phase = "response_body" if response is not None else "response_headers"
+            wrapped_timeout = requests.exceptions.ReadTimeout(safe_detail(exc))
+            annotate_timeout(wrapped_timeout, exc, timeout_phase)
+            if budget_constrained:
+                deadline_error = RequestDeadlineExceeded(
+                    f"request deadline expired during the provider call ({safe_detail(exc)})"
+                )
+                annotate_timeout(deadline_error, exc, timeout_phase)
+                raise deadline_error from exc
+            raise wrapped_timeout from exc
+        annotate_timeout(exc, exc)
         raise
     return response
 
@@ -8915,7 +9540,7 @@ def build_fusion_request_preflight() -> FusionRequestPreflight:
             uuid_hex=lambda: uuid.uuid4().hex,
         ),
         fusion_model_id=FUSION_MODEL_ID,
-        default_timeout_seconds=float(DEFAULT_FUSION_CONFIG["fusion_timeout_seconds"]),
+        default_timeout_seconds=safe_float(DEFAULT_FUSION_CONFIG["fusion_timeout_seconds"], 60.0),
     )
 
 
@@ -9145,21 +9770,11 @@ def run_fusion_chat_completion(
     # Fusion is a closed Pro engine (ficelle_pro). On a core-only install the runner
     # and preflight symbols are None, so reject cleanly instead of crashing with a
     # NoneType call if a client targets ficelle/auto-fusion directly.
-    if FusionRunner is None:
-        return (
-            404,
-            {"error": {"message": f"model not found: {FUSION_MODEL_ID} (Fusion requires Ficelle Pro)", "type": "not_found"}},
-            {},
-        )
-    is_entitled = license_ops.is_entitled() if entitled is None else entitled
-    if not is_entitled:
-        # Pack present but the license is inactive/expired/past-grace: fail closed with an
-        # explicit license error (R10), not a generic upstream/model failure.
-        return (
-            402,
-            {"error": {"message": "Ficelle Pro license is inactive or expired — run `ficelle license status` and refresh billing.", "type": "license_required"}},
-            {},
-        )
+    try:
+        require_pro_feature("Fusion", FusionRunner, entitled=entitled)
+    except (ProEntitlementRequired, license_ops.ProPackUnavailable) as exc:
+        status, payload = pro_feature_error(exc)
+        return status, payload, {}
     preflight = build_fusion_request_preflight().prepare(
         body,
         config,
@@ -9272,7 +9887,7 @@ def run_fusion_chat_completion(
     judge_status = str(judge_result["judge_status"])
     judge_attempts = judge_result["judge_attempts"]
     degraded_flags.update(judge_result["degraded_flags"])
-    judge_latency = float(judge_result["latency_seconds"])
+    judge_latency = safe_float(judge_result["latency_seconds"], 0.0)
 
     draft_text: str | None = None
     draft_model: dict[str, Any] | None = None
@@ -9291,7 +9906,7 @@ def run_fusion_chat_completion(
         draft_model = draft_result["draft_model"]
         draft_attempts = draft_result["draft_attempts"]
         degraded_flags.update(draft_result["degraded_flags"])
-        draft_latency = float(draft_result["latency_seconds"])
+        draft_latency = safe_float(draft_result["latency_seconds"], 0.0)
 
     ranking_aggregate: list[dict[str, Any]] = []
     ranking_metadata: dict[str, Any] = {}
@@ -9343,7 +9958,7 @@ def run_fusion_chat_completion(
     synth_attempts = synthesizer_result["synth_attempts"]
     synth_errors = synthesizer_result["synth_errors"]
     degraded_flags.update(synthesizer_result["degraded_flags"])
-    synth_latency = float(synthesizer_result["latency_seconds"])
+    synth_latency = safe_float(synthesizer_result["latency_seconds"], 0.0)
     reason_code = str(synthesizer_result["reason_code"])
     synth_candidate_count = int(synthesizer_result["candidate_count"])
     metadata = fusion_run_metadata(
@@ -9808,8 +10423,13 @@ def finish_reason_from_clean_sse_eof(
     return finished_choices[min(finished_choices)]
 
 
-def sse_event_allows_done_normalization(event: bytes) -> bool:
-    """Whether one complete SSE event is safe to treat as part of a successful stream."""
+def sse_event_normalization_verdict(event: bytes) -> tuple[bool, bool]:
+    """``(allows_done_normalization, carries_upstream_error)`` for one complete SSE event.
+
+    The two answers are independent: an event withholds `[DONE]` normalization for several
+    innocent reasons (it *is* the `[DONE]`, it is unparseable, its shape is unfamiliar), and only
+    an explicit `event: error` or an error payload makes it evidence of an upstream failure.
+    """
     data_lines: list[bytes] = []
     event_type = b""
     for raw_line in event.split(b"\n"):
@@ -9823,44 +10443,57 @@ def sse_event_allows_done_normalization(event: bytes) -> bool:
         if field in {b"id", b"retry"}:
             continue
         if field != b"data" or not delimiter:
-            return False
+            return False, False
         data_lines.append(value.lstrip())
     if event_type in {b"error", b"stream_error"}:
-        return False
+        return False, True
     if not data_lines:
-        return True
+        return True, False
     # SSE joins repeated data fields with a newline before dispatching the event. Parsing each
     # line separately rejects valid JSON split at whitespace between tokens.
     payload = b"\n".join(data_lines).strip()
     if payload == b"[DONE]":
         # A terminal [DONE] is handled independently from the bounded tail. If more events follow
         # and push it out of that tail, EOF normalization must not manufacture a second terminator.
-        return False
+        return False, False
     if not payload:
-        return False
+        return False, False
     try:
         parsed = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
-        return False
+        return False, False
     if not isinstance(parsed, dict):
-        return False
+        return False, False
     payload_type = str(parsed.get("type") or "").strip().lower()
     if isinstance(parsed.get("error"), (dict, str)) or payload_type in {"error", "stream_error"}:
-        return False
+        return False, True
     choices = parsed.get("choices")
-    return choices is None or (
-        isinstance(choices, list) and all(isinstance(choice, dict) for choice in choices)
+    return (
+        choices is None
+        or (isinstance(choices, list) and all(isinstance(choice, dict) for choice in choices)),
+        False,
     )
 
 
-def consume_sse_normalization_events(buffer: bytes, *, final: bool = False) -> tuple[bool, bytes]:
-    """Validate complete SSE events and return the bounded incomplete suffix."""
+def consume_sse_normalization_events(buffer: bytes, *, final: bool = False) -> tuple[bool, bytes, bool]:
+    """Validate complete SSE events; report the incomplete suffix and any upstream error event.
+
+    One scan answers both questions the relay asks of the frames going past: may a missing
+    `[DONE]` be normalized away, and did the upstream announce a failure inside the stream. They
+    are separate answers because most reasons to withhold normalization (a `[DONE]`, an
+    unparseable frame, an unfamiliar shape) are not failures at all.
+    """
     trailing_cr = b""
     if not final and buffer.endswith(b"\r"):
         buffer, trailing_cr = buffer[:-1], b"\r"
     normalized = buffer.replace(b"\r\n", b"\n").replace(b"\r", b"\n") + trailing_cr
     *events, carry = normalized.split(b"\n\n")
-    return all(sse_event_allows_done_normalization(event) for event in events), carry
+    verdicts = [sse_event_normalization_verdict(event) for event in events]
+    return (
+        all(allows_done for allows_done, _ in verdicts),
+        carry,
+        any(carries_error for _, carries_error in verdicts),
+    )
 
 
 # How much of the stream's tail is kept to recognize the terminal frame. An SSE terminator is
@@ -9902,6 +10535,18 @@ def usage_from_sse_tail(tail: bytes) -> dict[str, Any] | None:
     return usage
 
 
+def exception_chain_contains_timeout(exc: BaseException) -> bool:
+    """Whether an exception or one of its wrapped causes is a transport timeout."""
+    return any(
+        isinstance(
+            current,
+            (TimeoutError, requests.exceptions.Timeout, RequestDeadlineExceeded),
+        )
+        or type(current).__name__ == "ReadTimeoutError"
+        for current in walk_exception_chain(exc)
+    )
+
+
 def stream_chunks_to_writer(
     chunks: Iterable[bytes],
     write_chunk: Any,
@@ -9926,6 +10571,11 @@ def stream_chunks_to_writer(
     stream_tail = b""
     normalization_carry = b""
     normalization_valid = True
+    # An upstream error event that arrives AFTER the first relayed byte. Nothing can be retried at
+    # that point, but the request is not a success either: the bytes were forwarded verbatim and
+    # the attempt was recorded as `ok`, so the model's success rate — the input that drives routing
+    # order — counted a failed generation as a win.
+    error_event_seen = False
     precommit_buffer = bytearray()
     precommit_scan_buffer = bytearray()
     precommit_scan_offset = 0
@@ -9957,6 +10607,7 @@ def stream_chunks_to_writer(
         nonlocal stream_tail
         nonlocal normalization_valid
         nonlocal normalization_carry
+        nonlocal error_event_seen
 
         # The writer may emit HTTP headers before attempting the first body write. Mark
         # the response as committed before calling it so a body failure cannot trigger a
@@ -9992,9 +10643,10 @@ def stream_chunks_to_writer(
         stream_tail = (stream_tail + outbound_chunk)[-SSE_TERMINAL_TAIL_BYTES:]
         if expect_sse_done and normalization_valid:
             try:
-                normalization_valid, normalization_carry = consume_sse_normalization_events(
+                normalization_valid, normalization_carry, chunk_carried_error = consume_sse_normalization_events(
                     normalization_carry + outbound_chunk
                 )
+                error_event_seen = error_event_seen or chunk_carried_error
                 if len(normalization_carry) > SSE_TERMINAL_TAIL_BYTES:
                     normalization_valid = False
                 if not normalization_valid:
@@ -10105,7 +10757,7 @@ def stream_chunks_to_writer(
             # emit an explicit terminal error frame so the client sees a failure instead of a
             # silently truncated stream.
             emit_terminal_error(reason, detail)
-        return {
+        result = {
             "status": "fail",
             "reason": reason,
             "stream_started": response_committed,
@@ -10114,6 +10766,12 @@ def stream_chunks_to_writer(
             "error_type": type(exc).__name__,
             "message": detail,
         }
+        if not writing_to_client and exception_chain_contains_timeout(exc):
+            # Requests wraps urllib3.ReadTimeoutError as ConnectionError while consuming
+            # Response.iter_content(). The chain retains the actual timeout even though
+            # the public exception name no longer does.
+            result["timeout_phase"] = "response_body"
+        return result
     if not response_committed:
         return {
             "status": "fail",
@@ -10124,13 +10782,31 @@ def stream_chunks_to_writer(
         }
     if expect_sse_done and normalization_valid:
         try:
-            normalization_valid, normalization_carry = consume_sse_normalization_events(
+            normalization_valid, normalization_carry, tail_carried_error = consume_sse_normalization_events(
                 normalization_carry,
                 final=True,
             )
+            error_event_seen = error_event_seen or tail_carried_error
         except Exception:
             normalization_valid = False
             normalization_carry = b""
+    if error_event_seen:
+        # The upstream announced its own failure after content was already on the wire. Its bytes
+        # were relayed untouched, including whatever terminator it sent, but the attempt is a
+        # `mid_stream_failure`: no fallback (the response is committed), an explicit terminal error
+        # frame so the client is not left reading a partial answer as a complete one, and never a
+        # synthetic `[DONE]` — this return is deliberately ahead of the normalization below.
+        detail = "upstream sent an SSE error event after streaming content"
+        emit_terminal_error("mid_stream_failure", detail)
+        return {
+            "status": "fail",
+            "reason": "mid_stream_failure",
+            "stream_started": True,
+            "chunk_count": chunk_count,
+            "bytes_sent": bytes_sent,
+            "error_type": "upstream_error_after_content",
+            "message": detail,
+        }
     ended_with_done = sse_stream_ended_with_done(stream_tail) if expect_sse_done else False
     finish_reason = (
         finish_reason_from_sse_tail(stream_tail)
@@ -10239,64 +10915,128 @@ def verified_capability_row(profile_id: str, model: dict[str, Any], state: dict[
 
 
 def record_verified_capability(profile_id: str, model: dict[str, Any], result: dict[str, Any]) -> None:
-    def mutate(state: dict[str, Any]) -> None:
-        key = cooldown_key(model)
-        canonical_profile_id = canonical_virtual_model_id(profile_id)
-        verified = state.setdefault("verified_capabilities", {})
-        if not isinstance(verified, dict):
-            verified = {}
-            state["verified_capabilities"] = verified
-        by_profile = verified.setdefault(key, {})
-        if not isinstance(by_profile, dict):
-            by_profile = {}
-            verified[key] = by_profile
-        status = str(result.get("status") or "unknown")
-        row = {
-            "status": "verified" if status == "pass" else "failed",
-            "capability": capability_for_benchmark(profile_id, str(result.get("test_type") or "")),
-            "test_type": result.get("test_type"),
-            "model_id": model.get("id"),
-            "upstream_id": model.get("upstream_id"),
-            "message": safe_detail(result.get("message")),
-        }
-        # This row — not the benchmark result — is what the routing gate and the re-probe scheduler
-        # read, so the verdict's basis has to travel with it or its short TTL never applies.
-        if result.get(VERDICT_BASIS_KEY):
-            row[VERDICT_BASIS_KEY] = result[VERDICT_BASIS_KEY]
-            # Counted here because this is the one place holding the previous row and the new one at
-            # once, under the state lock. Deriving it from the previous row's basis instead would be
-            # lossy — every probe rewrites the row, so "no marker" cannot distinguish "already
-            # retried" from "never rejected" — and racy, since two probers would read before either
-            # writes. The reader (`route_rejection_deserves_a_retry_soon`) owns what to do with it.
-            row[VERDICT_STREAK_KEY] = consecutive_verdict_count(
-                by_profile.get(canonical_profile_id), row
-            )
+    _STATE_STORE.update(
+        lambda state: record_verified_capability_in_state(state, profile_id, model, result),
+        reason="record_verified_capability",
+    )
 
-            # Discovery persisted the corresponding benchmark result immediately before this call.
-            # Keep both evidence histories on the same TTL policy; otherwise the scheduler converges
-            # after the second refusal while scoring and admin history still age every refusal in an
-            # hour. Match the exact probe so a concurrent/manual result is never annotated by
-            # another writer's streak.
-            benchmark_results = state.get("benchmark_results")
-            benchmark_profiles = benchmark_results.get(key) if isinstance(benchmark_results, dict) else None
-            benchmark_row = benchmark_profiles.get(canonical_profile_id) if isinstance(benchmark_profiles, dict) else None
-            if (
-                isinstance(benchmark_row, dict)
-                and result.get("ran_at")
-                and benchmark_row.get("ran_at") == result.get("ran_at")
-                and benchmark_row.get("test_type") == row.get("test_type")
-                and benchmark_row.get(VERDICT_BASIS_KEY) == row.get(VERDICT_BASIS_KEY)
-            ):
-                updated_benchmark_row = dict(benchmark_row)
-                updated_benchmark_row[VERDICT_STREAK_KEY] = row[VERDICT_STREAK_KEY]
-                benchmark_profiles[canonical_profile_id] = redact_sensitive_json(updated_benchmark_row)
-        if status == "pass":
-            row["verified_at"] = result.get("ran_at") or now_iso()
-        else:
-            row["failed_at"] = result.get("ran_at") or now_iso()
-        by_profile[canonical_profile_id] = redact_sensitive_json(row)
 
-    _STATE_STORE.update(mutate, reason="record_verified_capability")
+def record_verified_capability_in_state(
+    state: dict[str, Any],
+    profile_id: str,
+    model: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    """Write one capability verdict into `state`, so a caller with another write can share the cycle."""
+    key = cooldown_key(model)
+    canonical_profile_id = canonical_virtual_model_id(profile_id)
+    verified = state.setdefault("verified_capabilities", {})
+    if not isinstance(verified, dict):
+        verified = {}
+        state["verified_capabilities"] = verified
+    by_profile = verified.setdefault(key, {})
+    if not isinstance(by_profile, dict):
+        by_profile = {}
+        verified[key] = by_profile
+    status = str(result.get("status") or "unknown")
+    row = {
+        "status": "verified" if status == "pass" else "failed",
+        "capability": capability_for_benchmark(profile_id, str(result.get("test_type") or "")),
+        "test_type": result.get("test_type"),
+        "model_id": model.get("id"),
+        "upstream_id": model.get("upstream_id"),
+        "message": safe_detail(result.get("message")),
+    }
+    # This row — not the benchmark result — is what the routing gate and the re-probe scheduler
+    # read, so the verdict's basis has to travel with it or its short TTL never applies.
+    if result.get(VERDICT_BASIS_KEY):
+        row[VERDICT_BASIS_KEY] = result[VERDICT_BASIS_KEY]
+        # Counted here because this is the one place holding the previous row and the new one at
+        # once, under the state lock. Deriving it from the previous row's basis instead would be
+        # lossy — every probe rewrites the row, so "no marker" cannot distinguish "already
+        # retried" from "never rejected" — and racy, since two probers would read before either
+        # writes. The reader (`route_rejection_deserves_a_retry_soon`) owns what to do with it.
+        row[VERDICT_STREAK_KEY] = consecutive_verdict_count(
+            by_profile.get(canonical_profile_id), row
+        )
+
+        # Discovery persisted the corresponding benchmark result immediately before this call.
+        # Keep both evidence histories on the same TTL policy; otherwise the scheduler converges
+        # after the second refusal while scoring and admin history still age every refusal in an
+        # hour. Match the exact probe so a concurrent/manual result is never annotated by
+        # another writer's streak.
+        benchmark_results = state.get("benchmark_results")
+        benchmark_profiles = benchmark_results.get(key) if isinstance(benchmark_results, dict) else None
+        benchmark_row = benchmark_profiles.get(canonical_profile_id) if isinstance(benchmark_profiles, dict) else None
+        if (
+            isinstance(benchmark_row, dict)
+            and result.get("ran_at")
+            and benchmark_row.get("ran_at") == result.get("ran_at")
+            and benchmark_row.get("test_type") == row.get("test_type")
+            and benchmark_row.get(VERDICT_BASIS_KEY) == row.get(VERDICT_BASIS_KEY)
+        ):
+            updated_benchmark_row = dict(benchmark_row)
+            updated_benchmark_row[VERDICT_STREAK_KEY] = row[VERDICT_STREAK_KEY]
+            benchmark_profiles[canonical_profile_id] = redact_sensitive_json(updated_benchmark_row)
+    # A verdict that did not come from a probe says where it did come from, so the admin and the
+    # next reader can tell a benchmark failure from a failure a real request observed. Absent means
+    # `probe`, which is what every reader defaults to; `evidence_source` is a separate, admin-side
+    # field naming which state section the row was read from.
+    for provenance_key in ("verdict_origin", "request_id"):
+        if result.get(provenance_key):
+            row[provenance_key] = safe_detail(result[provenance_key])
+    if status == "pass":
+        row["verified_at"] = result.get("ran_at") or now_iso()
+    else:
+        row["failed_at"] = result.get("ran_at") or now_iso()
+    by_profile[canonical_profile_id] = redact_sensitive_json(row)
+
+
+
+def record_production_profile_failure(
+    state: dict[str, Any],
+    profile_id: str,
+    model: dict[str, Any],
+    attempt_reason: str,
+    *,
+    request_id: str | None = None,
+    detail: str | None = None,
+) -> None:
+    """Record a real request's semantic failure as failed-capability evidence for a gated profile.
+
+    Until this existed, the strongest evidence a model cannot serve a profile was thrown away:
+    a compression request that came back with an empty assistant message after 654KB of streamed
+    reasoning left nothing in `verified_capabilities`, because only the benchmark and discovery
+    probes ever write there — so the route gate kept electing the same model, and only a probe
+    hours later could disagree. One production failure is enough to close the gate; the next
+    passing probe reopens it by overwriting the same row.
+
+    Deliberately scoped to gated profiles (`is_specialized_profile`): a generic profile does not
+    route on this evidence, and the anti-empty fallback keeps even a gated pool servable. And to
+    reasons the model is answerable for (`PRODUCTION_PROFILE_FAILURE_REASONS`, defined in
+    `failures.py` by excluding `NO_MODEL_FAULT_FAILURE_REASONS`): a client looping on
+    `max_tokens=20` would otherwise close the gate on every candidate it touched.
+    """
+    if attempt_reason not in PRODUCTION_PROFILE_FAILURE_REASONS:
+        return
+    canonical_profile_id = canonical_virtual_model_id(profile_id)
+    if not is_specialized_profile(canonical_profile_id):
+        return
+    record_verified_capability_in_state(
+        state,
+        canonical_profile_id,
+        model,
+        {
+            "status": "fail",
+            # The gate reads a row only while it matches the profile's current probe shape, so
+            # production evidence has to be filed under that same test type to be read at all.
+            "test_type": expected_benchmark_test_type(canonical_profile_id),
+            "message": f"{attempt_reason}: {detail}" if detail else attempt_reason,
+            "ran_at": now_iso(),
+            "verdict_origin": "production",
+            "request_id": request_id,
+        },
+    )
 
 
 def tool_call_arguments(call: dict[str, Any]) -> dict[str, Any]:
@@ -10336,6 +11076,14 @@ def probe_pause(seconds: float) -> None:
 _PROBE_PACER = ProviderProbePacer(pause=lambda seconds: probe_pause(seconds))
 
 
+# Being a probe is a property of the caller, not of the call, so the probe jobs get it bound into
+# their ports once rather than naming it at every site. It is one fact with several consequences —
+# a failure a later probe success may rebut, a success that lifts no cooldown and steers no
+# latency score — and binding it here is what keeps them from being set independently.
+probe_set_cooldown = functools.partial(set_cooldown, origin=FAILURE_ORIGIN_PROBE)
+probe_record_success = functools.partial(record_success, origin=FAILURE_ORIGIN_PROBE)
+
+
 def build_benchmark_runner() -> BenchmarkRunner:
     return BenchmarkRunner(
         load_or_refresh_catalog=load_or_refresh_catalog,
@@ -10344,10 +11092,10 @@ def build_benchmark_runner() -> BenchmarkRunner:
         benchmark_body=benchmark_body,
         invoke_model=invoke_model,
         classify_failure=classify_failure,
-        set_cooldown=set_cooldown,
+        set_cooldown=probe_set_cooldown,
         record_benchmark_failure=record_benchmark_failure,
         record_benchmark_result=record_benchmark_result,
-        record_success=record_success,
+        record_success=probe_record_success,
         record_verified_capability=record_verified_capability,
         record_capability_discrepancy=record_capability_discrepancy,
         extract_message_text=extract_message_text,
@@ -10366,10 +11114,10 @@ def build_capability_discovery_job() -> CapabilityDiscoveryJob:
         benchmark_body=benchmark_body,
         invoke_model=invoke_model,
         classify_failure=classify_failure,
-        set_cooldown=set_cooldown,
+        set_cooldown=probe_set_cooldown,
         record_benchmark_result=record_benchmark_result,
         record_verified_capability=record_verified_capability,
-        record_success=record_success,
+        record_success=probe_record_success,
         extract_message_text=extract_message_text,
         safe_detail=safe_detail,
         now_iso=now_iso,
@@ -10401,7 +11149,7 @@ def record_benchmark_failure(model: dict[str, Any], reason: str, profile_id: str
             reason,
             detail=detail,
             profile_id=profile_id,
-            update_failure_stats=update_failure_stats,
+            update_failure_stats=functools.partial(update_failure_stats, origin=FAILURE_ORIGIN_PROBE),
             record_model_error=record_model_error_in_state,
         )
 
@@ -10553,11 +11301,56 @@ def discovery_eligible_models(catalog: dict[str, Any], state: dict[str, Any]) ->
     )
 
 
+def discovery_priority_candidates(
+    profile_id: str,
+    models: list[dict[str, Any]],
+    state: dict[str, Any],
+    profiles: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """The due models this profile could route, in the order routing itself would try them.
+
+    The router's own ranking, not a second copy of it: the routing requirements decide who can
+    take a priority slot at all, and the order is the one a re-test would change first. A profile
+    the config does not define keeps the plain score order.
+    """
+    profile = profiles.get(canonical_virtual_model_id(profile_id))
+    if isinstance(profile, dict):
+        return candidates_for_profile(profile_id, models, state, profile)
+    return sort_available_for_virtual_model_policy(
+        profile_id,
+        models,
+        state,
+        model_auto_score=model_auto_score,
+        safe_int=safe_int,
+        safe_float=safe_float,
+        cooldown_key=cooldown_key,
+    )
+
+
+def discovery_priority_ports(config: dict[str, Any] | None) -> DiscoveryPriorityPorts:
+    # Normalized once per call: the queue ranks every live profile, and normalizing inside that
+    # loop rebuilt the same profile map for each of them.
+    profiles = normalized_virtual_profiles(config if isinstance(config, dict) else {})
+    return DiscoveryPriorityPorts(
+        recently_routed_profile_ids=lambda state: recently_routed_profile_ids_use_case(
+            state,
+            parse_timestamp=parse_iso_timestamp,
+            now_seconds=time.time,
+        ),
+        ranked_profile_candidates=lambda profile_id, models, state: discovery_priority_candidates(
+            profile_id, models, state, profiles
+        ),
+        stale_failed_profile_evidence=stale_failed_profile_evidence,
+    )
+
+
 def models_needing_discovery(
     catalog: dict[str, Any],
     state: dict[str, Any],
     profile_ids: list[str],
     config: dict[str, Any] | None = None,
+    *,
+    prioritize: bool = True,
 ) -> list[dict[str, Any]]:
     return models_needing_discovery_use_case(
         catalog,
@@ -10569,6 +11362,7 @@ def models_needing_discovery(
         catalog_denies_capability=lambda profile_id, candidate: catalog_denies_capability(
             profile_id, candidate, config
         ),
+        priority_ports=discovery_priority_ports(config) if prioritize else None,
     )
 
 
@@ -10631,8 +11425,8 @@ def _run_auto_benchmark_cycle_locked(config: dict[str, Any]) -> dict[str, Any]:
         # after that load cannot be replaced by the stale snapshot at the end of the cycle.
         write_runtime_state=write_auto_benchmark_state,
         probeable_capability_profiles=probeable_capability_profiles,
-        models_needing_discovery=lambda catalog, state, profile_ids: models_needing_discovery(
-            catalog, state, profile_ids, config
+        models_needing_discovery=lambda catalog, state, profile_ids, prioritize=True: models_needing_discovery(
+            catalog, state, profile_ids, config, prioritize=prioritize
         ),
         model_due_capabilities=lambda model, profile_ids, state: model_due_capabilities(
             model, profile_ids, state, config
@@ -10877,7 +11671,7 @@ def run_failover_demo(
         knocked_out=knocked_out,
         attempts=attempts,
         answer=answer,
-        duration_seconds=float(captured["duration_seconds"] or (time.monotonic() - started)),
+        duration_seconds=safe_float(captured["duration_seconds"], time.monotonic() - started),
         all_candidates_free=all(
             model_is_strict_zero(model) for model in candidates if str(model.get("id") or "") in attempted_ids
         ),
@@ -10930,7 +11724,12 @@ def build_connector_registry(config: dict[str, Any] | None = None) -> dict[str, 
 
 def target_legacy_export_payload(target_id: str, config: dict[str, Any]) -> dict[str, Any] | None:
     effective_config = effective_runtime_config(config)
-    export = target_export(build_connector_registry(effective_config), target_id, effective_config)
+    export = target_export(
+        build_connector_registry(effective_config),
+        target_id,
+        effective_config,
+        api_token=api_token(),
+    )
     if export is None:
         return None
     return export.legacy_payload()
@@ -10951,7 +11750,12 @@ def target_export_public_fields(export: TargetExport) -> dict[str, Any]:
 
 def target_public_export_payload(target_id: str, config: dict[str, Any]) -> dict[str, Any] | None:
     effective_config = effective_runtime_config(config)
-    export = target_export(build_connector_registry(effective_config), target_id, effective_config)
+    export = target_export(
+        build_connector_registry(effective_config),
+        target_id,
+        effective_config,
+        api_token=api_token(),
+    )
     if export is None:
         return None
     payload = target_export_public_fields(export)
@@ -10970,7 +11774,7 @@ def generic_client_export_payload(config: dict[str, Any]) -> dict[str, Any]:
         fusion_model_id=FUSION_MODEL_ID,
         fusion_visible_in_model_list=fusion_visible_in_model_list,
     )
-    export = adapter.export_config(TargetExportContext(config=effective_config))
+    export = adapter.export_config(TargetExportContext(config=effective_config, api_token=api_token()))
     payload = target_export_public_fields(export)
     if export.config is not None:
         payload["config"] = dict(export.config)
@@ -10978,7 +11782,7 @@ def generic_client_export_payload(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def target_summary_payload(adapter: TargetAdapter, config: dict[str, Any]) -> dict[str, Any]:
-    export = adapter.export_config(TargetExportContext(config=config))
+    export = adapter.export_config(TargetExportContext(config=config, api_token=api_token()))
     return {
         **target_export_public_fields(export),
         "display_name": adapter.display_name,
@@ -11044,6 +11848,12 @@ class ThreadingHTTPServer(_StdThreadingHTTPServer):
             max_active=MAX_ACTIVE_CHAT_REQUESTS,
             max_reserved_bytes=MAX_AGGREGATE_CHAT_REQUEST_BYTES,
         )
+        # Set by `install_shutdown_handler`, read between fallback attempts. A restart is not a
+        # routing failure: the request stops asking for new candidates and its route-log row says
+        # `service_restarting` rather than blaming whichever model happened to be next. Owned by
+        # the server rather than the module, so a fresh server starts fresh and two of them (tests,
+        # embedded use) cannot read each other's lifecycle.
+        self.stopping = threading.Event()
         self._handler_slots = threading.BoundedSemaphore(MAX_ACTIVE_HTTP_HANDLERS)
 
     def process_request(self, request: Any, client_address: Any) -> None:
@@ -11069,6 +11879,15 @@ class ThreadingHTTPServer(_StdThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._handler_slots.release()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # Browsers routinely retire idle keep-alive/EventSource sockets. Those resets are
+        # connection lifecycle, not failed Ficelle requests, and socketserver's default is
+        # a full traceback for each one. Real handler exceptions keep the default report.
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class RouterHandler(BaseHTTPRequestHandler):
@@ -11225,6 +12044,49 @@ class RouterHandler(BaseHTTPRequestHandler):
             time.sleep(timeout)
             return False
 
+    def _client_connected(self) -> bool:
+        """False once the caller closed its end, without consuming a byte of what it sent.
+
+        Peeked rather than read: a keep-alive client is allowed to pipeline its next request
+        while this one is still running, and consuming that would corrupt the connection. A
+        readable socket whose peek returns nothing is the half-close every hung-up client
+        produces. Checked between fallback attempts only (`ChatCompletionAttemptPorts`), so a
+        request nobody is waiting for stops spending attempts and frees its admission slot.
+        """
+        connection = getattr(self, "connection", None)
+        if connection is None:
+            return True
+        try:
+            if not select.select([connection], [], [], 0)[0]:
+                return True
+            return bool(connection.recv(1, socket.MSG_PEEK))
+        except OSError:
+            # The socket itself is gone; nothing is waiting for this answer.
+            return False
+        except ValueError:
+            # select cannot watch this descriptor (past FD_SETSIZE). Unknown, not gone: keep
+            # serving rather than abandoning a request whose client is very likely still there.
+            return True
+
+    def _terminal_reason(self) -> str | None:
+        """Why no further fallback attempt is worth starting, or None to keep going.
+
+        The `terminal_reason` port of `ChatCompletionAttemptPorts`, read between attempts only.
+        The name is the one the loop, the route log and the failure payload already use for this
+        value (`TERMINAL_ENDINGS`), so it is not renamed on the way through.
+
+        Liveness is tested first even though `stopping` is the free check: when both are true the
+        answer has to be `client_disconnected`, because that one suppresses the response body
+        entirely while `service_restarting` still writes a 503. Testing the flag first would make
+        Ficelle write that 503 into a socket nobody is reading. The `select` this costs runs once
+        per fallback, not per byte.
+        """
+        if not self._client_connected():
+            return "client_disconnected"
+        if self.server.stopping.is_set():  # type: ignore[attr-defined]
+            return "service_restarting"
+        return None
+
     def _write_sse_raw(self, frame: str) -> None:
         self.wfile.write(frame.encode("utf-8"))
         self.wfile.flush()
@@ -11248,7 +12110,19 @@ class RouterHandler(BaseHTTPRequestHandler):
             raise RequestBodyTooLarge(
                 f"request body of {length} bytes exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit"
             )
-        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            raw = self.rfile.read(length) if length else b"{}"
+        except OSError as exc:
+            # `timeout = 60` above arms the socket read: a client that announced a body and then
+            # went quiet (or vanished) surfaces here as TimeoutError/ConnectionResetError. Both
+            # are OSError, and neither is an internal failure to report as a 500.
+            raise RequestBodyUnavailable(
+                f"request body was not received: {type(exc).__name__}"
+            ) from exc
+        if len(raw) < length:
+            raise RequestBodyUnavailable(
+                f"request body was not received: expected {length} bytes, received {len(raw)}"
+            )
         try:
             data = json.loads(raw.decode("utf-8"))
         except Exception as exc:
@@ -11268,7 +12142,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.server.server_address[1],  # type: ignore[attr-defined]
         )
 
-    def _remote_admin_authenticated(self) -> bool:
+    def _admin_authenticated(self) -> bool:
         authorization = self.headers.get("Authorization")
         expected = admin_token()
         return (
@@ -11277,17 +12151,19 @@ class RouterHandler(BaseHTTPRequestHandler):
             or admin_token_matches(self.headers.get("X-Ficelle-Admin-Token"), expected)
         )
 
-    def _remote_api_authenticated(self) -> bool:
+    def _api_authenticated(self) -> bool:
         return bearer_token_matches(self.headers.get("Authorization"), api_token())
 
-    def _remote_request_authorized(self, path: str) -> bool:
-        if self._bind_is_loopback():
+    def _request_authorized(self, path: str) -> bool:
+        if path in {"/health", "/v1/health"}:
             return True
         if path == "/admin" or path.startswith("/admin/"):
-            return self._remote_admin_authenticated()
-        return self._remote_api_authenticated()
+            return self._admin_authenticated()
+        if path == "/v1" or path.startswith("/v1/"):
+            return self._api_authenticated()
+        return True
 
-    def _reject_remote_authentication(self, path: str, *, unread_body: bool = False) -> None:
+    def _reject_authentication(self, path: str, *, unread_body: bool = False) -> None:
         if path == "/admin" or path.startswith("/admin/"):
             challenge = 'Basic realm="Ficelle Admin", charset="UTF-8"'
         else:
@@ -11306,16 +12182,14 @@ class RouterHandler(BaseHTTPRequestHandler):
         """Guard for the whole admin write surface, bind-aware."""
         if not self._admin_origin_ok():
             return False
-        if self._bind_is_loopback():
-            return True
-        return self._remote_admin_authenticated()
+        return self._admin_authenticated()
 
     def _host_header_ok(self) -> bool:
         """Anti-DNS-rebinding guard, applied to every method before routing.
 
         The Origin guard only runs on admin POSTs, so without this a page on an attacker domain
-        rebound to 127.0.0.1 reads the entire GET surface — the admin token included — and can
-        spend free quota through /v1. Checking ``Host`` makes the attacker's own name fail.
+        rebound to 127.0.0.1 can still target the listener with the attacker's own host name.
+        Checking ``Host`` makes that name fail before authentication or routing.
         """
         return request_host_allowed(
             self.headers.get("Host"),
@@ -11359,11 +12233,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             411, "length_required", "chunked request bodies are not supported; send Content-Length"
         )
 
-    def _reject_unsupported_media_type(self) -> None:
+    def _reject_unsupported_media_type(self, resource: str = "chat completions") -> None:
         self._reject_unread_body(
             415,
             "unsupported_media_type",
-            "chat completions require Content-Type: application/json",
+            f"{resource} require Content-Type: application/json",
         )
 
     def _json_content_type_ok(self) -> bool:
@@ -11375,11 +12249,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         token (the token gates the credential-write endpoint specifically)."""
         if not self._admin_origin_ok():
             return False
-        if not self._bind_is_loopback():
-            return self._remote_admin_authenticated()
-        presented = self.headers.get("X-Ficelle-Admin-Token") or ""
-        # Constant-time compare to avoid a token-recovery timing side-channel.
-        return admin_token_matches(presented, admin_token())
+        return self._admin_authenticated()
 
     @property
     def config(self) -> dict[str, Any]:
@@ -11389,14 +12259,22 @@ class RouterHandler(BaseHTTPRequestHandler):
         message = (fmt % args).translate(LOG_CONTROL_CHAR_TABLE)
         sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), message))
 
+    def log_error(self, fmt: str, *args: Any) -> None:
+        # BaseHTTPRequestHandler reports every idle keep-alive expiry as an error even
+        # though the previous response completed normally. Suppress only that exact
+        # built-in message; malformed requests and application failures remain visible.
+        if fmt == "Request timed out: %r":
+            return
+        super().log_error(fmt, *args)
+
     def do_GET(self) -> None:  # noqa: N802
         try:
             if not self._host_header_ok():
                 self._reject_foreign_host()
                 return
             path = urlparse(self.path).path.rstrip("/") or "/"
-            if not self._remote_request_authorized(path):
-                self._reject_remote_authentication(path)
+            if not self._request_authorized(path):
+                self._reject_authentication(path)
                 return
             if path in {"/health", "/v1/health"}:
                 # Cache read only. `health_payload` documents why this endpoint must never
@@ -11404,7 +12282,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(200, health_payload(self.config))
                 return
             if path == "/admin":
-                self._send_html(200, admin_page_html(embed_token=self._bind_is_loopback()))
+                self._send_html(200, admin_page_html())
                 return
             if path == "/admin/state":
                 self._send_json(200, admin_state(self.config))
@@ -11435,8 +12313,11 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(200, runtime_state_diagnostics())
                 return
             if path == "/admin/fusion":
-                if FusionRunner is None:
-                    self._send_json(404, {"error": {"message": "Fusion is a Ficelle Pro feature", "type": "not_found"}})
+                try:
+                    require_pro_feature("Fusion", FusionRunner)
+                except (ProEntitlementRequired, license_ops.ProPackUnavailable) as exc:
+                    status, payload = pro_feature_error(exc)
+                    self._send_json(status, payload)
                     return
                 state = load_runtime_state()
                 self._send_json(200, fusion_admin_payload(self.config, state))
@@ -11445,8 +12326,11 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(200, router_settings_payload(self.config))
                 return
             if path == "/admin/compression":
-                if compress_block is None:
-                    self._send_json(404, {"error": {"message": "Compression is a Ficelle Pro feature", "type": "not_found"}})
+                try:
+                    require_pro_feature("Compression", compress_block)
+                except (ProEntitlementRequired, license_ops.ProPackUnavailable) as exc:
+                    status, payload = pro_feature_error(exc)
+                    self._send_json(status, payload)
                     return
                 self._send_json(200, compression_admin_payload(self.config, limit=admin_query_limit(self.path)))
                 return
@@ -11458,11 +12342,18 @@ class RouterHandler(BaseHTTPRequestHandler):
                 except license_ops.LicenseNotInstalled:
                     self._send_json(404, _LICENSE_PRO_ONLY_404)
                     return
+                except license_ops.ProPackUnavailable as exc:
+                    self._send_json(503, {"error": {"code": "pro_pack_unavailable", "message": str(exc), "type": "service_unavailable"}})
+                    return
                 payload["service_url"] = license_ops.service_url()
                 self._send_json(200, payload)
                 return
             if path == "/admin/license/install":
-                pro_install = _load_pro_install_module()
+                try:
+                    pro_install = _load_pro_install_module()
+                except Exception:
+                    self._send_json(503, {"error": {"code": "pro_pack_unavailable", "message": "Ficelle Pro installer is unavailable", "type": "service_unavailable"}})
+                    return
                 self._send_json(200, pro_install.read_install_status())
                 return
             if path == "/admin/audit":
@@ -11510,35 +12401,31 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_export_payload(export)
                 return
             if path == "/v1/models":
-                entitled = license_ops.is_entitled()
-                effective_config = effective_runtime_config(self.config, entitled=entitled)
-                catalog = load_or_refresh_catalog(self.config, entitled=entitled)
-                data = []
-                now = int(time.time())
-                profiles = normalized_virtual_profiles(effective_config)
-                for mid in listed_virtual_model_ids(effective_config, entitled=entitled):
-                    data.append({
-                        "id": mid,
-                        "object": "model",
-                        "created": now,
-                        "owned_by": "ficelle",
-                        **virtual_model_listing_metadata(mid, profiles, effective_config),
-                    })
-                for model in catalog.get("models", []):
-                    if not isinstance(model, dict):
-                        continue
-                    data.append({
-                        "id": model.get("id"),
-                        "object": "model",
-                        "created": now,
-                        "owned_by": f"ficelle/{model.get('source')}",
-                        "context_length": model.get("context_length"),
-                        "upstream_id": model.get("upstream_id"),
-                        "invokable": model.get("invokable"),
-                        "supports_tools": model.get("supports_tools"),
-                        "supports_structured_outputs": model.get("supports_structured_outputs"),
-                    })
-                self._send_json(200, {"object": "list", "data": data})
+                self._send_json(
+                    200,
+                    {
+                        "object": "list",
+                        "data": list(iter_listed_model_objects(self.config, entitled=license_ops.is_entitled())),
+                    },
+                )
+                return
+            if path.startswith("/v1/models/"):
+                # OpenAI's model-retrieve route. Hermes polls it for `ficelle/auto-compression`,
+                # whose id contains a slash — so the id is everything after the prefix, not one
+                # path segment. Percent-decoded because a client is free to encode that slash.
+                model_id = unquote(path[len("/v1/models/"):])
+                model = next(
+                    (
+                        row
+                        for row in iter_listed_model_objects(self.config, entitled=license_ops.is_entitled())
+                        if row.get("id") == model_id
+                    ),
+                    None,
+                )
+                if model is None:
+                    self._send_json(404, model_not_found_body(safe_detail(model_id) or "[redacted]"))
+                    return
+                self._send_json(200, model)
                 return
             if path in {"/status", "/v1/status"}:
                 catalog = load_or_refresh_catalog(self.config)
@@ -11549,7 +12436,55 @@ class RouterHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(500, safe_error_body(exc))
 
+    def _send_request_body_unavailable(self, exc: Exception) -> None:
+        """408 for a caller that announced a body and never finished sending it.
+
+        Nothing failed on our side, so this is never a 500. Best-effort: the socket that timed out
+        being read may well refuse the write too.
+        """
+        self.close_connection = True
+        try:
+            self._send_json(
+                408,
+                error_body_result(
+                    exc,
+                    error_type="client_disconnected",
+                    fallback_message="request body was not received",
+                ),
+                headers={"Connection": "close"},
+            )
+        except OSError:
+            pass
+
+    def _send_unhandled_post_error(self, exc: Exception) -> None:
+        """The last-resort answer of a POST route that raised: 500 for whatever Ficelle failed at.
+
+        A body the caller never finished sending is not that, and is re-raised for `do_POST` to
+        answer as the 408 it is — calling it an internal error would send whoever debugs it to the
+        wrong side of the socket. Re-raised rather than answered here so the 408 has exactly one
+        writer: this method exists because the per-route `except Exception` would otherwise swallow
+        it, and the chat route already re-raises for the same reason.
+        """
+        if isinstance(exc, RequestBodyUnavailable):
+            raise exc
+        self._send_json(500, safe_error_body(exc))
+
     def do_POST(self) -> None:  # noqa: N802
+        """Route the POST, answering an unfinished request body once for every route.
+
+        Every route funnels through `_read_body`, so the caller that announces a body and then goes
+        quiet can surface anywhere below — including out of a route with no handler of its own, and
+        out of one whose own `except Exception` hands it to `_send_unhandled_post_error`, which
+        re-raises it. Answered here for the same reason `Content-Length` is validated once in
+        `_route_post`: it is a property of the request, not of the route, and one writer is what
+        keeps the answer identical whichever route saw it.
+        """
+        try:
+            self._route_post()
+        except RequestBodyUnavailable as exc:
+            self._send_request_body_unavailable(exc)
+
+    def _route_post(self) -> None:
         # Guarded: unlike do_GET this method has no top-level try, so a raise here would answer
         # nothing at all and drop the connection rather than surfacing an error.
         try:
@@ -11557,8 +12492,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._reject_foreign_host(unread_body=True)
                 return
             path = urlparse(self.path).path.rstrip("/") or "/"
-            if not self._remote_request_authorized(path):
-                self._reject_remote_authentication(path, unread_body=True)
+            if not self._request_authorized(path):
+                self._reject_authentication(path, unread_body=True)
                 return
             # Checked once here rather than per route: every handler funnels through _read_body,
             # whose RequestBodyTooLarge subclasses ValueError and would otherwise be answered as
@@ -11598,6 +12533,40 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._log_rejected_header(message, "Origin")
             self._reject_unread_body(403, "forbidden", message)
             return
+        if path == "/admin/quality-feedback":
+            if not self._json_content_type_ok():
+                self._reject_unsupported_media_type("quality feedback")
+                return
+            try:
+                body = self._read_body()
+                result = record_quality_feedback(body)
+                # The audit can correlate a repeated operator action by its slot hash, but never
+                # writes the supplied request id or arbitrary operator text outside the closed body.
+                event_hash = hashlib.sha256(
+                    f"{body['request_id']}|{body['validator']}".encode("utf-8")
+                ).hexdigest()
+                write_admin_audit(
+                    "admin.quality_feedback.record",
+                    after={"status": result["status"], "revision": result["revision"], "quality": result["quality"]},
+                    metadata={
+                        "event_hash": event_hash,
+                        "outcome": body["outcome"],
+                        "severity": body["severity"],
+                        "reason": body["reason"],
+                        "validator": body["validator"],
+                    },
+                )
+                self._send_json(200, result)
+            except QualityFeedbackError as exc:
+                self._send_json(
+                    exc.http_status,
+                    {"error": {"code": exc.code, "message": exc.code, "type": "quality_feedback_error"}},
+                )
+            except ValueError as exc:
+                self._send_json(400, bad_request_body(exc))
+            except Exception as exc:
+                self._send_unhandled_post_error(exc)
+            return
         if path == "/admin/refresh":
             try:
                 catalog = refresh_catalog(self.config)
@@ -11605,7 +12574,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 write_admin_audit("admin.refresh", after={"summary": summary})
                 self._send_json(200, {"summary": summary})
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/update":
@@ -11630,7 +12599,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except update_service.UpdateError as exc:
                 self._send_json(500, {"error": {"message": str(exc), "type": "update_error"}})
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         # License management (Pro). Shared with `ficelle license` via ficelle.license_ops; the
@@ -11647,12 +12616,14 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(200, license_ops.status_dict(entitlement))
             except license_ops.LicenseNotInstalled:
                 self._send_json(404, _LICENSE_PRO_ONLY_404)
+            except license_ops.ProPackUnavailable as exc:
+                self._send_json(503, {"error": {"code": "pro_pack_unavailable", "message": str(exc), "type": "service_unavailable"}})
             except license_ops.LicenseOperationError as exc:
                 self._send_json(400, {"error": {"message": str(exc), "type": "license_error"}})
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/license/refresh":
@@ -11662,10 +12633,12 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(200, license_ops.status_dict(entitlement))
             except license_ops.LicenseNotInstalled:
                 self._send_json(404, _LICENSE_PRO_ONLY_404)
+            except license_ops.ProPackUnavailable as exc:
+                self._send_json(503, {"error": {"code": "pro_pack_unavailable", "message": str(exc), "type": "service_unavailable"}})
             except license_ops.LicenseOperationError as exc:
                 self._send_json(400, {"error": {"message": str(exc), "type": "license_error"}})
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/license/deactivate":
@@ -11675,8 +12648,10 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"deactivated": True, "service_ok": service_ok})
             except license_ops.LicenseNotInstalled:
                 self._send_json(404, _LICENSE_PRO_ONLY_404)
+            except license_ops.ProPackUnavailable as exc:
+                self._send_json(503, {"error": {"code": "pro_pack_unavailable", "message": str(exc), "type": "service_unavailable"}})
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/license/install":
@@ -11704,8 +12679,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 return
             try:
                 pro_install = _load_pro_install_module()
-            except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+            except Exception:
+                self._send_json(503, {"error": {"code": "pro_pack_unavailable", "message": "Ficelle Pro installer is unavailable", "type": "service_unavailable"}})
                 return
 
             try:
@@ -11738,7 +12713,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     },
                 )
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/benchmark":
@@ -11763,7 +12738,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             finally:
                 if job_id:
                     finish_admin_job("benchmark", job_id)
@@ -11784,7 +12759,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/cooldowns":
@@ -11830,7 +12805,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/providers/probe":
@@ -11854,7 +12829,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/providers/toggle":
@@ -11898,7 +12873,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path.startswith("/admin/providers/") and path.endswith("/key"):
@@ -11980,7 +12955,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/quarantine":
@@ -12017,12 +12992,15 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/fusion":
-            if FusionRunner is None:
-                self._send_json(404, {"error": {"message": "Fusion is a Ficelle Pro feature", "type": "not_found"}})
+            try:
+                require_pro_feature("Fusion", FusionRunner)
+            except (ProEntitlementRequired, license_ops.ProPackUnavailable) as exc:
+                status, payload = pro_feature_error(exc)
+                self._send_json(status, payload)
                 return
             try:
                 body = self._read_body()
@@ -12040,12 +13018,15 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/fusion/rollback":
-            if FusionRunner is None:
-                self._send_json(404, {"error": {"message": "Fusion is a Ficelle Pro feature", "type": "not_found"}})
+            try:
+                require_pro_feature("Fusion", FusionRunner)
+            except (ProEntitlementRequired, license_ops.ProPackUnavailable) as exc:
+                status, payload = pro_feature_error(exc)
+                self._send_json(status, payload)
                 return
             try:
                 body = self._read_body()
@@ -12056,7 +13037,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/settings":
@@ -12064,6 +13045,13 @@ class RouterHandler(BaseHTTPRequestHandler):
                 body = self._read_body()
                 before = normalize_router_settings(self.config, strict=False)
                 settings = validate_settings_payload(body)
+                if compression_settings_changed(before, settings):
+                    try:
+                        require_pro_feature("Compression", compress_block)
+                    except (ProEntitlementRequired, license_ops.ProPackUnavailable) as exc:
+                        status, payload = pro_feature_error(exc)
+                        self._send_json(status, payload)
+                        return
                 saved = save_router_settings(self.config, settings)
                 audit = write_admin_audit(
                     "admin.settings.save",
@@ -12084,24 +13072,39 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/settings/rollback":
             try:
                 body = self._read_body()
                 audit_id = str(body.get("audit_id") or body.get("id") or "").strip()
+                row = find_admin_audit_entry(audit_id)
+                snapshot = ((row or {}).get("before") or {}).get("settings") if isinstance((row or {}).get("before"), dict) else None
+                before = normalize_router_settings(self.config, strict=False)
+                if isinstance(snapshot, dict):
+                    candidate = normalize_router_settings(snapshot, strict=True)
+                    if compression_settings_changed(before, candidate):
+                        try:
+                            require_pro_feature("Compression", compress_block)
+                        except (ProEntitlementRequired, license_ops.ProPackUnavailable) as exc:
+                            status, payload = pro_feature_error(exc)
+                            self._send_json(status, payload)
+                            return
                 settings = rollback_router_settings_from_audit(audit_id, self.config)
                 self._send_json(200, {"settings": {"config": settings}})
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/compression/retrieve":
-            if compress_block is None:
-                self._send_json(404, {"error": {"message": "Compression is a Ficelle Pro feature", "type": "not_found"}})
+            try:
+                require_pro_feature("Compression", compress_block)
+            except (ProEntitlementRequired, license_ops.ProPackUnavailable) as exc:
+                status, payload = pro_feature_error(exc)
+                self._send_json(status, payload)
                 return
             try:
                 body = self._read_body()
@@ -12111,19 +13114,22 @@ class RouterHandler(BaseHTTPRequestHandler):
             except FileNotFoundError as exc:
                 self._send_json(404, {"error": {"code": "not_found", "message": str(exc)}})
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/compression/clear":
-            if compress_block is None:
-                self._send_json(404, {"error": {"message": "Compression is a Ficelle Pro feature", "type": "not_found"}})
+            try:
+                require_pro_feature("Compression", compress_block)
+            except (ProEntitlementRequired, license_ops.ProPackUnavailable) as exc:
+                status, payload = pro_feature_error(exc)
+                self._send_json(status, payload)
                 return
             try:
                 removed = clear_compression_store(store_path=COMPRESSION_STORE_PATH)
                 write_admin_audit("admin.compression.clear", after={"removed": removed}, metadata={"removed": removed})
                 self._send_json(200, {"removed": removed})
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/profiles":
@@ -12146,7 +13152,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path == "/admin/profiles/rollback":
@@ -12172,7 +13178,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
-                self._send_json(500, safe_error_body(exc))
+                self._send_unhandled_post_error(exc)
             return
 
         if path != CHAT_COMPLETIONS_PATH:
@@ -12201,6 +13207,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         request_id = uuid.uuid4().hex
         requested_model = DEFAULT_CHAT_COMPLETION_MODEL
+        # The redacted twin, seeded so failure telemetry can name a profile before normalization.
+        safe_requested_model = DEFAULT_CHAT_COMPLETION_MODEL
+        # The caller's stream flag, known only once the body parses. False until then, which is
+        # what a request that never got that far actually is.
+        requested_stream = False
         request_started = time.monotonic()
         # Validated synthetic-run correlation id (L2-R3), or None on any failed gate. It
         # supplements route telemetry only — Ficelle's random request id stays authoritative
@@ -12219,14 +13230,97 @@ class RouterHandler(BaseHTTPRequestHandler):
                 row = {**row, "synthetic_case_id": synthetic_case_id}
             if workload is not None:
                 row = {**row, "workload": workload}
-            write_route_log(row)
+            try:
+                write_route_log(row)
+            except Exception as exc:
+                # Telemetry never becomes the reason a request fails, and reporting that here is
+                # what lets every caller simply write its row. The type only: a row already holds
+                # redacted values, but the exception that rejected it may quote raw content.
+                sys.stderr.write(f"ficelle: request telemetry failed (non-fatal): {type(exc).__name__}\n")
 
         def record_telemetry_with_case(telemetry: ChatCompletionRouteTelemetry) -> None:
             telemetry = _telemetry_with_synthetic_case(telemetry, synthetic_case_id)
             apply_chat_route_telemetry(_telemetry_with_workload(telemetry, workload))
 
+        def log_chat_request_failure(
+            status: int, reason: str, exc: Exception, *, record_route_state: bool = False
+        ) -> None:
+            """Give the handler's own failures a route-log row and one stderr line.
+
+            Without this a 400 or a 500 raised here left no trace at all: the Requests page
+            showed nothing (the route never reached the telemetry the router writes) and the
+            service log was silent, so the only evidence was the client's error body. The row is
+            the shape every no-attempt route already uses (`build_no_attempt_route_log`), and it is
+            what the Requests page reads: an append-only line, no lock, no read-modify-write.
+
+            `record_route_state` additionally refreshes the last-route record in `state.json` — a
+            full lock, parse, deep copy and rewrite. Only the internal-error path asks for it,
+            because only that path can fire after a candidate ran and would otherwise leave the
+            admin showing an earlier success as the latest route. A malformed body or a client that
+            never finished sending one never chose a candidate and never wrote state, and answering
+            it must not either: a client looping on a bad request would otherwise rewrite
+            `state.json` once per attempt. The stderr line names the exception type and the request
+            id only: no traceback, no request content.
+            """
+            duration = time.monotonic() - request_started
+            if record_route_state:
+                record_last_route(safe_requested_model, "fail", reason, request_id, 0, 0, duration)
+            write_route_log_with_case(
+                {
+                    **build_no_attempt_route_log(
+                        request_id=request_id,
+                        safe_requested_model=safe_requested_model,
+                        status=status,
+                        reason=reason,
+                        duration_seconds=duration,
+                        stream=requested_stream,
+                    ),
+                    "error_type": type(exc).__name__,
+                }
+            )
+            sys.stderr.write(
+                f"ficelle: chat request {request_id} failed: {reason} ({type(exc).__name__})\n"
+            )
+
+        def record_post_commit_failure(exc: Exception) -> bool:
+            """True once the success response is on the wire, so no error body may follow it.
+
+            The route already has its success row and the client is mid-way through reading a
+            body; a second status line would corrupt the connection. The correction is an
+            append-only delivery event on the same request id, plus one stderr line — the single
+            place that pairing is written, so a caller cannot record one half of it.
+            """
+            if not nonstream_success_started:
+                return False
+            write_route_log_with_case(
+                {
+                    "event": "request_delivery_update",
+                    "request_id": request_id,
+                    "final_reason": "client_disconnected",
+                    "error_type": type(exc).__name__,
+                }
+            )
+            sys.stderr.write(
+                f"ficelle: chat request {request_id} failed after its response was "
+                f"committed: {type(exc).__name__}\n"
+            )
+            return True
+
+        def respond_internal_error(exc: Exception) -> None:
+            if record_post_commit_failure(exc):
+                return
+            log_chat_request_failure(500, "internal_error", exc, record_route_state=True)
+            self._send_json(
+                500,
+                safe_error_body(exc, request_id=request_id),
+                headers=ficelle_response_headers(request_id, requested_model),
+            )
+
+        nonstream_success_started = False
+        retention_leases: list[OutputRetentionLease] = []
         try:
             body = self._read_body()
+            requested_stream = bool(body.get("stream"))
             chat_request = normalize_chat_completion_request(body)
             requested_model = chat_request.requested_model
             safe_requested_model = chat_request.safe_requested_model
@@ -12345,7 +13439,13 @@ class RouterHandler(BaseHTTPRequestHandler):
                         response.close()
 
                 return ChatCompletionAttemptPorts(
-                    invoke_model=invoke_model,
+                    invoke_model=lambda model, request_body, config, **kwargs: invoke_model(
+                        model,
+                        request_body,
+                        config,
+                        retention_leases=retention_leases,
+                        **kwargs,
+                    ),
                     apply_cooldown=lambda cooldown: apply_chat_attempt_cooldown(
                         cooldown,
                         effective_config,
@@ -12374,6 +13474,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     is_timeout_exception=lambda exc: isinstance(exc, requests.exceptions.Timeout),
                     is_deadline_exception=lambda exc: isinstance(exc, RequestDeadlineExceeded),
                     quota_cooldown_matches_model=quota_cooldown_matches_model,
+                    terminal_reason=self._terminal_reason,
                     unsupported_parameters_for=lambda model, request_body: unsupported_parameters_for_model(
                         model, request_body, config=effective_config
                     ),
@@ -12417,6 +13518,10 @@ class RouterHandler(BaseHTTPRequestHandler):
                 raise RuntimeError("chat completion route completed without a response")
             if attempt_result.raw_response is not None:
                 success_response = attempt_result.raw_response
+                # The route success is already in the append-only log at this point. If
+                # the caller has gone away, append a correction instead of attempting a
+                # second HTTP 500 on a response whose headers are already committed.
+                nonstream_success_started = True
                 self.send_response(success_response.status)
                 self.send_header("Content-Type", success_response.content_type)
                 for key, value in success_response.headers.items():
@@ -12429,20 +13534,54 @@ class RouterHandler(BaseHTTPRequestHandler):
                 failure_response = attempt_result.json_response
                 self._send_json(failure_response.status, failure_response.payload, headers=failure_response.headers)
                 return
+            # `abandoned`: the run is fully logged and the caller is gone, so nothing is written
+            # and the socket is not kept alive for a peer that already left.
+            self.close_connection = True
+            return
+        except RequestBodyUnavailable as exc:
+            # The 408 itself is answered once for every route in `do_POST`. What is route-specific
+            # is this request's own id and its row on the Requests page, so that is recorded here
+            # and the response is left to the one place that writes it.
+            log_chat_request_failure(408, "client_disconnected", exc)
+            raise
+        except UpstreamResponseBudgetExceeded as exc:
+            log_chat_request_failure(503, "server_busy", exc)
+            self._send_json(
+                503,
+                {"error": {"code": "server_busy", "message": str(exc), "type": "server_error"}},
+                headers=ficelle_response_headers(request_id, requested_model),
+            )
+        except requests.exceptions.RequestException as exc:
+            # Before `OSError`, which `requests`' own exceptions subclass. An upstream transport
+            # failure that escaped the attempt loop is an internal error, not a dead caller socket.
+            respond_internal_error(exc)
+            return
+        except OSError as exc:
+            # Every socket failure toward the caller, not just the three connection classes:
+            # `TimeoutError` (a client that stopped reading until the send buffer timed out) and
+            # a bare `OSError` on a dead descriptor mean the same thing here, and both used to
+            # fall through to the generic 500 branch below.
+            self.close_connection = True
+            record_post_commit_failure(exc)
             return
         except ValueError as exc:
+            # Guarded like the other write branches, and not speculatively: the success response is
+            # committed before its headers are serialized, so a header value this handler cannot
+            # send raises here with a 200 status line already buffered
+            # (`test_chat_handler_never_writes_an_error_over_a_committed_response`).
+            if record_post_commit_failure(exc):
+                return
+            log_chat_request_failure(400, "bad_request", exc)
             self._send_json(
                 400,
                 bad_request_body(exc, request_id=request_id),
                 headers=ficelle_response_headers(request_id, requested_model),
             )
         except Exception as exc:
-            self._send_json(
-                500,
-                safe_error_body(exc, request_id=request_id),
-                headers=ficelle_response_headers(request_id, requested_model),
-            )
+            respond_internal_error(exc)
         finally:
+            for retention_lease in retention_leases:
+                retention_lease.release()
             admission.release()
 
 
@@ -12575,10 +13714,12 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
             record_catalog_refresh_error(None)
 
 
-# How long a SIGTERM waits for requests already in flight. `ficelle stop` SIGKILLs after its own
-# grace period, so this stays comfortably under it: draining is worth doing, stalling a restart
-# is not.
-SHUTDOWN_DRAIN_SECONDS = 5.0
+# How long a SIGTERM waits for requests already in flight. launchd's default `ExitTimeOut` is 20s
+# and the plist sets none, so that is the whole budget: past it the process is SIGKILLed anyway.
+# Five seconds was well under it and cut multi-minute routes short for no gain; requests in flight
+# now also stop taking new fallbacks (`ThreadingHTTPServer.stopping`), so the wait ends as soon as
+# the attempt already running does.
+SHUTDOWN_DRAIN_SECONDS = 20.0
 
 
 def drain_inflight_requests(server: Any, timeout_seconds: float) -> int:
@@ -12607,12 +13748,12 @@ def install_shutdown_handler(server: Any) -> None:
     row was never written. State stays consistent either way (writes are atomic); what was lost
     was the client's ability to tell a finished answer from a killed one.
     """
-    draining = threading.Event()
-
     def handle(signum: int, _frame: Any) -> None:
-        if draining.is_set():
+        # `server.stopping` is both the reentrancy guard for a second signal and the flag in-flight
+        # requests read to stop taking new fallbacks: one state, one flag.
+        if server.stopping.is_set():
             return
-        draining.set()
+        server.stopping.set()
         print(f"ficelle: signal {signum} received, draining for up to {SHUTDOWN_DRAIN_SECONDS}s", flush=True)
 
         def drain() -> None:
@@ -12650,14 +13791,19 @@ def refresh_hermes_integration_on_startup() -> bool:
 def serve(config: dict[str, Any]) -> None:
     host = str(config.get("host") or "127.0.0.1")
     port = int(config.get("port") or 8646)
+    # Startup is where an operator reads the service's output, and a setting that is silently
+    # doing nothing has to be named somewhere.
+    report_config_warnings(config)
     refresh_hermes_integration_on_startup()
     # Strict-zero fail-fast: refuse to start if paid fallback was somehow enabled.
     # The catalog warm runs in a background thread below (where this guard would be
     # swallowed), so assert it synchronously here before binding — cheap, no network.
     if config.get("allow_paid_fallback") is not False:
         raise RuntimeError("allow_paid_fallback must stay false for the free router MVP")
-    if not bind_host_is_loopback(host):
-        ensure_exposed_access_tokens()
+    # Both credentials are the stable local client/admin contract too. Generate and validate
+    # them before binding so a loopback peer cannot inherit an unauthenticated control plane and
+    # every bind has persistent, owner-only, independently scoped tokens.
+    ensure_access_tokens()
     # Bind and start serving BEFORE warming the catalog. A slow or hanging provider
     # catalog fetch must never keep the HTTP server from binding — otherwise the whole
     # service is unreachable at startup (`ficelle restart` reports "did not become

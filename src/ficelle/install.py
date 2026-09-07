@@ -22,7 +22,6 @@ from ficelle.connector_registry import load_connectors, register_connector, unre
 from ficelle.runtime_paths import RuntimePaths
 from ficelle.service import active_home_pointer_path, persist_active_service_context
 from ficelle.url_security import connectable_host, connectable_http_url
-from ficelle.use_cases.admin_security import bind_host_is_loopback
 from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
     provider_key_setup_commands,
@@ -36,10 +35,14 @@ MANAGED_CONFIG_BEGIN = "# BEGIN FICELLE MANAGED CONFIG"
 MANAGED_CONFIG_END = "# END FICELLE MANAGED CONFIG"
 PROVIDER_PLUGIN_NAME = "ficelle"
 PROVIDER_PLUGIN_ENV_KEY = "FICELLE_API_KEY"
+# Kept as an import-compatible marker for older integrations; setup never emits or stores it.
 PROVIDER_PLUGIN_ENV_PLACEHOLDER = "ficelle-local"
 COMPRESSION_PLUGIN_NAME = "ficelle-compression"
 COMPRESSION_TOOLSET_NAME = "ficelle"
 CONNECTORS = ("hermes", "openclaw")
+PLUGIN_OWNER_FICELLE = "ficelle"
+PLUGIN_OWNER_HERMES = "hermes"
+HERMES_CATALOG_SIDECAR = ".hermes-catalog.json"
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,10 @@ class PreflightCheck:
     @property
     def failed(self) -> bool:
         return self.status == "fail"
+
+
+class HermesPluginConflictError(RuntimeError):
+    """An externally managed Hermes plugin would shadow a different Ficelle payload."""
 
 
 def default_hermes_home() -> Path:
@@ -235,6 +242,90 @@ def trees_equal(source: Path, destination: Path) -> bool:
     return all(trees_equal(source / name, destination / name) for name in comparison.common_dirs)
 
 
+def _normalized_plugin_payload(root: Path) -> dict[str, bytes] | None:
+    """Return runtime-relevant plugin files, ignoring provenance and generated files.
+
+    Catalog pins may legitimately carry an older manifest version when a Ficelle release did not
+    change connector behavior. Everything else must match so Hermes cannot load stale code from
+    its higher-priority flat plugin directory.
+    """
+    if not root.is_dir():
+        return None
+    payload: dict[str, bytes] = {}
+    try:
+        for child in sorted(root.rglob("*")):
+            relative = child.relative_to(root)
+            if (
+                HERMES_CATALOG_SIDECAR in relative.parts
+                or ".git" in relative.parts
+                or "__pycache__" in relative.parts
+                or child.suffix == ".pyc"
+                or not child.is_file()
+            ):
+                continue
+            content = child.read_bytes()
+            if relative.as_posix() in {"plugin.yaml", "plugin.yml"}:
+                content = b"".join(
+                    line
+                    for line in content.splitlines(keepends=True)
+                    if not line.startswith(b"version:")
+                )
+            payload[relative.as_posix()] = content
+    except OSError:
+        return None
+    return payload
+
+
+def _require_compatible_external_plugin(source: Path, destination: Path) -> None:
+    source_payload = _normalized_plugin_payload(source)
+    if source_payload is None:
+        raise FileNotFoundError(f"Ficelle Hermes plugin template not found: {source}")
+    if _normalized_plugin_payload(destination) == source_payload:
+        return
+    raise HermesPluginConflictError(
+        f"Hermes-managed plugin at {destination} differs from this Ficelle connector. "
+        "Update or remove that plugin with Hermes, then rerun "
+        "`ficelle connectors install hermes`. No Hermes files were changed."
+    )
+
+
+def _registered_hermes_plugin_ownership(ficelle_home: Path) -> dict[str, str]:
+    record = load_connectors(ficelle_home).get("hermes") or {}
+    metadata = record.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    ownership = metadata.get("plugin_ownership")
+    if isinstance(ownership, dict):
+        return {
+            relative: owner
+            for relative, owner in ownership.items()
+            if isinstance(relative, str)
+            and owner in {PLUGIN_OWNER_FICELLE, PLUGIN_OWNER_HERMES}
+        }
+    hashes = metadata.get("plugin_sha256")
+    if not isinstance(hashes, dict):
+        return {}
+    return {
+        relative: PLUGIN_OWNER_FICELLE
+        for relative, digest in hashes.items()
+        if isinstance(relative, str) and isinstance(digest, str)
+    }
+
+
+def _hermes_manages_flat_plugin(hermes_home: Path, destination: Path) -> bool:
+    plugins_dir = hermes_home / "plugins"
+    if destination.parent != plugins_dir:
+        return False
+    if (destination / HERMES_CATALOG_SIDECAR).is_file():
+        return True
+    try:
+        metadata = json.loads(
+            (plugins_dir / ".install-metadata.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return False
+    return isinstance(metadata, dict) and isinstance(metadata.get(destination.name), dict)
+
+
 def copy_plugin_tree(
     source: Path,
     destination: Path,
@@ -270,8 +361,6 @@ def configured_runtime_config(runtime_dir: Path) -> dict[str, Any]:
 
 def provider_plugin_env_value(runtime_dir: Path, *, credential_dir: Path | None = None) -> str:
     """Return the credential Hermes must send to the selected listener."""
-    if bind_host_is_loopback(configured_runtime_config(runtime_dir).get("host")):
-        return PROVIDER_PLUGIN_ENV_PLACEHOLDER
     token_dir = credential_dir or runtime_dir
     try:
         token = (token_dir / "api-token").read_text(encoding="utf-8").strip()
@@ -290,8 +379,8 @@ def seed_provider_plugin_env_key(options: InstallOptions, *, runtime_dir: Path |
     declares at least one env var, and only builds a client once that var
     resolves to a usable value -- so without this the plugin is installed, the
     exported config names ``provider: ficelle``, and every call still fails with
-    "provider not configured". A loopback router ignores the placeholder; an exposed router
-    requires the real owner API token, which this setup synchronizes after service installation.
+    "provider not configured". The setup synchronizes the real owner API token for every bind,
+    including loopback, so the generated client configuration remains valid after auth hardening.
 
     Seeding the file rather than printing an ``export`` line keeps the marker scoped to the
     selected Hermes home. Hermes loads that file on restart and may then select Ficelle as its
@@ -301,14 +390,9 @@ def seed_provider_plugin_env_key(options: InstallOptions, *, runtime_dir: Path |
 
     env_path = options.hermes_home / ".env"
     selected_runtime = runtime_dir or options.ficelle_home
-    configured_host = configured_runtime_config(selected_runtime).get("host")
-    protected_listener = not bind_host_is_loopback(configured_host)
     existing = parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY, "").strip()
-    if existing and not protected_listener:
-        print(f"Provider plugin key already set: {PROVIDER_PLUGIN_ENV_KEY} in {env_path}")
-        return
     if options.dry_run:
-        action = "sync protected API token" if protected_listener else f"set {PROVIDER_PLUGIN_ENV_KEY}"
+        action = f"sync API token in {PROVIDER_PLUGIN_ENV_KEY}"
         print(f"DRY RUN: {action} in {env_path}")
         return
     value = provider_plugin_env_value(
@@ -322,16 +406,49 @@ def seed_provider_plugin_env_key(options: InstallOptions, *, runtime_dir: Path |
     print(f"Provider plugin key set: {PROVIDER_PLUGIN_ENV_KEY} in {env_path}")
 
 
-def install_plugins(options: InstallOptions, *, runtime_dir: Path | None = None) -> None:
+def install_plugins(
+    options: InstallOptions,
+    *,
+    runtime_dir: Path | None = None,
+) -> dict[str, str]:
     install_specs = hermes_plugin_install_specs(options.hermes_home)
+    previous_ownership = _registered_hermes_plugin_ownership(options.ficelle_home)
+    ownership: dict[str, str] = {}
+
+    # Hermes discovers nested providers first and flat plugins second, so a catalog copy at
+    # plugins/ficelle wins. Validate all externally owned payloads before any Hermes mutation.
+    flat_provider = options.hermes_home / "plugins" / PROVIDER_PLUGIN_NAME
+    if flat_provider.exists():
+        _require_compatible_external_plugin(install_specs[0][0], flat_provider)
+        ownership[str(flat_provider.relative_to(options.hermes_home))] = PLUGIN_OWNER_HERMES
+
+    compression_source, compression_destination = install_specs[1]
+    compression_relative = str(compression_destination.relative_to(options.hermes_home))
+    external_compression = (
+        compression_destination.exists()
+        and (
+            _hermes_manages_flat_plugin(options.hermes_home, compression_destination)
+            or previous_ownership.get(compression_relative) != PLUGIN_OWNER_FICELLE
+        )
+    )
+    if external_compression:
+        _require_compatible_external_plugin(compression_source, compression_destination)
+
     for source, destination in install_specs:
+        relative = str(destination.relative_to(options.hermes_home))
+        if destination == compression_destination and external_compression:
+            ownership[relative] = PLUGIN_OWNER_HERMES
+            print(f"Hermes-managed plugin preserved: {destination}")
+            continue
         copy_plugin_tree(
             source,
             destination,
             dry_run=options.dry_run,
             backup_existing=options.backup_existing,
         )
+        ownership[relative] = PLUGIN_OWNER_FICELLE
     seed_provider_plugin_env_key(options, runtime_dir=runtime_dir)
+    return ownership
 
 
 def refresh_installed_hermes_integration(
@@ -369,7 +486,13 @@ def refresh_installed_hermes_integration(
     from ficelle.router import parse_env_file
 
     env_key_existed = bool(parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY))
-    install_plugins(options, runtime_dir=runtime_dir)
+    try:
+        plugin_ownership = install_plugins(options, runtime_dir=runtime_dir)
+    except HermesPluginConflictError as exc:
+        # An optional connector must never prevent the independently healthy Core service from
+        # starting after an update. The explicit connector command reports the conflict instead.
+        print(f"Hermes connector refresh skipped: {exc}", file=sys.stderr)
+        return
     config_path = hermes_home / "config.yaml"
     try:
         config_text = config_path.read_text(encoding="utf-8", errors="replace")
@@ -382,6 +505,7 @@ def refresh_installed_hermes_integration(
         config_existed=config_existed,
         env_file_existed=env_file_existed,
         env_key_existed=env_key_existed,
+        plugin_ownership=plugin_ownership,
     )
     for ownership_key in ("config_created", "env_file_created", "env_key_created"):
         metadata[ownership_key] = bool(
@@ -433,7 +557,15 @@ def restore_latest_backup(path: Path, *, dry_run: bool) -> bool:
 
 def rollback_last_hermes_install(options: InstallOptions) -> bool:
     changed_count = 0
+    plugin_ownership = _registered_hermes_plugin_ownership(options.ficelle_home)
     for _source, destination in hermes_plugin_install_specs(options.hermes_home):
+        relative = str(destination.relative_to(options.hermes_home))
+        if (
+            plugin_ownership.get(relative) == PLUGIN_OWNER_HERMES
+            or _hermes_manages_flat_plugin(options.hermes_home, destination)
+        ):
+            print(f"Hermes-managed plugin left untouched during rollback: {destination}")
+            continue
         if restore_latest_backup(destination, dry_run=options.dry_run):
             changed_count += 1
 
@@ -666,7 +798,7 @@ def hermes_config_body(
 ) -> str:
     lines = [
         "# Ficelle provider for Hermes. Strict-zero defaults only; no provider secret is included.",
-        "# Needs FICELLE_API_KEY set to any non-placeholder value in $HERMES_HOME/.env, which",
+        "# Needs FICELLE_API_KEY set to the owner API token in $HERMES_HOME/.env, which",
         "# ficelle-setup seeds when it installs the plugin: Hermes ignores a provider whose",
         "# declared env var does not resolve. Keep it in the file rather than exported.",
         "providers:",
@@ -917,6 +1049,7 @@ def hermes_connector_metadata(
     config_existed: bool,
     env_file_existed: bool,
     env_key_existed: bool,
+    plugin_ownership: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     config_path = options.hermes_home / "config.yaml"
     snippet_path = options.hermes_home / "ficelle" / "hermes-config.snippet.yaml"
@@ -928,6 +1061,14 @@ def hermes_connector_metadata(
     from ficelle.router import parse_env_file
 
     env_value = parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY)
+    recorded_ownership = (
+        dict(plugin_ownership)
+        if plugin_ownership is not None
+        else {
+            str(destination.relative_to(options.hermes_home)): PLUGIN_OWNER_FICELLE
+            for _source, destination in hermes_plugin_install_specs(options.hermes_home)
+        }
+    )
     return {
         "config_created": not config_existed and config_path.is_file(),
         "config_managed": MANAGED_CONFIG_BEGIN in config_text and MANAGED_CONFIG_END in config_text,
@@ -943,7 +1084,10 @@ def hermes_connector_metadata(
         "plugin_sha256": {
             str(destination.relative_to(options.hermes_home)): tree_sha256(destination)
             for _source, destination in hermes_plugin_install_specs(options.hermes_home)
+            if recorded_ownership.get(str(destination.relative_to(options.hermes_home)))
+            == PLUGIN_OWNER_FICELLE
         },
+        "plugin_ownership": recorded_ownership,
     }
 
 
@@ -981,11 +1125,23 @@ def remove_hermes_connector(ficelle_home: Path) -> tuple[bool, list[str]]:
             changed.append(f"{env_path}:{PROVIDER_PLUGIN_ENV_KEY}")
     plugin_hashes = metadata.get("plugin_sha256")
     expected_plugin_hashes = plugin_hashes if isinstance(plugin_hashes, dict) else {}
+    plugin_ownership = metadata.get("plugin_ownership")
+    explicit_plugin_ownership = (
+        plugin_ownership if isinstance(plugin_ownership, dict) else None
+    )
     unchanged_plugin_destinations: list[Path] = []
     for source, destination in hermes_plugin_install_specs(hermes_home):
         if not destination.exists():
             continue
         relative = str(destination.relative_to(hermes_home))
+        if (
+            _hermes_manages_flat_plugin(hermes_home, destination)
+            or (
+                explicit_plugin_ownership is not None
+                and explicit_plugin_ownership.get(relative) != PLUGIN_OWNER_FICELLE
+            )
+        ):
+            continue
         expected = expected_plugin_hashes.get(relative)
         unchanged = (
             tree_sha256(destination) == expected
@@ -1340,6 +1496,11 @@ def run_install(options: InstallOptions) -> int:
     if options.preflight_only:
         print("Preflight complete. No install actions were run.")
         return 0
+    if options.connectors and options.skip_smoke and not options.dry_run:
+        raise SystemExit(
+            "--skip-smoke cannot be used while activating a connector; "
+            "Core must pass doctor, health, and models first."
+        )
 
     if not options.skip_package:
         install_package(options)
@@ -1371,8 +1532,15 @@ def run_install(options: InstallOptions) -> int:
             from ficelle.router import parse_env_file
 
             env_key_existed = bool(parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY))
+            plugin_ownership = _registered_hermes_plugin_ownership(options.ficelle_home)
             if not options.skip_plugin:
-                install_plugins(options, runtime_dir=options.ficelle_home)
+                try:
+                    plugin_ownership = install_plugins(
+                        options,
+                        runtime_dir=options.ficelle_home,
+                    )
+                except HermesPluginConflictError as exc:
+                    raise SystemExit(str(exc)) from exc
             configure_hermes(options, runtime_dir=options.ficelle_home)
             if not options.dry_run:
                 metadata = hermes_connector_metadata(
@@ -1380,6 +1548,7 @@ def run_install(options: InstallOptions) -> int:
                     config_existed=config_existed,
                     env_file_existed=env_file_existed,
                     env_key_existed=env_key_existed,
+                    plugin_ownership=plugin_ownership,
                 )
                 for ownership_key in (
                     "config_created",
@@ -1439,7 +1608,7 @@ def run_install(options: InstallOptions) -> int:
         print(f"Verify: `{cli} health` and `{cli} models`.")
     print(
         f"OpenAI client: `OpenAI(base_url=\"{base_url}\", "
-        "api_key=\"ficelle-local\")`."
+        "api_key=os.environ[\"FICELLE_API_KEY\"])` (use the owner API token)."
     )
     for connector in options.connectors:
         print(f"Connector installed: {connector}")
@@ -1474,7 +1643,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-package", action="store_true", help="Skip pip install step.")
     parser.add_argument("--skip-plugin", action="store_true", help="Skip Hermes provider plugin copy.")
     parser.add_argument("--skip-service", action="store_true", help="Skip managed service install/start step.")
-    parser.add_argument("--skip-smoke", action="store_true", help="Skip doctor/health/models smoke checks.")
+    parser.add_argument(
+        "--skip-smoke",
+        action="store_true",
+        help="Skip doctor/health/models smoke checks (not allowed for connector activation).",
+    )
     parser.add_argument(
         "--non-interactive",
         action="store_true",

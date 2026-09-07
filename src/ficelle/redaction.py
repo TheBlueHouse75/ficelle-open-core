@@ -35,8 +35,20 @@ def is_sensitive_json_key(key: Any) -> bool:
     )
 
 
+# How much of an untrusted string the redaction patterns run over when the caller is going to
+# truncate the result anyway. Error details are provider- or client-controlled, and the seven
+# patterns are scanned in full over whatever they are handed — so a megabyte-sized error body
+# would be a megabyte of regex work for a value that is then cut to a couple of hundred characters.
+# Bounded here rather than at each call site, and only when a `limit` is given: a full-document
+# redaction (`redact_sensitive_json`) must keep every byte it is asked to clean. Far above any
+# `limit` a caller passes, so nothing that survives today is lost.
+REDACTION_INPUT_LIMIT = 4096
+
+
 def redact_sensitive_text(value: Any, limit: int | None = None, *, collapse: bool = False) -> str | None:
     text = str(value or "")
+    if limit is not None:
+        text = text[:REDACTION_INPUT_LIMIT]
     if collapse:
         text = " ".join(text.split())
     if not text:

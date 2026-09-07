@@ -66,7 +66,7 @@ raw numbers: [the benchmark write-up](https://ficelle-website.netlify.app/blog/f
 Install the versioned open Core from its GitHub Release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.9/scripts/bootstrap-ficelle.py | python3
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.10/scripts/bootstrap-ficelle.py | python3
 ~/.local/bin/ficelle doctor --text
 ```
 
@@ -77,7 +77,7 @@ key in shell history, enter it silently before running the same safe command:
 (
   read -s FICELLE_LICENSE_KEY
   export FICELLE_LICENSE_KEY
-  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.9/scripts/bootstrap-ficelle.py | python3
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.10/scripts/bootstrap-ficelle.py | python3
 )
 ```
 
@@ -123,13 +123,18 @@ Point your client at `http://127.0.0.1:8646/v1`.
 The local endpoint works with the OpenAI client without a hosted Ficelle account:
 
 ```python
+import os
+
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:8646/v1",
-    api_key="ficelle-local",
+    api_key=os.environ["FICELLE_API_KEY"],
 )
 ```
+
+Load the owner-only local credential first with
+`export FICELLE_API_KEY="$(ficelle access-token api)"`.
 
 ### See the failover, without waiting for an outage
 
@@ -185,15 +190,15 @@ its own HTTPS manifest with `FICELLE_UPDATE_MANIFEST_URL`. The compact manifest 
 
 ```json
 {
-  "version": "0.3.9",
-  "release_url": "https://github.com/TheBlueHouse75/ficelle-open-core/releases/tag/v0.3.9",
+  "version": "0.3.10",
+  "release_url": "https://github.com/TheBlueHouse75/ficelle-open-core/releases/tag/v0.3.10",
   "core": {
-    "wheel_url": "https://downloads.example/ficelle_router-0.3.9-py3-none-any.whl",
+    "wheel_url": "https://downloads.example/ficelle_router-0.3.10-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>"
   },
   "pro": {
     "wheel_url": "https://install.ficelle.ai/api/releases/latest/wheel",
-    "filename": "ficelle_pro-0.3.9-py3-none-any.whl",
+    "filename": "ficelle_pro-0.3.10-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>",
     "authorization": "entitlement"
   }

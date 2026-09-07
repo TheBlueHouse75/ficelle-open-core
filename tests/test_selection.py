@@ -245,6 +245,7 @@ def test_sort_available_for_virtual_model_uses_score_failures_context_and_id_tie
         "ficelle/openrouter/same-score-z": 70.0,
         "ficelle/openrouter/same-score-a": 70.0,
     }
+    # A pre-ledger record: the streak is read through the ledger migration.
     state = {"stats": {"openrouter::high-failures": {"consecutive_failures": 2}}}
 
     ordered = sort_available_for_virtual_model_policy(
@@ -255,6 +256,7 @@ def test_sort_available_for_virtual_model_uses_score_failures_context_and_id_tie
         safe_int=lambda value, default: int(value) if value is not None else default,
         safe_float=lambda value, default: float(value) if value is not None else default,
         cooldown_key=lambda model: f"{model.get('source')}::{model.get('upstream_id')}",
+        now_epoch=lambda: 1_000_000.0,
     )
 
     assert [model["id"] for model in ordered] == [

@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover - Windows fallback for local imports/tests
     fcntl = None
 
 
-RUNTIME_STATE_HISTORY_KEYS = ("benchmark_results", "verified_capabilities")
+RUNTIME_STATE_HISTORY_KEYS = ("benchmark_results", "verified_capabilities", "quality_feedback")
 
 
 @contextmanager
@@ -54,7 +54,7 @@ def parse_iso_timestamp(value: Any) -> float | None:
 def runtime_evidence_timestamp_value(row: Any) -> str | None:
     if not isinstance(row, dict):
         return None
-    value = row.get("verified_at") or row.get("failed_at") or row.get("ran_at")
+    value = row.get("verified_at") or row.get("failed_at") or row.get("ran_at") or row.get("recorded_at")
     return str(value) if value else None
 
 
@@ -143,6 +143,68 @@ def merge_runtime_history_rows(current: Any, incoming: Any) -> Any:
     return merged
 
 
+def merge_quality_feedback_history(current: Any, incoming: Any, *, now: float | None = None) -> dict[str, Any]:
+    """Preserve active feedback slots from stale writers while letting expiry pruning stick.
+
+    Quality feedback is a revisioned slot ledger, unlike benchmark history's timestamped
+    per-profile rows. Its entries must merge by revision and omit expired slots, otherwise a
+    stale whole-state repair could either drop a correction or resurrect evidence a write pruned.
+    """
+    reference = time.time() if now is None else now
+    current_models = current if isinstance(current, dict) else {}
+    incoming_models = incoming if isinstance(incoming, dict) else {}
+    merged: dict[str, Any] = {}
+    for model_key in set(current_models) | set(incoming_models):
+        current_profiles = current_models.get(model_key)
+        incoming_profiles = incoming_models.get(model_key)
+        if not isinstance(current_profiles, dict) and not isinstance(incoming_profiles, dict):
+            continue
+        profiles: dict[str, Any] = {}
+        current_profiles = current_profiles if isinstance(current_profiles, dict) else {}
+        incoming_profiles = incoming_profiles if isinstance(incoming_profiles, dict) else {}
+        for profile_id in set(current_profiles) | set(incoming_profiles):
+            current_slots = _quality_feedback_slots(current_profiles.get(profile_id), reference)
+            incoming_slots = _quality_feedback_slots(incoming_profiles.get(profile_id), reference)
+            slots: dict[str, Any] = {}
+            for slot_key in set(current_slots) | set(incoming_slots):
+                current_row = current_slots.get(slot_key)
+                incoming_row = incoming_slots.get(slot_key)
+                if current_row is None:
+                    slots[str(slot_key)] = copy.deepcopy(incoming_row)
+                    continue
+                if incoming_row is None:
+                    slots[str(slot_key)] = copy.deepcopy(current_row)
+                    continue
+                current_revision = _quality_feedback_revision(current_row)
+                incoming_revision = _quality_feedback_revision(incoming_row)
+                if incoming_revision is not None and (current_revision is None or incoming_revision > current_revision):
+                    slots[str(slot_key)] = copy.deepcopy(incoming_row)
+                else:
+                    slots[str(slot_key)] = copy.deepcopy(current_row)
+            if slots:
+                profiles[str(profile_id)] = {"event_slots": slots}
+        if profiles:
+            merged[str(model_key)] = profiles
+    return merged
+
+
+def _quality_feedback_slots(ledger: Any, now: float) -> dict[Any, dict[str, Any]]:
+    slots = ledger.get("event_slots") if isinstance(ledger, dict) else None
+    if not isinstance(slots, dict):
+        return {}
+    active: dict[Any, dict[str, Any]] = {}
+    for slot_key, row in slots.items():
+        expires_at = parse_iso_timestamp(row.get("expires_at")) if isinstance(row, dict) else None
+        if expires_at is not None and expires_at > now:
+            active[slot_key] = row
+    return active
+
+
+def _quality_feedback_revision(row: dict[str, Any]) -> int | None:
+    revision = row.get("revision")
+    return revision if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 1 else None
+
+
 def merge_runtime_state_for_write(current: Any, incoming: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(current, dict):
         return incoming
@@ -154,6 +216,13 @@ def merge_runtime_state_for_write(current: Any, incoming: dict[str, Any]) -> dic
     for key in RUNTIME_STATE_HISTORY_KEYS:
         current_value = current.get(key)
         incoming_value = incoming.get(key)
+        if key == "quality_feedback":
+            combined = merge_quality_feedback_history(current_value, incoming_value)
+            if combined:
+                merged[key] = combined
+            else:
+                merged.pop(key, None)
+            continue
         if isinstance(current_value, dict):
             if isinstance(incoming_value, dict):
                 merged[key] = merge_runtime_history_rows(current_value, incoming_value)

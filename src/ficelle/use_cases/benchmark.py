@@ -1059,7 +1059,7 @@ class BenchmarkRunner:
     set_cooldown: Callable[..., Any]
     record_benchmark_failure: Callable[..., None]
     record_benchmark_result: Callable[[str, dict[str, Any], dict[str, Any]], None]
-    record_success: Callable[..., None]
+    record_success: Callable[[dict[str, Any], float], None]
     record_verified_capability: Callable[[str, dict[str, Any], dict[str, Any]], None]
     record_capability_discrepancy: Callable[[str, dict[str, Any], bool], None]
     extract_message_text: Callable[[Any], str]
@@ -1238,7 +1238,7 @@ class BenchmarkRunner:
                 "text_preview": self.safe_detail(text, 160),
             })
             if passed:
-                self.record_success(model, latency, representative_latency=False)
+                self.record_success(model, latency)
                 self.record_benchmark_result(profile_id, model, result)
                 self.record_verified_capability(profile_id, model, result)
                 self.record_capability_discrepancy(profile_id, model, True)
@@ -1400,14 +1400,30 @@ def has_deliverable_message(payload: Any) -> bool:
 TRUNCATION_FINISH_REASONS = frozenset({"length", "model_length", "max_tokens", "max_output_tokens", "max_completion_tokens"})
 
 
-def finish_reason_is_truncation(payload: Any) -> bool:
-    """True when the first choice stopped because the completion token budget ran out."""
+# The other terminal verdict a provider can state on an HTTP 200: the generation itself failed.
+# Content emitted before it is partial by definition, so the choice is evidence of an upstream
+# failure, not of a served answer. Kept to the one spelling providers actually send — a wider
+# guess here would bench models over a finish_reason nobody defined.
+ERROR_FINISH_REASONS = frozenset({"error"})
+
+
+def _first_choice_finish_reason(payload: Any) -> str:
     if not isinstance(payload, dict):
-        return False
+        return ""
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        return False
-    return str(choices[0].get("finish_reason") or "").strip().lower() in TRUNCATION_FINISH_REASONS
+        return ""
+    return str(choices[0].get("finish_reason") or "").strip().lower()
+
+
+def finish_reason_is_truncation(payload: Any) -> bool:
+    """True when the first choice stopped because the completion token budget ran out."""
+    return _first_choice_finish_reason(payload) in TRUNCATION_FINISH_REASONS
+
+
+def finish_reason_is_error(payload: Any) -> bool:
+    """True when the first choice's own `finish_reason` reports an upstream generation failure."""
+    return _first_choice_finish_reason(payload) in ERROR_FINISH_REASONS
 
 
 def tool_call_arguments(call: dict[str, Any]) -> dict[str, Any]:

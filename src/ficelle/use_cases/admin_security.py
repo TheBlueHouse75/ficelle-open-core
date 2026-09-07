@@ -176,10 +176,9 @@ ADMIN_HTML_SECURITY_HEADERS = {
 def request_host_allowed(host_header: str | None, server_port: int, bind_host: str) -> bool:
     """Reject a request whose ``Host`` is not this server, which is what closes DNS rebinding.
 
-    The Origin guard already blocks cross-origin *writes*, but it never runs on GET, so a page
-    on a short-TTL domain rebound to 127.0.0.1 could read the whole admin surface — including the
-    admin token embedded in the page. Matching ``Host`` against what this server actually binds
-    makes the rebound name fail before routing.
+    The Origin guard already blocks cross-origin *writes*, but it never runs on GET. Matching
+    ``Host`` against what this server actually binds makes a short-TTL domain rebound to
+    127.0.0.1 fail before authentication or routing.
 
     A deliberate non-loopback bind (the Tailscale end-to-end test bed) stays reachable: its own
     host is allowed alongside loopback. Absent ``Host`` is allowed — HTTP/1.0 clients and the CLI

@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     if installed.returncode != 0:
         return installed.returncode
     installed = subprocess.run(
-        [str(python), "-m", "pip", "install", "-e", "--no-deps", str(ROOT)],
+        [str(python), "-m", "pip", "install", "--no-deps", "-e", str(ROOT)],
         check=False,
     )
     if installed.returncode != 0:

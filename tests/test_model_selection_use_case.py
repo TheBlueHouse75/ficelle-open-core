@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from ficelle.selection import SelectionPolicy
+from ficelle.selection import SelectionPolicy, sort_available_for_virtual_model
 from ficelle.use_cases.model_selection import ModelSelectionPorts, ModelSelectionRunner
 
 
@@ -153,3 +153,61 @@ def test_model_selection_from_state_does_not_read_runtime_state_or_probe_quota()
     result = runner.select_models_result_from_state("ficelle/auto-tools", catalog, {}, {})
 
     assert [model.id for model in result.candidates] == ["ficelle/openrouter/ok"]
+
+
+def test_the_pool_is_ordered_by_score_alone():
+    """One mechanism for a stale `failed` verdict: its score penalty, which does not decay.
+
+    There used to be a second — a primary demotion key here — and it dominated the score, which
+    then had to be cancelled out in the discovery queue. The demotion now arrives as the -24/-16
+    the model still carries (`model_scoring._failed_verdict_penalty`), so it reaches the order
+    through the score like everything else.
+    """
+    # `condemned` is what a candidate holding an expired `failed` verdict looks like from here:
+    # its own base score minus the undecayed penalty, which is what puts it last.
+    scores = {"best": 90.0, "condemned": 95.0 - 24.0, "plain": 70.0}
+    models = [
+        {"id": model_id, "source": "openrouter", "upstream_id": model_id}
+        for model_id in ("best", "condemned", "plain")
+    ]
+
+    ordered = sort_available_for_virtual_model(
+        "ficelle/auto-compression",
+        models,
+        {},
+        model_auto_score=lambda _profile, model, _state: scores[model["id"]],
+        safe_int=lambda value, default: int(value) if value is not None else default,
+        safe_float=lambda value, default: float(value) if value is not None else default,
+        cooldown_key=lambda model: model["id"],
+    )
+
+    assert [model["id"] for model in ordered] == ["best", "condemned", "plain"]
+
+
+def test_the_tie_break_reads_the_ledger_a_request_success_has_answered():
+    """Equal scores are split by the same recency-weighted count the score subtracts, not by a
+    streak a probe could have zeroed; a rebutted row is escalation memory only."""
+    now = 1_000_000.0
+    models = [
+        {"id": model_id, "source": "openrouter", "upstream_id": model_id}
+        for model_id in ("failing", "clean", "answered")
+    ]
+    state = {
+        "stats": {
+            "failing": {"failure_ledger": {"timeout": {"origin": "request", "status": "open", "weight": 1.0, "last_at": now, "episode": 1}}},
+            "answered": {"failure_ledger": {"timeout": {"origin": "request", "status": "rebutted", "weight": 3.0, "last_at": now, "episode": 3}}},
+        }
+    }
+
+    ordered = sort_available_for_virtual_model(
+        "ficelle/auto-fast",
+        models,
+        state,
+        model_auto_score=lambda _profile, _model, _state: 80.0,
+        safe_int=lambda value, default: int(value) if value is not None else default,
+        safe_float=lambda value, default: float(value) if value is not None else default,
+        cooldown_key=lambda model: model["id"],
+        now_epoch=lambda: now,
+    )
+
+    assert [model["id"] for model in ordered] == ["answered", "clean", "failing"]

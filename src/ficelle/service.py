@@ -5,8 +5,10 @@ import getpass
 import json
 import os
 import plistlib
+import shlex
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
@@ -172,6 +174,20 @@ def persist_service_context(paths: ServicePaths) -> bool:
         f"{paths.active_home_pointer}.\n"
     )
     return False
+
+
+def _usable_recorded_interpreter(
+    candidate: Path,
+    run_command: RunCommand,
+) -> Path | None:
+    """Return a persisted service interpreter only when it still loads Ficelle."""
+    if not candidate.exists():
+        return None
+    try:
+        probe = run_command([str(candidate), "-c", "import ficelle"])
+    except OSError:
+        return None
+    return candidate if probe.returncode == 0 else None
 
 
 class LaunchAgentServiceBackend:
@@ -408,6 +424,36 @@ class SystemdUserServiceBackend:
         write_text_file(self.paths.systemd_unit, self.unit_payload())
         return self.daemon_reload()
 
+    def recorded_interpreter(self) -> Path | None:
+        """Read and validate the interpreter from the existing generated unit."""
+        try:
+            lines = self.paths.systemd_unit.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            return None
+        prefix = "ExecStart="
+        suffix = " -m ficelle.router --serve"
+        for line in lines:
+            if not line.startswith(prefix):
+                continue
+            command = line.removeprefix(prefix)
+            if command.endswith(suffix):
+                command = command[: -len(suffix)].strip()
+                try:
+                    parsed = shlex.split(command)
+                except ValueError:
+                    return None
+                if len(parsed) == 1:
+                    command = parsed[0]
+                elif not Path(command).exists():
+                    return None
+            else:
+                try:
+                    command = shlex.split(command)[0] if command else ""
+                except ValueError:
+                    return None
+            return _usable_recorded_interpreter(Path(command), self.run_command) if command else None
+        return None
+
     def install(self) -> int:
         reload_result = self.write_unit()
         if reload_result.returncode != 0:
@@ -437,6 +483,12 @@ class SystemdUserServiceBackend:
     def restart(self) -> int:
         if not self.paths.systemd_unit.exists():
             return self.install()
+        recorded = self.recorded_interpreter()
+        if recorded is not None and recorded != self.paths.install_python:
+            print(f"reusing the interpreter the service was installed with: {recorded}")
+            self.paths = replace(self.paths, install_python=recorded)
+        elif recorded is None:
+            print(f"installed interpreter unusable; repointing the service at {self.paths.install_python}")
         reload_result = self.write_unit()
         if reload_result.returncode != 0:
             sys.stderr.write(reload_result.stderr or reload_result.stdout)
@@ -598,6 +650,17 @@ class WindowsScheduledTaskBackend:
         # schtasks expects the exported-task encoding: UTF-16 with a BOM.
         write_text_file(self.task_xml, self.task_payload(), encoding="utf-16")
 
+    def recorded_interpreter(self) -> Path | None:
+        """Read and validate the executable from the existing Task Scheduler XML."""
+        namespace = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+        try:
+            root = ET.parse(self.task_xml).getroot()
+        except (OSError, UnicodeError, ET.ParseError):
+            return None
+        command = root.find(f".//{namespace}Command")
+        value = command.text.strip() if command is not None and command.text else ""
+        return _usable_recorded_interpreter(Path(value), self.run_command) if value else None
+
     def install(self) -> int:
         self.write_task_definition()
         self.run_command(["schtasks", "/End", "/TN", self.task_name])
@@ -634,9 +697,13 @@ class WindowsScheduledTaskBackend:
         return 0
 
     def restart(self) -> int:
-        # Unlike the LaunchAgent's recorded_interpreter(), this re-decides the interpreter
-        # from the current process on every restart — the systemd backend shares that
-        # trade-off. Revisit if the second-install repointing incident recurs on Windows.
+        if self.task_xml.exists():
+            recorded = self.recorded_interpreter()
+            if recorded is not None and recorded != self.paths.install_python:
+                print(f"reusing the interpreter the service was installed with: {recorded}")
+                self.paths = replace(self.paths, install_python=recorded)
+            elif recorded is None:
+                print(f"installed interpreter unusable; repointing the service at {self.paths.install_python}")
         return self.install()
 
     def stop(self) -> int:

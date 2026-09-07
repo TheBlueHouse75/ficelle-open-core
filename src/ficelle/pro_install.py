@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 
 from ficelle import __version__ as CORE_VERSION
+from ficelle import artifact_integrity
 from ficelle.install import CommandResult, pip_is_unavailable
 from ficelle.json_store import atomic_write_json, load_json
 from ficelle.probe_lock import file_lock
@@ -157,6 +158,11 @@ def pro_wheel_url() -> str:
     return os.getenv("FICELLE_WHEEL_URL", DEFAULT_WHEEL_URL)
 
 
+def pro_attestation_url(wheel_url: str | None = None) -> str:
+    parsed = urlparse(wheel_url or pro_wheel_url())
+    return parsed._replace(path=f"{parsed.path}.attestation").geturl()
+
+
 @contextmanager
 def exclusive_install_lock(
     lock_path: Path | None = None,
@@ -248,6 +254,34 @@ def download_pro_wheel(
     except Exception as exc:  # network/auth/transport — never surface the request body or the key
         raise ProInstallError(f"could not download the Pro pack ({type(exc).__name__})") from exc
     return wheel
+
+
+def download_pro_attestation(
+    license_key: str,
+    *,
+    wheel_url: str | None = None,
+    opener: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Fetch the small signed sidecar through the same credential-safe transport as the wheel."""
+    url = pro_attestation_url(wheel_url)
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {license_key}", "Accept": "application/json"},
+    )
+    open_url = opener or _open_same_origin
+    try:
+        with open_url(request, timeout=30) as response:
+            raw = response.read(artifact_integrity.MAX_ATTESTATION_BYTES + 1)
+    except Exception as exc:
+        raise ProInstallError(
+            f"could not download the Pro release attestation ({type(exc).__name__})"
+        ) from exc
+    if len(raw) > artifact_integrity.MAX_ATTESTATION_BYTES:
+        raise ProInstallError("Pro release attestation exceeds the maximum allowed size")
+    try:
+        return artifact_integrity.parse_attestation(raw)
+    except artifact_integrity.ArtifactIntegrityError as exc:
+        raise ProInstallError("Pro release attestation is invalid") from exc
 
 
 def _command_result(command: list[str], result: CommandResult | int) -> CommandResult:
@@ -411,22 +445,38 @@ def _pip_run(command: list[str]) -> CommandResult:
     return CommandResult(command, completed.returncode, completed.stdout, completed.stderr)
 
 
-def _verify_wheel_checksum(wheel: Path) -> None:
-    """Verify the wheel against a pinned SHA-256 before it is executed, when one is provided via
-    ``FICELLE_WHEEL_SHA256`` (parity with the standalone bootstrap's ``--sha256``).
-
-    Absent a pin, the trust boundary for the in-app "latest wheel" install is TLS plus the
-    license-gated endpoint: a checksum served by the same index would add nothing against an
-    endpoint compromise, and no separate trust root is available at first-install time (the signed
-    entitlement only exists after activation, which happens after the pack is installed). An
-    operator who wants the extra guarantee pins the hash out-of-band via the env var.
-    """
+def _verify_remote_wheel_integrity(
+    wheel: Path,
+    license_key: str,
+    *,
+    opener: Callable[..., Any] | None = None,
+) -> None:
+    """Require an out-of-band digest or the offline release signature before executing a wheel."""
     expected = os.getenv("FICELLE_WHEEL_SHA256", "").strip().lower()
-    if not expected:
+    if expected:
+        actual = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        if actual != expected:
+            raise ProInstallError("Pro pack checksum mismatch — refusing to install")
         return
-    actual = hashlib.sha256(wheel.read_bytes()).hexdigest()
-    if actual != expected:
-        raise ProInstallError("Pro pack checksum mismatch — refusing to install")
+    wheel_url = pro_wheel_url()
+    parsed = urlparse(wheel_url)
+    if parsed.scheme == "http" and (parsed.hostname or "").lower() in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }:
+        # A loopback HTTP endpoint is the explicit local-development exception. Production HTTPS
+        # and every non-loopback transport must prove the offline release signature.
+        return
+    envelope = download_pro_attestation(
+        license_key,
+        wheel_url=wheel_url,
+        opener=opener,
+    )
+    try:
+        artifact_integrity.verify_artifact_attestation(wheel, envelope)
+    except artifact_integrity.ArtifactIntegrityError as exc:
+        raise ProInstallError("Pro release signature mismatch — refusing to install") from exc
 
 
 def install_pro(
@@ -444,5 +494,5 @@ def install_pro(
         raise ProInstallError("a license key is required to install Ficelle Pro")
     with tempfile.TemporaryDirectory(prefix="ficelle-pro-install-") as tmp:
         wheel = download_pro_wheel(license_key, Path(tmp), opener=opener)
-        _verify_wheel_checksum(wheel)
+        _verify_remote_wheel_integrity(wheel, license_key, opener=opener)
         install_pro_wheel(wheel, runner=runner)

@@ -21,6 +21,7 @@ class ModelSelectionPorts:
     apply_verified_capability_ttl: Callable[[dict[str, Any]], None]
     apply_route_on_capability_reference: Callable[[dict[str, Any]], None]
     selection_policy: Callable[[], SelectionPolicy]
+    quality_feedback_scoring_state: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] = lambda state, _config: state
 
 
 @dataclass(frozen=True)
@@ -92,11 +93,12 @@ class ModelSelectionRunner:
         *,
         purpose: SelectionPurpose = "route",
     ) -> SelectionResult:
+        scoring_state = self.ports.quality_feedback_scoring_state(state, config)
         return select_models_result_from_typed_rows(
             requested_model,
             typed_rows,
             config,
-            state,
+            scoring_state,
             self.ports.selection_policy(),
             purpose=purpose,
         )

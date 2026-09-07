@@ -3,7 +3,7 @@
 
 This script is intentionally stdlib-only so it can be served as:
 
-    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.9/scripts/bootstrap-ficelle.py | python3
+    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.10/scripts/bootstrap-ficelle.py | python3
 
 Without a license key it installs the versioned open Core from the public GitHub
 release. With ``FICELLE_LICENSE_KEY`` (or the legacy ``FICELLE_INSTALL_TOKEN``)
@@ -30,13 +30,13 @@ from email.parser import Parser
 from pathlib import Path
 from typing import Mapping, Sequence
 
-CORE_VERSION = "0.3.9"
+CORE_VERSION = "0.3.10"
 DEFAULT_CORE_WHEEL_URL = (
     "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
     f"v{CORE_VERSION}/ficelle_router-{CORE_VERSION}-py3-none-any.whl"
 )
 DEFAULT_CORE_SHA256 = (
-    "f48e9996cfce3e239d5b81da63e10a86d2ba3b12b00ebf1977ec5a0365d0345e"
+    "51933629f1abbbc6a3502f4640b3904d8a32c57cfe4102b640bd000989e33ded"
 )
 DEFAULT_WHEEL_URL = f"https://install.ficelle.ai/api/releases/{CORE_VERSION}/wheel"
 PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
@@ -44,6 +44,7 @@ CORE_RUNTIME_REQUIREMENTS = ("cryptography>=42", "packaging>=24", "requests>=2.3
 DEFAULT_HERMES_HOME = Path.home() / ".hermes"
 CONNECTORS = ("hermes", "openclaw")
 FALLBACK_WHEEL_FILENAME = "ficelle_pro-0-py3-none-any.whl"
+MAX_ATTESTATION_BYTES = 16 * 1024
 # Deliberately accepts only the PEP 440 subset emitted by Ficelle's release service.
 # Any valid-but-unrecognized form safely falls back to FALLBACK_WHEEL_FILENAME.
 _WHEEL_FILENAME_PATTERN = re.compile(
@@ -410,6 +411,76 @@ def download_wheel(options: BootstrapOptions, download_dir: Path) -> Path:
     )
 
 
+def pro_attestation_url(wheel_url: str) -> str:
+    parsed = urllib.parse.urlsplit(wheel_url)
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, f"{parsed.path}.attestation", parsed.query, parsed.fragment)
+    )
+
+
+def download_pro_attestation(options: BootstrapOptions, download_dir: Path) -> Path:
+    url = pro_attestation_url(options.wheel_url)
+    destination = download_dir / "ficelle-pro-wheel.attestation.json"
+    print(f"Downloading Ficelle Pro release attestation: {redact_url(url)}")
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {options.license_key or ''}",
+        },
+    )
+    try:
+        with open_wheel(request, timeout=30, authenticated=True) as response:
+            raw = response.read(MAX_ATTESTATION_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"release attestation download failed with HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"release attestation download failed: {exc.reason}") from exc
+    if len(raw) > MAX_ATTESTATION_BYTES:
+        raise SystemExit("release attestation exceeds the maximum allowed size")
+    destination.write_bytes(raw)
+    return destination
+
+
+def pro_wheel_needs_signed_attestation(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme in {"", "file"}:
+        return False
+    return not (
+        parsed.scheme == "http"
+        and (parsed.hostname or "").lower().rstrip(".") in _LOOPBACK_HOSTS
+    )
+
+
+def verify_pro_wheel_integrity(
+    options: BootstrapOptions,
+    python: Path,
+    wheel: Path,
+    download_dir: Path,
+) -> None:
+    """Verify a remote Pro wheel against an independent release root before pip executes it."""
+    if options.sha256:
+        verify_sha256(wheel, options.sha256)
+        return
+    if not pro_wheel_needs_signed_attestation(options.wheel_url):
+        print("Local development wheel: signed release attestation not required.")
+        return
+    attestation = download_pro_attestation(options, download_dir)
+    result = run_command(
+        [
+            str(python),
+            "-m",
+            "ficelle.artifact_integrity",
+            "verify",
+            str(wheel),
+            str(attestation),
+        ],
+        dry_run=False,
+        env=command_env(options),
+    )
+    ensure_success(result, action="Pro release attestation verification")
+
+
 def download_core_wheel(options: BootstrapOptions, download_dir: Path) -> Path:
     return download_url_wheel(
         options.core_wheel_url,
@@ -688,7 +759,7 @@ def run_bootstrap(options: BootstrapOptions) -> int:
         wheels = [core_wheel]
         if options.license_key:
             pro_wheel = download_wheel(options, download_dir)
-            verify_sha256(pro_wheel, options.sha256)
+            verify_pro_wheel_integrity(options, python, pro_wheel, download_dir)
             verify_pro_core_compatibility(pro_wheel, dry_run=False)
             install_requirements(
                 options,
@@ -731,7 +802,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Expected Core wheel SHA256.",
     )
     parser.add_argument("--wheel-url", default=os.getenv("FICELLE_WHEEL_URL", DEFAULT_WHEEL_URL), help="Private wheel URL or local wheel path. Default: Ficelle install service endpoint.")
-    parser.add_argument("--sha256", default=os.getenv("FICELLE_WHEEL_SHA256"), help="Expected wheel SHA256. Strongly recommended for release validation.")
+    parser.add_argument(
+        "--sha256",
+        default=os.getenv("FICELLE_WHEEL_SHA256"),
+        help="Optional out-of-band Pro wheel SHA256; remote releases otherwise require the bundled signing root.",
+    )
     parser.add_argument(
         "--python",
         default=os.getenv("FICELLE_PYTHON"),

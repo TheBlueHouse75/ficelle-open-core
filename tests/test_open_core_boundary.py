@@ -24,6 +24,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 # Exercise the free path, not just the import: load_config() is where a missing
 # engine's config-layer symbols would be dereferenced, and normalize_compression_settings
 # is the compression symbol reached on the settings/observability path (it must resolve
@@ -44,7 +46,8 @@ _ALL_CLOSED = _COMPRESSION + _FUSION_ENGINE + _PROVIDER_PACK
 # worktree's core + closed-pack sources explicitly — robust to how pytest is invoked
 # (plain `pytest` or with a manual PYTHONPATH).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SRC_PATHS = (str(_REPO_ROOT / "src"), str(_REPO_ROOT / "ficelle-pro" / "src"))
+_PRO_SRC = _REPO_ROOT / "ficelle-pro" / "src"
+_SRC_PATHS = (str(_REPO_ROOT / "src"), str(_PRO_SRC))
 
 
 def _run_core_with_modules_blocked(
@@ -119,6 +122,21 @@ def test_core_never_lists_auto_fusion_without_engine(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.skipif(
+    not _PRO_SRC.is_dir(),
+    reason="the generated open-core mirror does not include the closed Pro package",
+)
+def test_partial_pro_pack_reports_unavailable_fusion_engine(tmp_path: Path) -> None:
+    body = (
+        "status, payload, _ = router.run_fusion_chat_completion("
+        "{'model': router.FUSION_MODEL_ID, 'messages': []}, router.load_config(), {}, 'req', 0.0, 0); "
+        "assert status == 503, status; "
+        "assert payload['error']['code'] == 'pro_pack_unavailable', payload"
+    )
+    result = _run_core_with_modules_blocked(_FUSION_ENGINE, tmp_path, body)
+    assert result.returncode == 0, result.stderr
+
+
 def test_core_fusion_request_rejects_cleanly_without_engine(tmp_path: Path) -> None:
     # A client that targets ficelle/auto-fusion directly must get a clean 404, never a
     # 'NoneType object is not callable' crash from the absent FusionRunner/preflight.
@@ -128,7 +146,7 @@ def test_core_fusion_request_rejects_cleanly_without_engine(tmp_path: Path) -> N
         "assert status == 404, status; "
         "assert payload['error']['type'] == 'not_found', payload"
     )
-    result = _run_core_with_modules_blocked(_FUSION_ENGINE, tmp_path, body)
+    result = _run_core_with_modules_blocked(("ficelle_pro",), tmp_path, body)
     assert result.returncode == 0, result.stderr
 
 

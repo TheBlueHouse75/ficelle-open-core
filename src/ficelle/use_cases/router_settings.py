@@ -133,8 +133,11 @@ def normalize_router_settings(raw: Any, *, policy: RouterSettingsPolicy, strict:
         for reason in policy.cooldown_reasons
     }
     return {
+        # Minimum 1, not 0: `0` used to mean "try every candidate" and produced a 171-attempt
+        # fallback window on a live `auto-fast` pool. A saved 0 is rejected outright, and a stored
+        # one is rewritten to the default by the config-policy migration.
         "max_attempts_per_request": settings_int(
-            source, "max_attempts_per_request", defaults["max_attempts_per_request"], minimum=0, maximum=12, strict=strict
+            source, "max_attempts_per_request", defaults["max_attempts_per_request"], minimum=1, maximum=12, strict=strict
         ),
         "catalog_timeout_seconds": settings_int(
             source, "catalog_timeout_seconds", defaults["catalog_timeout_seconds"], minimum=5, maximum=120, strict=strict
@@ -196,6 +199,31 @@ def normalize_router_settings(raw: Any, *, policy: RouterSettingsPolicy, strict:
         ),
         "compression": policy.normalize_compression_settings(source.get("compression"), strict=strict),
     }
+
+
+def router_config_warnings(config: Any) -> list[str]:
+    """Config values that are silently not doing what the file says, one line each.
+
+    Found on a live install and surfacing nowhere: three profiles carried a `models` list that
+    `candidates_for_profile` only reads in `manual_order` mode, so the operator's chosen order had
+    no effect at all. Read from the RAW config rather than through the normalizers on purpose — the
+    warning is about the gap between what the file says and what runs, and a normalized profile has
+    already resolved its mode and dropped the ignored list. Returned rather than printed, so the
+    caller decides where they go and can say each one once.
+    """
+    warnings: list[str] = []
+    source = config if isinstance(config, dict) else {}
+    profiles = source.get("virtual_profiles")
+    for profile_id, profile in sorted((profiles if isinstance(profiles, dict) else {}).items()):
+        if not isinstance(profile, dict) or str(profile.get("mode") or "auto") == "manual_order":
+            continue
+        models = profile.get("models")
+        if isinstance(models, list) and models:
+            warnings.append(
+                f"{profile_id} is in '{profile.get('mode') or 'auto'}' mode, so its {len(models)} "
+                "listed models are ignored; switch it to 'manual_order' to use that order."
+            )
+    return warnings
 
 
 def validate_settings_payload(payload: dict[str, Any], *, policy: RouterSettingsPolicy) -> dict[str, Any]:

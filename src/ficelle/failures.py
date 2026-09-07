@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from ficelle.redaction import sanitize_error_detail
 
@@ -33,6 +34,7 @@ FailureReason = Literal[
     "rate_limited_upstream",
     "request_too_large",
     "server_error",
+    "tls_error",
     "unavailable",
 ]
 
@@ -321,6 +323,61 @@ def status_for_error_codes(*values: Any) -> int | None:
     return None
 
 
+def walk_exception_chain(exc: Any) -> Iterator[BaseException]:
+    """Yield an exception and everything it wraps, nearest cause first, each one once.
+
+    ``__cause__``/``__context__`` are the explicit links; ``args`` carries the rest, because
+    the layers that matter here wrap by argument — `requests` hands a `urllib3` error to
+    `ConnectionError(...)`, which itself carries the original `OSError`. Breadth-first so the
+    innermost socket error is reached last and the caller's first match is the nearest one.
+    """
+    pending: deque[BaseException] = deque([exc] if isinstance(exc, BaseException) else [])
+    seen: set[int] = set()
+    while pending:
+        current = pending.popleft()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        yield current
+        for linked in (current.__cause__, current.__context__, *getattr(current, "args", ())):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+
+
+def first_exception_errno(exc: Any) -> int | None:
+    """The first non-zero ``errno`` found walking an exception and its wrapped causes.
+
+    Transport failures reach the router several layers away from the socket that produced
+    them: `requests` wraps a `urllib3` error, which wraps the original `OSError`. The errno
+    is the only field that separates a provider that answered slowly from a keep-alive
+    connection the network dropped (``ETIMEDOUT``, ``ECONNRESET``, ``EPIPE``), so it is worth
+    recovering from the chain instead of reading only the outermost type.
+    """
+    for current in walk_exception_chain(exc):
+        candidate = getattr(current, "errno", None)
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate:
+            return candidate
+    return None
+
+
+def exception_is_tls_failure(exc: BaseException) -> bool:
+    """Whether this transport exception is, or wraps, a TLS/certificate failure.
+
+    Read off the class hierarchy rather than by importing `requests`/`ssl`: the same fault surfaces
+    as `requests.exceptions.SSLError`, `ssl.SSLError` or urllib3's own subclass depending on which
+    layer raised it, and `requests.exceptions.SSLError` subclasses `ConnectionError`, so the name is
+    the only thing that separates it from an ordinary connection drop. The whole chain is walked for
+    the same reason `first_exception_errno` walks it: a handshake failure reaches the router wrapped
+    in whatever the layer above turned it into.
+    """
+    return any(
+        base.__name__.startswith("SSL")
+        for current in walk_exception_chain(exc)
+        for base in type(current).__mro__
+    )
+
+
 @dataclass(frozen=True)
 class FailureMarkers:
     false_free: tuple[str, ...] = FALSE_FREE_TEXT_MARKERS
@@ -362,14 +419,15 @@ DEFAULT_FAILURE_MARKERS = FailureMarkers()
 # verdict — one name, one meaning, and the two paths' differing consequences stay deliberate.
 REQUEST_REJECTION_STATUSES = frozenset({400, 422})
 
-# Failures the CALLER caused, not the model. Two consequences, both flowing from that single fact:
-# `cooldown_policy_for_reason` withholds the cooldown, and the consecutive-failure streak skips them.
+# Failures the MODEL is not answerable for — most of them the caller's doing, two of them
+# Ficelle's own. Two consequences, both flowing from that single fact: `cooldown_policy_for_reason`
+# withholds the cooldown, and the consecutive-failure streak skips them.
 # The streak's penalty is cumulative (12 points each, `model_scoring`), so without the exemption a
 # client looping on a too-small max_tokens would progressively demote every candidate it touches,
 # reordering a whole profile's pool over a limit that says nothing about the models. They are still
 # counted and shown — a model that only ever truncates must stay visible rather than keep a clean
 # record.
-CALLER_CAUSED_FAILURE_REASONS = frozenset(
+NO_MODEL_FAULT_FAILURE_REASONS = frozenset(
     {
         "truncated_before_content",
         # The upstream refused the request body itself. A malformed tool_call or an unsupported
@@ -379,19 +437,66 @@ CALLER_CAUSED_FAILURE_REASONS = frozenset(
         "bad_upstream_request",
         # This model's request contract differs from another candidate's: it either wants a private
         # field the OpenAI schema has no room for, or disables an otherwise valid option. Neither
-        # case says the model is unhealthy, so the caller-caused set carries the right consequences:
-        # no cooldown and no scoring streak.
+        # case says the model is unhealthy, so this set carries the right consequences: no cooldown
+        # and no scoring streak.
         "bad_upstream_contract",
         # Writing to the caller's socket failed: the client hung up mid-stream. The upstream was
         # answering fine; cooling it would punish a healthy model for a client-side abort.
         "client_disconnected",
+        # Ficelle's own wall-clock request budget ran out (L2-R2, and earlier attempts may have
+        # spent most of it). The candidate proved nothing wrong — often it was never even asked —
+        # so blaming it would demote a healthy pool on every slow request.
+        # `service_restarting` is deliberately absent: it is recorded as `attempted: False` and the
+        # loop breaks immediately, so it reaches no state writer at all and needs no exemption. Its
+        # consequences live in `TERMINAL_ENDINGS` below.
+        "request_deadline_exceeded",
     }
 )
 
+
+@dataclass(frozen=True)
+class TerminalEnding:
+    """What an ending Ficelle itself produced means for the answer and for the route log.
+
+    `http_status` `None` means the ending does not decide the status — the attempted failures do.
+    `route_log_status` `None` means the Requests page shows the status that was sent; a value
+    there is a status the client never received and that exists only on the row.
+    """
+
+    http_status: int | None = None
+    error_type: str | None = None
+    writes_body: bool = True
+    route_log_status: int | None = None
+
+
+# The three endings the attempt loop can decide by itself, and everything that follows from each.
+# One table because the same fact used to be re-derived by four separate string comparisons — the
+# HTTP status, the payload `type`, the route-log reason and "is a body written at all" — which is
+# how a run the route log called `client_disconnected` still carried a `final_status` of 502 that
+# was never sent to anyone.
+TERMINAL_ENDINGS: dict[str, TerminalEnding] = {
+    # The caller hung up. Nothing is written back (there is no socket left to write to), so the
+    # route log carries 499 — nginx's "client closed request" — rather than a status that was
+    # never on the wire.
+    "client_disconnected": TerminalEnding(
+        error_type="client_disconnected",
+        writes_body=False,
+        route_log_status=499,
+    ),
+    # Ficelle is draining a SIGTERM: the caller is still there and gets a 503 telling it to retry,
+    # never a verdict on the pool. It does not outrank a run every attempt of which said the
+    # request body itself was invalid — that 400 is the truthful answer whatever ended the run.
+    "service_restarting": TerminalEnding(http_status=503, error_type="service_restarting"),
+    # Ficelle's own request budget expired. Deliberately no status of its own: the attempted
+    # failures are the real cause, and answering 504 over a run that died on provider 500s would
+    # hide it.
+    "request_deadline_exceeded": TerminalEnding(),
+}
+
 # Failures no other candidate can do better on, because the candidate was never the problem. Trying
 # the next one replays the same rejection and burns a healthy model's turn. Distinct from
-# CALLER_CAUSED_FAILURE_REASONS, which is about *state writes*: a truncated response is the caller's
-# fault too, yet a model with a larger budget may well answer, so it keeps its failover.
+# NO_MODEL_FAULT_FAILURE_REASONS, which is about *state writes*: a truncated response is no model's
+# fault either, yet a model with a larger budget may well answer, so it keeps its failover.
 #
 # `bad_upstream_contract` is deliberately absent: a candidate-specific rejection is not a verdict
 # on the body across the pool. The evidence includes a private reasoning field being required or
@@ -416,6 +521,18 @@ NON_RETRYABLE_FAILURE_REASONS = frozenset({"bad_upstream_request"})
 # request to read. It is a verdict on the source held for the length of one request, which is exactly
 # why it lives here as a reason rather than as a key.
 SOURCE_DIVERTING_FAILURE_REASONS = frozenset({"bad_upstream_contract"})
+
+# Attempt reasons that judge the MODEL on the profile it was asked to serve, rather than the
+# provider or the transport: the upstream answered, and what came back was unusable as an answer.
+# A real request ending this way writes `failed` capability evidence (`record_production_profile_failure`),
+# which closes a gated profile's route gate for that model — so a reason the model is not answerable
+# for must never be in here: a client looping on `max_tokens=20` would otherwise close the gate on
+# every candidate it touched. Written as a subtraction rather than by hand so that stays true when
+# either set moves.
+PRODUCTION_PROFILE_FAILURE_REASONS = (
+    frozenset({"empty_assistant_message", "upstream_finish_error"}) - NO_MODEL_FAULT_FAILURE_REASONS
+)
+assert PRODUCTION_PROFILE_FAILURE_REASONS, "no model-answerable reason left to write production evidence from"
 
 # Fields providers disagree on because the OpenAI chat-completions schema does not define them. One
 # upstream may demand a field while another rejects the same field as extra; neither verdict applies
@@ -552,7 +669,11 @@ def rejected_sampling_parameters(text: str, body: dict[str, Any] | None = None) 
 # (gateway wrapper, then the real upstream's), so the useful half is at the end.
 UPSTREAM_DETAIL_LIMIT = 400
 
-PROVIDER_SCOPED_COOLDOWN_REASONS = {"rate_limited", "auth_or_credit"}
+# Provider-wide by construction, not by classification: a TLS handshake that fails describes the
+# transport to the provider's host, never one model id, so `tls_error` joins the two reasons the
+# body can state. It is raised by the invocation path (`evaluate_invocation_exception`), never by
+# `classify_failure` — an upstream that answered HTTP already completed its handshake.
+PROVIDER_SCOPED_COOLDOWN_REASONS = {"rate_limited", "auth_or_credit", "tls_error"}
 PROVIDER_ERROR_REASONS = PROVIDER_SCOPED_COOLDOWN_REASONS | {"quota_exhausted", "no_free_quota"}
 
 BENCHMARK_ROUTE_BLOCKING_REASONS = {
@@ -604,17 +725,13 @@ def cooldown_policy_for_reason(reason: str, *, source: str = "") -> CooldownPoli
             ),
             model_cooldown=False,
         )
-    if reason in CALLER_CAUSED_FAILURE_REASONS:
-        # The caller, not the model, produced the failure: a token budget that ran out before any
-        # content, a request body the upstream refuses, a client that hung up mid-stream. Record it
-        # so the model stays scored and visible in the admin, but never cool it — one client sending
-        # max_tokens=20 or a malformed tool_call would otherwise empty a whole profile's pool for
-        # the cooldown window, which is exactly how a bad client takes the router down.
-        return CooldownPolicy(record_provider_error=False, model_cooldown=False)
-    if reason == "request_deadline_exceeded":
-        # Ficelle's own request budget ended the attempt (L2-R2). The model proved nothing
-        # wrong — earlier attempts may have consumed most of the budget — so no cooldown;
-        # the attempt stays recorded for scoring and diagnosis.
+    if reason in NO_MODEL_FAULT_FAILURE_REASONS:
+        # Something other than the model produced the failure: a token budget that ran out before
+        # any content, a request body the upstream refuses, a client that hung up mid-stream, or
+        # Ficelle's own request deadline. Record it so the model stays scored and visible in the
+        # admin, but never cool it — one client sending max_tokens=20 or a malformed tool_call would
+        # otherwise empty a whole profile's pool for the cooldown window, which is exactly how a bad
+        # client takes the router down.
         return CooldownPolicy(record_provider_error=False, model_cooldown=False)
     if reason == "quota_exhausted":
         return CooldownPolicy(
@@ -834,6 +951,17 @@ def bad_request_body(exc: Exception, *, request_id: str | None = None) -> dict[s
     return error_body(exc, error_type="bad_request", fallback_message="bad request", request_id=request_id)
 
 
+def model_not_found_body(safe_id: str) -> dict[str, Any]:
+    """404 body for a model id this Ficelle does not serve, whichever route was asked.
+
+    `GET /v1/models/{id}` and a chat completion naming an unknown model state the same fact, so
+    they state it with the same words: a client that reads one message and then the other must not
+    have to work out that they mean the same thing. Takes an already-redacted id — the caller owns
+    the sanitization, since the chat path has one on hand and the lookup route builds one.
+    """
+    return {"error": {"message": f"model {safe_id} is not served by this Ficelle", "type": "model_not_found"}}
+
+
 def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
     actions: list[str] = []
     if reason_counts.get("auth_or_credit"):
@@ -862,6 +990,8 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
         actions.append("One upstream rejected a request option or provider-private field that another candidate may handle. Ficelle kept the request unchanged and preferred a different provider for the next attempt when one was available. No model was cooled.")
     if reason_counts.get("client_disconnected"):
         actions.append("The client closed the connection while the answer was streaming; the upstream was healthy and was not cooled. Look at the client's timeout or cancel behaviour, not at the model.")
+    if reason_counts.get("service_restarting"):
+        actions.append("Ficelle was stopping (service restart or update) and did not start further fallback attempts for this request. No model was cooled: nothing upstream failed. Retry once the service is back up.")
     if reason_counts.get("truncated_before_content"):
         actions.append("The completion token budget ran out before the model emitted any content; reasoning models spend it on reasoning tokens first. Raise max_tokens on the request. No model was cooled: this is a request-side limit, not an upstream failure.")
     if reason_counts.get("empty_assistant_message") or reason_counts.get("invalid_success_json"):
@@ -914,23 +1044,50 @@ def request_feature_incompatible(errors: list[dict[str, Any]]) -> bool:
     return bool(errors) and all(row.get("reason") == "unsupported_tool_schema" for row in errors)
 
 
-def upstream_failure_status(errors: list[dict[str, Any]]) -> int:
+def upstream_failure_status(errors: list[dict[str, Any]], *, terminal_reason: str | None = None) -> int:
     """HTTP status for a run where no candidate delivered.
 
-    Paired with `build_upstream_failure_error`, which reads the same verdict off the same list:
+    Paired with `build_upstream_failure_error`, which reads the same verdict off the same inputs:
     every caller of one must use the other, or the status and the payload's `type` disagree.
+
+    `terminal_reason` is why the loop stopped, carried explicitly rather than re-inferred from the
+    error list: the row that records an abandonment has `attempted: False`, so the scan below never
+    sees it and used to answer 502 `upstream_failure` for a run the route log called
+    `service_restarting`. What each ending means is read off `TERMINAL_ENDINGS`, and only after the
+    two verdicts about the request itself: a run every attempt of which said the body was invalid
+    answers 400 whether or not a SIGTERM happened to cut it short — the restart changed when the
+    run stopped, not what was wrong with the request.
     """
-    if request_feature_incompatible(errors):
-        return 422
-    if caller_rejected_request(errors):
-        return 400
+    # Both verdicts are about the request the caller sent, so they read the rows where it was
+    # actually sent. The abandonment row is `attempted: False`, and counting it would let a SIGTERM
+    # turn a run every attempt of which rejected the body into a 503 that says nothing true.
     attempted_errors = [error for error in errors if error.get("attempted") is not False]
+    if request_feature_incompatible(attempted_errors):
+        return 422
+    if caller_rejected_request(attempted_errors):
+        return 400
+    ending = TERMINAL_ENDINGS.get(terminal_reason or "")
+    if ending is not None and ending.http_status is not None:
+        return ending.http_status
     reasons = {str(error.get("reason") or "") for error in attempted_errors}
     if reasons and reasons <= {"rate_limited", "rate_limited_upstream", "quota_exhausted"}:
         return 429
     if reasons and reasons <= {"timeout", "request_deadline_exceeded"}:
         return 504
     return 502
+
+
+def route_log_failure_status(errors: list[dict[str, Any]], *, terminal_reason: str | None = None) -> int:
+    """The status the Requests page shows for a run where no candidate delivered.
+
+    The same status the client got, except for an ending that writes no body at all: there the row
+    carries the ending's own `route_log_status` (499 for a caller that hung up) instead of a 502 or
+    504 nobody ever received.
+    """
+    ending = TERMINAL_ENDINGS.get(terminal_reason or "")
+    if ending is not None and ending.route_log_status is not None:
+        return ending.route_log_status
+    return upstream_failure_status(errors, terminal_reason=terminal_reason)
 
 
 def upstream_retry_after_seconds(errors: list[dict[str, Any]], status: int) -> int | None:
@@ -954,6 +1111,7 @@ def build_upstream_failure_error(
     candidate_count: int,
     attempts: list[dict[str, Any]],
     errors: list[dict[str, Any]],
+    terminal_reason: str | None = None,
 ) -> dict[str, Any]:
     reason_counts: dict[str, int] = {}
     safe_details: list[dict[str, Any]] = []
@@ -980,16 +1138,34 @@ def build_upstream_failure_error(
         safe_details.append({key: value for key, value in safe_row.items() if value is not None})
     reason_summary = ", ".join(f"{reason}={count}" for reason, count in sorted(reason_counts.items())) or "unknown"
     safe_requested_model = sanitize_error_detail(requested_model, 250) or "[redacted]"
-    if list(reason_counts) == ["unsupported_tool_schema"]:  # `request_feature_incompatible`
-        feature_detail = safe_details[-1].get("detail") if safe_details else ""
+    # Same predicates, same order and the same attempted-only rows as `upstream_failure_status`:
+    # the status and this payload's `type` are one verdict written twice, and they must not drift.
+    attempted_errors = [error for error in errors if error.get("attempted") is not False]
+    # The row a rejection message quotes is the last one that was actually sent: an abandonment row
+    # is last in the list but carries no upstream words, so quoting it would drop the provider
+    # sentence naming the malformed field.
+    attempted_details = [
+        detail for row, detail in zip(errors, safe_details) if row.get("attempted") is not False
+    ]
+    ending = TERMINAL_ENDINGS.get(terminal_reason or "")
+    if request_feature_incompatible(attempted_errors):
+        feature_detail = attempted_details[-1].get("detail") if attempted_details else ""
         message = "the requested model does not support a tool-schema feature in this request" + (
             f": {feature_detail}" if feature_detail else ""
         )
         error_type = "invalid_request_error"
-    elif list(reason_counts) == ["bad_upstream_request"]:  # `caller_rejected_request`, already counted
-        upstream_detail = safe_details[-1].get("detail") if safe_details else ""
+    elif caller_rejected_request(attempted_errors):
+        upstream_detail = attempted_details[-1].get("detail") if attempted_details else ""
         message = "upstream rejected this request as invalid" + (f": {upstream_detail}" if upstream_detail else "")
         error_type = "invalid_request_error"
+    elif ending is not None and ending.error_type is not None:
+        # The run was cut short by an ending Ficelle owns, so the payload must not read as a
+        # verdict on the pool.
+        message = (
+            f"Ficelle stopped taking new fallback attempts for {safe_requested_model} "
+            f"({ending.error_type}; {len(attempts)}/{candidate_count} attempted; {reason_summary})"
+        )
+        error_type = ending.error_type
     else:
         message = f"all Ficelle candidates failed for {safe_requested_model} ({len(attempts)}/{candidate_count} attempted; {reason_summary})"
         error_type = "upstream_failure"

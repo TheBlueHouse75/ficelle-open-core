@@ -551,6 +551,111 @@ def test_sha256_verification_rejects_mismatch(tmp_path):
         raise AssertionError("expected checksum mismatch")
 
 
+def test_remote_pro_wheel_is_verified_with_the_installed_core_root(
+    monkeypatch,
+    tmp_path,
+):
+    wheel = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    attestation = tmp_path / "release.attestation.json"
+    attestation.write_text("{}", encoding="utf-8")
+    options = make_options(
+        tmp_path,
+        wheel_url="https://install.example.test/api/releases/0.1.3/wheel",
+        license_key="FICL-SECRET",
+    )
+    commands = []
+    monkeypatch.setattr(
+        bootstrap,
+        "download_pro_attestation",
+        lambda _options, _directory: attestation,
+    )
+
+    def run(command, *, dry_run, env=None):
+        commands.append(command)
+        return bootstrap.CommandResult(list(command), 0)
+
+    monkeypatch.setattr(bootstrap, "run_command", run)
+
+    bootstrap.verify_pro_wheel_integrity(
+        options,
+        Path("/ficelle/bin/python"),
+        wheel,
+        tmp_path,
+    )
+
+    assert commands == [[
+        "/ficelle/bin/python",
+        "-m",
+        "ficelle.artifact_integrity",
+        "verify",
+        str(wheel),
+        str(attestation),
+    ]]
+
+
+def test_remote_pro_wheel_stops_when_signature_verification_fails(
+    monkeypatch,
+    tmp_path,
+):
+    wheel = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    attestation = tmp_path / "release.attestation.json"
+    attestation.write_text("{}", encoding="utf-8")
+    options = make_options(
+        tmp_path,
+        wheel_url="https://install.example.test/api/releases/0.1.3/wheel",
+        license_key="FICL-SECRET",
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "download_pro_attestation",
+        lambda _options, _directory: attestation,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "run_command",
+        lambda *args, **kwargs: bootstrap.CommandResult([], 2),
+    )
+
+    with pytest.raises(SystemExit, match="attestation verification failed"):
+        bootstrap.verify_pro_wheel_integrity(
+            options,
+            Path("/ficelle/bin/python"),
+            wheel,
+            tmp_path,
+        )
+
+
+def test_attestation_download_uses_the_license_key_and_bounded_sidecar(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    options = make_options(
+        tmp_path,
+        wheel_url="https://install.example.test/api/releases/0.1.3/wheel?channel=stable",
+        license_key="FICL-SECRET",
+    )
+
+    def open_attestation(request, *, timeout, authenticated):
+        captured["url"] = request.full_url
+        captured["authorization"] = request.get_header("Authorization")
+        captured["authenticated"] = authenticated
+        return io.BytesIO(b'{"schema_version":1}')
+
+    monkeypatch.setattr(bootstrap, "open_wheel", open_attestation)
+
+    path = bootstrap.download_pro_attestation(options, tmp_path)
+
+    assert captured == {
+        "url": "https://install.example.test/api/releases/0.1.3/wheel.attestation?channel=stable",
+        "authorization": "Bearer FICL-SECRET",
+        "authenticated": True,
+    }
+    assert path.read_bytes() == b'{"schema_version":1}'
+
+
 def test_pro_wheel_must_require_the_bootstrap_core_version(tmp_path):
     compatible = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
     write_pro_wheel(

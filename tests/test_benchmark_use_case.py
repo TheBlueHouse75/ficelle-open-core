@@ -50,6 +50,7 @@ from ficelle.use_cases.capability_discovery import (
     VERDICT_BASIS_KEY,
     VERDICT_STREAK_KEY,
     CapabilityDiscoveryJob,
+    DiscoveryPriorityPorts,
     ProviderProbePacer,
     clear_background_job_error_in_state,
     consecutive_verdict_count,
@@ -57,6 +58,7 @@ from ficelle.use_cases.capability_discovery import (
     model_due_capabilities,
     models_needing_discovery,
     probeable_capability_profiles,
+    recently_routed_profile_ids,
     record_background_job_error_in_state,
 )
 
@@ -561,6 +563,59 @@ def test_models_needing_discovery_filters_cooldowns_quarantine_and_fresh_verdict
     assert [model["id"] for model in eligible] == ["ready", "complete"]
     assert due == ["ficelle/auto-tools"]
     assert [model["id"] for model in needing] == ["ready"]
+
+
+def test_discovery_queue_promotes_the_stale_verdicts_a_live_pool_would_route():
+    """The whole point of D2: 5 probes per cycle against ~180 models, in catalog order.
+
+    `nemotron-3.5-lightning` sat 162nd in that queue while ranking FIRST for `auto-compression` on
+    an expired verdict, so it was never re-tested and kept serving.
+    """
+    models = [{"id": f"m{index}", "invokable": True} for index in range(5)]
+    profiles = ["ficelle/auto-compression", "ficelle/auto-json"]
+    state = {
+        "last_routes": {
+            "ficelle/auto-compression": {"seen_at": "recent"},
+            "ficelle/auto-json": {"seen_at": "ancient"},
+        }
+    }
+    # m3 and m2 hold stale verdicts for the live profile — m3 near the top, m2 pushed to the back
+    # by the frozen penalty, both only movable by a re-test; m1 ranks second but has no stale
+    # verdict; m4 has one but only for a profile nothing has routed lately.
+    ranks = {"ficelle/auto-compression": ["m3", "m1", "m0", "m2", "m4"], "ficelle/auto-json": ["m4"]}
+    stale = {("ficelle/auto-compression", "m3"), ("ficelle/auto-compression", "m2"), ("ficelle/auto-json", "m4")}
+
+    priority_ports = DiscoveryPriorityPorts(
+        recently_routed_profile_ids=lambda _state: recently_routed_profile_ids(
+            _state,
+            parse_timestamp=lambda value: {"recent": 999_000.0, "ancient": 0.0}.get(value),
+            now_seconds=lambda: 1_000_000.0,
+        ),
+        ranked_profile_candidates=lambda profile_id, candidates, _state: sorted(
+            candidates, key=lambda model: ranks[profile_id].index(model["id"])
+        ),
+        stale_failed_profile_evidence=lambda profile_id, model, _state: (profile_id, model["id"]) in stale,
+    )
+
+    needing = models_needing_discovery(
+        {"models": models},
+        state,
+        profiles,
+        model_on_cooldown=lambda _model, _state: (False, None),
+        model_is_quarantined=lambda _model, _state: False,
+        verified_capability_row=lambda _profile_id, _model, _state: {},
+        catalog_denies_capability=lambda _profile_id, _model: False,
+        priority_ports=priority_ports,
+    )
+
+    assert recently_routed_profile_ids(
+        state,
+        parse_timestamp=lambda value: {"recent": 999_000.0, "ancient": 0.0}.get(value),
+        now_seconds=lambda: 1_000_000.0,
+    ) == ["ficelle/auto-compression"], "a route from a day ago no longer makes a pool live"
+    # m3 then m2 jump the queue in routing order; everything else keeps catalog order and nothing
+    # is dropped.
+    assert [model["id"] for model in needing] == ["m3", "m2", "m0", "m1", "m4"]
 
 
 def test_benchmark_runner_falls_back_to_next_candidate_after_semantic_failure():

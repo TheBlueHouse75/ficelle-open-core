@@ -33,7 +33,7 @@ from typing import Any
 
 from ficelle.runtime_paths import RuntimePaths
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Retention bounds for the derived index (the JSONL source keeps everything).
 MAX_ROWS = 100_000
@@ -87,6 +87,7 @@ _COLUMNS = (
     "prompt_price",
     "completion_price",
     "attempts_json",
+    "delivery_corrected",
 )
 
 _INSERT_SQL = (
@@ -106,7 +107,16 @@ _ATTEMPT_KEYS = (
     "status",
     "reason",
     "error_type",
+    "error_detail",
+    "error_errno",
     "latency_seconds",
+    "read_timeout_seconds",
+    "connect_timeout_seconds",
+    "read_timeout_source",
+    "request_budget_remaining_seconds",
+    "timeout_phase",
+    "transport_retry",
+    "stale_latency_seconds",
     "stream_started",
     "stream_chunk_count",
     "stream_bytes_sent",
@@ -140,6 +150,52 @@ def query(
         return [_public_row(row) for row in rows]
 
 
+def resolve_quality_feedback_attribution(
+    request_id: Any,
+    *,
+    store_path: Path | None = None,
+    source_path: Path | None = None,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Resolve one attributable final success for local operator quality feedback.
+
+    This is intentionally a literal equality lookup over the existing redacted derived index.
+    The caller receives only trusted route provenance, never the request id it supplied, and
+    failed, delivery-corrected, incomplete, future or expired rows fail closed as ``None``.
+    """
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    reference = time.time() if now is None else now
+    if not math.isfinite(reference):
+        return None
+    with closing(_connect(store_path)) as conn:
+        _catch_up(conn, source_path)
+        row = conn.execute(
+            """
+            SELECT profile, source, upstream_id, model_id, status, reason, ts
+            FROM requests WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    timestamp = row["ts"]
+    if (
+        not isinstance(timestamp, (int, float))
+        or not math.isfinite(float(timestamp))
+        or float(timestamp) > reference
+        or float(timestamp) + MAX_AGE_SECONDS <= reference
+        or not isinstance(row["status"], int)
+        or not 200 <= row["status"] < 300
+        or row["reason"] != "ok"
+    ):
+        return None
+    fields = {key: row[key] for key in ("profile", "source", "upstream_id", "model_id")}
+    if not all(isinstance(value, str) and value for value in fields.values()):
+        return None
+    return {**fields, "timestamp": float(timestamp)}
+
+
 def tail(
     *,
     cursor: Any = None,
@@ -165,12 +221,24 @@ def tail(
     """
     bounded = max(1, min(_safe_int(limit, DEFAULT_TAIL_LIMIT) or DEFAULT_TAIL_LIMIT, MAX_QUERY_LIMIT))
     with closing(_connect(store_path)) as conn:
-        _catch_up(conn, source_path)
+        _, delivery_updated = _catch_up(conn, source_path)
         head = _head(conn)
         start = _safe_int(cursor, None)
         if start is None:
             return {"cursor": head, "entries": [], "resync": False}
+        if delivery_updated:
+            # The current tail ingested a delivery correction. Force one list reload instead
+            # of applying that existing request as a new row.
+            return {"cursor": head, "entries": [], "resync": True}
         if start > head or head - start > MAX_TAIL_REPLAY:
+            return {"cursor": head, "entries": [], "resync": True}
+        corrected = conn.execute(
+            "SELECT 1 FROM requests WHERE rowid > ? AND delivery_corrected = 1 LIMIT 1",
+            (start,),
+        ).fetchone()
+        if corrected is not None:
+            # Another admin read may have ingested the correction before this tail. Its
+            # moved rowid persists the signal so every subscriber behind it still reloads.
             return {"cursor": head, "entries": [], "resync": True}
         where, params = _filter_conditions(profile, source, reason, status, q)
         clause = " AND ".join(["rowid > ?", *where])
@@ -372,19 +440,19 @@ def window_seconds_from_label(label: Any) -> int:
 # --------------------------------------------------------------------------- #
 # Ingestion
 # --------------------------------------------------------------------------- #
-def _catch_up(conn: sqlite3.Connection, source_path: Path | None) -> int:
-    """Ingest new complete lines from the route log since the stored byte offset."""
+def _catch_up(conn: sqlite3.Connection, source_path: Path | None) -> tuple[int, bool]:
+    """Ingest new complete lines and report whether an existing row was corrected."""
     path = (
         source_path
         if source_path is not None
         else _RUNTIME_PATHS.read_path(DEFAULT_ROUTE_LOG_PATH)
     )
     if not path.exists():
-        return 0
+        return 0, False
     try:
         source_stat = path.stat()
     except OSError:
-        return 0
+        return 0, False
     current_size = source_stat.st_size
     source_identity = (
         f"{path.resolve()}:{source_stat.st_dev}:{source_stat.st_ino}"
@@ -407,8 +475,9 @@ def _catch_up(conn: sqlite3.Connection, source_path: Path | None) -> int:
         # runs on a quiescent log (not only when new lines arrive).
         _trim(conn)
         conn.commit()
-        return 0
+        return 0, False
     inserted = 0
+    delivery_updated = False
     pending: list[dict[str, Any]] = []
     try:
         with path.open("rb") as handle:
@@ -426,22 +495,28 @@ def _catch_up(conn: sqlite3.Connection, source_path: Path | None) -> int:
                 if row is not None:
                     pending.append(row)
                 if len(pending) >= INGEST_BATCH:
-                    inserted += _insert_rows(conn, pending)
+                    changed, updated = _insert_rows(conn, pending)
+                    inserted += changed
+                    delivery_updated = delivery_updated or updated
                     _set_meta(conn, "ingest_offset", str(offset))
                     conn.commit()
                     pending = []
     except OSError:
         if pending:
-            inserted += _insert_rows(conn, pending)
+            changed, updated = _insert_rows(conn, pending)
+            inserted += changed
+            delivery_updated = delivery_updated or updated
         _set_meta(conn, "ingest_offset", str(offset))
         conn.commit()
-        return inserted
+        return inserted, delivery_updated
     if pending:
-        inserted += _insert_rows(conn, pending)
+        changed, updated = _insert_rows(conn, pending)
+        inserted += changed
+        delivery_updated = delivery_updated or updated
     _set_meta(conn, "ingest_offset", str(offset))
     _trim(conn)
     conn.commit()
-    return inserted
+    return inserted, delivery_updated
 
 
 def _parse_line(raw_line: bytes) -> dict[str, Any] | None:
@@ -470,6 +545,18 @@ def _row_from_log_line(raw: Any) -> dict[str, Any] | None:
     request_id = raw.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         return None
+    if raw.get("event") == "request_delivery_update":
+        # The normal success row is written before a non-streaming body is handed to the
+        # caller. If that final socket write fails, this append-only correction preserves
+        # the real delivery verdict without rewriting routes.jsonl.
+        if raw.get("final_reason") != "client_disconnected":
+            return None
+        return {
+            "_event": "request_delivery_update",
+            "request_id": request_id,
+            "reason": "client_disconnected",
+            "error_type": _str_or_none(raw.get("error_type")),
+        }
 
     raw_attempts = raw.get("attempts")
     attempts = (
@@ -547,6 +634,7 @@ def _row_from_log_line(raw: Any) -> dict[str, Any] | None:
         "prompt_price": _price_per_token(reference.get("prompt")),
         "completion_price": _price_per_token(reference.get("completion")),
         "attempts_json": json.dumps(attempts, ensure_ascii=False, sort_keys=True),
+        "delivery_corrected": 0,
     }
 
 
@@ -571,12 +659,35 @@ def _price_per_token(value: Any) -> float | None:
     return price if price is not None and price >= 0 and math.isfinite(price) else None
 
 
-def _insert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> int:
+def _insert_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> tuple[int, bool]:
     if not rows:
-        return 0
+        return 0, False
     before = conn.total_changes
-    conn.executemany(_INSERT_SQL, [tuple(row[col] for col in _COLUMNS) for row in rows])
-    return conn.total_changes - before
+    delivery_updated = False
+    # Preserve source order: a route and its delivery correction can land in the same
+    # ingest batch, and the correction must see the row that immediately precedes it.
+    for row in rows:
+        if row.get("_event") == "request_delivery_update":
+            update_before = conn.total_changes
+            conn.execute(
+                """
+                UPDATE requests
+                SET rowid = (SELECT COALESCE(MAX(rowid), 0) + 1 FROM requests),
+                    reason = ?, error_type = ?, delivery_corrected = 1
+                WHERE request_id = ? AND (reason IS NOT ? OR error_type IS NOT ?)
+                """,
+                (
+                    row["reason"],
+                    row["error_type"],
+                    row["request_id"],
+                    row["reason"],
+                    row["error_type"],
+                ),
+            )
+            delivery_updated = delivery_updated or conn.total_changes > update_before
+            continue
+        conn.execute(_INSERT_SQL, tuple(row[col] for col in _COLUMNS))
+    return conn.total_changes - before, delivery_updated
 
 
 def _trim(conn: sqlite3.Connection, now: float | None = None) -> None:
@@ -694,7 +805,8 @@ def _create_requests_table(conn: sqlite3.Connection) -> None:
           completion_tokens INTEGER,
           prompt_price REAL,
           completion_price REAL,
-          attempts_json TEXT
+          attempts_json TEXT,
+          delivery_corrected INTEGER NOT NULL DEFAULT 0
         )
         """
     )

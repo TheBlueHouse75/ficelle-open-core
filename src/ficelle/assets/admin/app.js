@@ -160,7 +160,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       return [...models].sort((a, b) => {
         const as = Number(a.auto_scores?.[profileId] ?? -1), bs = Number(b.auto_scores?.[profileId] ?? -1);
         if (as !== bs) return bs - as;
-        const af = Number(modelStats(a)?.consecutive_failures || 0), bf = Number(modelStats(b)?.consecutive_failures || 0);
+        const af = Number(modelStats(a)?.failure_penalty_weight || 0), bf = Number(modelStats(b)?.failure_penalty_weight || 0);
         if (af !== bf) return af - bf;
         const cd = Number(b.context_length || 0) - Number(a.context_length || 0);
         if (cd !== 0) return cd;
@@ -442,9 +442,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         push("Success rate", Math.round(pct(s.successes, s.requests)) + "% &middot; " + Number(s.successes || 0) + "/" + Number(s.requests || 0) + " calls");
         if (s.latency_ewma != null) push("Avg latency", Number(s.latency_ewma).toFixed(2) + "s");
         // Kept apart: a caller-caused failure (a too-small max_tokens) updates the last reason
-        // without extending the streak, so pairing them would blame the streak on the wrong event.
-        // Splitting them also surfaces those failures, which carry no streak at all.
-        if (s.consecutive_failures) push("Recent failures", '<span style="color:var(--danger)">' + Number(s.consecutive_failures) + " in a row</span>");
+        // without entering the ledger, so pairing them would blame the penalty on the wrong event.
+        // Splitting them also surfaces those failures, which carry no penalty at all.
+        if (Number(s.failure_penalty_weight || 0) > 0) {
+          const reasons = Object.entries(s.open_failure_reasons || {}).map(([reason, weight]) => reasonLabel(reason) + " x" + Number(weight).toFixed(1)).join(", ");
+          push("Recent failures", '<span style="color:var(--danger)">' + Number(s.failure_penalty_weight).toFixed(1) + " weighted" + (reasons ? " (" + esc(reasons) + ")" : "") + (s.failure_retest_due ? ", re-test due" : "") + "</span>");
+        }
         if (s.last_failure_reason) push("Last failure", esc(reasonLabel(s.last_failure_reason)));
         if (s.last_success_at) push("Last success", timeChip(s.last_success_at));
       }
@@ -1493,7 +1496,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      view.innerHTML = '<div class="card pro-gate-card"><div class="card-body">'
 	        + '<span class="pro-kicker">Ficelle Pro</span><h2>' + esc(feature.gateTitle) + "</h2>"
 	        + "<p>" + esc(feature.description) + "</p>"
-	        + '<button class="btn primary" type="button" data-open-pro>Explore Ficelle Pro</button>'
+        + '<button class="btn primary" type="button" data-open-pro>Open License</button>'
 	        + "</div></div>";
 	      bindProGateActions(view);
 	    }
@@ -1528,12 +1531,25 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        + '<section class="card pro-activation"><div class="card-head"><div><h2>Already have a license key?</h2>'
 	          + '<div class="ch-sub">Paste it here. Ficelle installs and activates Pro on this machine, with no terminal and no core reinstall.</div></div></div>'
 	          + '<div class="card-body"><div class="pro-activation-form">'
-	            + '<input type="text" class="key-input" id="proKeyInput" aria-label="Ficelle Pro license key" placeholder="Enter your license key" autocomplete="off" spellcheck="false" />'
+	            + '<div class="key-input-wrap"><input type="password" class="key-input" id="proKeyInput" aria-label="Ficelle Pro license key" placeholder="Enter your license key" autocomplete="off" spellcheck="false" />'
+	            + '<button class="btn ghost sm" type="button" id="toggleProKeyBtn" aria-label="Show license key" aria-controls="proKeyInput" aria-pressed="false">Show</button></div>'
 	            + '<button class="btn primary" type="button" id="unlockProBtn">Unlock Pro</button>'
 	          + '</div><div class="ch-sub" id="proInstallProgress" style="margin-top:12px" aria-live="polite"></div></div>'
 	        + "</section></div>";
 	      $("unlockProBtn").addEventListener("click", unlockPro);
+	      bindKeyReveal("proKeyInput", "toggleProKeyBtn");
 	      if (deepLinkedKey) $("proKeyInput").value = deepLinkedKey;
+	    }
+	    function bindKeyReveal(inputId, buttonId) {
+	      const input = $(inputId), button = $(buttonId);
+	      if (!input || !button) return;
+	      button.addEventListener("click", () => {
+	        const visible = input.type === "text";
+	        input.type = visible ? "password" : "text";
+	        button.textContent = visible ? "Show" : "Hide";
+	        button.setAttribute("aria-label", visible ? "Show license key" : "Hide license key");
+	        button.setAttribute("aria-pressed", String(!visible));
+	      });
 	    }
 	    let proInstalledForActivation = false;
 	    async function unlockPro() {
@@ -1664,8 +1680,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      const retryControls =
 	        '<div class="settings-grid">' +
 	          fusionSetting("setMaxAttempts", "Max attempts per request",
-	            settingsNumber("setMaxAttempts", "max_attempts_per_request", s.max_attempts_per_request, 0, 12),
-	            "How many upstream models Ficelle tries for one request to a virtual model. If the first fails, it moves to the next eligible model in the pool, up to this many. 0 means try every eligible candidate. The effective number is capped by how many models the pool has. Direct (non-virtual) model calls ignore this and never fall back. Default 4.") +
+	            settingsNumber("setMaxAttempts", "max_attempts_per_request", s.max_attempts_per_request, 1, 12),
+	            "How many upstream models Ficelle tries for one request to a virtual model. If the first fails, it moves to the next eligible model in the pool, up to this many. The effective number is capped by how many models the pool has. Direct (non-virtual) model calls ignore this and never fall back. Default 4.") +
 	        "</div>";
 	      const cooldownControls =
 	        '<div class="settings-grid">' +
@@ -2435,11 +2451,26 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const aok = a.reason === "ok";
         const acls = aok ? "ok" : (Number(a.status) >= 200 && Number(a.status) < 300 ? "warn" : "danger");
         const al = a.latency_seconds != null ? Number(a.latency_seconds).toFixed(2) + "s" : "";
+        const timeout = [];
+        if (a.read_timeout_seconds != null) timeout.push("read timeout " + Number(a.read_timeout_seconds).toFixed(2) + "s");
+        if (a.timeout_phase === "connect" && a.connect_timeout_seconds != null) timeout.push("connect timeout " + Number(a.connect_timeout_seconds).toFixed(2) + "s");
+        if (a.read_timeout_source) timeout.push(String(a.read_timeout_source).replaceAll("_", " "));
+        if (a.timeout_phase) timeout.push("phase " + String(a.timeout_phase).replaceAll("_", " "));
+        if (a.request_budget_remaining_seconds != null) timeout.push("request budget " + Number(a.request_budget_remaining_seconds).toFixed(2) + "s at start");
+        if (a.transport_retry === "stale_connection") timeout.push("replayed on fresh connection" + (a.stale_latency_seconds != null ? " (" + Number(a.stale_latency_seconds).toFixed(2) + "s discarded)" : ""));
+        if (a.error_errno != null) timeout.push("errno " + Number(a.error_errno));
+        if (a.error_detail) {
+          // The router prefixes the message with the exception type, which the row already shows as error_type.
+          const prefix = a.error_type ? String(a.error_type) + ": " : "";
+          const message = String(a.error_detail).trim();
+          timeout.push(prefix && message.startsWith(prefix) ? message.slice(prefix.length) : message);
+        }
+        const timeoutText = timeout.length ? " · " + timeout.join(" · ") : "";
         return '<div class="req-attempt"><span class="badge">#' + (i + 1) + "</span>" +
           '<span class="mono req-attempt-up">' + esc(a.upstream || a.model || "—") + "</span>" +
           '<span class="req-attempt-src">' + esc(a.source ? providerLabel(a.source) : "—") + "</span>" +
           '<span class="badge ' + acls + '">' + esc(String(a.status ?? a.reason ?? "—")) + "</span>" +
-          '<span class="req-attempt-reason">' + esc(reasonWithCode(a.reason)) + (a.error_type ? " · " + esc(a.error_type) : "") + "</span>" +
+          '<span class="req-attempt-reason">' + esc(reasonWithCode(a.reason)) + (a.error_type ? " · " + esc(a.error_type) : "") + esc(timeoutText) + "</span>" +
           (al ? '<span class="req-attempt-lat">' + esc(al) + "</span>" : "") +
           "</div>";
       }).join("") : '<div class="req-attempt"><span class="req-attempt-reason">No per-attempt detail recorded.</span></div>';
@@ -2911,7 +2942,16 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (!viewMeta[name]) name = "routing";
       setCurrentView(name);
       document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.dataset.view === name));
-      document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.nav === name));
+      let currentNavItem = null;
+      document.querySelectorAll(".nav-item").forEach((b) => {
+        const active = b.dataset.nav === name;
+        b.classList.toggle("active", active);
+        if (active) {
+          b.setAttribute("aria-current", "page");
+          currentNavItem = b;
+        }
+        else b.removeAttribute("aria-current");
+      });
       document.body.classList.toggle("routing-fixed", name === "routing");
       const m = name === "license" && !state?.pro_installed ? proUpgradeMeta : viewMeta[name];
       $("viewEyebrow").textContent = m.eyebrow; $("viewTitle").textContent = m.title; $("viewDesc").textContent = m.desc;
@@ -2920,14 +2960,17 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       syncLongRunningActions();
       if (name === "requests") enterRequests(); else stopRequestsLive();
       if (location.hash !== "#/" + name) history.replaceState(null, "", "#/" + name);
-      window.scrollTo({ top: 0, behavior: "instant" in document.documentElement.style ? "instant" : "auto" });
+      window.scrollTo(0, 0);
+      if (currentNavItem && window.matchMedia("(max-width: 1080px)").matches) {
+        currentNavItem.scrollIntoView({ block: "nearest", inline: "center" });
+      }
     }
     function viewActions(name) {
 	      const btn = (id, label, primary, icon, title) => '<button class="btn ' + (primary ? "primary" : "") + '" id="' + id + '"' + (title ? ' title="' + esc(title) + '"' : "") + ">" + (icon || "") + label + "</button>";
 	      if (name === "routing") return btn("refreshBtn", "Refresh catalog", false, ic(ICONS.refresh), "Re-fetch each provider's model list and rebuild the free-only catalog. Metadata only — no test requests, no tokens spent.") + btn("benchmarkBtn", "Retest candidates", false, ic(ICONS.retest), "Send a real test request to every usable model in this pool, one by one, to refresh pass/fail evidence. Uses a little quota per model. Tests of one provider are spaced ~4s apart so this cannot trip its rate limit, so a large pool takes several minutes.") + btn("saveBtn", 'Save<span id="saveCount" class="save-count"></span>', true, ic(ICONS.save));
-	      if (name === "fusion") return state?.pro_installed ? btn("saveFusionBtn", "Save settings", true, ic(ICONS.save)) : "";
+	      if (name === "fusion") return state?.pro_entitled ? btn("saveFusionBtn", "Save settings", true, ic(ICONS.save)) : "";
 	      if (name === "settings") return btn("saveSettingsBtn", "Save settings", true, ic(ICONS.save));
-	      if (name === "compression") return state?.pro_installed ? btn("reloadCompressionBtn", "Reload", false, ic(ICONS.refresh)) + btn("saveCompressionBtn", "Save settings", true, ic(ICONS.save)) : "";
+	      if (name === "compression") return state?.pro_entitled ? btn("reloadCompressionBtn", "Reload", false, ic(ICONS.refresh)) + btn("saveCompressionBtn", "Save settings", true, ic(ICONS.save)) : "";
 	      if (name === "health") return btn("canaryBtn", "Run canary", true, ic(ICONS.canary));
       if (name === "audit") return btn("reloadAuditBtn", "Reload", false, ic(ICONS.refresh));
       if (name === "requests") return btn("reloadRequestsBtn", "Reload", false, ic(ICONS.refresh)) + '<button class="btn' + (requestsLive ? " primary" : "") + '" id="liveRequestsBtn" type="button" title="Stream new requests as they are routed, without reloading the page." aria-pressed="' + (requestsLive ? "true" : "false") + '">' + liveLabel() + "</button>";
@@ -2942,10 +2985,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        $("saveBtn").addEventListener("click", saveProfiles);
 	        // The header is rebuilt on every view switch, so the fresh button needs the count.
 	        syncSaveButton();
-	      } else if (name === "fusion") { if (state?.pro_installed) $("saveFusionBtn").addEventListener("click", saveFusion); }
+	      } else if (name === "fusion") { if (state?.pro_entitled) $("saveFusionBtn").addEventListener("click", saveFusion); }
 		      else if (name === "settings") $("saveSettingsBtn").addEventListener("click", saveSettings);
 	      else if (name === "compression") {
-	        if (state?.pro_installed) {
+	        if (state?.pro_entitled) {
 	          $("reloadCompressionBtn").addEventListener("click", () => loadCompression().then(() => showToast("Compression dashboard reloaded.")).catch((e) => showToast(e.message)));
 	          $("saveCompressionBtn").addEventListener("click", saveCompression);
 	        }
@@ -3023,8 +3066,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     // Delegates to the closed pack. No-op (resolves undefined) on a core-only install so callers
     // (loadState, loadOptionalCompression, the Reload button) degrade gracefully without the Pro module.
-    async function loadCompression(after = true) {
-      return proViews.loadCompression ? proViews.loadCompression(proApi, after) : undefined;
+	    async function loadCompression(after = true) {
+	      if (!proApi.getState()?.pro_entitled) {
+	        setCompressionPayload({ observability: {}, events: [], event_count: 0 });
+	        return undefined;
+	      }
+	      return proViews.loadCompression ? proViews.loadCompression(proApi, after) : undefined;
     }
 	    async function loadOptionalCompression() {
 	      try {
@@ -3336,7 +3383,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const pref = localStorage.getItem(THEME_KEY) || "system";
       const eff = pref === "system" ? (mq.matches ? "dark" : "light") : pref;
       document.documentElement.setAttribute("data-theme", eff);
-      document.querySelectorAll("[data-theme-pref]").forEach((b) => b.classList.toggle("active", b.dataset.themePref === pref));
+      document.querySelectorAll("[data-theme-pref]").forEach((b) => {
+        const active = b.dataset.themePref === pref;
+        b.classList.toggle("active", active);
+        b.setAttribute("aria-pressed", active ? "true" : "false");
+      });
+      const themeColor = document.querySelector('meta[name="theme-color"]');
+      if (themeColor) themeColor.content = getComputedStyle(document.documentElement).getPropertyValue("--bg-0").trim();
     }
     function initTheme() {
       applyTheme();
@@ -3348,7 +3401,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     function initNav() {
       document.querySelectorAll(".nav-item").forEach((b) => b.addEventListener("click", () => setView(b.dataset.nav)));
       $("railHealth").addEventListener("click", () => setView("health"));
-      window.addEventListener("hashchange", () => setView((location.hash || "#/routing").replace("#/", "")));
+      document.querySelector(".skip-link").addEventListener("click", (event) => {
+        event.preventDefault();
+        $("mainContent").focus();
+        window.scrollTo(0, 0);
+      });
+      window.addEventListener("hashchange", () => {
+        if (location.hash.startsWith("#/")) setView(location.hash.slice(2));
+      });
     }
     function initStaticControls() {
       $("autoModeBtn").addEventListener("click", () => setProfile({ mode: "auto" }));
@@ -3443,13 +3503,27 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
        while showing it upfront would flash on every healthy load. */
     const BOOT_DEADLINE_MS = 90000; // matches wait_for_admin_status() in cli.py
     const BOOT_NOTICE_DELAY_MS = 600;
-    function bootNotice(text) {
+    function bootNotice(text, waiting = false) {
       const el = $("bootNotice");
-      el.textContent = text;
+      $("bootStatus").textContent = text;
+      el.classList.toggle("is-waiting", waiting);
+      el.replaceChildren();
+      if (waiting) {
+        const signal = document.createElement("span");
+        signal.className = "boot-signal";
+        signal.setAttribute("aria-hidden", "true");
+        const copy = document.createElement("span");
+        copy.textContent = text;
+        el.append(signal, copy);
+      } else {
+        el.textContent = text;
+      }
       el.hidden = false;
     }
     async function bootstrapState() {
-      const slow = setTimeout(() => bootNotice("Waiting for the Ficelle service to come up…"), BOOT_NOTICE_DELAY_MS);
+      const main = $("mainContent");
+      main.setAttribute("aria-busy", "true");
+      const slow = setTimeout(() => bootNotice("Waiting for the Ficelle service to come up…", true), BOOT_NOTICE_DELAY_MS);
       const deadline = Date.now() + BOOT_DEADLINE_MS;
       let lastError = null;
       let attempt = 0;
@@ -3458,6 +3532,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           try {
             await loadState();
             $("bootNotice").hidden = true;
+            if ($("bootStatus").textContent) $("bootStatus").textContent = "Ficelle service ready.";
             return;
           } catch (e) {
             lastError = e;
@@ -3470,6 +3545,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         }
       } finally {
         clearTimeout(slow);
+        main.removeAttribute("aria-busy");
       }
       bootNotice("Can't reach the Ficelle service. Check it with `ficelle status`, then reload this page.");
       showToast(lastError ? (lastError.message || String(lastError)) : "Loading the router state failed.");

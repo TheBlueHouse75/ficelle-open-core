@@ -11,8 +11,8 @@ router bug.
 In **Cursor Settings → Models**:
 
 1. Add the model id `ficelle/auto-tools` as a custom model name.
-2. Enable the **OpenAI API key** override and paste any non-empty key
-   (`ficelle-local`).
+2. Run `ficelle access-token api`, then enable the **OpenAI API key** override
+   and paste that owner token. Treat it as a local secret.
 3. Enable **Override OpenAI Base URL** and set `http://127.0.0.1:8646/v1`.
 4. Select the `ficelle/auto-tools` model in chat.
 

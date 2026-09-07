@@ -27,7 +27,11 @@ MACHINE_ID_PATH = _RUNTIME_PATHS.router_dir / "machine-id"
 DEFAULT_LICENSE_SERVICE_URL = "https://install.ficelle.ai"
 
 
-class LicenseNotInstalled(Exception):
+class ProPackUnavailable(Exception):
+    """The optional Pro pack is absent or cannot load one of its required components."""
+
+
+class LicenseNotInstalled(ProPackUnavailable):
     """Raised when the closed pack (and thus the license client) is absent — the free core."""
 
 
@@ -58,9 +62,30 @@ def _licensing() -> Any:
         from ficelle_pro import licensing
     except ModuleNotFoundError as exc:
         if exc.name not in {"ficelle_pro", "ficelle_pro.licensing"}:
-            raise
+            raise ProPackUnavailable("Ficelle Pro licensing component is broken") from exc
         raise LicenseNotInstalled() from exc
+    except ImportError as exc:
+        raise ProPackUnavailable("Ficelle Pro licensing component is broken") from exc
+    except Exception as exc:
+        raise ProPackUnavailable("Ficelle Pro licensing component is broken") from exc
     return licensing
+
+
+def require_pro_component(component: str, loaded: Any) -> None:
+    """Raise a stable error when an optional Pro engine is absent or partially broken."""
+    if loaded is not None:
+        return
+    try:
+        import ficelle_pro  # noqa: F401
+    except ModuleNotFoundError as exc:
+        if exc.name == "ficelle_pro":
+            raise LicenseNotInstalled() from exc
+        raise ProPackUnavailable(f"Ficelle Pro {component} pack is incomplete") from exc
+    except ImportError as exc:
+        raise ProPackUnavailable(f"Ficelle Pro {component} pack is broken") from exc
+    except Exception as exc:
+        raise ProPackUnavailable(f"Ficelle Pro {component} pack is broken") from exc
+    raise ProPackUnavailable(f"Ficelle Pro {component} pack is incomplete")
 
 
 def ensure_installed() -> None:
@@ -134,7 +159,7 @@ def is_entitled(now: float | None = None) -> bool:
     """
     try:
         licensing = _licensing()
-    except (LicenseNotInstalled, ImportError):
+    except (LicenseNotInstalled, ProPackUnavailable, ImportError):
         # A partially installed or broken optional pack must disable paid routing, not
         # take down the open-core router that remains usable without it.
         return False

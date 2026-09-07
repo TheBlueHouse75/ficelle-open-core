@@ -113,6 +113,85 @@ def discovery_eligible_models(
     return out
 
 
+# A profile counts as live while its last route is this recent. One day covers an install used on
+# working days without keeping a profile "hot" from a session a week ago.
+DISCOVERY_RECENT_ROUTE_WINDOW_SECONDS = 86_400
+
+
+@dataclass(frozen=True)
+class DiscoveryPriorityPorts:
+    """What it takes to know which due models a live profile is holding down on a frozen verdict.
+
+    The queue is otherwise catalog order over ~180 models against 5 probes every 3 hours, so a
+    model in the middle is never reached: `nvidia/nemotron-3.5-lightning:free` sat 162nd while
+    `auto-compression` served it on an expired `failed` verdict. That verdict no longer decays —
+    the model keeps its full penalty until a probe replaces the row — so the only thing that can
+    ever move it, up or out, is a re-test. Priority is computed, not stored: `last_routes` says
+    which profiles are live, and every due candidate such a profile could route and holds on a
+    stale `failed` verdict goes first, in the profile's own routing order.
+    """
+
+    # Profiles routed inside the window, most recently routed first.
+    recently_routed_profile_ids: Callable[[dict[str, Any]], list[str]]
+    # The profile's candidates in the order routing would try them.
+    ranked_profile_candidates: Callable[[str, list[dict[str, Any]], dict[str, Any]], list[dict[str, Any]]]
+    stale_failed_profile_evidence: Callable[[str, dict[str, Any], dict[str, Any]], bool]
+
+
+def recently_routed_profile_ids(
+    state: dict[str, Any],
+    *,
+    parse_timestamp: Callable[[Any], float | None],
+    now_seconds: Callable[[], float],
+    window_seconds: float = DISCOVERY_RECENT_ROUTE_WINDOW_SECONDS,
+) -> list[str]:
+    """Profiles with a route recorded inside the window, most recent first."""
+    routes = state.get("last_routes") if isinstance(state, dict) else None
+    if not isinstance(routes, dict):
+        return []
+    now_ts = now_seconds()
+    rows: list[tuple[float, str]] = []
+    for profile_id, raw in routes.items():
+        if not isinstance(raw, dict):
+            continue
+        stamp = parse_timestamp(raw.get("seen_at"))
+        if stamp is None or (now_ts - stamp) > window_seconds:
+            continue
+        rows.append((stamp, str(profile_id)))
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    return [profile_id for _stamp, profile_id in rows]
+
+
+def prioritized_discovery_queue(
+    due_models: list[dict[str, Any]],
+    state: dict[str, Any],
+    profile_ids: list[str],
+    *,
+    ports: DiscoveryPriorityPorts,
+) -> list[dict[str, Any]]:
+    """Move the due models a live pool holds on a stale `failed` verdict to the front.
+
+    Everything else keeps catalog order, so this reorders the queue without shrinking it.
+    """
+    priority_ids: list[str] = []
+    for profile_id in ports.recently_routed_profile_ids(state):
+        if profile_id not in profile_ids:
+            continue
+        for model in ports.ranked_profile_candidates(profile_id, due_models, state):
+            model_id = str(model.get("id") or "")
+            if model_id and model_id not in priority_ids and ports.stale_failed_profile_evidence(
+                profile_id, model, state
+            ):
+                priority_ids.append(model_id)
+    if not priority_ids:
+        return due_models
+    rank = {model_id: index for index, model_id in enumerate(priority_ids)}
+    return sorted(
+        due_models,
+        key=lambda model: rank.get(str(model.get("id") or ""), len(rank)),
+    )
+
+
 def models_needing_discovery(
     catalog: dict[str, Any],
     state: dict[str, Any],
@@ -122,9 +201,10 @@ def models_needing_discovery(
     model_is_quarantined: Callable[[dict[str, Any], dict[str, Any]], bool],
     verified_capability_row: Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]],
     catalog_denies_capability: Callable[[str, dict[str, Any]], bool],
+    priority_ports: DiscoveryPriorityPorts | None = None,
 ) -> list[dict[str, Any]]:
-    """Return eligible models with at least one due discovery capability."""
-    return [
+    """Return eligible models with at least one due discovery capability, most useful first."""
+    due_models = [
         model
         for model in discovery_eligible_models(
             catalog,
@@ -140,6 +220,9 @@ def models_needing_discovery(
             catalog_denies_capability=catalog_denies_capability,
         )
     ]
+    if priority_ports is None:
+        return due_models
+    return prioritized_discovery_queue(due_models, state, profile_ids, ports=priority_ports)
 
 
 # The provider rejected the REQUEST we sent, not the account. A 400/422 is by definition about this
@@ -367,7 +450,7 @@ class CapabilityDiscoveryJob:
         self.record_benchmark_result(profile_id, model, result)
         self.record_verified_capability(profile_id, model, result)
         if passed:
-            self.record_success(model, round(time.monotonic() - started, 3), representative_latency=False)
+            self.record_success(model, round(time.monotonic() - started, 3))
         return "verified" if passed else "failed"
 
     def _record_http_capability_result(
@@ -416,10 +499,9 @@ class CapabilityDiscoveryJob:
         load_state: Callable[[], dict[str, Any]],
         write_runtime_state: Callable[[dict[str, Any]], None],
         probeable_capability_profiles: Callable[[dict[str, Any]], list[str]],
-        models_needing_discovery: Callable[
-            [dict[str, Any], dict[str, Any], list[str]],
-            list[dict[str, Any]],
-        ],
+        # `(catalog, state, profile_ids, *, prioritize=True)`. `prioritize=False` skips the
+        # queue ordering, which the per-model re-check below does not need.
+        models_needing_discovery: Callable[..., list[dict[str, Any]]],
         model_due_capabilities: Callable[[dict[str, Any], list[str], dict[str, Any]], list[str]],
         auto_benchmark_models_per_cycle: Callable[[dict[str, Any]], int],
         probing_is_within_budget: Callable[[dict[str, Any], dict[str, Any]], bool],
@@ -450,8 +532,10 @@ class CapabilityDiscoveryJob:
             # earlier model may have cooled this one's whole provider — or its quota scope — and
             # probing it would only deepen a limit already recorded. `models_needing_discovery` is
             # the same eligibility predicate that picked these models, so there is one authority on
-            # what is probeable rather than a second, narrower copy of it here.
-            still_probeable = models_needing_discovery(catalog, state, profile_ids)
+            # what is probeable rather than a second, narrower copy of it here. Unprioritized:
+            # this is a membership test, and ranking the whole due set once per probed model
+            # would score every candidate of every live profile for an answer order cannot change.
+            still_probeable = models_needing_discovery(catalog, state, profile_ids, prioritize=False)
             if not any(other.get("id") == model.get("id") for other in still_probeable):
                 counts["skipped"] += len(due)
                 continue

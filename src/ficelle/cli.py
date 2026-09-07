@@ -245,10 +245,7 @@ def router_url(path: str) -> str:
 
 
 def router_request_headers(path: str) -> dict[str, str]:
-    """Authenticate owner CLI calls when the router listens beyond loopback."""
-    config = router.load_config()
-    if router.bind_host_is_loopback(config.get("host")):
-        return {}
+    """Authenticate every owner CLI call with the token for its router scope."""
     token = router.admin_token() if path == "/admin" or path.startswith("/admin/") else router.api_token()
     return {"Authorization": f"Bearer {token}"}
 
@@ -378,6 +375,16 @@ def http_json(path: str, *, method: str = "GET", payload: dict[str, Any] | None 
 def doctor_status() -> dict[str, Any]:
     config = router.load_config()
     service = read_admin_status()
+    error_name = str(service.get("error") or "").lower()
+    error_detail = str(service.get("detail") or "").lower()
+    if not service.get("ready") and (
+        "timeout" in error_name or "timed out" in error_detail
+    ):
+        # `/admin/status.json` builds a catalog summary and can occasionally miss the
+        # deliberately short first probe while the router is busy. One longer retry
+        # avoids diagnosing a healthy service as unreachable; connection refusals and
+        # HTTP errors still return immediately.
+        service = read_admin_status(timeout_seconds=5.0)
     config_read_path = router.runtime_read_path(router.CONFIG_PATH)
     catalog_read_path = router.runtime_read_path(router.CATALOG_PATH)
     state_read_path = router.runtime_read_path(router.STATE_PATH)
@@ -588,7 +595,6 @@ def cmd_connectors(args: argparse.Namespace) -> int:
             "ficelle.install",
             "--skip-package",
             "--skip-service",
-            "--skip-smoke",
             "--ficelle-home",
             str(FICELLE_HOME),
             "--connector",
@@ -640,6 +646,12 @@ def cmd_license(args: argparse.Namespace) -> int:
             print(json.dumps(license_ops.status_dict(None)))
             return 1
         print("Ficelle Pro is not installed (this is the free open core); no license to manage.")
+        return 1
+    except license_ops.ProPackUnavailable as exc:
+        if json_output:
+            print(json.dumps({"licensed": False, "error": {"code": "pro_pack_unavailable", "message": str(exc)}}))
+        else:
+            print(f"Ficelle Pro is unavailable: {exc}")
         return 1
     if args.action == "status":
         return _print_license_status(
@@ -881,7 +893,7 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 
 def cmd_access_token(scope: str) -> int:
-    """Print an explicitly requested owner token for an exposed listener."""
+    """Print an explicitly requested owner token for the local router."""
     token = router.admin_token() if scope == "admin" else router.api_token()
     print(token)
     return 0
@@ -1036,7 +1048,7 @@ def main(argv: list[str] | None = None) -> int:
     license_parser.add_argument("--json", action="store_true", dest="json_output", help="Machine-readable status (JSON)")
     access_token_parser = sub.add_parser(
         "access-token",
-        help="Print an owner-only token for a non-loopback listener",
+        help="Print an owner-only local router token",
     )
     access_token_parser.add_argument("scope", choices=["admin", "api"])
     sub.add_parser("install-pro", help="Install/upgrade to Ficelle Pro from a license key (detached helper; key via FICELLE_LICENSE_KEY)")

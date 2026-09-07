@@ -23,6 +23,9 @@ class FakeRouter:
     def load_runtime_config(self) -> dict[str, Any]:
         return {"providers": {"future_provider": {"enabled": True, "base_url": "https://example.invalid/v1"}}}
 
+    def api_token(self) -> str:
+        return "owner-api-token"
+
     def load_or_refresh_catalog(self, config: dict[str, Any]) -> dict[str, Any]:
         return {"generated_at": "2026-01-01T00:00:00Z", "models": []}
 
@@ -1086,6 +1089,15 @@ def test_execution_eligibility_covers_every_scope():
     )
     assert (shared["eligible"], shared["scope"]) == (False, "shared_account")
 
+    malformed_quota = synthetic_health.execution_eligibility(
+        _EligibilityRouter(cooldown=(True, "quota:quota_exhausted"), quota_keys={"provider:alpha"}),
+        _eligible_model(),
+        {"quota_cooldowns": {"provider:alpha": {"until": "not-a-number"}}},
+        None,
+        catalog_generation=generation,
+    )
+    assert (malformed_quota["eligible"], malformed_quota["scope"]) == (False, "quota_pool")
+
     model_cooled = eligibility(_EligibilityRouter(cooldown=(True, "timeout")), _eligible_model())
     assert (model_cooled["eligible"], model_cooled["scope"], model_cooled["reason"]) == (
         False, "model", "cooldown:timeout"
@@ -1836,6 +1848,14 @@ def test_service_preflight_accepts_a_service_running_the_harness_build(monkeypat
     assert ok is True
     assert evidence["build_match"] is True
     assert "build_diagnostic" not in evidence
+
+
+def test_service_inference_headers_always_use_the_owner_api_token() -> None:
+    router = SimpleNamespace(api_token=lambda: "owner-api-token")
+
+    assert synthetic_health._service_inference_headers(router) == {
+        "Authorization": "Bearer owner-api-token"
+    }
 
 
 def test_service_preflight_fails_closed_on_build_mismatch(monkeypatch: Any) -> None:

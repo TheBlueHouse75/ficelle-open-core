@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import plistlib
 import re
@@ -897,7 +898,17 @@ def _matching_quota_cooldown_key(router: Any, model: dict[str, Any], state: dict
                 continue
         except Exception:
             continue
-        if float(raw.get("until") or 0) > 0:
+        parser = getattr(router, "safe_float", None)
+        if callable(parser):
+            until = parser(raw.get("until"), 0.0)
+        else:
+            try:
+                until = float(raw.get("until") or 0)
+            except (TypeError, ValueError):
+                until = 0.0
+            if not math.isfinite(until):
+                until = 0.0
+        if until > 0:
             return str(key)
     return None
 
@@ -3611,10 +3622,8 @@ def _base_url(config: dict[str, Any]) -> str:
     return connectable_http_url(config.get("host"), port_number, "/v1")
 
 
-def _service_request_headers(router: Any, config: dict[str, Any]) -> dict[str, str]:
-    configured_host = str(config.get("host") or "127.0.0.1").strip().lower()
-    loopback_hosts = set(getattr(router, "LOOPBACK_BIND_HOSTS", {"127.0.0.1", "localhost", "::1"}))
-    return {} if configured_host in loopback_hosts else {"Authorization": f"Bearer {router.api_token()}"}
+def _service_inference_headers(router: Any) -> dict[str, str]:
+    return {"Authorization": f"Bearer {router.api_token()}"}
 
 
 def _run_public_result(summary: dict[str, Any]) -> dict[str, Any]:
@@ -3761,7 +3770,6 @@ def _finalize_run(
     try:
         _, end_evidence = _service_preflight(
             str(metadata.get("service_base_url") or _base_url(router.load_runtime_config())),
-            headers=_service_request_headers(router, router.load_runtime_config()),
         )
         after = end_evidence.get("service_build_identity")
         before = metadata.get("service_build_identity")
@@ -3799,7 +3807,7 @@ def _run_cases(
 ) -> dict[str, Any]:
     outcomes = latest_case_outcomes(paths.cases)
     base_url = _base_url(config)
-    request_headers = _service_request_headers(router, config)
+    request_headers = _service_inference_headers(router)
     client = LoopbackChatClient(base_url, headers=request_headers)
     deadline = time.monotonic() + max_duration_seconds if max_duration_seconds and max_duration_seconds > 0 else None
     last_source_at: dict[str, float] = {}
@@ -3874,7 +3882,7 @@ def _run_cases(
         append_jsonl(paths.cases, _planned_row(str(metadata["run_id"]), case))
         try:
             if case.validator == "service-preflight":
-                ok, evidence = _service_preflight(base_url, headers=request_headers)
+                ok, evidence = _service_preflight(base_url)
                 outcome = _preflight_outcome(case, ok, evidence)
                 # Record what the service said it was running next to the harness's own
                 # build_identity — the pair is what makes a contaminated rerun readable.

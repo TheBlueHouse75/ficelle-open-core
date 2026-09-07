@@ -41,7 +41,12 @@ def imported_modules(path: Path) -> list[str]:
 def test_openclaw_target_adapter_exports_experimental_config_without_rewriting_core_ids():
     adapter = OpenClawTargetAdapter(virtual_models=CANONICAL_MODELS)
 
-    export = adapter.export_config(TargetExportContext(config={"host": "127.0.0.7", "port": "8700"}))
+    export = adapter.export_config(
+        TargetExportContext(
+            config={"host": "127.0.0.7", "port": "8700"},
+            api_token="owner-api-token",
+        )
+    )
 
     assert export.target_id == "openclaw"
     assert export.base_url == "http://127.0.0.7:8700/v1"
@@ -50,7 +55,7 @@ def test_openclaw_target_adapter_exports_experimental_config_without_rewriting_c
     provider = export.config["models"]["providers"]["ficelle"]
     assert provider["baseUrl"] == "http://127.0.0.7:8700/v1"
     assert provider["api"] == "openai-completions"
-    assert provider["apiKey"] == "ficelle-local"
+    assert provider["apiKey"] == "owner-api-token"
     provider_model_ids = [model["id"] for model in provider["models"]]
     assert provider_model_ids == list(CANONICAL_MODELS)
     for provider_model in provider["models"]:
@@ -66,7 +71,7 @@ def test_openclaw_target_adapter_exports_experimental_config_without_rewriting_c
     assert defaults["models"][openclaw_model_ref("ficelle", "ficelle/auto-fast")]["params"] == {
         "ficelleCoreModel": "ficelle/auto-fast"
     }
-    assert export.redaction_status == "no_secrets"
+    assert export.redaction_status == "contains_ficelle_access_token"
 
 
 def test_openclaw_custom_models_inherit_base_profile_capabilities():
@@ -80,7 +85,7 @@ def test_openclaw_custom_models_inherit_base_profile_capabilities():
         },
     )
 
-    export = adapter.export_config(TargetExportContext(config={}))
+    export = adapter.export_config(TargetExportContext(config={}, api_token="owner-api-token"))
 
     assert export.config is not None
     models = {
@@ -100,7 +105,7 @@ def test_openclaw_target_adapter_has_no_hermes_imports_or_plugin_assumptions():
     assert not any(module == forbidden or module.startswith(f"{forbidden}.") for module in modules for forbidden in forbidden_modules)
 
     adapter = OpenClawTargetAdapter(virtual_models=CANONICAL_MODELS)
-    export = adapter.export_config(TargetExportContext(config={}))
+    export = adapter.export_config(TargetExportContext(config={}, api_token="owner-api-token"))
     serialized = json.dumps(asdict(export), sort_keys=True).lower()
 
     assert "hermes" not in serialized
@@ -116,7 +121,12 @@ def test_openclaw_target_export_runs_with_ficelle_home_outside_hermes_home(tmp_p
     )
     adapter = OpenClawTargetAdapter(virtual_models=CANONICAL_MODELS)
 
-    export = adapter.export_config(TargetExportContext(config={"host": "localhost", "port": "8646"}))
+    export = adapter.export_config(
+        TargetExportContext(
+            config={"host": "localhost", "port": "8646"},
+            api_token="owner-api-token",
+        )
+    )
     serialized = json.dumps(asdict(export), sort_keys=True).lower()
 
     assert paths.ficelle_home == ficelle_home

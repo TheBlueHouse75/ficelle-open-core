@@ -5,7 +5,7 @@ import json
 from ficelle.failures import (
     ACCOUNT_RATE_LIMIT_TEXT_MARKERS,
     BENCHMARK_ROUTE_BLOCKING_REASONS,
-    CALLER_CAUSED_FAILURE_REASONS,
+    NO_MODEL_FAULT_FAILURE_REASONS,
     FALSE_FREE_PAYMENT_DEMAND_MARKERS,
     ERROR_CODE_STATUSES,
     FALSE_FREE_TEXT_MARKERS,
@@ -15,14 +15,19 @@ from ficelle.failures import (
     PROVIDER_ERROR_REASONS,
     PROVIDER_SCOPED_COOLDOWN_REASONS,
     SOURCE_DIVERTING_FAILURE_REASONS,
+    TERMINAL_ENDINGS,
     bad_request_body,
     build_upstream_failure_error,
     caller_rejected_request,
     classify_failure,
     cooldown_policy_for_reason,
+    exception_is_tls_failure,
+    model_not_found_body,
+    route_log_failure_status,
     safe_error_body,
     status_for_error_codes,
     upstream_failure_actions,
+    upstream_failure_status,
 )
 
 
@@ -100,8 +105,14 @@ def test_transient_failures_return_transient_reasons():
 
 
 def test_failure_reason_sets_match_routing_contracts():
-    assert PROVIDER_SCOPED_COOLDOWN_REASONS == {"rate_limited", "auth_or_credit"}
-    assert PROVIDER_ERROR_REASONS == {"rate_limited", "auth_or_credit", "quota_exhausted", "no_free_quota"}
+    assert PROVIDER_SCOPED_COOLDOWN_REASONS == {"rate_limited", "auth_or_credit", "tls_error"}
+    assert PROVIDER_ERROR_REASONS == {
+        "rate_limited",
+        "auth_or_credit",
+        "tls_error",
+        "quota_exhausted",
+        "no_free_quota",
+    }
     assert BENCHMARK_ROUTE_BLOCKING_REASONS == {
         "billing_or_paid",
         "no_free_quota",
@@ -619,9 +630,9 @@ def test_caller_caused_policies_record_the_failure_without_cooling():
     Recording still happens — `set_cooldown` runs `update_failure_stats` and
     `record_model_error_in_state` before consulting the policy — so a model that truncates on every
     request stays scored and visible instead of silently keeping a perfect record. Driven off the
-    set itself, so a fourth member added later cannot quietly skip the contract.
+    set itself, so a member added later cannot quietly skip the contract.
     """
-    for reason in sorted(CALLER_CAUSED_FAILURE_REASONS):
+    for reason in sorted(NO_MODEL_FAULT_FAILURE_REASONS):
         policy = cooldown_policy_for_reason(reason, source="nous")
 
         assert policy.model_cooldown is False, reason
@@ -660,6 +671,124 @@ def test_a_wholly_rejected_request_answers_with_the_upstream_message():
     assert mixed_error["message"].startswith("all Ficelle candidates failed")
 
 
+def test_a_restart_names_itself_in_both_the_status_and_the_payload():
+    """The run's ending is carried, not re-derived, and the two halves cannot drift.
+
+    The row that records the abandonment is `attempted: False`, so every scan over the error list
+    skips it: the status was 502 `upstream_failure` for a run whose route log already said
+    `service_restarting`, blaming a pool that was never asked.
+    """
+    errors = [
+        {"model": "ficelle/nous/a", "reason": "server_error", "status": 503},
+        {"model": "ficelle/groq/b", "reason": "service_restarting", "attempted": False},
+    ]
+
+    assert upstream_failure_status(errors) == 502
+    assert upstream_failure_status(errors, terminal_reason="service_restarting") == 503
+
+    error = build_upstream_failure_error(
+        "ficelle/auto-fast", "req-stop", 2, [{"model": "x"}], errors, "service_restarting"
+    )["error"]
+    assert error["type"] == "service_restarting"
+    assert error["message"].startswith("Ficelle stopped taking new fallback attempts")
+    assert any("service restart or update" in action for action in error["actions"])
+
+    # Ficelle's own deadline deliberately does not restate the status: the attempted failures are
+    # what the caller needs to see, and a 504 over them would hide the 503 that actually happened.
+    assert upstream_failure_status(errors, terminal_reason="request_deadline_exceeded") == 502
+
+
+def test_the_restart_does_not_outrank_what_was_wrong_with_the_request():
+    """A SIGTERM changes when the run stopped, never what the caller sent.
+
+    Every attempt said the upstream refused the body itself, so the truthful answer is that 400
+    with the provider's own words — a 503 would tell the client to retry a request that will be
+    rejected identically every time.
+    """
+    errors = [
+        {"model": "ficelle/nous/a", "reason": "bad_upstream_request", "status": 400, "detail": "bad tool_call"},
+        {"model": "ficelle/groq/b", "reason": "service_restarting", "attempted": False},
+    ]
+
+    assert upstream_failure_status(errors, terminal_reason="service_restarting") == 400
+
+    error = build_upstream_failure_error(
+        "ficelle/auto-fast", "req-stop", 2, [{"model": "x"}], errors, "service_restarting"
+    )["error"]
+    assert error["type"] == "invalid_request_error"
+    assert "bad tool_call" in error["message"]
+
+
+def test_a_dead_caller_is_logged_with_a_status_nobody_was_sent():
+    """`client_disconnected` writes no body at all, so the row must not claim a status.
+
+    The route log used to carry the 502/504/429 the run would have answered, which reads on the
+    Requests page as a failure the client saw. 499 says what happened: the caller closed first.
+    """
+    errors = [
+        {"model": "ficelle/nous/a", "reason": "timeout", "status": "timeout"},
+        {"model": "ficelle/groq/b", "reason": "client_disconnected", "attempted": False},
+    ]
+
+    assert upstream_failure_status(errors, terminal_reason="client_disconnected") == 504
+    assert route_log_failure_status(errors, terminal_reason="client_disconnected") == 499
+    # Every other ending is shown with the status the client actually received.
+    assert route_log_failure_status(errors, terminal_reason="service_restarting") == 503
+    assert route_log_failure_status(errors, terminal_reason="request_deadline_exceeded") == 504
+    assert not TERMINAL_ENDINGS["client_disconnected"].writes_body
+
+
+def test_redaction_bounds_its_input_before_the_patterns_run(monkeypatch):
+    """A provider body cannot hand the redaction regexes an unbounded string.
+
+    Every input here is provider- or client-controlled and the seven patterns scan whatever they
+    are given, for a value that is then cut to a couple of hundred characters. The bound lives in
+    `redact_sensitive_text` so it holds for every caller, not only the one that remembered it.
+    """
+    from ficelle import redaction
+
+    # The real patterns still redact what is inside the bound.
+    assert redaction.sanitize_error_detail("boom Authorization: Bearer abc123def", 180) == (
+        "boom [redacted]"
+    )
+
+    seen: list[int] = []
+
+    class RecordingPattern:
+        def sub(self, _replacement, text):
+            seen.append(len(text))
+            return text
+
+    monkeypatch.setattr(redaction, "SENSITIVE_ERROR_PATTERNS", [RecordingPattern()])
+    detail = redaction.sanitize_error_detail("x" * 200_000, 180)
+
+    assert seen == [redaction.REDACTION_INPUT_LIMIT]
+    assert len(detail) == 180
+
+
+def test_a_tls_failure_is_recognized_through_its_wrappers():
+    """A handshake failure reaches the router wrapped in whatever the layer above made of it."""
+
+    class SSLFakeError(Exception):
+        pass
+
+    assert exception_is_tls_failure(SSLFakeError("certificate verify failed"))
+    assert exception_is_tls_failure(ConnectionError("wrapped", SSLFakeError("certificate verify failed")))
+    assert not exception_is_tls_failure(ConnectionError("connection refused"))
+
+
+def test_model_not_found_body_is_one_wording_for_every_route():
+    """The lookup route and the chat refusal state the same fact, so they state it identically."""
+    body = model_not_found_body("ficelle/does-not-exist")
+
+    assert body == {
+        "error": {
+            "message": "model ficelle/does-not-exist is not served by this Ficelle",
+            "type": "model_not_found",
+        }
+    }
+
+
 def test_caller_rejected_request_needs_every_attempt_to_agree():
     assert caller_rejected_request([{"reason": "bad_upstream_request"}]) is True
     assert caller_rejected_request([{"reason": "bad_upstream_request"}, {"reason": "rate_limited"}]) is False
@@ -668,7 +797,7 @@ def test_caller_rejected_request_needs_every_attempt_to_agree():
     assert caller_rejected_request([]) is False
 
 
-def test_caller_caused_failures_are_the_only_ones_exempt_from_the_streak():
+def test_no_model_fault_failures_are_the_only_ones_exempt_from_the_streak():
     """The consecutive-failure streak is reserved for what the model is answerable for.
 
     Its penalty is cumulative (12 points each), so counting a caller's too-small max_tokens, its
@@ -678,16 +807,23 @@ def test_caller_caused_failures_are_the_only_ones_exempt_from_the_streak():
 
     `bad_upstream_contract` is the one member no caller caused: the exemption is there because the
     turn that fails is the one Ficelle learns the model's trace on, and the next one succeeds.
-    Cooling or demoting a model over it would bench a working candidate for being fixed.
+    Cooling or demoting a model over it would bench a working candidate for being fixed. The
+    deadline is Ficelle's own doing, which is why the set is named for the absence of a model fault
+    rather than for the caller: on a deadline the earlier attempts are what spent the budget.
     """
-    assert CALLER_CAUSED_FAILURE_REASONS == {
+    assert NO_MODEL_FAULT_FAILURE_REASONS == {
         "truncated_before_content",
         "bad_upstream_request",
         "bad_upstream_contract",
         "client_disconnected",
+        "request_deadline_exceeded",
     }
+    # `service_restarting` is not a member and needs no exemption: the loop records it as
+    # `attempted: False` and breaks, so it never reaches a cooldown or a scoring streak. What it
+    # does mean lives in `TERMINAL_ENDINGS`.
+    assert "service_restarting" not in NO_MODEL_FAULT_FAILURE_REASONS
     for upstream_fault in ("unavailable", "server_error", "timeout", "empty_assistant_message"):
-        assert upstream_fault not in CALLER_CAUSED_FAILURE_REASONS
+        assert upstream_fault not in NO_MODEL_FAULT_FAILURE_REASONS
 
 
 def test_provider_scoped_policy_uses_the_provider_cooldown_as_sole_blocking_scope():

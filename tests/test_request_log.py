@@ -90,6 +90,114 @@ def test_ingestion_is_idempotent(paths):
     assert _count(db) == 3
 
 
+def test_quality_feedback_attribution_uses_exact_request_id_and_only_final_successes(paths):
+    log, db = paths
+    now = time.time()
+    _write(
+        log,
+        [
+            _line("request-good", now=now),
+            _line("request-failed", now=now, final_status=502, final_reason="upstream_failure"),
+            _line("request-unattributed", now=now, selected_source=None, selected_upstream=None, selected_model=None),
+        ],
+    )
+
+    attributed = rl.resolve_quality_feedback_attribution(
+        "request-good",
+        store_path=db,
+        source_path=log,
+        now=now,
+    )
+
+    assert attributed == {
+        "profile": "ficelle/auto-orchestrator",
+        "source": "openrouter",
+        "upstream_id": "google/gemma",
+        "model_id": "ficelle/openrouter/gemma:free",
+        "timestamp": pytest.approx(now),
+    }
+    # This is deliberately not a list-filter search: wildcard-looking input remains a literal
+    # request id and cannot attribute a neighboring route.
+    assert rl.resolve_quality_feedback_attribution("request-%", store_path=db, source_path=log, now=now) is None
+    assert rl.resolve_quality_feedback_attribution("request-failed", store_path=db, source_path=log, now=now) is None
+    assert rl.resolve_quality_feedback_attribution("request-unattributed", store_path=db, source_path=log, now=now) is None
+
+
+def test_delivery_update_corrects_a_logged_success_without_rewriting_history(paths):
+    log, db = paths
+    now = time.time()
+    _write(
+        log,
+        [
+            _line("r1", now=now),
+            {
+                "event": "request_delivery_update",
+                "request_id": "r1",
+                "final_reason": "client_disconnected",
+                "error_type": "BrokenPipeError",
+                "logged_at": _iso(now),
+            },
+        ],
+    )
+
+    row = rl.query(store_path=db, source_path=log)[0]
+    totals = rl.summary(store_path=db, source_path=log, now=now)
+
+    assert row["status"] == 200
+    assert row["reason"] == "client_disconnected"
+    assert row["error_type"] == "BrokenPipeError"
+    assert totals["total"] == 1
+    assert totals["ok"] == 0
+
+
+def test_live_tail_requests_a_resync_after_a_delivery_update(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [_line("r1", now=now)])
+    cursor = rl.tail(store_path=db, source_path=log)["cursor"]
+    _write(
+        log,
+        [
+            {
+                "event": "request_delivery_update",
+                "request_id": "r1",
+                "final_reason": "client_disconnected",
+                "error_type": "ConnectionResetError",
+                "logged_at": _iso(now),
+            }
+        ],
+    )
+
+    update = rl.tail(cursor=cursor, store_path=db, source_path=log)
+
+    assert update == {"cursor": cursor + 1, "entries": [], "resync": True}
+
+
+def test_live_tail_keeps_delivery_resync_after_another_read_ingested_it(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [_line("r1", now=now)])
+    cursor = rl.tail(store_path=db, source_path=log)["cursor"]
+    _write(
+        log,
+        [
+            {
+                "event": "request_delivery_update",
+                "request_id": "r1",
+                "final_reason": "client_disconnected",
+                "error_type": "BrokenPipeError",
+                "logged_at": _iso(now),
+            }
+        ],
+    )
+
+    # Summary polling can win the ingestion race with the Requests SSE subscriber.
+    rl.summary(store_path=db, source_path=log, now=now)
+    update = rl.tail(cursor=cursor, store_path=db, source_path=log)
+
+    assert update == {"cursor": cursor + 1, "entries": [], "resync": True}
+
+
 def test_partial_trailing_line_is_not_ingested_until_complete(paths):
     log, db = paths
     now = time.time()
@@ -457,6 +565,43 @@ def test_only_whitelisted_fields_are_stored(paths):
                                     conn.execute("SELECT * FROM requests LIMIT 1").fetchone()))])
     assert "prompt" not in cols and "messages" not in cols and "authorization" not in cols
     assert "SECRET" not in dump and "SECRETTOKEN" not in dump and "SECRETHDR" not in dump
+
+
+def test_timeout_diagnostics_are_whitelisted_inside_attempts(paths):
+    log, db = paths
+    now = time.time()
+    _write(
+        log,
+        [
+            _line(
+                "r1",
+                now=now,
+                attempts=[
+                    {
+                        "model": "m",
+                        "reason": "request_deadline_exceeded",
+                        "read_timeout_seconds": 18.25,
+                        "connect_timeout_seconds": 5.0,
+                        "read_timeout_source": "request_deadline",
+                        "request_budget_remaining_seconds": 20.25,
+                        "timeout_phase": "response_headers",
+                    }
+                ],
+            )
+        ],
+    )
+
+    attempt = rl.query(store_path=db, source_path=log)[0]["attempts"][0]
+
+    assert attempt == {
+        "model": "m",
+        "reason": "request_deadline_exceeded",
+        "read_timeout_seconds": 18.25,
+        "connect_timeout_seconds": 5.0,
+        "read_timeout_source": "request_deadline",
+        "request_budget_remaining_seconds": 20.25,
+        "timeout_phase": "response_headers",
+    }
 
 
 def test_missing_source_file_is_safe(paths):

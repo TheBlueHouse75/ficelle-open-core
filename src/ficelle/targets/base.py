@@ -13,6 +13,7 @@ TargetKind = Literal["agent_host", "native_app", "control_plane", "generic_clien
 @dataclass(frozen=True)
 class TargetExportContext:
     config: Mapping[str, Any]
+    api_token: str | None = None
 
 
 @dataclass(frozen=True)

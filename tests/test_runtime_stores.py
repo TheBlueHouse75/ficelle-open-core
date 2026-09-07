@@ -19,6 +19,89 @@ def file_snapshot(path: Path) -> tuple[bytes, int, int]:
     return path.read_bytes(), stat.st_mode, stat.st_mtime_ns
 
 
+def test_runtime_state_merges_active_quality_feedback_slots_from_stale_writers(tmp_path):
+    store = StateStore(
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "state.lock",
+        backup_dir=tmp_path / "backups",
+    )
+    store.write(
+        {
+            "quality_feedback": {
+                "openrouter::google/gemma": {
+                    "ficelle/auto-orchestrator": {
+                        "event_slots": {
+                            "first": {
+                                "revision": 1,
+                                "outcome": "fail",
+                                "severity": "major",
+                                "reason": "invalid_json",
+                                "validator": "validator.one",
+                                "recorded_at": "2026-01-01T00:00:00+00:00",
+                                "expires_at": "2099-01-01T00:00:00+00:00",
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    )
+    stale = store.snapshot()
+    store.update(
+        lambda current: current["quality_feedback"]["openrouter::google/gemma"]["ficelle/auto-orchestrator"][
+            "event_slots"
+        ].update(
+            {
+                "first": {
+                    "revision": 2,
+                    "outcome": "pass",
+                    "severity": "none",
+                    "reason": "empty_output",
+                    "content": "corrected verdict",
+                    "validator": "validator.one.corrected",
+                    "recorded_at": "2026-01-02T00:00:00+00:00",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                },
+                "second": {
+                    "revision": 1,
+                    "outcome": "fail",
+                    "severity": "major",
+                    "reason": "invalid_json",
+                    "content": "new evidence",
+                    "validator": "validator.two",
+                    "recorded_at": "2026-01-03T00:00:00+00:00",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                },
+            }
+        )
+    )
+
+    store.write(stale)
+
+    slots = store.snapshot()["quality_feedback"]["openrouter::google/gemma"]["ficelle/auto-orchestrator"]["event_slots"]
+    assert set(slots) == {"first", "second"}
+    assert slots["first"] == {
+        "revision": 2,
+        "outcome": "pass",
+        "severity": "none",
+        "reason": "empty_output",
+        "content": "corrected verdict",
+        "validator": "validator.one.corrected",
+        "recorded_at": "2026-01-02T00:00:00+00:00",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+    }
+    assert slots["second"] == {
+        "revision": 1,
+        "outcome": "fail",
+        "severity": "major",
+        "reason": "invalid_json",
+        "content": "new evidence",
+        "validator": "validator.two",
+        "recorded_at": "2026-01-03T00:00:00+00:00",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+    }
+
+
 def test_runtime_paths_resolve_from_explicit_environment(tmp_path):
     hermes_home = tmp_path / "hermes"
     ficelle_home = tmp_path / "ficelle-home"

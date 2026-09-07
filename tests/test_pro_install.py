@@ -5,6 +5,9 @@ and pip are injected, so nothing hits the network or actually installs anything.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import os
 import sys
 import threading
@@ -14,10 +17,12 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from conftest import unreleasable_version
 
-from ficelle import pro_install
+from ficelle import artifact_integrity, pro_install
 from ficelle.install import CommandResult
 
 
@@ -60,6 +65,31 @@ def write_pro_wheel(path: Path, core_requirement: str | None = None) -> None:
             f"Requires-Dist: {requirement}\n"
             "Requires-Dist: cryptography>=42\n",
         )
+
+
+def signed_release_attestation(wheel: Path) -> tuple[dict[str, object], str]:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = base64.b64encode(
+        private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ).decode("ascii")
+    artifact = {
+        "distribution": "ficelle-pro",
+        "version": "0.1.3",
+        "core_version": pro_install.CORE_VERSION,
+        "filename": wheel.name,
+        "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        "size": wheel.stat().st_size,
+    }
+    unsigned = {
+        "schema_version": artifact_integrity.SCHEMA_VERSION,
+        "key_id": artifact_integrity.RELEASE_KEY_ID,
+        "artifact": artifact,
+    }
+    message = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        **unsigned,
+        "signature": base64.b64encode(private_key.sign(message)).decode("ascii"),
+    }, public_key
 
 
 class _FakeHeaders:
@@ -342,6 +372,7 @@ def test_install_pro_downloads_then_pips_that_wheel(monkeypatch) -> None:
         "verify_pro_core_compatibility",
         lambda wheel: None,
     )
+    monkeypatch.setenv("FICELLE_WHEEL_URL", "http://127.0.0.1:9/wheel")
     pro_install.install_pro("FICL-x", opener=opener, runner=runner)
     # Regression: the download used to be saved as the invalid "ficelle_pro-latest.whl", which pip
     # rejects ("Invalid wheel filename"); it must now be a valid wheel name.
@@ -349,8 +380,6 @@ def test_install_pro_downloads_then_pips_that_wheel(monkeypatch) -> None:
 
 
 def test_install_pro_verifies_pinned_checksum(monkeypatch) -> None:
-    import hashlib
-
     body = b"WHEEL-CONTENT"
     installed: list[list[str]] = []
 
@@ -384,6 +413,65 @@ def test_install_pro_verifies_pinned_checksum(monkeypatch) -> None:
     assert installed == []  # pip never ran on the tampered wheel
 
 
+def test_install_pro_requires_the_offline_signature_for_remote_wheels(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    write_pro_wheel(source)
+    wheel_bytes = source.read_bytes()
+    envelope, public_key = signed_release_attestation(source)
+    monkeypatch.setitem(
+        artifact_integrity.RELEASE_PUBLIC_KEYS,
+        artifact_integrity.RELEASE_KEY_ID,
+        public_key,
+    )
+    requested: list[str] = []
+    installed: list[list[str]] = []
+
+    def opener(request: object, timeout: float) -> _FakeResponse:
+        url = request.full_url  # type: ignore[attr-defined]
+        requested.append(url)
+        if url.endswith(".attestation"):
+            return _FakeResponse(json.dumps(envelope).encode())
+        return _FakeResponseWithHeaders(wheel_bytes, source.name)
+
+    pro_install.install_pro(
+        "FICL-x",
+        opener=opener,
+        runner=lambda command: installed.append(command) or 0,
+    )
+
+    assert requested == [
+        pro_install.DEFAULT_WHEEL_URL,
+        f"{pro_install.DEFAULT_WHEEL_URL}.attestation",
+    ]
+    assert len(installed) == 2
+
+
+def test_install_pro_refuses_a_remote_wheel_without_an_attestation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    write_pro_wheel(source)
+    wheel_bytes = source.read_bytes()
+    installed: list[list[str]] = []
+
+    def opener(request: object, timeout: float) -> _FakeResponse:
+        if request.full_url.endswith(".attestation"):  # type: ignore[attr-defined]
+            raise OSError("missing")
+        return _FakeResponseWithHeaders(wheel_bytes, source.name)
+
+    with pytest.raises(pro_install.ProInstallError, match="attestation"):
+        pro_install.install_pro(
+            "FICL-x",
+            opener=opener,
+            runner=lambda command: installed.append(command) or 0,
+        )
+    assert installed == []
+
+
 def test_pro_wheel_must_match_the_installed_core(tmp_path: Path) -> None:
     compatible = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
     write_pro_wheel(compatible)
@@ -413,6 +501,7 @@ def test_pro_wheel_url_honors_env_override(monkeypatch) -> None:
     assert pro_install.pro_wheel_url() == pro_install.DEFAULT_WHEEL_URL
     monkeypatch.setenv("FICELLE_WHEEL_URL", "http://127.0.0.1:9/wheel")
     assert pro_install.pro_wheel_url() == "http://127.0.0.1:9/wheel"
+    assert pro_install.pro_attestation_url() == "http://127.0.0.1:9/wheel.attestation"
 
 
 def test_install_pro_cli_reads_env_key_then_restarts(monkeypatch) -> None:

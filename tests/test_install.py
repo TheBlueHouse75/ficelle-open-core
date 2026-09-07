@@ -12,6 +12,7 @@ import pytest
 from ficelle.install import (
     MANAGED_CONFIG_BEGIN,
     CommandResult,
+    HermesPluginConflictError,
     InstallOptions,
     backup_existing_path,
     build_parser,
@@ -27,6 +28,7 @@ from ficelle.install import (
     ensure_hermes_plugin_enabled,
     expose_cli_scripts,
     hermes_plugin_install_specs,
+    hermes_connector_metadata,
     install_plugins,
     PROVIDER_PLUGIN_ENV_KEY,
     PROVIDER_PLUGIN_ENV_PLACEHOLDER,
@@ -73,14 +75,13 @@ def make_options(tmp_path, **overrides):
 
 
 def _register_test_hermes_connector(options: InstallOptions) -> None:
-    from ficelle.install import hermes_connector_metadata
     from ficelle.router import parse_env_file
 
     config_existed = (options.hermes_home / "config.yaml").exists()
     env_path = options.hermes_home / ".env"
     env_file_existed = env_path.exists()
     env_key_existed = bool(parse_env_file(env_path).get(PROVIDER_PLUGIN_ENV_KEY))
-    install_plugins(options)
+    plugin_ownership = install_plugins(options)
     configure_hermes(options)
     register_connector(
         options.ficelle_home,
@@ -91,6 +92,7 @@ def _register_test_hermes_connector(options: InstallOptions) -> None:
             config_existed=config_existed,
             env_file_existed=env_file_existed,
             env_key_existed=env_key_existed,
+            plugin_ownership=plugin_ownership,
         ),
     )
 
@@ -308,6 +310,68 @@ def test_run_install_passes_hermes_home_to_service_and_smokes(monkeypatch, tmp_p
     assert all(ficelle_home == str(tmp_path / ".ficelle") for _command, _hermes_home, ficelle_home in calls)
 
 
+def test_run_install_checks_core_health_before_mutating_hermes(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+    connector_mutations: list[str] = []
+    monkeypatch.setattr("ficelle.install.run_preflight", lambda options, target=None: None)
+    monkeypatch.setattr("ficelle.install.ensure_dedicated_keychain", lambda options: None)
+    monkeypatch.setattr(
+        "ficelle.install.install_plugins",
+        lambda options, runtime_dir=None: connector_mutations.append("plugins") or {},
+    )
+    monkeypatch.setattr(
+        "ficelle.install.configure_hermes",
+        lambda options, runtime_dir=None: connector_mutations.append("config"),
+    )
+
+    def fake_run(command, *, dry_run, env=None):
+        calls.append(command)
+        if command[-1] == "health":
+            return CommandResult(command, 17)
+        return CommandResult(command, 0, stdout='{"auth": {}}\n')
+
+    monkeypatch.setattr("ficelle.install.run_command", fake_run)
+    options = make_options(
+        tmp_path,
+        dry_run=False,
+        skip_package=True,
+        skip_service=True,
+    )
+
+    with pytest.raises(SystemExit) as error:
+        run_install(options)
+
+    assert error.value.code == 17
+    assert calls == [
+        ["/usr/bin/python3", "-m", "ficelle.cli", "doctor", "--json"],
+        ["/usr/bin/python3", "-m", "ficelle.cli", "health"],
+    ]
+    assert connector_mutations == []
+    assert not options.hermes_home.exists()
+
+
+def test_run_install_rejects_smoke_skip_before_connector_mutation(monkeypatch, tmp_path):
+    mutations: list[str] = []
+    monkeypatch.setattr("ficelle.install.run_preflight", lambda options, target=None: None)
+    monkeypatch.setattr(
+        "ficelle.install.ensure_dedicated_keychain",
+        lambda options: mutations.append("keychain"),
+    )
+    options = make_options(
+        tmp_path,
+        dry_run=False,
+        skip_package=True,
+        skip_service=True,
+        skip_smoke=True,
+    )
+
+    with pytest.raises(SystemExit, match="Core must pass doctor, health, and models first"):
+        run_install(options)
+
+    assert mutations == []
+    assert not options.hermes_home.exists()
+
+
 def test_run_install_stops_on_failed_command(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr("ficelle.install.run_preflight", lambda options, target=None: None)
@@ -348,7 +412,14 @@ def test_run_install_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_path)
         "ficelle.install.active_home_pointer_path",
         lambda: tmp_path / ".config" / "ficelle" / "active-home",
     )
-    options = make_options(tmp_path, skip_plugin=True, skip_service=True, skip_smoke=True, editable=False)
+    options = make_options(
+        tmp_path,
+        target="generic",
+        skip_plugin=True,
+        skip_service=True,
+        skip_smoke=True,
+        editable=False,
+    )
 
     assert run_install(options) == 0
     assert calls == [
@@ -1295,23 +1366,120 @@ def test_plugin_reinstall_repairs_directory_in_place_of_packaged_file(tmp_path):
 from ficelle.router import parse_env_file
 
 
-def _install_plugins_into(tmp_path, monkeypatch, **overrides):
-    """Run install_plugins() against throwaway plugin sources, return the options."""
+def _test_plugin_sources(tmp_path, monkeypatch):
     provider_source = tmp_path / "provider-source"
     compression_source = tmp_path / "compression-source"
     for source in (provider_source, compression_source):
         source.mkdir()
-        (source / "__init__.py").write_text(source.name)
-        (source / "plugin.yaml").write_text(f"name: {source.name}\n")
+        (source / "__init__.py").write_text(source.name, encoding="utf-8")
+        (source / "plugin.yaml").write_text(
+            f"name: {source.name}\nversion: 2.0.0\n",
+            encoding="utf-8",
+        )
     monkeypatch.setattr("ficelle.install.packaged_plugin_dir", lambda: provider_source)
     monkeypatch.setattr(
         "ficelle.install.packaged_compression_plugin_dir",
         lambda: compression_source,
     )
+    return provider_source, compression_source
+
+
+def _install_plugins_into(tmp_path, monkeypatch, **overrides):
+    """Run install_plugins() against throwaway plugin sources, return the options."""
+    _test_plugin_sources(tmp_path, monkeypatch)
     overrides.setdefault("dry_run", False)
     options = make_options(tmp_path, target="hermes", **overrides)
     install_plugins(options)
     return options
+
+
+def test_install_plugins_preserves_catalog_owned_assets_and_records_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    provider_source, compression_source = _test_plugin_sources(tmp_path, monkeypatch)
+    options = make_options(tmp_path, target="hermes", dry_run=False)
+    flat_provider = options.hermes_home / "plugins" / "ficelle"
+    flat_compression = options.hermes_home / "plugins" / "ficelle-compression"
+    for source, destination in (
+        (provider_source, flat_provider),
+        (compression_source, flat_compression),
+    ):
+        shutil.copytree(source, destination)
+        manifest = destination / "plugin.yaml"
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace("2.0.0", "1.0.0"),
+            encoding="utf-8",
+        )
+    (flat_provider / ".hermes-catalog.json").write_text(
+        '{"catalog_name":"ficelle","sha":"abc123"}\n',
+        encoding="utf-8",
+    )
+    (options.hermes_home / "plugins" / ".install-metadata.json").write_text(
+        '{"ficelle-compression":{"pinned":true,"revision":"abc123"}}\n',
+        encoding="utf-8",
+    )
+
+    plugin_ownership = install_plugins(options)
+    configure_hermes(options)
+    metadata = hermes_connector_metadata(
+        options,
+        config_existed=False,
+        env_file_existed=False,
+        env_key_existed=False,
+        plugin_ownership=plugin_ownership,
+    )
+    register_connector(
+        options.ficelle_home,
+        "hermes",
+        client_home=options.hermes_home,
+        metadata=metadata,
+    )
+
+    assert plugin_ownership == {
+        "plugins/ficelle": "hermes",
+        "plugins/model-providers/ficelle": "ficelle",
+        "plugins/ficelle-compression": "hermes",
+    }
+    assert set(metadata["plugin_sha256"]) == {"plugins/model-providers/ficelle"}
+    assert (flat_provider / ".hermes-catalog.json").exists()
+    assert "version: 1.0.0" in (flat_compression / "plugin.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    removed, _messages = remove_hermes_connector(options.ficelle_home)
+
+    assert removed is True
+    assert flat_provider.exists()
+    assert flat_compression.exists()
+    assert not (options.hermes_home / "plugins" / "model-providers" / "ficelle").exists()
+
+
+@pytest.mark.parametrize(
+    ("external_relative", "source_index"),
+    [
+        (Path("plugins/ficelle"), 0),
+        (Path("plugins/ficelle-compression"), 1),
+    ],
+)
+def test_install_plugins_rejects_incompatible_external_payload_before_mutation(
+    tmp_path,
+    monkeypatch,
+    external_relative,
+    source_index,
+):
+    sources = _test_plugin_sources(tmp_path, monkeypatch)
+    options = make_options(tmp_path, target="hermes", dry_run=False)
+    external_plugin = options.hermes_home / external_relative
+    shutil.copytree(sources[source_index], external_plugin)
+    (external_plugin / "__init__.py").write_text("stale runtime", encoding="utf-8")
+
+    with pytest.raises(HermesPluginConflictError, match="No Hermes files were changed"):
+        install_plugins(options)
+
+    assert (external_plugin / "__init__.py").read_text(encoding="utf-8") == "stale runtime"
+    assert not (options.hermes_home / "plugins" / "model-providers" / "ficelle").exists()
+    assert not (options.hermes_home / ".env").exists()
 
 
 def test_install_plugins_seeds_the_provider_plugin_env_key(tmp_path, monkeypatch):
@@ -1324,11 +1492,13 @@ def test_install_plugins_seeds_the_provider_plugin_env_key(tmp_path, monkeypatch
     options = _install_plugins_into(tmp_path, monkeypatch)
 
     env_values = parse_env_file(options.hermes_home / ".env")
-    assert env_values[PROVIDER_PLUGIN_ENV_KEY] == PROVIDER_PLUGIN_ENV_PLACEHOLDER
+    assert env_values[PROVIDER_PLUGIN_ENV_KEY] == (options.ficelle_home / "api-token").read_text(
+        encoding="utf-8"
+    )
 
 
-def test_install_plugins_keeps_an_existing_provider_plugin_env_key(tmp_path, monkeypatch):
-    """A value the user already chose must survive a reinstall."""
+def test_install_plugins_replaces_a_stale_provider_plugin_env_key(tmp_path, monkeypatch):
+    """A reinstall synchronizes a stale key that the hardened router would reject."""
     hermes_home = make_options(tmp_path, target="hermes").hermes_home
     hermes_home.mkdir(parents=True, exist_ok=True)
     env_path = hermes_home / ".env"
@@ -1337,7 +1507,9 @@ def test_install_plugins_keeps_an_existing_provider_plugin_env_key(tmp_path, mon
     options = _install_plugins_into(tmp_path, monkeypatch)
     assert options.hermes_home == hermes_home
 
-    assert parse_env_file(env_path)[PROVIDER_PLUGIN_ENV_KEY] == "chosen-by-user"
+    assert parse_env_file(env_path)[PROVIDER_PLUGIN_ENV_KEY] == (options.ficelle_home / "api-token").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_install_plugins_syncs_real_api_token_for_exposed_listener(tmp_path, monkeypatch):
@@ -1424,6 +1596,31 @@ def test_refresh_installed_hermes_integration_updates_managed_main_route(tmp_pat
     assert 'key_env: "FICELLE_API_KEY"' in config.read_text(encoding="utf-8")
     assert parse_env_file(hermes_home / ".env")[PROVIDER_PLUGIN_ENV_KEY] == "canonical-token"
     assert list(hermes_home.glob("config.yaml.backup-*"))
+
+
+def test_refresh_installed_hermes_integration_does_not_block_core_on_catalog_conflict(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from ficelle.install import refresh_installed_hermes_integration
+
+    provider_source, _compression_source = _test_plugin_sources(tmp_path, monkeypatch)
+    hermes_home = tmp_path / "hermes"
+    flat_provider = hermes_home / "plugins" / "ficelle"
+    shutil.copytree(provider_source, flat_provider)
+    (flat_provider / "__init__.py").write_text("stale runtime", encoding="utf-8")
+
+    refresh_installed_hermes_integration(
+        hermes_home,
+        tmp_path / "runtime",
+        tmp_path / "ficelle-home",
+    )
+
+    assert "Hermes connector refresh skipped" in capsys.readouterr().err
+    assert (flat_provider / "__init__.py").read_text(encoding="utf-8") == "stale runtime"
+    assert not (hermes_home / "plugins" / "model-providers" / "ficelle").exists()
+    assert not (hermes_home / ".env").exists()
 
 
 def test_install_plugins_dry_run_writes_no_provider_plugin_env_key(tmp_path, monkeypatch):
@@ -1533,6 +1730,17 @@ def test_rollback_restores_only_paths_with_backups(monkeypatch, tmp_path):
     for destination in destinations:
         destination.mkdir(parents=True)
         (destination / "plugin.yaml").write_text("name: preexisting\n")
+    register_connector(
+        options.ficelle_home,
+        "hermes",
+        client_home=options.hermes_home,
+        metadata={
+            "plugin_ownership": {
+                str(destination.relative_to(options.hermes_home)): "ficelle"
+                for destination in destinations
+            }
+        },
+    )
 
     install_plugins(options)
     assert rollback_last_hermes_install(options) is True

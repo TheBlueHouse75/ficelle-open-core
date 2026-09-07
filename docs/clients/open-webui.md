@@ -11,7 +11,7 @@ against a live install — please report deltas.
 In **Admin Panel → Settings → Connections → OpenAI API**, add a connection:
 
 - API Base URL: `http://127.0.0.1:8646/v1`
-- API Key: `ficelle-local` (any non-empty value)
+- API Key: the owner token returned by `ficelle access-token api`
 
 Save, then refresh the model list: the `ficelle/auto-*` profiles appear in the
 picker.
@@ -30,8 +30,8 @@ and Ficelle binds to the host's loopback only. Two working setups:
   `--add-host=host.docker.internal:host-gateway` does **not** work here: it maps
   the alias to the bridge gateway IP, an address a loopback-only bind never
   accepts. Binding Ficelle to a non-loopback address instead is possible but
-  changes its security posture (non-loopback listeners require the access-token
-  flow) — prefer `--network host`.
+  changes its security posture and transport exposure — prefer `--network host`.
+  Every listener still requires the same API token.
 
 ## Notes
 

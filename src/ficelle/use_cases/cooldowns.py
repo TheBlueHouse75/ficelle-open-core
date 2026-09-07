@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from ficelle.failures import (
-    CALLER_CAUSED_FAILURE_REASONS,
+    NO_MODEL_FAULT_FAILURE_REASONS,
     MODEL_NOT_SERVEABLE_NOTE,
     PROVIDER_SCOPED_COOLDOWN_REASONS,
     CooldownPolicy,
 )
+from ficelle.state_store import parse_iso_timestamp
 
 
 StateMutator = Callable[[dict[str, Any]], dict[str, Any] | None]
@@ -27,7 +29,8 @@ TRANSIENT_QUOTA_PROBE_BACKOFF_SECONDS = (60, 300, 900)
 @dataclass(frozen=True)
 class CooldownWritePorts:
     update_state: UpdateState
-    update_failure_stats: Callable[[dict[str, Any], dict[str, Any], str], None]
+    # `(state, model, reason, *, attempt_reason)` — the attempt reason keys the backoff window.
+    update_failure_stats: Callable[..., None]
     record_model_error_in_state: Callable[
         [dict[str, Any], dict[str, Any], str, str | None, int | str | None, str | None, str | None],
         None,
@@ -157,7 +160,7 @@ def quota_cooldown_matches_model(key: str, model: dict[str, Any], *, ports: Cool
 def provider_on_cooldown(source: str, state: dict[str, Any], *, ports: CooldownReadPorts) -> tuple[bool, str | None]:
     provider_cooldowns = state.get("provider_cooldowns") if isinstance(state.get("provider_cooldowns"), dict) else {}
     cd = (provider_cooldowns.get(str(source)) or {}) if isinstance(provider_cooldowns, dict) else {}
-    until = float(cd.get("until") or 0)
+    until = ports.safe_float(cd.get("until"), 0.0)
     if until > ports.now_seconds():
         return True, str(cd.get("reason") or "provider_cooldown")
     return False, None
@@ -192,7 +195,7 @@ def model_on_cooldown(model: dict[str, Any], state: dict[str, Any], *, ports: Co
         if until > 0:
             return True, "quota:quota_exhausted"
     cd = ((state.get("cooldowns") or {}).get(cooldown_key(model)) or {})
-    until = float(cd.get("until") or 0)
+    until = ports.safe_float(cd.get("until"), 0.0)
     if until > ports.now_seconds():
         return True, str(cd.get("reason") or "cooldown")
     return False, None
@@ -310,6 +313,22 @@ def set_model_not_found_quarantine_in_state(
 SCORE_DECAY_HALF_LIFE_SECONDS = 7 * 86_400
 
 
+def score_decay_factor(elapsed_seconds: float) -> float:
+    """The half-life weight an observation `elapsed_seconds` old still carries.
+
+    Shared with the read path (`success_rate_for_model`): the counters are aged when a new
+    observation is folded in AND again for the time since that write, so one clock and one curve
+    govern both and an idle model cannot keep a frozen rate for weeks.
+    """
+    try:
+        elapsed = float(elapsed_seconds)
+    except (TypeError, ValueError):
+        return 1.0
+    if elapsed <= 0:
+        return 1.0
+    return 0.5 ** (elapsed / SCORE_DECAY_HALF_LIFE_SECONDS)
+
+
 def _decay_scored_counters(record: dict[str, Any], now_epoch: float) -> None:
     """Age the scoring counters before folding in a new observation.
 
@@ -326,7 +345,7 @@ def _decay_scored_counters(record: dict[str, Any], now_epoch: float) -> None:
         except (TypeError, ValueError):
             elapsed = 0.0
         if elapsed > 0:
-            factor = 0.5 ** (elapsed / SCORE_DECAY_HALF_LIFE_SECONDS)
+            factor = score_decay_factor(elapsed)
             scored_successes *= factor
             scored_failures *= factor
     record["scored_successes"] = round(scored_successes, 6)
@@ -337,23 +356,282 @@ def _decay_scored_counters(record: dict[str, Any], now_epoch: float) -> None:
 def _safe_number(value: Any) -> float:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
-    return number if number > 0 else 0.0
+    return number if math.isfinite(number) and number > 0 else 0.0
 
 
-def _record_failure(record: dict[str, Any], reason: str, *, ports: CooldownStatsPorts) -> None:
+def _safe_timestamp(value: Any) -> float | None:
+    """Read a persisted timestamp without rejecting the Unix epoch itself."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+# How long two failures of the same kind still count as the same episode. Long enough to catch a
+# model failing on a request every half hour (`minimax-m3` timed out 31 times that way), short
+# enough that a model quiet for a working day starts its escalation over.
+COOLDOWN_BACKOFF_WINDOW_SECONDS = 6 * 3600
+# The escalation itself: base x 2^(k-1), capped at 4x the base and never above an hour, so a short
+# by-design cooldown (`request_too_large`, 120s) stays short and no reason can be silently turned
+# into a day-long block by repetition.
+COOLDOWN_BACKOFF_MAX_SECONDS = 3600
+
+# One memory of a model's failures: `failure_ledger` in its `state.stats` record, one row per
+# ATTEMPT reason. A row carries the `origin` of the failures accumulated since it was last
+# rebutted (`request` outranks `probe`), a `status`, a recency-weighted count (`weight`, aged on
+# the scored counters' half-life) and the count inside the current 6-hour episode (`episode`) —
+# two readings of the same failures at two horizons: the score asks how much a model has failed
+# lately, the escalation asks whether it is failing right now — and `last_at`. Three derivations
+# read it: `failure_penalty_weight` (the score), `recent_failure_reason_count` (the escalation) and
+# `_settle_ledger_on_success` (the rebuttal rule). It replaced `consecutive_failures` (a streak any
+# success zeroed, a 5-token probe included) and `recent_failure_reasons` (the repeat windows the
+# escalation read); why, and the evidence, are in docs/components/router.md § Candidate scoring.
+FAILURE_LEDGER_KEY = "failure_ledger"
+FAILURE_ORIGIN_REQUEST = "request"
+FAILURE_ORIGIN_PROBE = "probe"
+# `open`: the model still answers for these failures. `retest_due`: a probe answered since, which
+# proves the model responds, not that a real request would succeed, so the penalty collapses to
+# one failure's worth (enough to rank behind clean peers, not enough to stay buried) until a real
+# request closes it. `rebutted`: a success of the same standing answered; the row stays only as
+# escalation memory, because a model failing one request in two never lacks a success.
+LEDGER_STATUS_OPEN = "open"
+LEDGER_STATUS_RETEST_DUE = "retest_due"
+LEDGER_STATUS_REBUTTED = "rebutted"
+LEDGER_STATUSES = frozenset({LEDGER_STATUS_OPEN, LEDGER_STATUS_RETEST_DUE, LEDGER_STATUS_REBUTTED})
+# Rows per record. A model fails a handful of distinct ways and a row nothing reads any more is
+# dropped on the next write, so the cap only guards the state file against a pathological reason
+# vocabulary; when it bites, rebutted rows go first, then the lightest.
+FAILURE_LEDGER_MAX_ROWS = 12
+# Below this a row's recency-weighted count no longer says anything (about four half-lives).
+FAILURE_LEDGER_MIN_WEIGHT = 0.05
+# The score penalty per unit of open ledger weight, i.e. per recent failure the model has not
+# answered for. Unchanged from the streak it replaced.
+FAILURE_PENALTY_POINTS = 12.0
+
+
+def _ledger_row(origin: str, status: str, weight: float, last_at: float, episode: int) -> dict[str, Any]:
+    return {
+        "origin": FAILURE_ORIGIN_PROBE if origin == FAILURE_ORIGIN_PROBE else FAILURE_ORIGIN_REQUEST,
+        "status": status if status in LEDGER_STATUSES else LEDGER_STATUS_OPEN,
+        "weight": round(_safe_number(weight), 6),
+        "last_at": float(last_at),
+        "episode": max(1, int(episode)),
+    }
+
+
+def _decayed_weight(row: dict[str, Any], now_epoch: float) -> float:
+    return _safe_number(row.get("weight")) * score_decay_factor(now_epoch - _safe_number(row.get("last_at")))
+
+
+def _legacy_ledger_rows(record: dict[str, Any], now_epoch: float) -> dict[str, dict[str, Any]]:
+    """The ledger a pre-ledger record implies, so an existing install keeps its standing.
+
+    The reason windows become rebutted rows (they only ever fed the escalation, and their count
+    is the episode count), and a live streak becomes one open row under the last failure reason,
+    dated by `last_failure_at` when that parses and by now otherwise: the penalty it carried is
+    kept, not re-derived.
+    """
+    rows: dict[str, dict[str, Any]] = {}
+    windows = record.get("recent_failure_reasons")
+    if isinstance(windows, dict):
+        for name, raw in windows.items():
+            if not isinstance(raw, dict):
+                continue
+            count = _safe_number(raw.get("count"))
+            last_at = _safe_timestamp(raw.get("last_at"))
+            if count <= 0 or last_at is None:
+                continue
+            rows[str(name)] = _ledger_row(FAILURE_ORIGIN_REQUEST, LEDGER_STATUS_REBUTTED, count, last_at, int(count))
+    streak = int(_safe_number(record.get("consecutive_failures")))
+    if streak > 0:
+        reason = str(record.get("last_failure_reason") or "").strip() or "unknown"
+        last_at = parse_iso_timestamp(record.get("last_failure_at"))
+        if last_at is None:
+            last_at = now_epoch
+        previous = rows.get(reason)
+        weight = max(streak, previous["weight"] if previous else 0)
+        rows[reason] = _ledger_row(FAILURE_ORIGIN_REQUEST, LEDGER_STATUS_OPEN, weight, last_at, previous["episode"] if previous else 1)
+    return rows
+
+
+def failure_ledger(record: Any, now_epoch: float) -> dict[str, dict[str, Any]]:
+    """The record's ledger as read: normalized row copies, migrated from the pre-ledger fields when
+    the record has none, malformed rows dropped. Never raises on hand-edited or older state."""
+    if not isinstance(record, dict):
+        return {}
+    stored = record.get(FAILURE_LEDGER_KEY)
+    if not isinstance(stored, dict):
+        return _legacy_ledger_rows(record, now_epoch)
+    rows: dict[str, dict[str, Any]] = {}
+    for reason, raw in stored.items():
+        if not isinstance(raw, dict):
+            continue
+        weight = _safe_number(raw.get("weight"))
+        last_at = _safe_timestamp(raw.get("last_at"))
+        if weight <= 0 or last_at is None:
+            continue
+        rows[str(reason)] = _ledger_row(
+            str(raw.get("origin") or ""), str(raw.get("status") or ""), weight, last_at, int(_safe_number(raw.get("episode")))
+        )
+    return rows
+
+
+def _write_ledger(record: dict[str, Any], rows: dict[str, dict[str, Any]], now_epoch: float) -> None:
+    kept: dict[str, dict[str, Any]] = {}
+    for reason, row in rows.items():
+        if _decayed_weight(row, now_epoch) < FAILURE_LEDGER_MIN_WEIGHT:
+            continue
+        # Neither the penalty nor the escalation reads a rebutted row past the episode window.
+        if row["status"] == LEDGER_STATUS_REBUTTED and (now_epoch - row["last_at"]) > COOLDOWN_BACKOFF_WINDOW_SECONDS:
+            continue
+        kept[reason] = row
+    if len(kept) > FAILURE_LEDGER_MAX_ROWS:
+        ranked = sorted(
+            kept.items(),
+            key=lambda item: (item[1]["status"] != LEDGER_STATUS_REBUTTED, _decayed_weight(item[1], now_epoch)),
+        )
+        for reason, _row in ranked[: len(kept) - FAILURE_LEDGER_MAX_ROWS]:
+            kept.pop(reason)
+    if kept:
+        record[FAILURE_LEDGER_KEY] = kept
+    else:
+        record.pop(FAILURE_LEDGER_KEY, None)
+    # The fields the ledger replaced: dropped on the first write after an upgrade, so a record is
+    # migrated once and no reader can find a streak that disagrees with the ledger.
+    record.pop("consecutive_failures", None)
+    record.pop("recent_failure_reasons", None)
+
+
+def _record_ledger_failure(record: dict[str, Any], reason: str, origin: str, now_epoch: float) -> None:
+    rows = failure_ledger(record, now_epoch)
+    previous = rows.get(reason)
+    if previous is None:
+        rows[reason] = _ledger_row(origin, LEDGER_STATUS_OPEN, 1.0, now_epoch, 1)
+    else:
+        # The origin describes the failures since the last rebuttal: a rebutted row starts over
+        # with this failure's, and a request failure outranks a probe's because only a request
+        # success may rebut it.
+        if previous["status"] == LEDGER_STATUS_REBUTTED or origin == FAILURE_ORIGIN_REQUEST:
+            merged_origin = origin
+        else:
+            merged_origin = previous["origin"]
+        # A quiet working day ends the episode; the weight carries across it, aged.
+        same_episode = (now_epoch - previous["last_at"]) <= COOLDOWN_BACKOFF_WINDOW_SECONDS
+        rows[reason] = _ledger_row(
+            merged_origin,
+            LEDGER_STATUS_OPEN,
+            # A rebuttal keeps only the episode memory. Its failures no longer belong to the
+            # penalty, so a fresh failure starts that weight from one rather than reactivating it.
+            (0.0 if previous["status"] == LEDGER_STATUS_REBUTTED else _decayed_weight(previous, now_epoch)) + 1.0,
+            now_epoch,
+            previous["episode"] + 1 if same_episode else 1,
+        )
+    _write_ledger(record, rows, now_epoch)
+
+
+def _settle_ledger_on_success(record: dict[str, Any], origin: str, now_epoch: float) -> None:
+    """The rebuttal rule: a request success rebuts every row; a probe success rebuts the rows
+    probes wrote and only marks a request-origin row due for a re-test."""
+    rows = failure_ledger(record, now_epoch)
+    for row in rows.values():
+        if row["status"] == LEDGER_STATUS_REBUTTED:
+            continue
+        if origin == FAILURE_ORIGIN_REQUEST or row["origin"] == FAILURE_ORIGIN_PROBE:
+            row["status"] = LEDGER_STATUS_REBUTTED
+        else:
+            row["status"] = LEDGER_STATUS_RETEST_DUE
+    _write_ledger(record, rows, now_epoch)
+
+
+def _row_penalty_weight(row: dict[str, Any], now_epoch: float) -> float:
+    """What one row adds to the penalty: its aged weight while open, at most one failure's worth
+    once a probe has answered for it, nothing once rebutted."""
+    if row["status"] == LEDGER_STATUS_REBUTTED:
+        return 0.0
+    weight = _decayed_weight(row, now_epoch)
+    return min(weight, 1.0) if row["status"] == LEDGER_STATUS_RETEST_DUE else weight
+
+
+def failure_penalty_weight(record: Any, now_epoch: float) -> float:
+    """The recency-weighted count of failures this record still answers for; the score subtracts
+    `FAILURE_PENALTY_POINTS` per unit."""
+    return sum(_row_penalty_weight(row, now_epoch) for row in failure_ledger(record, now_epoch).values())
+
+
+def failure_ledger_summary(record: Any, now_epoch: float) -> dict[str, Any]:
+    """What the admin shows of the ledger, under the names the projection and dashboard use: the
+    penalty weight, the reasons still open, and whether a probe has already answered for some."""
+    open_reasons: dict[str, float] = {}
+    penalty = 0.0
+    retest_due = False
+    for reason, row in failure_ledger(record, now_epoch).items():
+        if row["status"] == LEDGER_STATUS_REBUTTED:
+            continue
+        open_reasons[reason] = round(_decayed_weight(row, now_epoch), 2)
+        retest_due = retest_due or row["status"] == LEDGER_STATUS_RETEST_DUE
+        penalty += _row_penalty_weight(row, now_epoch)
+    return {
+        "failure_penalty_weight": round(penalty, 2),
+        "open_failure_reasons": open_reasons,
+        "failure_retest_due": retest_due,
+    }
+
+
+def recent_failure_reason_count(record: Any, reason: str, now_epoch: float) -> int:
+    """How many times `reason` failed inside the current episode (0 when the episode is over).
+
+    A row whose last failure is older than the episode window counts for nothing — a quiet
+    working day starts the escalation over — and a success does not end an episode: the row
+    survives it as escalation memory, which is what the streak this replaced got wrong.
+    """
+    row = failure_ledger(record, now_epoch).get(reason)
+    if row is None or (now_epoch - row["last_at"]) > COOLDOWN_BACKOFF_WINDOW_SECONDS:
+        return 0
+    return row["episode"]
+
+
+def escalated_cooldown_seconds(base_seconds: int, repeats: int) -> int:
+    """`base x 2^(repeats-1)`, capped — the model-cooldown backoff.
+
+    The cooldown table is flat, so a model that times out every time it is picked was cooled for the
+    same 300s and returned to the pool for the next request, over and over. Escalation is driven by
+    the ledger's episode count, NOT by a streak: a streak is zeroed by the first success, which is
+    exactly what a model failing one request in two never lacks. Providers already escalate this
+    way for quota probes (`quota_probe_backoff_seconds`).
+    """
+    base = max(0, int(base_seconds))
+    if repeats <= 1 or base >= COOLDOWN_BACKOFF_MAX_SECONDS:
+        return base
+    # Two doublings at most (4x the base), and never above an hour.
+    return int(min(base * 2 ** min(repeats - 1, 2), COOLDOWN_BACKOFF_MAX_SECONDS))
+
+
+def _record_failure(
+    record: dict[str, Any],
+    reason: str,
+    *,
+    ports: CooldownStatsPorts,
+    attempt_reason: str = "",
+    origin: str = FAILURE_ORIGIN_REQUEST,
+) -> None:
+    now_epoch = ports.now_epoch()
     record["requests"] = ports.safe_int(record.get("requests"), 0) + 1
     record["failures"] = ports.safe_int(record.get("failures"), 0) + 1
-    _decay_scored_counters(record, ports.now_epoch())
-    if reason not in CALLER_CAUSED_FAILURE_REASONS:
-        # A caller's own bad request is visible in the lifetime totals but must not drag the
-        # score, the same exemption the consecutive-failure streak already makes.
+    _decay_scored_counters(record, now_epoch)
+    # A failure the model is not answerable for — a caller's own bad request, Ficelle's own deadline
+    # or restart — stays visible in the lifetime totals but must drag neither the score nor the
+    # ledger: none of these reasons cools, so there is no escalation to feed either. See
+    # NO_MODEL_FAULT_FAILURE_REASONS.
+    if reason not in NO_MODEL_FAULT_FAILURE_REASONS:
         record["scored_failures"] = round(_safe_number(record.get("scored_failures")) + 1.0, 6)
-    # The streak drives a cumulative score penalty and the selection tie-break, so it stays reserved
-    # for failures the model is answerable for. See CALLER_CAUSED_FAILURE_REASONS.
-    if reason not in CALLER_CAUSED_FAILURE_REASONS:
-        record["consecutive_failures"] = ports.safe_int(record.get("consecutive_failures"), 0) + 1
+        # The ledger row is keyed on the ATTEMPT reason when the caller observed one. Several
+        # distinct endings share one cooldown reason — an empty assistant message, a bad
+        # `finish_reason` and a transport exception all cool as `unavailable` — and counting them
+        # together escalated each other's block on evidence about none of them.
+        _record_ledger_failure(record, attempt_reason or reason, origin, now_epoch)
     record["last_failure_at"] = ports.now_iso()
     record["last_failure_reason"] = reason
     reasons = record.setdefault("failure_reasons", {})
@@ -373,14 +651,15 @@ def _record_success(
     latency_seconds: float,
     *,
     ports: CooldownStatsPorts,
-    representative_latency: bool = True,
+    origin: str = FAILURE_ORIGIN_REQUEST,
 ) -> None:
+    now_epoch = ports.now_epoch()
     record["requests"] = ports.safe_int(record.get("requests"), 0) + 1
     record["successes"] = ports.safe_int(record.get("successes"), 0) + 1
-    record["consecutive_failures"] = 0
-    _decay_scored_counters(record, ports.now_epoch())
+    _settle_ledger_on_success(record, origin, now_epoch)
+    _decay_scored_counters(record, now_epoch)
     record["scored_successes"] = round(_safe_number(record.get("scored_successes")) + 1.0, 6)
-    if representative_latency:
+    if origin == FAILURE_ORIGIN_REQUEST:
         record["latency_ewma"] = _latency_ewma(record.get("latency_ewma"), latency_seconds)
     else:
         # A capability probe asks for a handful of tokens, so its latency says nothing about how
@@ -391,11 +670,19 @@ def _record_success(
     record["last_success_at"] = ports.now_iso()
 
 
-def update_failure_stats(state: dict[str, Any], model: dict[str, Any], reason: str, *, ports: CooldownStatsPorts) -> None:
+def update_failure_stats(
+    state: dict[str, Any],
+    model: dict[str, Any],
+    reason: str,
+    *,
+    ports: CooldownStatsPorts,
+    attempt_reason: str = "",
+    origin: str = FAILURE_ORIGIN_REQUEST,
+) -> None:
     stats = state.setdefault("stats", {})
     key = ports.cooldown_key(model)
     record = stats.setdefault(key, {})
-    _record_failure(record, reason, ports=ports)
+    _record_failure(record, reason, ports=ports, attempt_reason=attempt_reason, origin=origin)
 
 
 def update_success_stats(
@@ -404,12 +691,52 @@ def update_success_stats(
     latency_seconds: float,
     *,
     ports: CooldownStatsPorts,
-    representative_latency: bool = True,
+    origin: str = FAILURE_ORIGIN_REQUEST,
 ) -> None:
     stats = state.setdefault("stats", {})
     key = ports.cooldown_key(model)
     record = stats.setdefault(key, {})
-    _record_success(record, latency_seconds, ports=ports, representative_latency=representative_latency)
+    _record_success(record, latency_seconds, ports=ports, origin=origin)
+
+
+def completion_tokens_per_second(
+    completion_tokens: Any,
+    latency_seconds: Any,
+    first_byte_seconds: Any = None,
+) -> float | None:
+    """Generation throughput of one answered request, or None when it cannot be measured.
+
+    Wall-clock latency conflates queueing with generation: a model that waits 40s and then writes
+    900 tokens in 10s is not the same upstream as one that starts instantly and crawls, yet both
+    read as 50s. Subtracting time-to-first-byte isolates the part the model controls. Telemetry
+    only for now — nothing scores on it.
+    """
+    tokens = _safe_number(completion_tokens)
+    latency = _safe_number(latency_seconds)
+    if tokens <= 0 or latency <= 0:
+        return None
+    first_byte = _safe_number(first_byte_seconds)
+    generation = latency - first_byte if 0 < first_byte < latency else latency
+    if generation <= 0:
+        return None
+    return round(tokens / generation, 4)
+
+
+def update_throughput_stats(
+    state: dict[str, Any],
+    model: dict[str, Any],
+    tokens_per_second: float | None,
+    *,
+    ports: CooldownStatsPorts,
+) -> None:
+    """Fold one measured throughput into the per-upstream EWMA, if there is one to fold."""
+    if tokens_per_second is None or tokens_per_second <= 0:
+        return
+    stats = state.setdefault("stats", {})
+    record = stats.setdefault(ports.cooldown_key(model), {})
+    record["completion_tokens_per_second"] = round(
+        _latency_ewma(record.get("completion_tokens_per_second"), float(tokens_per_second)), 4
+    )
 
 
 def record_model_error_in_state(
@@ -657,21 +984,42 @@ def record_success_in_state(
     latency_seconds: float,
     *,
     ports: CooldownSuccessPorts,
-    representative_latency: bool = True,
+    origin: str = FAILURE_ORIGIN_REQUEST,
 ) -> None:
+    """Record a success, and — unless the caller is a probe — lift the blocks it disproves.
+
+    ``origin`` is the one fact a caller states about a success, because everything that follows
+    from being a probe follows together. A benchmark or discovery call is a few tokens on a
+    private body, so:
+
+    - it does not lift a route-blocking cooldown. A 300s `timeout` earned by an actual
+      600s-budget request was erased by the next auto-benchmark cycle seconds later, and the
+      model went straight back into the pool;
+    - its timing never reaches the latency EWMA that ranks models for real requests
+      (`probe_latency_ewma` instead);
+    - in the failure ledger it rebuts the failures probes wrote and only marks a request's
+      failure due for a re-test, where a request success rebuts everything
+      (`_settle_ledger_on_success`).
+
+    Everything else the success proves still applies — stats, scoring, the recorded
+    model/provider error, the quota block the probe genuinely re-tested, and the
+    `model_not_found` quarantine a served completion self-heals.
+    """
     key = ports.cooldown_key(model)
+    clear_cooldowns = origin == FAILURE_ORIGIN_REQUEST
+    source = str(model.get("source") or "").strip()
     successes = state.setdefault("successes", {})
     successes[key] = {
         "last_success_at": ports.now_iso(),
         "latency_seconds": latency_seconds,
     }
-    cooldowns = state.get("cooldowns")
-    if isinstance(cooldowns, dict):
-        cooldowns.pop(key, None)
-    provider_cooldowns = state.get("provider_cooldowns")
-    source = str(model.get("source") or "").strip()
-    if isinstance(provider_cooldowns, dict) and source:
-        provider_cooldowns.pop(source, None)
+    if clear_cooldowns:
+        cooldowns = state.get("cooldowns")
+        if isinstance(cooldowns, dict):
+            cooldowns.pop(key, None)
+        provider_cooldowns = state.get("provider_cooldowns")
+        if isinstance(provider_cooldowns, dict) and source:
+            provider_cooldowns.pop(source, None)
     quota_cooldowns = state.get("quota_cooldowns")
     if isinstance(quota_cooldowns, dict):
         for quota_key, raw in list(quota_cooldowns.items()):
@@ -688,7 +1036,7 @@ def record_success_in_state(
         if isinstance(row, dict) and str(row.get("reason") or "") == "model_not_found":
             quarantine.pop(key, None)
     ports.clear_model_error_in_state(state, model)
-    ports.update_success_stats(state, model, latency_seconds, representative_latency=representative_latency)
+    ports.update_success_stats(state, model, latency_seconds, origin=origin)
     if source:
         ports.update_provider_success_stats(state, source, latency_seconds)
 
@@ -739,6 +1087,116 @@ def prune_provider_scoped_model_cooldowns_in_state(state: dict[str, Any]) -> Non
             del cooldowns[key]
 
 
+def set_cooldown_in_state(
+    state: dict[str, Any],
+    model: dict[str, Any],
+    reason: str,
+    config: dict[str, Any],
+    *,
+    ports: CooldownWritePorts,
+    detail: str | None = None,
+    status: int | str | None = None,
+    request_id: str | None = None,
+    profile_id: str | None = None,
+    retry_after_seconds: int | None = None,
+    retry_after_source: str | None = None,
+    attempt_reason: str = "",
+    origin: str = FAILURE_ORIGIN_REQUEST,
+) -> AppliedCooldown:
+    """Apply the cooldown policy for this failure to `state`, and report what it blocked.
+
+    Separate from `set_cooldown` so a caller with more than one write to make for the same failure
+    can fold them into a single state cycle instead of taking the lock, parsing and rewriting the
+    whole state twice.
+    """
+    provider_source = ""
+    quota_key = ""
+    effective_config = config
+    # A provider that named a delay outranks Ficelle's own escalation: it knows when it will answer
+    # again, and doubling on top of it would only strand a model the provider offered back.
+    explicit_retry_after = retry_after_seconds is not None and retry_after_seconds > 0
+    if explicit_retry_after:
+        seconds = max(1, min(86_400, int(retry_after_seconds or 0)))
+        effective_config = {
+            **config,
+            "cooldown_seconds": {**(config.get("cooldown_seconds") or {}), reason: seconds},
+            "quota_probe_backoff_seconds": [seconds],
+        }
+        detail = f"retry after {seconds}s via {retry_after_source or 'provider'}; {detail or reason}"
+
+    # Every write converges the state toward the one-blocking-scope contract, so a
+    # legacy row cannot outlive the first cooldown written after an upgrade.
+    prune_provider_scoped_model_cooldowns_in_state(state)
+    ports.update_failure_stats(state, model, reason, attempt_reason=attempt_reason, origin=origin)
+    ports.record_model_error_in_state(state, model, reason, detail, status, request_id, profile_id)
+    source = str(model.get("source") or "").strip()
+    policy = ports.cooldown_policy_for_reason(reason, source)
+    if policy.record_provider_error:
+        ports.record_provider_error_in_state(state, model, reason, detail, status, request_id)
+    if policy.quota_cooldown:
+        quota_key = ports.set_quota_cooldown_in_state(state, model, effective_config, detail) or ""
+    if policy.provider_cooldown:
+        provider_source = ports.set_provider_cooldown_in_state(
+            state, policy.provider_cooldown_source, reason, effective_config, detail
+        ) or ""
+    quarantine = policy.quarantine
+    if quarantine and quarantine.reason == "billing_or_paid":
+        ports.set_billing_quarantine_in_state(
+            state,
+            model,
+            detail,
+            quarantine.source,
+            quarantine.fallback_note,
+        )
+    if quarantine and quarantine.reason == "no_free_quota":
+        ports.set_no_free_quota_quarantine_in_state(
+            state,
+            model,
+            detail,
+            quarantine.source,
+            quarantine.fallback_note,
+        )
+    if quarantine and quarantine.reason == "model_not_found":
+        ports.set_model_not_found_quarantine_in_state(
+            state,
+            model,
+            detail,
+            quarantine.source,
+            quarantine.fallback_note,
+        )
+    applied = AppliedCooldown(provider_source=provider_source, quota_key=quota_key)
+    if not policy.model_cooldown:
+        return applied
+    cooldowns = state.setdefault("cooldowns", {})
+    key = ports.cooldown_key(model)
+    seconds_map = effective_config.get("cooldown_seconds") or {}
+    base_seconds = int(seconds_map.get(reason) or seconds_map.get("unavailable") or 600)
+    now_ts = ports.now_seconds()
+    stats = state.get("stats") if isinstance(state.get("stats"), dict) else {}
+    # `update_failure_stats` above already wrote this failure to the ledger, so the episode count
+    # IS k. It is keyed on the ATTEMPT reason when there is one, so the escalation follows the
+    # failure the caller actually observed rather than the cooldown bucket several of them share.
+    repeats = (
+        0
+        if explicit_retry_after
+        else recent_failure_reason_count(stats.get(key), attempt_reason or reason, now_ts)
+    )
+    seconds = escalated_cooldown_seconds(base_seconds, repeats)
+    row: dict[str, Any] = {
+        "until": now_ts + seconds,
+        "reason": reason,
+        "detail": ports.safe_detail(detail),
+        "set_at": ports.now_iso(),
+    }
+    if seconds != base_seconds:
+        # Stated in the row so an operator reading state sees an escalation rather than a
+        # cooldown table that disagrees with the config.
+        row["base_seconds"] = base_seconds
+        row["reason_repeats"] = repeats
+    cooldowns[key] = row
+    return applied
+
+
 def set_cooldown(
     model: dict[str, Any],
     reason: str,
@@ -751,73 +1209,33 @@ def set_cooldown(
     profile_id: str | None = None,
     retry_after_seconds: int | None = None,
     retry_after_source: str | None = None,
+    attempt_reason: str = "",
+    origin: str = FAILURE_ORIGIN_REQUEST,
 ) -> AppliedCooldown:
-    """Write the cooldown policy for this failure, and report what it blocked beyond this model."""
-    provider_source = ""
-    quota_key = ""
-    effective_config = config
-    if retry_after_seconds is not None and retry_after_seconds > 0:
-        seconds = max(1, min(86_400, int(retry_after_seconds)))
-        effective_config = {
-            **config,
-            "cooldown_seconds": {**(config.get("cooldown_seconds") or {}), reason: seconds},
-            "quota_probe_backoff_seconds": [seconds],
-        }
-        detail = f"retry after {seconds}s via {retry_after_source or 'provider'}; {detail or reason}"
+    """Write the cooldown policy for this failure, and report what it blocked beyond this model.
+
+    `origin` is `"probe"` for a benchmark or discovery probe: its failure enters the ledger as one
+    a later probe success may rebut, while a request's failure waits for a request success.
+    """
+    applied = AppliedCooldown()
 
     def mutate(state: dict[str, Any]) -> None:
-        nonlocal provider_source, quota_key
-        # Every write converges the state toward the one-blocking-scope contract, so a
-        # legacy row cannot outlive the first cooldown written after an upgrade.
-        prune_provider_scoped_model_cooldowns_in_state(state)
-        ports.update_failure_stats(state, model, reason)
-        ports.record_model_error_in_state(state, model, reason, detail, status, request_id, profile_id)
-        source = str(model.get("source") or "").strip()
-        policy = ports.cooldown_policy_for_reason(reason, source)
-        if policy.record_provider_error:
-            ports.record_provider_error_in_state(state, model, reason, detail, status, request_id)
-        if policy.quota_cooldown:
-            quota_key = ports.set_quota_cooldown_in_state(state, model, effective_config, detail) or ""
-        if policy.provider_cooldown:
-            provider_source = ports.set_provider_cooldown_in_state(
-                state, policy.provider_cooldown_source, reason, effective_config, detail
-            ) or ""
-        quarantine = policy.quarantine
-        if quarantine and quarantine.reason == "billing_or_paid":
-            ports.set_billing_quarantine_in_state(
-                state,
-                model,
-                detail,
-                quarantine.source,
-                quarantine.fallback_note,
-            )
-        if quarantine and quarantine.reason == "no_free_quota":
-            ports.set_no_free_quota_quarantine_in_state(
-                state,
-                model,
-                detail,
-                quarantine.source,
-                quarantine.fallback_note,
-            )
-        if quarantine and quarantine.reason == "model_not_found":
-            ports.set_model_not_found_quarantine_in_state(
-                state,
-                model,
-                detail,
-                quarantine.source,
-                quarantine.fallback_note,
-            )
-        if not policy.model_cooldown:
-            return
-        cooldowns = state.setdefault("cooldowns", {})
-        seconds_map = effective_config.get("cooldown_seconds") or {}
-        seconds = int(seconds_map.get(reason) or seconds_map.get("unavailable") or 600)
-        cooldowns[ports.cooldown_key(model)] = {
-            "until": ports.now_seconds() + seconds,
-            "reason": reason,
-            "detail": ports.safe_detail(detail),
-            "set_at": ports.now_iso(),
-        }
+        nonlocal applied
+        applied = set_cooldown_in_state(
+            state,
+            model,
+            reason,
+            config,
+            ports=ports,
+            detail=detail,
+            status=status,
+            request_id=request_id,
+            profile_id=profile_id,
+            retry_after_seconds=retry_after_seconds,
+            retry_after_source=retry_after_source,
+            attempt_reason=attempt_reason,
+            origin=origin,
+        )
 
     ports.update_state(mutate, f"set_cooldown:{reason}")
-    return AppliedCooldown(provider_source=provider_source, quota_key=quota_key)
+    return applied

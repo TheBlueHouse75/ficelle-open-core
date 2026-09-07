@@ -32,22 +32,28 @@ except ImportError:  # pragma: no cover - exercised only in core-only installs
     put_original = None
 from ficelle.failures import (
     rejected_sampling_parameters,
-    CALLER_CAUSED_FAILURE_REASONS,
+    NO_MODEL_FAULT_FAILURE_REASONS,
     NON_RETRYABLE_FAILURE_REASONS,
     SOURCE_DIVERTING_FAILURE_REASONS,
+    TERMINAL_ENDINGS,
     UPSTREAM_DETAIL_LIMIT,
     caller_rejected_request,
+    exception_is_tls_failure,
+    first_exception_errno,
+    model_not_found_body,
     status_for_error_codes,
+    route_log_failure_status,
     upstream_failure_status,
     upstream_retry_after_seconds,
 )
 from ficelle.provider_admission import ProviderAdmissionRefused
+from ficelle.provider_credentials import ProviderCredentialsUnavailable
 from ficelle.coding_certification import CODING_PROFILE_ID
 from ficelle.domain_models import SelectionResult
 from ficelle.use_cases.cooldowns import AppliedCooldown
 from ficelle.redaction import redact_sensitive_json, sanitize_error_detail
 from ficelle.retry_hints import retry_hint
-from ficelle.use_cases.benchmark import finish_reason_is_truncation
+from ficelle.use_cases.benchmark import finish_reason_is_error, finish_reason_is_truncation
 
 
 DEFAULT_CHAT_COMPLETION_MODEL = "ficelle/auto-tools"
@@ -133,7 +139,11 @@ class ChatCompletionRouteTelemetry:
 
 @dataclass(frozen=True)
 class ChatCompletionAttemptRunResult:
-    outcome: Literal["non_streaming_success", "streaming_complete", "json_failure"]
+    # `abandoned` means the caller is gone: the run is fully logged and no response is built,
+    # because there is no socket left to write one to. Named rather than expressed as a
+    # `json_failure` carrying no response, so the handler reads an intent instead of guessing
+    # one from a missing field.
+    outcome: Literal["non_streaming_success", "streaming_complete", "json_failure", "abandoned"]
     raw_response: ChatCompletionRawResponse | None = None
     json_response: ChatCompletionResponse | None = None
 
@@ -233,6 +243,11 @@ class FailureRouteLogInput:
     # whenever every attempt died on the request body.
     errors: list[dict[str, Any]]
     compression: dict[str, Any] | None = None
+    # Why the attempt loop stopped early, when it did: `request_deadline_exceeded`,
+    # `client_disconnected` or `service_restarting`. Carried rather than re-derived from `errors`,
+    # because the row recording it is `attempted: False` and every scan that filters those out
+    # would answer as if the run had simply run out of candidates.
+    terminal_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -262,6 +277,9 @@ class UpstreamFailureResponseInput:
     attempts: list[dict[str, Any]]
     errors: list[dict[str, Any]]
     compression: dict[str, Any] | None = None
+    # Same fact as `FailureRouteLogInput.terminal_reason`, and the reason the status line and the
+    # route-log row cannot drift: both read it instead of guessing at the error list.
+    terminal_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -288,6 +306,10 @@ class AttemptCooldownRequest:
     status: CooldownStatus
     retry_after_seconds: int | None = None
     retry_after_source: str | None = None
+    # What the ATTEMPT failed on, which is not always what the cooldown is written under: an
+    # `empty_assistant_message` carries the generic `unavailable` cooldown. The applier needs the
+    # first to tell a semantic verdict about this model on this profile from a transport fault.
+    attempt_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -354,7 +376,10 @@ ResponseHeadersBuilder = Callable[[str, str], dict[str, str]]
 # (request_id, safe_requested_model, selected_model, attempt_count, compression, dropped_parameters)
 SuccessResponseHeadersBuilder = Callable[..., dict[str, str]]
 FailureResponseHeadersBuilder = Callable[[str, str, int, dict[str, Any] | None], dict[str, str]]
-UpstreamFailureErrorBuilder = Callable[[str, str, int, list[dict[str, Any]], list[dict[str, Any]]], dict[str, Any]]
+# (requested_model, request_id, candidate_count, attempts, errors, terminal_reason)
+UpstreamFailureErrorBuilder = Callable[
+    [str, str, int, list[dict[str, Any]], list[dict[str, Any]], str | None], dict[str, Any]
+]
 LastRouteRecorder = Callable[[str, str, str, str, int, int, float], None]
 RouteLogWriter = Callable[[dict[str, Any]], None]
 Clock = Callable[[], float]
@@ -413,6 +438,12 @@ class ChatCompletionAttemptPorts:
     # Reads a quota cooldown key at its own scope. Defaults to "matches nothing", so a wiring that
     # does not provide it simply never diverts on a quota key — the behaviour before this port.
     quota_cooldown_matches_model: QuotaCooldownMatcher = lambda _key, _model: False
+    # Why no further fallback attempt is worth starting, or None to keep going — a key of
+    # `TERMINAL_ENDINGS`, which is what the ending then means for the status, the body and the
+    # route log. Read between attempts only. One port rather than one per observable fact: the loop
+    # needs the reason it must record, not a set of booleans to re-combine into one. Defaults to
+    # "keep going", so a wiring that cannot observe anything behaves exactly as before.
+    terminal_reason: Callable[[], str | None] = lambda: None
     unsupported_parameters_for: Callable[[dict[str, Any], dict[str, Any]], tuple[str, ...]] = (
         lambda _model, _body: ()
     )
@@ -877,6 +908,22 @@ def evaluate_non_streaming_success_response(
             retry=_should_retry(reason, requested_model_is_virtual),
         )
 
+    if finish_reason_is_error(payload):
+        # The provider answered HTTP 200 and then said, in the choice itself, that the generation
+        # failed. Whatever content came with it is a partial answer, so this is an attempt failure
+        # rather than a served response — and a model-scoped one: the provider is fine, this
+        # generation was not. Retryable on a virtual profile, since the next candidate gets a body
+        # the upstream never rejected.
+        return _non_streaming_failure(
+            model,
+            status=status_code,
+            reason="upstream_finish_error",
+            latency_seconds=latency,
+            cooldown_reason="unavailable",
+            cooldown_detail='success response ended with finish_reason "error"',
+            retry=requested_model_is_virtual,
+        )
+
     if not has_deliverable(payload):
         # A reasoning model can burn the whole completion budget on reasoning tokens and stop before
         # emitting any assistant content. That is the caller's max_tokens being too small, not a
@@ -1007,6 +1054,9 @@ def evaluate_streaming_result(
         "stream_chunk_count": _safe_int(stream_result.get("chunk_count"), 0),
         "stream_bytes_sent": _safe_int(stream_result.get("bytes_sent"), 0),
     }
+    timeout_phase = stream_result.get("timeout_phase")
+    if timeout_phase in {"connect", "response_headers", "response_body"}:
+        attempt_update["timeout_phase"] = timeout_phase
     # The error object is the same six facts on every failure path below, so it is built
     # once here where they are all final.
     error = {
@@ -1019,6 +1069,23 @@ def evaluate_streaming_result(
     }
 
     if stream_result.get("status") == "ok":
+        streamed_choice = {"choices": [{"finish_reason": stream_result.get("finish_reason") or ""}]}
+        if finish_reason_is_error(streamed_choice):
+            # The streamed twin of the `upstream_finish_error` verdict the non-streaming path
+            # returns. A stream reported `ok` has committed its bytes, so this ends the attempt
+            # without diverting, exactly like the empty-message verdict below; a stream that
+            # failed before committing left the reader as `pre_stream_failure` and is classified
+            # in the `stream_started` branch further down.
+            return StreamingAttemptDecision(
+                outcome="mid_stream_failure",
+                attempt_update={**attempt_update, "reason": "upstream_finish_error"},
+                error={**error, "reason": "upstream_finish_error"},
+                cooldown_reason="unavailable",
+                cooldown_detail='streamed response ended with finish_reason "error"',
+                cooldown_status="stream_error",
+                usage=normalized_token_usage(stream_result.get("usage")),
+            )
+
         # The streamed twin of the `empty_assistant_message` verdict the non-streaming path
         # already returns, with two deliberate differences.
         #
@@ -1037,9 +1104,7 @@ def evaluate_streaming_result(
         # Defaults to True so a `stream_response` port that does not report the fact keeps
         # its current verdict.
         if not stream_result.get("deliverable_sent", True):
-            truncated = finish_reason_is_truncation(
-                {"choices": [{"finish_reason": stream_result.get("finish_reason") or ""}]}
-            )
+            truncated = finish_reason_is_truncation(streamed_choice)
             reason = "truncated_before_content" if truncated else "empty_assistant_message"
             return StreamingAttemptDecision(
                 outcome="mid_stream_failure",
@@ -1076,7 +1141,7 @@ def evaluate_streaming_result(
         # the generic model-scoped `unavailable` verdict.
         cooldown_reason=(
             reason
-            if classified_status is not None or reason in CALLER_CAUSED_FAILURE_REASONS
+            if classified_status is not None or reason in NO_MODEL_FAULT_FAILURE_REASONS
             else "unavailable"
         ),
         cooldown_detail=f"{reason}: {stream_result.get('error_type') or ''} {stream_result.get('message') or ''}".strip(),
@@ -1137,10 +1202,28 @@ def evaluate_invocation_exception(
 ) -> InvocationExceptionDecision:
     error_type = type(exc).__name__
     detail = f"{error_type}: {exc}"
+    # The transport's own words and its errno: without them a route row cannot tell a provider
+    # that answered slowly from a pooled keep-alive socket the network dropped, which fails as a
+    # short read timeout carrying `ETIMEDOUT` underneath. See docs/components/router.md.
+    # `sanitize_error_detail` bounds its own input, so an unbounded provider message never reaches
+    # the redaction regexes here or anywhere else.
+    error_detail = sanitize_error_detail(detail, UPSTREAM_DETAIL_LIMIT)
+    error_errno = first_exception_errno(exc)
     if deadline_exceeded:
         # Ficelle's own request budget ended the attempt (L2-R2): named distinctly so the
         # route row states which budget ended the request, and never blamed on the model.
         reason = status = error_reason = "request_deadline_exceeded"
+    elif isinstance(exc, ProviderCredentialsUnavailable):
+        # The request never left the process: no credential resolved for this provider. That is
+        # provider-wide by definition, so it takes the provider-scoped `auth_or_credit` policy
+        # instead of benching one model id for 600s while every sibling re-earns the same failure.
+        reason = error_reason = "auth_or_credit"
+        status = "exception"
+    elif exception_is_tls_failure(exc):
+        # A handshake that fails describes the transport to the provider's host, never one model
+        # id, so it is provider-scoped too — with a much shorter window than a dead credential.
+        reason = error_reason = "tls_error"
+        status = "exception"
     else:
         reason = "timeout" if timeout else "unavailable"
         status = "timeout" if timeout else "exception"
@@ -1150,6 +1233,8 @@ def evaluate_invocation_exception(
             "status": status,
             "reason": reason,
             "error_type": error_type,
+            "error_detail": error_detail,
+            "error_errno": error_errno,
             "latency_seconds": round(latency_seconds, 4),
         },
         error={
@@ -1222,7 +1307,45 @@ def build_success_route_telemetry(row: SuccessRouteLogInput) -> ChatCompletionRo
     )
 
 
-def failure_route_reason(errors: list[dict[str, Any]]) -> str:
+def build_no_attempt_route_log(
+    *,
+    request_id: str,
+    safe_requested_model: str,
+    status: int,
+    reason: str,
+    duration_seconds: float,
+    stream: bool,
+) -> dict[str, Any]:
+    """The route-log row for a request no model ever ran.
+
+    Two kinds share it: a refusal the router owns (`_refusal_response`) and a failure raised by the
+    HTTP handler before routing began. `candidate_count` 0 and an empty `attempts` mean it
+    literally — no model was picked, none was called, none was cooled — and the Requests index
+    reads both. One shape, on primitives, so a handler-level 400 cannot look like a different kind
+    of event from a routed refusal on the same page.
+    """
+    return {
+        "request_id": request_id,
+        "requested_model": safe_requested_model,
+        "final_status": status,
+        "final_reason": reason,
+        "candidate_count": 0,
+        "attempts": [],
+        "duration_seconds": round(duration_seconds, 4),
+        "stream": stream,
+    }
+
+
+def failure_route_reason(errors: list[dict[str, Any]], terminal_reason: str | None = None) -> str:
+    """What the Requests page calls this run.
+
+    A run the loop ended itself — deadline, dead caller, restart — is named by that ending rather
+    than by whichever provider error happened to be last: the ending is the whole reason there is
+    no answer. Only the endings `TERMINAL_ENDINGS` describes can name a run, so the reason on the
+    page always has a documented status, body and cooldown meaning behind it.
+    """
+    if terminal_reason in TERMINAL_ENDINGS:
+        return str(terminal_reason)
     return "bad_upstream_request" if caller_rejected_request(errors) else "upstream_failure"
 
 
@@ -1230,8 +1353,10 @@ def build_failure_route_log(row: FailureRouteLogInput) -> dict[str, Any]:
     return {
         "request_id": row.request_id,
         "requested_model": row.safe_requested_model,
-        "final_status": upstream_failure_status(row.errors),
-        "final_reason": failure_route_reason(row.errors),
+        # The status the client received — or, for an ending that writes no body at all, the
+        # ending's own route-log status rather than one nobody was sent.
+        "final_status": route_log_failure_status(row.errors, terminal_reason=row.terminal_reason),
+        "final_reason": failure_route_reason(row.errors, row.terminal_reason),
         "candidate_count": row.candidate_count,
         "attempt_count": row.attempt_count,
         "attempts": row.attempts,
@@ -1246,7 +1371,7 @@ def build_failure_route_telemetry(row: FailureRouteLogInput) -> ChatCompletionRo
         last_route=ChatCompletionLastRouteRecord(
             safe_requested_model=row.safe_requested_model,
             status="fail",
-            reason=failure_route_reason(row.errors),
+            reason=failure_route_reason(row.errors, row.terminal_reason),
             request_id=row.request_id,
             candidate_count=row.candidate_count,
             attempt_count=row.attempt_count,
@@ -1306,13 +1431,20 @@ def build_upstream_failure_response(
     build_headers: FailureResponseHeadersBuilder,
 ) -> ChatCompletionResponse:
     headers = build_headers(row.request_id, row.safe_requested_model, len(row.attempts), row.compression)
-    status = upstream_failure_status(row.errors)
+    status = upstream_failure_status(row.errors, terminal_reason=row.terminal_reason)
     retry_after_seconds = upstream_retry_after_seconds(row.errors, status)
     if retry_after_seconds is not None:
         headers["Retry-After"] = str(retry_after_seconds)
     return ChatCompletionResponse(
         status=status,
-        payload=build_error(row.requested_model, row.request_id, row.candidate_count, row.attempts, row.errors),
+        payload=build_error(
+            row.requested_model,
+            row.request_id,
+            row.candidate_count,
+            row.attempts,
+            row.errors,
+            row.terminal_reason,
+        ),
         headers=headers,
     )
 
@@ -1351,6 +1483,7 @@ def build_attempt_cooldown_request(
         status=status,
         retry_after_seconds=getattr(decision, "retry_after_seconds", None),
         retry_after_source=getattr(decision, "retry_after_source", None),
+        attempt_reason=str(getattr(decision, "attempt_update", {}).get("reason") or ""),
     )
 
 
@@ -1400,6 +1533,36 @@ def add_first_byte_telemetry(attempt_update: dict[str, Any], response: Any) -> N
     admission_source = getattr(response, "_ficelle_admission_source", None)
     if admission_source in {"declared_rpm", "provider_headers"}:
         attempt_update["admission_source"] = admission_source
+    add_transport_timeout_telemetry(attempt_update, response)
+
+
+def add_transport_timeout_telemetry(attempt_update: dict[str, Any], subject: Any) -> None:
+    """Copy Ficelle-owned timeout metadata from a response or transport exception.
+
+    The attributes are attached at the HTTP boundary in ``router.invoke_model``. Keeping
+    the route-log vocabulary here makes every outcome — success, provider HTTP failure,
+    or transport exception — use the same safe, numeric fields.
+    """
+    numeric_fields = {
+        "_ficelle_read_timeout_seconds": "read_timeout_seconds",
+        "_ficelle_connect_timeout_seconds": "connect_timeout_seconds",
+        "_ficelle_request_budget_remaining_seconds": "request_budget_remaining_seconds",
+        "_ficelle_stale_latency_seconds": "stale_latency_seconds",
+    }
+    for attribute, field in numeric_fields.items():
+        raw = getattr(subject, attribute, None)
+        if isinstance(raw, (int, float)) and math.isfinite(float(raw)) and float(raw) >= 0:
+            attempt_update[field] = round(float(raw), 4)
+    source = getattr(subject, "_ficelle_read_timeout_source", None)
+    if source in {"global", "profile_override", "base_profile_override", "explicit", "request_deadline"}:
+        attempt_update["read_timeout_source"] = source
+    phase = getattr(subject, "_ficelle_timeout_phase", None)
+    if phase in {"connect", "response_headers", "response_body"}:
+        attempt_update["timeout_phase"] = phase
+    # The stale-socket replay is the only transport retry there is, and the latency it threw
+    # away is what states it happened — so the name is written here rather than carried twice.
+    if "stale_latency_seconds" in attempt_update:
+        attempt_update["transport_retry"] = "stale_connection"
 
 
 class ChatCompletionRouter:
@@ -1587,6 +1750,10 @@ class ChatCompletionRouter:
         # Raised when a new fact invalidates the remaining window, so it is re-planned once per
         # useful diversion rather than once per attempt.
         divert_pending = False
+        # Why the loop stopped short of exhausting its window, once it has. Names the route in the
+        # telemetry and decides the status and body below, so nothing downstream has to re-read the
+        # error list to work out an ending the loop already knows.
+        terminal_reason: str | None = None
 
         def is_ruled_out(candidate: dict[str, Any]) -> bool:
             # Read per candidate on each re-plan. Each attempt contributes at most one key, so the
@@ -1700,18 +1867,28 @@ class ChatCompletionRouter:
                     if dropped_parameters
                     else plan.routed_body
                 )
-            # Checked between attempts, never mid-attempt: an answer already being produced is
-            # never abandoned. The first candidate always runs, so a deadline can shorten a
-            # failing request but can never turn a request into zero attempts.
-            if considered and deadline is not None and self.now() >= deadline:
-                errors.append({
-                    "model": model.get("id"),
-                    "upstream": model.get("upstream_id"),
-                    "source": model.get("source"),
-                    "reason": "request_deadline_exceeded",
-                    "attempted": False,
-                })
-                break
+            # The three reasons not to start the next attempt, checked at one point: Ficelle's own
+            # request budget ran out, the caller hung up, or the service is draining a SIGTERM.
+            # Checked between attempts, never mid-attempt — an answer already being produced is
+            # never abandoned — and only once one candidate has run, so these can shorten a failing
+            # request but can never turn a request into zero attempts. Each holds an admission slot
+            # for minutes and can answer no one; none of them is a model's fault, so nothing is
+            # cooled. The chosen-but-unasked candidate is recorded as such.
+            if considered:
+                terminal_reason = (
+                    "request_deadline_exceeded"
+                    if deadline is not None and self.now() >= deadline
+                    else ports.terminal_reason()
+                )
+                if terminal_reason is not None:
+                    errors.append({
+                        "model": model.get("id"),
+                        "upstream": model.get("upstream_id"),
+                        "source": model.get("source"),
+                        "reason": terminal_reason,
+                        "attempted": False,
+                    })
+                    break
             if not is_retry:
                 # A re-ask of the same model with a refused knob removed reuses its slot: the
                 # window counts candidates, not round trips. Counting it here would also let a
@@ -1785,6 +1962,7 @@ class ChatCompletionRouter:
                         ports.is_deadline_exception is not None and ports.is_deadline_exception(exc)
                     ),
                 )
+                add_transport_timeout_telemetry(exception_decision.attempt_update, exc)
                 rule_out(ports.apply_cooldown(build_attempt_cooldown_request(model, exception_decision)))
                 record_attempt_failure(
                     AttemptFailureRecordInput(
@@ -2035,9 +2213,18 @@ class ChatCompletionRouter:
                     stream=bool(body.get("stream")),
                     errors=errors,
                     compression=plan.compression_metadata,
+                    terminal_reason=terminal_reason,
                 )
             )
         )
+        ending = TERMINAL_ENDINGS.get(terminal_reason or "")
+        if ending is not None and not ending.writes_body:
+            # Route telemetry above is the whole record of this run. Building a body here would
+            # only invite the handler to write it to a socket nobody is reading — at best a
+            # wasted write, at worst a second failure on a connection that is already gone. A
+            # stopping service is the other case and not this one: its caller is still there, so
+            # it gets its normal failure response.
+            return ChatCompletionAttemptRunResult(outcome="abandoned")
         return ChatCompletionAttemptRunResult(
             outcome="json_failure",
             json_response=build_upstream_failure_response(
@@ -2049,6 +2236,7 @@ class ChatCompletionRouter:
                     attempts=attempts,
                     errors=errors,
                     compression=plan.compression_metadata,
+                    terminal_reason=terminal_reason,
                 ),
                 build_error=ports.build_failure_error,
                 build_headers=ports.build_failure_headers,
@@ -2079,16 +2267,14 @@ class ChatCompletionRouter:
         """
         duration = self.now() - request_started
         self.record_last_route(request.safe_requested_model, "fail", reason, request_id, 0, 0, duration)
-        route_row = {
-            "request_id": request_id,
-            "requested_model": request.safe_requested_model,
-            "final_status": status,
-            "final_reason": reason,
-            "candidate_count": 0,
-            "attempts": [],
-            "duration_seconds": round(duration, 4),
-            "stream": bool(body.get("stream")),
-        }
+        route_row = build_no_attempt_route_log(
+            request_id=request_id,
+            safe_requested_model=request.safe_requested_model,
+            status=status,
+            reason=reason,
+            duration_seconds=duration,
+            stream=bool(body.get("stream")),
+        )
         error_payload: dict[str, Any] = {"message": message, "type": error_type, "request_id": request_id}
         if refusal_details:
             route_row["refusal"] = dict(refusal_details)
@@ -2179,6 +2365,9 @@ class ChatCompletionRouter:
                 None,
             )
             if row is None:
+                # Same words as `GET /v1/models/{id}` answers for the same id: one fact, one
+                # sentence, whichever route the client happened to ask.
+                not_found = model_not_found_body(safe_requested)["error"]
                 return self._refusal_response(
                     body,
                     request,
@@ -2186,8 +2375,8 @@ class ChatCompletionRouter:
                     request_started,
                     status=404,
                     reason="model_not_found",
-                    error_type="model_not_found",
-                    message=f"model {safe_requested} is not in the active catalog",
+                    error_type=str(not_found["type"]),
+                    message=str(not_found["message"]),
                 )
             block_reason = selection.excluded_reasons.get(str(row.get("id") or "")) or "not_selectable"
             scope = REFUSAL_SCOPE_BY_BLOCK_REASON.get(block_reason, "model")

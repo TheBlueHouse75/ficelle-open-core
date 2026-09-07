@@ -23,10 +23,10 @@ model_provider = "ficelle"
 model = "ficelle/auto-tools"
 ```
 
-The router ignores the key's value but Codex requires the variable to be set:
+Load the exact owner API token that Ficelle requires:
 
 ```bash
-export FICELLE_API_KEY=ficelle-local
+export FICELLE_API_KEY="$(ficelle access-token api)"
 codex --profile ficelle
 ```
 

@@ -31,6 +31,9 @@ class GenericClientTargetAdapter:
     supports_health_check: bool = True
 
     def export_config(self, context: TargetExportContext) -> TargetExport:
+        api_token = (context.api_token or "").strip()
+        if not api_token:
+            raise ValueError("an owner API token is required to export a usable client configuration")
         config = dict(context.config)
         base_url = target_base_url(config)
         # Both forms, because clients disagree on what an "endpoint" field means: some append
@@ -47,7 +50,7 @@ class GenericClientTargetAdapter:
             config={
                 "base_url": base_url,
                 "chat_completions_url": chat_completions_url,
-                "api_key": "ficelle-local",
+                "api_key": api_token,
                 "models": list(models),
             },
             presets=(
@@ -56,17 +59,18 @@ class GenericClientTargetAdapter:
                     "base_url": base_url,
                     "chat_completions_url": chat_completions_url,
                     "model": primary,
-                    "api_key": "ficelle-local",
+                    "api_key": api_token,
                 },
             ),
             warnings=(
-                "Use the placeholder api_key only for clients that require a non-empty key for local loopback calls.",
+                "Use the owner-only api_key generated for this Ficelle installation; do not share it.",
                 "Paste base_url into clients that append the route themselves, chat_completions_url into clients whose endpoint field wants the full chat URL.",
             ),
             verification_commands=(
                 ("ficelle", "health"),
                 ("ficelle", "models"),
             ),
+            redaction_status="contains_ficelle_access_token",
         )
 
     def install_assets(self, context: TargetInstallContext) -> TargetInstallResult:

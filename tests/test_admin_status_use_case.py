@@ -205,6 +205,35 @@ def test_catalog_with_auto_scores_enriches_copy_without_mutating_source():
     assert enriched["models"][0]["auto_score_details"]["ficelle/auto-fast"]["model_id"] == "m1"
 
 
+def test_catalog_score_details_keep_quality_feedback_projection_redacted():
+    enriched = catalog_with_auto_scores(
+        {"models": [{"id": "m1"}]},
+        {"virtual_profiles": {"ficelle/auto-orchestrator": {}}},
+        {},
+        apply_verified_capability_ttl=lambda _config: None,
+        normalized_virtual_profiles=lambda config: config["virtual_profiles"],
+        normalized_free_access=lambda _model: {"eligible": True},
+        model_score_explanation=lambda _profile_id, _model, _state: {
+            "score_total": 70.0,
+            "score_total_without_quality": 82.0,
+            "score_total_with_quality": 70.0,
+            "quality_adjustment": -12.0,
+            "quality_sample_count": 3,
+            "quality_last_reason": "invalid_json",
+            "quality_last_severity": "major",
+            "quality_last_recorded_at": "2026-09-07T10:00:00+00:00",
+            "quality_status": "fail",
+        },
+    )
+
+    details = enriched["models"][0]["auto_score_details"]["ficelle/auto-orchestrator"]
+    assert details["quality_sample_count"] == 3
+    assert details["quality_adjustment"] == -12.0
+    assert details["quality_last_reason"] == "invalid_json"
+    assert "request_id" not in repr(details)
+    assert "event_slots" not in repr(details)
+
+
 def test_admin_job_helpers_record_redact_finish_and_filter_active_jobs():
     row = build_admin_job_row(
         "job-1",
@@ -850,6 +879,8 @@ def test_active_model_cooldown_rows_filters_expired_and_sorts_by_remaining_time(
                 "fast": {"until": 120.0, "reason": "timeout", "set_at": "now"},
                 "expired": {"until": 90.0, "reason": "gone"},
                 "bad": {"until": "not-a-number"},
+                "infinite": {"until": "Infinity"},
+                "nan": {"until": "NaN"},
             }
         },
         100.0,
@@ -1003,7 +1034,35 @@ def test_failed_profile_evidence_row_prefers_verified_capability_failure():
         "test_type": "json",
         "failed_at": "2026-06-22T00:00:00+00:00",
         "evidence_source": "verified_capability",
+        # No `verdict_origin` on the row means it came from a probe; a real request stamps
+        # "production" and the admin now shows which one it was.
+        "verdict_origin": "probe",
     }
+
+
+def test_failed_profile_evidence_row_carries_a_production_verdict_origin():
+    model = {"id": "model-a", "upstream_id": "up-a", "source": "test"}
+
+    row = failed_profile_evidence_row(
+        "ficelle/auto-compression",
+        model,
+        {},
+        canonical_virtual_model_id=lambda profile_id: profile_id,
+        verified_capability_row=lambda _profile_id, _model, _state: {
+            "status": "failed",
+            "message": "empty_assistant_message",
+            "test_type": "compression",
+            "failed_at": "2026-06-22T00:00:00+00:00",
+            "verdict_origin": "production",
+        },
+        raw_benchmark_row=lambda *_args: {},
+        benchmark_result_matches_current_test=lambda *_args: True,
+        redacted_benchmark_row=lambda _profile_id, row: row,
+        safe_detail=lambda value: None if value is None else str(value),
+    )
+
+    assert row["verdict_origin"] == "production"
+    assert row["evidence_source"] == "verified_capability", "the state section it was read from"
 
 
 def test_failed_profile_evidence_row_uses_current_failed_benchmark():
@@ -1031,6 +1090,7 @@ def test_failed_profile_evidence_row_uses_current_failed_benchmark():
     assert row["test_type"] == "tool_call"
     assert row["failed_at"] == "2026-06-22T00:01:00+00:00"
     assert row["evidence_source"] == "benchmark_result"
+    assert row["verdict_origin"] == "probe"
 
 
 def test_failed_profile_evidence_row_returns_empty_without_current_failure():
@@ -1081,7 +1141,6 @@ def test_model_history_row_assembles_stats_evidence_and_rank_details():
                     "requests": "3",
                     "successes": "2",
                     "failures": "1",
-                    "consecutive_failures": "1",
                     "latency_ewma": 0.4,
                     "last_failure_reason": "server_error",
                 }
