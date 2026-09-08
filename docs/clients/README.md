@@ -6,9 +6,9 @@ Every recipe below ends at the same place: an OpenAI-compatible client talking t
 http://127.0.0.1:8646/v1
 ```
 
-with the owner API token returned locally by `ficelle access-token api`. The router
-authenticates loopback and non-loopback clients alike. Install and start Ficelle
-first, load `export FICELLE_API_KEY="$(ficelle access-token api)"`, and store a
+without a Ficelle token on the default loopback listener. A deliberate non-loopback
+bind requires the owner API token returned locally by `ficelle access-token api`.
+Install and start Ficelle first, then store a
 provider key (`ficelle set-key openrouter`): the model
 list is served from public catalogs without credentials, so **a populated model
 list does not mean a completion can be served** — `ficelle doctor --text` tells

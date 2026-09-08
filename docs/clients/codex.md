@@ -23,12 +23,15 @@ model_provider = "ficelle"
 model = "ficelle/auto-tools"
 ```
 
-Load the exact owner API token that Ficelle requires:
+Codex requires the configured environment variable to be non-empty. For the
+default loopback listener, use a non-secret local value:
 
 ```bash
-export FICELLE_API_KEY="$(ficelle access-token api)"
+export FICELLE_API_KEY=ficelle-local
 codex --profile ficelle
 ```
+
+For a non-loopback bind, use `ficelle access-token api` as the value.
 
 Hermes uses the same variable name from `$HERMES_HOME/.env`. Ficelle setup seeds it so Hermes can
 select Ficelle as its main provider, explicitly or through `provider: auto`; that behavior is

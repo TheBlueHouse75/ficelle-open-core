@@ -171,6 +171,7 @@ from ficelle.use_cases.benchmark import (
     configured_benchmark_media_path as configured_benchmark_media_path_use_case,
     expected_probe_test_type,
     extract_message_text as benchmark_extract_message_text,
+    finish_reason_is_error,
     finish_reason_is_truncation,
     extract_reasoning_text as benchmark_extract_reasoning_text,
     extract_tool_calls as benchmark_extract_tool_calls,
@@ -233,6 +234,18 @@ from ficelle.use_cases.chat_completion import (
     build_streaming_response_start,
     normalize_chat_completion_request,
     prepare_compression_route_body as prepare_chat_compression_route_body,
+)
+from ficelle.anthropic_messages import (
+    ANTHROPIC_MESSAGES_PATH,
+    ANTHROPIC_VERSION,
+    DEFAULT_ANTHROPIC_MODEL_MAPPING,
+    AnthropicResponseError,
+    OpenAIToAnthropicStreamTranslator,
+    anthropic_sse_error_event,
+    encode_anthropic_message_stream,
+    translate_anthropic_request,
+    translate_openai_error,
+    translate_openai_response,
 )
 from ficelle.use_cases.failover_demo import (
     FailoverDemoResult,
@@ -1494,6 +1507,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "benchmark_long_context_tokens": LONG_CONTEXT_BENCHMARK_DEFAULT_TOKENS,
     "benchmark_compression_chars": COMPRESSION_BENCHMARK_DEFAULT_CHARS,
     "compression": copy.deepcopy(DEFAULT_COMPRESSION_CONFIG),
+    # Claude Code sends Anthropic model-family ids even when a gateway serves a different
+    # upstream. The mapping is explicit so the operator can choose which stable Ficelle profile
+    # each family receives without ever presenting the selected free model as Claude.
+    "anthropic_model_mapping": copy.deepcopy(DEFAULT_ANTHROPIC_MODEL_MAPPING),
     "allow_paid_fallback": False,
     "canary": {
         "enabled": True,
@@ -5599,7 +5616,6 @@ def build_admin_state_builder() -> AdminStateBuilder:
     return AdminStateBuilder(
         AdminStateBuildPorts(
             load_or_refresh_catalog=load_or_refresh_catalog,
-            run_due_quota_probes=run_due_quota_probes,
             load_runtime_state=load_runtime_state,
             normalized_virtual_profiles=normalized_virtual_profiles,
             build_admin_status=build_admin_status,
@@ -10521,9 +10537,9 @@ def usage_from_sse_tail(tail: bytes) -> dict[str, Any] | None:
     """The `usage` object of the stream's final chunks, when the provider emitted one.
 
     OpenAI-style streams put usage in a late chunk right before `[DONE]`, and only when
-    the caller asked for it (`stream_options.include_usage`) — Ficelle never alters the
-    upstream request, so this is opportunistic: parse the already-buffered terminal tail
-    and take the last well-formed usage object found.
+    the caller asked for it (`stream_options.include_usage`). The OpenAI surface leaves that
+    choice to its caller; the Anthropic adapter requests it so translated usage is accurate.
+    Parse the already-buffered terminal tail and take the last well-formed usage object found.
     """
     # The common case is a client that never asked for usage: skip all parsing for it.
     if b'"usage"' not in tail:
@@ -10555,6 +10571,7 @@ def stream_chunks_to_writer(
     expect_sse_done: bool = True,
     expected_choice_count: int = 1,
     stream_commit_policy: str = "immediate",
+    write_terminal_error: Any | None = None,
 ) -> dict[str, Any]:
     if stream_commit_policy not in STREAM_COMMIT_POLICIES:
         raise ValueError(f"unsupported stream_commit_policy: {stream_commit_policy}")
@@ -10586,6 +10603,10 @@ def stream_chunks_to_writer(
         # reported to the caller via the returned dict regardless. Never a synthetic [DONE]:
         # a truncated or error-terminated stream must stay distinguishable from a complete one.
         try:
+            if write_terminal_error is not None:
+                write_terminal_error(reason, detail)
+                flush()
+                return
             if stream_tail.endswith(b"\n\n"):
                 boundary = b""
             elif stream_tail.endswith(b"\n"):
@@ -12143,6 +12164,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         )
 
     def _admin_authenticated(self) -> bool:
+        """Trust the loopback boundary; require the owner credential on exposed binds."""
+        if self._bind_is_loopback():
+            return True
         authorization = self.headers.get("Authorization")
         expected = admin_token()
         return (
@@ -12152,7 +12176,39 @@ class RouterHandler(BaseHTTPRequestHandler):
         )
 
     def _api_authenticated(self) -> bool:
-        return bearer_token_matches(self.headers.get("Authorization"), api_token())
+        """Trust local clients on loopback; require API credentials on exposed binds."""
+        if self._bind_is_loopback():
+            return True
+        expected = api_token()
+        if bearer_token_matches(self.headers.get("Authorization"), expected):
+            return True
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        return path == ANTHROPIC_MESSAGES_PATH and admin_token_matches(
+            self.headers.get("X-Api-Key"), expected
+        )
+
+    def _send_protocol_json(
+        self,
+        status: int,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        """Render pre-routing failures in the wire protocol selected by the request path."""
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path != ANTHROPIC_MESSAGES_PATH:
+            self._send_json(status, payload, headers=headers)
+            return
+        safe_request_id = request_id or uuid.uuid4().hex
+        response_headers = dict(headers or {})
+        response_headers["request-id"] = safe_request_id
+        response_headers["anthropic-version"] = ANTHROPIC_VERSION
+        self._send_json(
+            status,
+            translate_openai_error(status, payload, safe_request_id),
+            headers=response_headers,
+        )
 
     def _request_authorized(self, path: str) -> bool:
         if path in {"/health", "/v1/health"}:
@@ -12172,7 +12228,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         if unread_body:
             self.close_connection = True
             headers["Connection"] = "close"
-        self._send_json(
+        self._send_protocol_json(
             401,
             {"error": {"code": "authentication_required", "message": "authentication required"}},
             headers=headers,
@@ -12212,13 +12268,17 @@ class RouterHandler(BaseHTTPRequestHandler):
         if unread_body:
             self._reject_unread_body(403, "forbidden", message)
             return
-        self._send_json(403, {"error": {"code": "forbidden", "message": message}})
+        self._send_protocol_json(403, {"error": {"code": "forbidden", "message": message}})
 
     def _reject_unread_body(self, status: int, code: str, message: str) -> None:
         # The declared (or chunked) body remains unread. HTTP/1.1 would otherwise interpret
         # those bytes as another request on a reused socket, so this response must close it.
         self.close_connection = True
-        self._send_json(status, {"error": {"code": code, "message": message}}, headers={"Connection": "close"})
+        self._send_protocol_json(
+            status,
+            {"error": {"code": code, "message": message}},
+            headers={"Connection": "close"},
+        )
 
     def _reject_payload_too_large(self) -> None:
         self._reject_unread_body(
@@ -12245,8 +12305,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         return content_type.strip().lower() == "application/json"
 
     def _admin_write_authorized(self) -> bool:
-        """Guard secret-bearing admin writes: the CSRF origin check plus the local admin
-        token (the token gates the credential-write endpoint specifically)."""
+        """Guard secret-bearing admin writes: same-origin is sufficient on loopback;
+        exposed binds additionally require the local admin token."""
         if not self._admin_origin_ok():
             return False
         return self._admin_authenticated()
@@ -12288,11 +12348,9 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_json(200, admin_state(self.config))
                 return
             if path == "/admin/status.json":
-                # A GET must not spend free quota. Probing stays available through an explicit
-                # opt-in, so `ficelle doctor` and the dashboard's polling — which hit this on a
-                # timer — can no longer fire upstream calls as a side effect of being read.
-                probe = (parse_qs(urlparse(self.path).query).get("probe") or [""])[0] == "1"
-                self._send_json(200, admin_status(self.config, run_quota_probes=probe))
+                # A GET must not spend free quota. Explicit probes use the same-origin-protected
+                # POST endpoint, so dashboard polling and cross-site requests stay read-only.
+                self._send_json(200, admin_status(self.config, run_quota_probes=False))
                 return
             if path == "/admin/update":
                 self._send_json(200, update_service.public_update_status())
@@ -12444,7 +12502,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         """
         self.close_connection = True
         try:
-            self._send_json(
+            self._send_protocol_json(
                 408,
                 error_body_result(
                     exc,
@@ -12467,7 +12525,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         """
         if isinstance(exc, RequestBodyUnavailable):
             raise exc
-        self._send_json(500, safe_error_body(exc))
+        self._send_protocol_json(500, safe_error_body(exc))
 
     def do_POST(self) -> None:  # noqa: N802
         """Route the POST, answering an unfinished request body once for every route.
@@ -12520,7 +12578,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     return
         except Exception as exc:
             self.close_connection = True
-            self._send_json(
+            self._send_protocol_json(
                 500,
                 safe_error_body(exc),
                 headers={"Connection": "close"},
@@ -13181,8 +13239,16 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_unhandled_post_error(exc)
             return
 
-        if path != CHAT_COMPLETIONS_PATH:
+        anthropic_surface = path == ANTHROPIC_MESSAGES_PATH
+        if path not in {CHAT_COMPLETIONS_PATH, ANTHROPIC_MESSAGES_PATH}:
             self._send_json(404, not_found_body("POST", path, target_base_url(self.config)))
+            return
+        if anthropic_surface and self.headers.get("Anthropic-Version") != ANTHROPIC_VERSION:
+            self._reject_unread_body(
+                400,
+                "invalid_anthropic_version",
+                f"Anthropic-Version must be {ANTHROPIC_VERSION}",
+            )
             return
         origin_header = self.headers.get("Origin")
         if not inference_origin_allowed(
@@ -13195,7 +13261,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._reject_unread_body(403, "forbidden", message)
             return
         if not self._json_content_type_ok():
-            self._reject_unsupported_media_type()
+            self._reject_unsupported_media_type(
+                "Anthropic messages" if anthropic_surface else "chat completions"
+            )
             return
         admission = self.server.chat_admission.try_acquire(declared_length)  # type: ignore[attr-defined]
         if admission is None:
@@ -13212,6 +13280,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         # The caller's stream flag, known only once the body parses. False until then, which is
         # what a request that never got that far actually is.
         requested_stream = False
+        anthropic_stop_sequences: tuple[str, ...] = ()
+        anthropic_ignored_fields: tuple[str, ...] = ()
         request_started = time.monotonic()
         # Validated synthetic-run correlation id (L2-R3), or None on any failed gate. It
         # supplements route telemetry only — Ficelle's random request id stays authoritative
@@ -13230,6 +13300,12 @@ class RouterHandler(BaseHTTPRequestHandler):
                 row = {**row, "synthetic_case_id": synthetic_case_id}
             if workload is not None:
                 row = {**row, "workload": workload}
+            if anthropic_surface:
+                row = {
+                    **row,
+                    "protocol": "anthropic_messages",
+                    "anthropic_ignored_fields": list(anthropic_ignored_fields),
+                }
             try:
                 write_route_log(row)
             except Exception as exc:
@@ -13239,8 +13315,79 @@ class RouterHandler(BaseHTTPRequestHandler):
                 sys.stderr.write(f"ficelle: request telemetry failed (non-fatal): {type(exc).__name__}\n")
 
         def record_telemetry_with_case(telemetry: ChatCompletionRouteTelemetry) -> None:
-            telemetry = _telemetry_with_synthetic_case(telemetry, synthetic_case_id)
-            apply_chat_route_telemetry(_telemetry_with_workload(telemetry, workload))
+            apply_chat_route_telemetry(telemetry_with_route_context(telemetry))
+
+        def telemetry_with_route_context(
+            telemetry: ChatCompletionRouteTelemetry,
+        ) -> ChatCompletionRouteTelemetry:
+            telemetry = _telemetry_with_workload(
+                _telemetry_with_synthetic_case(telemetry, synthetic_case_id),
+                workload,
+            )
+            if anthropic_surface:
+                telemetry.route_log["protocol"] = "anthropic_messages"
+                telemetry.route_log["anthropic_ignored_fields"] = list(
+                    anthropic_ignored_fields
+                )
+            return telemetry
+
+        def inference_headers(headers: dict[str, str] | None = None) -> dict[str, str]:
+            merged = dict(headers or {})
+            if anthropic_surface:
+                merged["request-id"] = request_id
+                merged["anthropic-version"] = ANTHROPIC_VERSION
+                dropped = {
+                    item.strip()
+                    for item in merged.get("X-Ficelle-Dropped-Params", "").split(",")
+                    if item.strip()
+                }
+                dropped.update(anthropic_ignored_fields)
+                if dropped:
+                    merged["X-Ficelle-Dropped-Params"] = ",".join(sorted(dropped))
+            return merged
+
+        def send_inference_json(
+            status: int,
+            payload: dict[str, Any],
+            *,
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            if anthropic_surface:
+                if status >= 400 or "error" in payload:
+                    payload = translate_openai_error(status, payload, request_id)
+                else:
+                    payload = translate_openai_response(
+                        payload,
+                        request_id=request_id,
+                        routed_model=safe_requested_model,
+                        stop_sequences=anthropic_stop_sequences,
+                    )
+            self._send_json(status, payload, headers=inference_headers(headers))
+
+        def detect_inference_success_error(
+            payload: Any,
+            model: dict[str, Any] | None = None,
+        ) -> tuple[str, str, int | None] | None:
+            detected = success_error_payload_failure(payload, model)
+            if detected is not None or not anthropic_surface:
+                return detected
+            try:
+                translate_openai_response(
+                    payload,
+                    request_id=request_id,
+                    routed_model=safe_requested_model,
+                    stop_sequences=anthropic_stop_sequences,
+                )
+            except (AnthropicResponseError, TypeError, ValueError, OverflowError):
+                # This is an upstream representation failure, not a bad Anthropic request.
+                # Detect it inside the shared attempt loop so another eligible model can answer
+                # before Ficelle commits a byte to the client.
+                return (
+                    "invalid_success_json",
+                    "upstream response cannot be represented as an Anthropic message",
+                    502,
+                )
+            return None
 
         def log_chat_request_failure(
             status: int, reason: str, exc: Exception, *, record_route_state: bool = False
@@ -13310,7 +13457,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             if record_post_commit_failure(exc):
                 return
             log_chat_request_failure(500, "internal_error", exc, record_route_state=True)
-            self._send_json(
+            send_inference_json(
                 500,
                 safe_error_body(exc, request_id=request_id),
                 headers=ficelle_response_headers(request_id, requested_model),
@@ -13321,12 +13468,24 @@ class RouterHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_body()
             requested_stream = bool(body.get("stream"))
+            if anthropic_surface:
+                translated = translate_anthropic_request(
+                    body,
+                    self.config.get("anthropic_model_mapping"),
+                )
+                if translated.routed_model not in configured_virtual_model_ids(self.config):
+                    raise ValueError(
+                        "anthropic_model_mapping must target a configured Ficelle virtual profile"
+                    )
+                body = translated.openai_body
+                anthropic_stop_sequences = translated.stop_sequences
+                anthropic_ignored_fields = translated.ignored_fields
             chat_request = normalize_chat_completion_request(body)
             requested_model = chat_request.requested_model
             safe_requested_model = chat_request.safe_requested_model
             entitled = license_ops.is_entitled()
             if requested_model in configured_custom_virtual_model_ids(self.config) and not entitled:
-                self._send_json(
+                send_inference_json(
                     402,
                     custom_profiles_license_error(),
                     headers=ficelle_response_headers(request_id, safe_requested_model),
@@ -13367,39 +13526,81 @@ class RouterHandler(BaseHTTPRequestHandler):
                     deadline_monotonic: float | None = None,
                 ) -> dict[str, Any]:
                     headers_sent = False
+                    upstream_content_type = str(
+                        response.headers.get("Content-Type") or "text/event-stream"
+                    )
+                    expect_sse_done = "event-stream" in upstream_content_type.lower()
+                    plain_json_buffer = bytearray()
+                    anthropic_translator = (
+                        OpenAIToAnthropicStreamTranslator(
+                            request_id=request_id,
+                            routed_model=safe_requested_model,
+                            stop_sequences=anthropic_stop_sequences,
+                        )
+                        if anthropic_surface and expect_sse_done
+                        else None
+                    )
+
+                    def ensure_stream_headers() -> None:
+                        nonlocal headers_sent
+                        if headers_sent:
+                            return
+                        stream_start = build_streaming_response_start(
+                            StreamingResponseStartInput(
+                                request_id=request_id,
+                                safe_requested_model=safe_requested_model,
+                                selected_model=model,
+                                attempt_count=attempt_count,
+                                response_status=response.status_code,
+                                response_headers=response.headers,
+                                compression=compression_metadata,
+                            ),
+                            build_headers=chat_success_response_headers,
+                        )
+                        self.send_response(stream_start.status)
+                        self.send_header(
+                            "Content-Type",
+                            "text/event-stream; charset=utf-8"
+                            if anthropic_surface
+                            else stream_start.content_type,
+                        )
+                        response_headers = (
+                            inference_headers(stream_start.headers)
+                            if anthropic_surface
+                            else stream_start.headers
+                        )
+                        for key, value in response_headers.items():
+                            self.send_header(key, value)
+                        # A streamed body has no Content-Length and is not chunk-framed, so
+                        # its end is the close itself. Under HTTP/1.1 that has to be stated
+                        # or the client waits for a next response that never comes.
+                        self.send_header("Connection", "close")
+                        self.close_connection = True
+                        self.end_headers()
+                        headers_sent = True
 
                     def write_stream_chunk(chunk: bytes) -> None:
-                        nonlocal headers_sent
-                        if not headers_sent:
-                            stream_start = build_streaming_response_start(
-                                StreamingResponseStartInput(
-                                    request_id=request_id,
-                                    safe_requested_model=safe_requested_model,
-                                    selected_model=model,
-                                    attempt_count=attempt_count,
-                                    response_status=response.status_code,
-                                    response_headers=response.headers,
-                                    compression=compression_metadata,
-                                ),
-                                build_headers=chat_success_response_headers,
-                            )
-                            self.send_response(stream_start.status)
-                            self.send_header("Content-Type", stream_start.content_type)
-                            for key, value in stream_start.headers.items():
-                                self.send_header(key, value)
-                            # A streamed body has no Content-Length and is not chunk-framed, so
-                            # its end is the close itself. Under HTTP/1.1 that has to be stated
-                            # or the client waits for a next response that never comes.
-                            self.send_header("Connection", "close")
-                            self.close_connection = True
-                            self.end_headers()
-                            headers_sent = True
-                        self.wfile.write(chunk)
+                        if anthropic_surface and not expect_sse_done:
+                            plain_json_buffer.extend(chunk)
+                            return
+                        outbound_chunks = (
+                            anthropic_translator.feed(chunk)
+                            if anthropic_translator is not None
+                            else [chunk]
+                        )
+                        if not outbound_chunks:
+                            return
+                        ensure_stream_headers()
+                        for outbound_chunk in outbound_chunks:
+                            self.wfile.write(outbound_chunk)
 
-                    # The [DONE] contract applies to SSE bodies; a provider answering a stream
-                    # request with a plain JSON body (no SSE framing) has no terminator to demand.
-                    upstream_content_type = str(response.headers.get("Content-Type") or "text/event-stream")
-                    expect_sse_done = "event-stream" in upstream_content_type.lower()
+                    def write_anthropic_terminal_error(
+                        reason: str,
+                        detail: str | None,
+                    ) -> None:
+                        ensure_stream_headers()
+                        self.wfile.write(anthropic_sse_error_event(reason, detail))
+
                     stream_commit_policy = stream_commit_policy_for_profile(requested_model, effective_config)
                     # A bounded transport read preserves incremental delivery and ensures the
                     # first-chunk error probe never materializes an entire long SSE body. Each
@@ -13421,7 +13622,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                         now_fn=time.time,
                     )
                     try:
-                        return stream_chunks_to_writer(
+                        stream_result = stream_chunks_to_writer(
                             observed,
                             write_stream_chunk,
                             self.wfile.flush,
@@ -13432,7 +13633,127 @@ class RouterHandler(BaseHTTPRequestHandler):
                                 else 1
                             ),
                             stream_commit_policy=stream_commit_policy,
+                            write_terminal_error=(
+                                write_anthropic_terminal_error
+                                if anthropic_surface and expect_sse_done
+                                else None
+                            ),
                         )
+                        if anthropic_surface and not expect_sse_done:
+                            if stream_result.get("status") != "ok":
+                                return {
+                                    **stream_result,
+                                    "reason": "pre_stream_failure",
+                                    "stream_started": False,
+                                }
+                            try:
+                                openai_payload = json.loads(
+                                    plain_json_buffer.decode("utf-8")
+                                )
+                                detected = detect_inference_success_error(
+                                    openai_payload,
+                                    model,
+                                )
+                                if detected is not None:
+                                    reason, detail, status = detected
+                                    return {
+                                        **stream_result,
+                                        "status": "error",
+                                        "reason": "pre_stream_failure",
+                                        "stream_started": False,
+                                        "error_type": str(status or reason),
+                                        "message": detail,
+                                    }
+                                if finish_reason_is_error(openai_payload):
+                                    return {
+                                        **stream_result,
+                                        "status": "fail",
+                                        "reason": "pre_stream_failure",
+                                        "stream_started": False,
+                                        "error_type": "upstream_finish_error",
+                                        "message": "upstream response ended with an error finish reason",
+                                    }
+                                translated_message = translate_openai_response(
+                                    openai_payload,
+                                    request_id=request_id,
+                                    routed_model=safe_requested_model,
+                                    stop_sequences=anthropic_stop_sequences,
+                                )
+                                if not translated_message["content"]:
+                                    return {
+                                        **stream_result,
+                                        "status": "fail",
+                                        "reason": "pre_stream_failure",
+                                        "stream_started": False,
+                                        "error_type": "empty_assistant_message",
+                                        "message": "upstream response had no deliverable content",
+                                    }
+                                outbound = encode_anthropic_message_stream(
+                                    translated_message
+                                )
+                            except (
+                                AnthropicResponseError,
+                                UnicodeDecodeError,
+                                json.JSONDecodeError,
+                                TypeError,
+                                ValueError,
+                                OverflowError,
+                            ) as exc:
+                                return {
+                                    **stream_result,
+                                    "status": "fail",
+                                    "reason": "pre_stream_failure",
+                                    "stream_started": False,
+                                    "error_type": type(exc).__name__,
+                                    "message": "upstream returned an invalid non-SSE stream body",
+                                }
+                            try:
+                                ensure_stream_headers()
+                                for outbound_chunk in outbound:
+                                    self.wfile.write(outbound_chunk)
+                                self.wfile.flush()
+                            except Exception as exc:
+                                return {
+                                    **stream_result,
+                                    "status": "fail",
+                                    "reason": "client_disconnected",
+                                    "stream_started": True,
+                                    "error_type": type(exc).__name__,
+                                    "message": safe_detail(exc),
+                                }
+                            choices = openai_payload.get("choices")
+                            first_choice = (
+                                choices[0]
+                                if isinstance(choices, list)
+                                and choices
+                                and isinstance(choices[0], dict)
+                                else {}
+                            )
+                            usage = (
+                                openai_payload.get("usage")
+                                if isinstance(openai_payload.get("usage"), dict)
+                                else None
+                            )
+                            return {
+                                **stream_result,
+                                "stream_started": True,
+                                "chunk_count": len(outbound),
+                                "bytes_sent": sum(len(chunk) for chunk in outbound),
+                                "finish_reason": first_choice.get("finish_reason") or "",
+                                "usage": usage,
+                                "deliverable_sent": True,
+                            }
+                        if anthropic_translator is not None and anthropic_translator.failed:
+                            return {
+                                **stream_result,
+                                "status": "fail",
+                                "reason": "mid_stream_failure",
+                                "stream_started": headers_sent,
+                                "error_type": anthropic_translator.error_code
+                                or "anthropic_translation_error",
+                                "message": anthropic_translator.error_detail,
+                            }
+                        return stream_result
                     finally:
                         # The guard may have abandoned the upstream mid-body; close so the
                         # pooled connection is not returned holding unread bytes.
@@ -13462,13 +13783,10 @@ class RouterHandler(BaseHTTPRequestHandler):
                     record_success_with_telemetry=lambda model, latency, telemetry: record_success_with_telemetry(
                         model,
                         latency,
-                        _telemetry_with_workload(
-                            _telemetry_with_synthetic_case(telemetry, synthetic_case_id),
-                            workload,
-                        ),
+                        telemetry_with_route_context(telemetry),
                     ),
                     stream_response=stream_response,
-                    detect_success_error=success_error_payload_failure,
+                    detect_success_error=detect_inference_success_error,
                     has_deliverable=has_deliverable_message,
                     classify_failure=classify_failure,
                     is_timeout_exception=lambda exc: isinstance(exc, requests.exceptions.Timeout),
@@ -13498,7 +13816,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             # Fusion first would make that refusal depend on `is_fusion_request` being set to a
             # value the refusal path has no opinion about.
             if chat_route.response is not None:
-                self._send_json(chat_route.response.status, chat_route.response.payload, headers=chat_route.response.headers)
+                send_inference_json(
+                    chat_route.response.status,
+                    chat_route.response.payload,
+                    headers=chat_route.response.headers,
+                )
                 return
             if chat_route.is_fusion_request:
                 recursion_depth = safe_int(self.headers.get("X-Ficelle-Fusion-Depth"), 0)
@@ -13511,28 +13833,51 @@ class RouterHandler(BaseHTTPRequestHandler):
                     recursion_depth,
                     entitled=entitled,
                 )
-                self._send_json(status, payload, headers=headers)
+                send_inference_json(status, payload, headers=headers)
                 return
             attempt_result = chat_result.attempt_result
             if attempt_result is None:
                 raise RuntimeError("chat completion route completed without a response")
             if attempt_result.raw_response is not None:
                 success_response = attempt_result.raw_response
+                success_content = success_response.content
+                success_content_type = success_response.content_type
+                if anthropic_surface:
+                    openai_payload = json.loads(success_content.decode("utf-8"))
+                    success_content = json.dumps(
+                        translate_openai_response(
+                            openai_payload,
+                            request_id=request_id,
+                            routed_model=safe_requested_model,
+                            stop_sequences=anthropic_stop_sequences,
+                        ),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    success_content_type = "application/json; charset=utf-8"
                 # The route success is already in the append-only log at this point. If
                 # the caller has gone away, append a correction instead of attempting a
                 # second HTTP 500 on a response whose headers are already committed.
                 nonstream_success_started = True
                 self.send_response(success_response.status)
-                self.send_header("Content-Type", success_response.content_type)
-                for key, value in success_response.headers.items():
+                self.send_header("Content-Type", success_content_type)
+                response_headers = (
+                    inference_headers(success_response.headers)
+                    if anthropic_surface
+                    else success_response.headers
+                )
+                for key, value in response_headers.items():
                     self.send_header(key, value)
-                self.send_header("Content-Length", str(len(success_response.content)))
+                self.send_header("Content-Length", str(len(success_content)))
                 self.end_headers()
-                self.wfile.write(success_response.content)
+                self.wfile.write(success_content)
                 return
             if attempt_result.json_response is not None:
                 failure_response = attempt_result.json_response
-                self._send_json(failure_response.status, failure_response.payload, headers=failure_response.headers)
+                send_inference_json(
+                    failure_response.status,
+                    failure_response.payload,
+                    headers=failure_response.headers,
+                )
                 return
             # `abandoned`: the run is fully logged and the caller is gone, so nothing is written
             # and the socket is not kept alive for a peer that already left.
@@ -13546,7 +13891,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             raise
         except UpstreamResponseBudgetExceeded as exc:
             log_chat_request_failure(503, "server_busy", exc)
-            self._send_json(
+            send_inference_json(
                 503,
                 {"error": {"code": "server_busy", "message": str(exc), "type": "server_error"}},
                 headers=ficelle_response_headers(request_id, requested_model),
@@ -13572,7 +13917,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             if record_post_commit_failure(exc):
                 return
             log_chat_request_failure(400, "bad_request", exc)
-            self._send_json(
+            send_inference_json(
                 400,
                 bad_request_body(exc, request_id=request_id),
                 headers=ficelle_response_headers(request_id, requested_model),

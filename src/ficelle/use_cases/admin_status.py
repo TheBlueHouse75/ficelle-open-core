@@ -56,7 +56,6 @@ StaleProfileModelRows: TypeAlias = Callable[
     [dict[str, Any], dict[str, Any], dict[str, Any]],
     list[dict[str, Any]],
 ]
-RunQuotaProbes: TypeAlias = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 LoadRuntimeState: TypeAlias = Callable[[], dict[str, Any]]
 CatalogWithScores: TypeAlias = Callable[
     [dict[str, Any], dict[str, Any], dict[str, Any]],
@@ -150,7 +149,6 @@ class AdminStatusBuildPorts:
 @dataclass(frozen=True)
 class AdminStateBuildPorts:
     load_or_refresh_catalog: LoadCatalog
-    run_due_quota_probes: RunQuotaProbes
     load_runtime_state: LoadRuntimeState
     normalized_virtual_profiles: NormalizeVirtualProfiles
     build_admin_status: BuildAdminStatus
@@ -190,7 +188,6 @@ class AdminStateBuilder:
 
     def build(self, config: dict[str, Any]) -> dict[str, Any]:
         catalog = self.ports.load_or_refresh_catalog(config)
-        self.ports.run_due_quota_probes(config, catalog)
         state = self.ports.load_runtime_state()
         if not isinstance(state, dict):
             state = {}
