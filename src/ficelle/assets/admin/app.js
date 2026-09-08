@@ -708,7 +708,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const manual = (draftProfiles[pid] || {}).mode === "manual_order";
         const modeTag = manual ? '<span class="badge info">Manual</span>' : '<span class="badge">Auto</span>';
         const proTag = isCustomProfileId(pid) ? '<span class="badge ' + (locked ? "warn" : "accent") + '">' + (locked ? "Locked" : "Pro") + '</span>' : "";
-        return '<button class="profile-tab ' + (pid === activeProfile ? "active " : "") + (locked ? "is-locked" : "") + '" type="button" data-profile="' + esc(pid) + '">' +
+        const selected = pid === activeProfile;
+        return '<button class="profile-tab ' + (selected ? "active " : "") + (locked ? "is-locked" : "") + '" type="button" data-profile="' + esc(pid) + '"' + (selected ? ' aria-current="true"' : "") + '>' +
           '<span class="pt-name">' + esc(lab[0]) + '</span>' +
           '<span class="pt-counts">' + modeTag + proTag + '<span class="badge accent">' + elig + " usable</span></span>" +
           '<span class="pt-id">' + esc(pid) + '</span>' +
@@ -778,6 +779,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       }
       $("autoModeBtn").classList.toggle("active", p.mode !== "manual_order");
       $("manualModeBtn").classList.toggle("active", p.mode === "manual_order");
+      $("autoModeBtn").setAttribute("aria-pressed", p.mode !== "manual_order" ? "true" : "false");
+      $("manualModeBtn").setAttribute("aria-pressed", p.mode === "manual_order" ? "true" : "false");
       $("autoTailToggle").checked = Boolean(p.auto_tail);
       $("orderBlock").style.display = manual ? "flex" : "none";
       $("autoNote").style.display = manual ? "none" : "flex";
@@ -1294,7 +1297,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     function providerListItemHTML(src, p) {
       const { accepted, raw } = providerCounts(p);
       const s = providerStatus(src, p);
-      return '<button type="button" class="prov-list-item' + (src === selectedProvider ? " active" : "") + '" data-prov="' + esc(src) + '">' +
+      const selected = src === selectedProvider;
+      return '<button type="button" class="prov-list-item' + (selected ? " active" : "") + '" data-prov="' + esc(src) + '"' + (selected ? ' aria-current="true"' : "") + '>' +
         providerLogo(src) +
         '<span class="pli-main"><span class="pli-name">' + esc(providerLabel(src)) + "</span>" +
           '<span class="pli-sub"><span class="pli-dot ' + (STATUS_DOT_TONE[s.state] || "warn") + '"></span>' + esc(s.label) + "</span></span>" +
@@ -1674,6 +1678,41 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      const options = [["off", "Off"], ["dry_run", "Dry run"], ["live_zone", "Live zone"]];
 	      return '<select id="setCompressionMode" data-settings-field="compression.mode">' + options.map(([v, label]) => '<option value="' + esc(v) + '"' + (value === v ? " selected" : "") + ">" + esc(label) + "</option>").join("") + "</select>";
 	    }
+	    const openSettingsSections = new Set(["retry"]);
+	    function settingsSection(id, title, help, body, advanced = true) {
+	      const open = openSettingsSections.has(id);
+	      return '<details class="fusion-setting-group settings-section" id="settings-' + esc(id) + '" data-settings-section="' + esc(id) + '"' + (open ? " open" : "") + '>' +
+	        '<summary><span class="settings-section-heading"><span>' + esc(title) + '</span><small>' + esc(help) + '</small></span>' +
+	        '<span class="settings-section-badge">' + (advanced ? "Advanced" : "Core") + "</span></summary>" +
+	        '<div class="settings-section-body">' + body + "</div></details>";
+	    }
+	    function bindSettingsNavigation(root) {
+	      const activate = (id) => {
+	        root.querySelectorAll("[data-settings-target]").forEach((button) => {
+	          const active = button.dataset.settingsTarget === id;
+	          button.classList.toggle("active", active);
+	          if (active) button.setAttribute("aria-current", "true");
+	          else button.removeAttribute("aria-current");
+	        });
+	      };
+	      root.querySelectorAll("[data-settings-section]").forEach((section) => {
+	        section.addEventListener("toggle", () => {
+	          const id = section.dataset.settingsSection;
+	          if (section.open) { openSettingsSections.add(id); activate(id); }
+	          else openSettingsSections.delete(id);
+	        });
+	      });
+	      root.querySelectorAll("[data-settings-target]").forEach((button) => button.addEventListener("click", () => {
+	        const id = button.dataset.settingsTarget;
+	        const section = root.querySelector('[data-settings-section="' + id + '"]');
+	        if (!section) return;
+	        section.open = true;
+	        openSettingsSections.add(id);
+	        activate(id);
+	        section.scrollIntoView({ behavior: "smooth", block: "start" });
+	      }));
+	      activate([...openSettingsSections][0] || "retry");
+	    }
 	    function renderSettings() {
 	      const s = draftSettings || {};
 	      const cd = s.cooldown_seconds || {};
@@ -1733,17 +1772,24 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	            settingsNumber("setAutoBenchModels", "auto_benchmark_models_per_cycle", s.auto_benchmark_models_per_cycle, 1, 50),
 	            "How many not-yet-fully-discovered models each cycle probes (across all their capabilities). Higher covers a new provider's catalog faster but uses more free-quota per cycle. Default 5.") +
 	        "</div>";
-	      $("settingsControls").innerHTML =
-	        '<div class="fusion-setting-groups">' +
-	          fusionSettingsGroup("Retry budget", "How hard Ficelle tries within a virtual model's pool before returning an error to the client.", retryControls) +
-	          fusionSettingsGroup("Cooldown durations", "When an upstream fails, Ficelle benches it so the next request skips it. Each row is the bench time (in seconds) for one kind of failure. Higher means more cautious; lower retries a flaky model sooner.", cooldownControls) +
-	          fusionSettingsGroup("Timeouts and quota probes", "Network time limits and how often Ficelle re-checks a provider whose free quota ran out.", timeoutControls) +
-	          fusionSettingsGroup("Capability re-verification", "How long a benchmark verdict (verified or failed) is trusted before a model is re-tested for a specialized virtual model. Longer means fewer benchmarks but slower recovery when a provider changes a model.", verificationControls) +
-	          fusionSettingsGroup("Benchmark probe budgets", "Input size of the heavy capability probes. Bigger long-context/compression probes test deeper but cost more free-quota tokens per benchmarked model. Lower them if quotas are tight.", benchmarkBudgetControls) +
-	          fusionSettingsGroup("Capability reference routing", "Opt-in (Phase B): trust the curated capability prior for routing before a model is benchmarked. Safe defaults keep this off; a failed benchmark always overrides it.", referenceRoutingControls) +
-	          fusionSettingsGroup("Automatic capability discovery", "Ficelle probes new models in the background and maps each to every virtual model it supports, so you don't click Canary. On by default; bounded per cycle and quota-aware.", autoBenchmarkControls) +
-	        "</div>";
-	      $("settingsControls").querySelectorAll("[data-settings-field]").forEach((el) => el.addEventListener("change", readSettingsDraft));
+	      const sections = [
+	        ["retry", "Retry budget", "How hard Ficelle tries within a virtual model's pool before returning an error to the client.", retryControls, false],
+	        ["cooldowns", "Cooldown durations", "When an upstream fails, Ficelle benches it so the next request skips it. Higher means more cautious; lower retries a flaky model sooner.", cooldownControls, true],
+	        ["timeouts", "Timeouts and quota probes", "Network time limits and how often Ficelle re-checks a provider whose free quota ran out.", timeoutControls, true],
+	        ["verification", "Capability re-verification", "How long a capability verdict is trusted before a specialized virtual model re-tests it.", verificationControls, true],
+	        ["budgets", "Benchmark probe budgets", "Input size of the heavy capability probes. Lower these values when free quotas are tight.", benchmarkBudgetControls, true],
+	        ["reference", "Capability reference routing", "Opt in to curated capability evidence before a model has been benchmarked.", referenceRoutingControls, true],
+	        ["discovery", "Automatic capability discovery", "Control the background discovery cycle and its quota-aware limits.", autoBenchmarkControls, true],
+	      ];
+	      const root = $("settingsControls");
+	      root.innerHTML = '<div class="settings-shell"><nav class="settings-index" aria-label="Settings sections">' +
+	        '<div class="settings-index-label">Settings map</div>' +
+	        sections.map(([id, title, _help, _body, advanced]) => '<button class="settings-index-button" type="button" data-settings-target="' + esc(id) + '" aria-controls="settings-' + esc(id) + '"><span>' + esc(title) + '</span>' + (advanced ? '<small>Advanced</small>' : '<small>Core</small>') + "</button>").join("") +
+	        '</nav><div class="settings-sections">' +
+	        sections.map(([id, title, help, body, advanced]) => settingsSection(id, title, help, body, advanced)).join("") +
+	        "</div></div>";
+	      root.querySelectorAll("[data-settings-field]").forEach((el) => el.addEventListener("change", readSettingsDraft));
+	      bindSettingsNavigation(root);
 	    }
 	    function readSettingsDraft() {
 	      // A blanked/invalid field falls back to the value currently loaded in the draft, so
@@ -1972,11 +2018,38 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     let requestsSummaryAt = 0;
     let requestsCursor = null;         // index position the rendered list was read at
     let requestsDegraded = false;
+    let requestsTransport = "paused";
     const REQ_WINDOWS = ["1h", "24h", "7d", "30d"];
-    const REQ_LIST_CAP = 200;          // rows kept in the payload and in the DOM
+    const REQ_LIST_CAP = 200;          // recent rows kept in memory and available to the pager
+    const REQ_PAGE_SIZE = 50;          // progressive disclosure keeps the first scan compact
     const REQ_FLUSH_MS = 400;          // coalesce a burst of streamed rows into one paint
     const REQ_SUMMARY_MS = 15000;      // the aggregates are the heavy read; refresh them sparingly
-    const liveLabel = () => ic(ICONS.watcher) + "Live: " + (requestsLive ? "on" : "off");
+    let requestsVisibleCount = REQ_PAGE_SIZE;
+    const REQUEST_TRANSPORT_META = {
+      live: { label: "Live", title: "Connected to the request event stream." },
+      connecting: { label: "Reconnecting", title: "Connecting to the request event stream." },
+      polling: { label: "Polling", title: "The live stream is unavailable; refreshing every five seconds." },
+      paused: { label: "Paused", title: "Live request updates are paused." },
+    };
+    function requestLiveButtonHTML() {
+      const meta = REQUEST_TRANSPORT_META[requestsTransport] || REQUEST_TRANSPORT_META.paused;
+      return '<button class="dimple-toggle is-' + esc(requestsTransport) + (requestsLive ? " is-on" : "") + '" id="liveRequestsBtn" type="button" role="switch" aria-checked="' + (requestsLive ? "true" : "false") + '" title="' + esc(meta.title) + '">' +
+        '<span class="dimple-track" aria-hidden="true"><span class="dimple-knob"></span></span>' +
+        '<span class="dimple-label">Updates</span><span class="dimple-state">' + esc(meta.label) + "</span></button>";
+    }
+    function syncRequestsLiveToggle() {
+      const button = $("liveRequestsBtn");
+      if (!button) return;
+      const meta = REQUEST_TRANSPORT_META[requestsTransport] || REQUEST_TRANSPORT_META.paused;
+      button.className = "dimple-toggle is-" + requestsTransport + (requestsLive ? " is-on" : "");
+      button.setAttribute("aria-checked", requestsLive ? "true" : "false");
+      button.title = meta.title;
+      button.innerHTML = '<span class="dimple-track" aria-hidden="true"><span class="dimple-knob"></span></span><span class="dimple-label">Updates</span><span class="dimple-state">' + esc(meta.label) + "</span>";
+    }
+    function setRequestsTransport(status) {
+      requestsTransport = REQUEST_TRANSPORT_META[status] ? status : "paused";
+      syncRequestsLiveToggle();
+    }
 
     function requestQuery() {
       const f = requestFilters;
@@ -2037,7 +2110,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
      * stays current without re-fetching the whole list; the 5s poll is the fallback for a
      * browser or proxy that cannot hold an event stream. Both stop when the view is left or
      * the tab is hidden — a background tab must not keep a connection or a timer alive. */
-    function stopRequestsLive() { closeRequestsStream(); stopRequestsPolling(); }
+    function stopRequestsTransport() { closeRequestsStream(); stopRequestsPolling(); }
+    function stopRequestsLive() { stopRequestsTransport(); setRequestsTransport("paused"); }
     function closeRequestsStream() {
       if (requestsStream) { requestsStream.close(); requestsStream = null; }
       if (requestsFlushTimer) { clearTimeout(requestsFlushTimer); requestsFlushTimer = null; }
@@ -2045,7 +2119,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     function stopRequestsPolling() { if (requestsTimer) { clearInterval(requestsTimer); requestsTimer = null; } }
     function startRequestsLive() {
-      stopRequestsLive();
+      stopRequestsTransport();
+      if (!requestsLive) { setRequestsTransport("paused"); return; }
+      setRequestsTransport("connecting");
       if (document.hidden) return;  // resumed by the visibilitychange handler
       if (typeof EventSource !== "function") { startRequestsPolling(); return; }
       // Resume from the snapshot the list was built on, so nothing routed between that read
@@ -2053,6 +2129,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const at = requestsCursor === null ? "" : "&cursor=" + encodeURIComponent(requestsCursor);
       const stream = new EventSource("/admin/requests/stream?" + requestQuery() + at);
       requestsStream = stream;
+      stream.addEventListener("open", () => { if (stream === requestsStream) setRequestsTransport("live"); });
       stream.addEventListener("requests", (ev) => {
         if (stream !== requestsStream) return;
         let batch;
@@ -2069,7 +2146,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         // EventSource retries on its own while it is CONNECTING (a server restart, or the
         // stream's own lifetime cap). CLOSED means it gave up — that is the only failure
         // worth downgrading the transport for.
-        if (stream.readyState !== EventSource.CLOSED) return;
+        if (stream.readyState !== EventSource.CLOSED) { setRequestsTransport("connecting"); return; }
         closeRequestsStream();
         startRequestsPolling();
         showToast("Live stream unavailable; falling back to polling.");
@@ -2077,6 +2154,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     function startRequestsPolling() {
       stopRequestsPolling();
+      setRequestsTransport("polling");
       requestsTimer = setInterval(() => {
         if (currentView !== "requests" || !requestsLive) { stopRequestsPolling(); return; }
         if (document.hidden) return;
@@ -2085,8 +2163,6 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     function toggleRequestsLive() {
       setRequestsLive(!requestsLive);
-      const b = $("liveRequestsBtn");
-      if (b) { b.innerHTML = liveLabel(); b.classList.toggle("primary", requestsLive); b.setAttribute("aria-pressed", requestsLive ? "true" : "false"); }
       if (requestsLive) startRequestsLive(); else stopRequestsLive();
     }
     function queueStreamedRequests(entries) {
@@ -2116,7 +2192,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         // Prepend just the new rows instead of rebuilding: the rows already on screen keep
         // their expanded state, and a long list costs nothing to leave alone.
         el.insertAdjacentHTML("afterbegin", fresh.map((e) => reqRowHTML(e, true)).join(""));
-        while (el.children.length > REQ_LIST_CAP) el.lastElementChild.remove();
+        while (el.children.length > Math.min(requestsVisibleCount, (requestsPayload.entries || []).length)) el.lastElementChild.remove();
+        renderRequestsListFooter((requestsPayload.entries || []).length);
       }
       if (Date.now() - requestsSummaryAt >= REQ_SUMMARY_MS) {
         requestsSummaryAt = Date.now();  // claim the slot before awaiting so a burst cannot stack fetches
@@ -2180,10 +2257,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     function renderRequestsTimeline() {
       const el = $("requestsTimeline"); if (!el) return;
       const buckets = (requestsSummary?.timeline) || [];
-      // Leave the chart alone while the pointer is on it: the 5s poll would otherwise
-      // rebuild the DOM under the cursor and drop the tooltip mid-read. This also comes
+      // Leave the chart alone while it is being inspected: the 5s poll would otherwise
+      // rebuild the DOM under the pointer or keyboard focus and drop the tooltip mid-read. This also comes
       // before the empty state so an expiring last bucket waits for pointer leave.
-      if ($("reqChart")?.matches(":hover")) return;
+      if ($("reqChart")?.matches(":hover, :focus-within")) return;
       if (!buckets.some((b) => Number(b.total || 0) > 0)) {
         stopChartResizeWatch();
         el.innerHTML = '<div class="empty">No requests in this window yet.</div>';
@@ -2293,11 +2370,15 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         ticks += '<text class="rc-xlab" x="' + cx.toFixed(1) + '" y="' + (P.top + H + 16) + '">' + esc(fmt(new Date(Number(buckets[i].bucket) * 1000))) + "</text>";
       }
 
-      const hits = buckets.map((_, i) =>
-        '<rect class="rc-hit" data-i="' + i + '" x="' + (P.left + i * slot).toFixed(1) + '" y="' + P.top + '" width="' + slot.toFixed(1) + '" height="' + H + '"/>'
-      ).join("");
+      const firstInteractiveBucket = Math.max(0, buckets.findIndex((bucket) => bucketCounts(bucket).total > 0));
+      const hits = buckets.map((bucket, i) => {
+        const counts = bucketCounts(bucket);
+        const when = fmt(new Date(Number(bucket.bucket) * 1000));
+        const label = when + ": " + counts.total + " requests, " + counts.ok + " successful, " + counts.err + " errors";
+        return '<rect class="rc-hit" data-i="' + i + '" tabindex="' + (i === firstInteractiveBucket ? "0" : "-1") + '" role="img" aria-label="' + esc(label) + '" x="' + (P.left + i * slot).toFixed(1) + '" y="' + P.top + '" width="' + slot.toFixed(1) + '" height="' + H + '"/>';
+      }).join("");
 
-      host.innerHTML = '<svg class="rc-svg" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + " " + height + '" role="img" aria-label="Request volume over time, success and error stacked per time bucket">' +
+      host.innerHTML = '<svg class="rc-svg" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + " " + height + '" role="group" aria-label="Request volume over time, success and error stacked per time bucket">' +
         grid +
         '<rect class="rc-band" id="rcBand" y="' + P.top + '" height="' + H + '" width="' + slot.toFixed(1) + '" rx="3" visibility="hidden"/>' +
         bars + ticks + hits + "</svg>" +
@@ -2307,44 +2388,61 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 
     function bindChartHover(host, buckets, geo) {
       const band = $("rcBand"), tip = $("reqTip");
-      host.querySelectorAll(".rc-hit").forEach((hit) => {
-        hit.addEventListener("mouseenter", () => {
-          const i = Number(hit.dataset.i);
-          const b = buckets[i]; if (!b || !band || !tip) return;
-          const { total, ok: okc, err: errc } = bucketCounts(b);
-          const start = new Date(Number(b.bucket) * 1000);
-          const end = new Date((Number(b.bucket) + geo.bucketSeconds) * 1000);
-          // Take the slot geometry off the hit rect itself rather than recomputing it,
-          // so the band and the tooltip cannot drift from the bars they point at.
-          const slotX = Number(hit.getAttribute("x")), slotW = Number(hit.getAttribute("width"));
-          band.setAttribute("x", slotX.toFixed(1));
-          band.setAttribute("visibility", "visible");
-          // The hit rects sit above the bars and swallow the pointer, so :hover never
-          // reaches the bar itself — carry the highlight explicitly.
-          host.querySelector(".rc-bar.is-active")?.classList.remove("is-active");
-          host.querySelector('.rc-bar[data-i="' + i + '"]')?.classList.add("is-active");
-          tip.innerHTML = '<div class="rt-when">' + esc(chartDay(start)) + " " + esc(chartClock(start)) + " – " + esc(chartClock(end)) + "</div>" +
-            (total
-              ? '<div class="rt-counts"><span><i class="dot ok"></i>' + okc + " ok</span><span><i class=\"dot danger\"></i>" + errc + " error" + (errc === 1 ? "" : "s") + "</span></div>" +
-                '<div class="rt-total">' + total + " request" + (total === 1 ? "" : "s") + "</div>"
-              : '<div class="rt-total">no traffic</div>');
-          tip.hidden = false;
-          // Sit beside the slot, on whichever side has room — never on top of the bar
-          // being read — then clamp so the card stays inside the plot.
-          const w = tip.offsetWidth;
-          const beside = slotX < geo.width / 2 ? slotX + slotW + 8 : slotX - w - 8;
-          tip.style.left = Math.max(4, Math.min(geo.width - w - 4, beside)) + "px";
+      const hits = [...host.querySelectorAll(".rc-hit")];
+      const showBucket = (hit) => {
+        const i = Number(hit.dataset.i);
+        const b = buckets[i]; if (!b || !band || !tip) return;
+        const { total, ok: okc, err: errc } = bucketCounts(b);
+        const start = new Date(Number(b.bucket) * 1000);
+        const end = new Date((Number(b.bucket) + geo.bucketSeconds) * 1000);
+        // Take the slot geometry off the hit rect itself rather than recomputing it,
+        // so the band and the tooltip cannot drift from the bars they point at.
+        const slotX = Number(hit.getAttribute("x")), slotW = Number(hit.getAttribute("width"));
+        band.setAttribute("x", slotX.toFixed(1));
+        band.setAttribute("visibility", "visible");
+        host.querySelector(".rc-bar.is-active")?.classList.remove("is-active");
+        host.querySelector('.rc-bar[data-i="' + i + '"]')?.classList.add("is-active");
+        tip.innerHTML = '<div class="rt-when">' + esc(chartDay(start)) + " " + esc(chartClock(start)) + " – " + esc(chartClock(end)) + "</div>" +
+          (total
+            ? '<div class="rt-counts"><span><i class="dot ok"></i>' + okc + " ok</span><span><i class=\"dot danger\"></i>" + errc + " error" + (errc === 1 ? "" : "s") + "</span></div>" +
+              '<div class="rt-total">' + total + " request" + (total === 1 ? "" : "s") + "</div>"
+            : '<div class="rt-total">no traffic</div>');
+        tip.hidden = false;
+        const width = tip.offsetWidth;
+        const beside = slotX < geo.width / 2 ? slotX + slotW + 8 : slotX - width - 8;
+        tip.style.left = Math.max(4, Math.min(geo.width - width - 4, beside)) + "px";
+      };
+      const hideBucket = () => {
+        $("rcBand")?.setAttribute("visibility", "hidden");
+        const currentTip = $("reqTip"); if (currentTip) currentTip.hidden = true;
+        host.querySelector(".rc-bar.is-active")?.classList.remove("is-active");
+      };
+      hits.forEach((hit, index) => {
+        hit.addEventListener("mouseenter", () => showBucket(hit));
+        hit.addEventListener("focus", () => {
+          hits.forEach((candidate) => candidate.setAttribute("tabindex", candidate === hit ? "0" : "-1"));
+          showBucket(hit);
+        });
+        hit.addEventListener("keydown", (event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const delta = event.key === "ArrowRight" ? 1 : -1;
+          hits[(index + delta + hits.length) % hits.length]?.focus();
         });
       });
       // The host outlives the poll, so this binds once for its whole lifetime.
       if (host.dataset.hoverBound) return;
       host.dataset.hoverBound = "1";
       host.addEventListener("mouseleave", () => {
-        $("rcBand")?.setAttribute("visibility", "hidden");
-        const t = $("reqTip"); if (t) t.hidden = true;
-        host.querySelector(".rc-bar.is-active")?.classList.remove("is-active");
+        if (host.matches(":focus-within")) return;
+        hideBucket();
         renderRequestsTimeline(); // catch up on any poll skipped while hovering
       });
+      host.addEventListener("focusout", () => requestAnimationFrame(() => {
+        if (host.matches(":focus-within")) return;
+        hideBucket();
+        renderRequestsTimeline();
+      }));
     }
 
     function startChartResizeWatch() {
@@ -2382,7 +2480,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         '<select id="reqStatus" class="req-select" aria-label="HTTP status">' + statusOpts + "</select>" +
         (hasFilter ? '<button class="btn ghost sm" type="button" id="reqReset">Reset</button>' : "");
       // A live tail is filtered server-side, so a filter change has to reopen it.
-      const apply = () => loadRequests().then(() => { if (requestsLive) startRequestsLive(); }).catch((e) => showToast(e.message));
+      const apply = () => {
+        requestsVisibleCount = REQ_PAGE_SIZE;
+        return loadRequests().then(() => { if (requestsLive) startRequestsLive(); }).catch((e) => showToast(e.message));
+      };
       $("reqProfile").addEventListener("change", (e) => { f.profile = e.target.value; apply(); });
       $("reqSource").addEventListener("change", (e) => { f.source = e.target.value; apply(); });
       $("reqReason").addEventListener("change", (e) => { f.reason = e.target.value; apply(); });
@@ -2393,27 +2494,64 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (reset) reset.addEventListener("click", () => { f.profile = ""; f.source = ""; f.reason = ""; f.status = ""; f.q = ""; renderRequestsFilters(); apply(); });
     }
 
-    function renderRequestsList() {
+    function renderRequestsList(focusRequestId = null) {
       const el = $("requestsList"); if (!el) return;
       const rows = requestsPayload?.entries || [];
-      if (!rows.length) { el.innerHTML = '<div class="empty">No matching requests yet. Route a request — or relax the filters — to see traffic here.</div>'; return; }
-      el.innerHTML = rows.map((e) => reqRowHTML(e)).join("");
+      const focusedRow = document.activeElement?.closest?.("[data-req-id]");
+      const restoreRequestId = focusRequestId || focusedRow?.dataset.reqId || null;
+      if (!rows.length) {
+        el.innerHTML = '<div class="empty">No matching requests yet. Route a request — or relax the filters — to see traffic here.</div>';
+        renderRequestsListFooter(0);
+        return;
+      }
+      const visibleRows = rows.slice(0, requestsVisibleCount);
+      el.innerHTML = visibleRows.map((e) => reqRowHTML(e)).join("");
       // Delegated, and assigned rather than added: the live tail prepends rows into this same
       // container, and a per-row listener would have to be re-attached on every batch.
       el.onclick = onRequestRowActivate;
       el.onkeydown = (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onRequestRowActivate(ev); } };
+      renderRequestsListFooter(rows.length);
+      if (restoreRequestId) {
+        const restored = [...el.querySelectorAll("[data-req-id]")].find((row) => row.dataset.reqId === restoreRequestId);
+        restored?.focus({ preventScroll: true });
+      }
+    }
+    function renderRequestsListFooter(total) {
+      const footer = $("requestsListFooter");
+      if (!footer) return;
+      if (!total) { footer.hidden = true; footer.replaceChildren(); return; }
+      const shown = Math.min(requestsVisibleCount, total);
+      footer.hidden = total <= REQ_PAGE_SIZE;
+      if (footer.hidden) { footer.replaceChildren(); return; }
+      footer.innerHTML = '<span>Showing ' + shown + " of " + total + " recent requests</span>" +
+        (shown < total ? '<button class="btn ghost sm" id="requestsLoadMore" type="button">Load 50 older</button>' : '<span class="req-list-complete">All recent requests loaded</span>');
+      const button = $("requestsLoadMore");
+      if (button) button.addEventListener("click", () => {
+        const firstNew = requestsPayload?.entries?.[requestsVisibleCount]?.request_id || null;
+        requestsVisibleCount = Math.min(requestsVisibleCount + REQ_PAGE_SIZE, total);
+        renderRequestsList(firstNew);
+      });
     }
     function onRequestRowActivate(ev) {
       const row = ev.target.closest("[data-req-id]");
       if (!row) return;
       const id = row.dataset.reqId;
       if (expandedRequests.has(id)) expandedRequests.delete(id); else expandedRequests.add(id);
-      renderRequestsList();
+      renderRequestsList(id);
+    }
+    function requestPanelId(requestId) {
+      let hash = 2166136261;
+      for (const char of String(requestId || "")) {
+        hash ^= char.codePointAt(0);
+        hash = Math.imul(hash, 16777619);
+      }
+      return "req-detail-" + (hash >>> 0).toString(16);
     }
     function reqRowHTML(e, isNew = false) {
       const ok = e.reason === "ok";
       const open = expandedRequests.has(e.request_id);
-      const statusBadge = '<span class="badge ' + (ok ? "ok" : "danger") + '">' + esc(String(e.status ?? "—")) + "</span>";
+      const panelId = requestPanelId(e.request_id);
+      const statusBadge = '<span class="badge req-status ' + (ok ? "ok" : "danger") + '">' + esc(String(e.status ?? "—")) + "</span>";
       const reasonText = ok ? "ok" : reasonWithCode(e.reason);
       const errType = (!ok && e.error_type) ? ' <span class="req-errtype">' + esc(e.error_type) + "</span>" : "";
       const lat = e.latency_seconds == null ? "—" : Number(e.latency_seconds).toFixed(2) + "s";
@@ -2426,7 +2564,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         ? '<span class="badge warn" title="' + esc(attemptChainSummary(e)) + '">' + (e.fallback ? "fallback " : "") + Number(e.attempt_count) + "×</span>"
         : (e.fallback ? '<span class="badge warn">fallback</span>' : "");
       const stream = e.stream ? '<span class="req-stream" title="streamed response">≋</span>' : "";
-      const head = '<div class="req-row' + (open ? " is-open" : "") + '" data-req-id="' + esc(e.request_id) + '" role="button" tabindex="0">' +
+      const rowLabel = [t.label, profileLabels[e.profile]?.[0] || e.profile || "unknown virtual model", e.source ? providerLabel(e.source) : "unknown provider", e.upstream_id || e.model_id || "unknown upstream", "status " + String(e.status ?? "unknown"), reasonText, lat + " latency"].join(", ");
+      const head = '<div class="req-row' + (open ? " is-open" : "") + '" data-req-id="' + esc(e.request_id) + '" role="button" tabindex="0" aria-label="' + esc(rowLabel) + '" aria-expanded="' + (open ? "true" : "false") + '" aria-controls="' + panelId + '">' +
         '<span class="req-time" title="' + esc(t.title) + '">' + esc(t.label) + "</span>" +
         '<span class="req-profile">' + esc(profileLabels[e.profile]?.[0] || e.profile || "—") + "</span>" +
         '<span class="req-prov">' + esc(e.source ? providerLabel(e.source) : "—") + "</span>" +
@@ -2436,7 +2575,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         '<span class="req-lat">' + esc(lat) + "</span>" +
         '<span class="req-flags">' + tries + stream + "</span>" +
         "</div>";
-      return '<div class="req-item' + (isNew ? " is-new" : "") + '">' + head + (open ? reqDetailHTML(e) : "") + "</div>";
+      return '<div class="req-item' + (isNew ? " is-new" : "") + '" role="listitem">' + head + (open ? reqDetailHTML(e, panelId) : "") + "</div>";
     }
     function attemptChainSummary(e) {
       const attempts = e.attempts || [];
@@ -2445,7 +2584,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         .map((a) => (a.source ? providerLabel(a.source) : "?") + " " + String(a.status ?? a.reason ?? "—"))
         .join(" → ");
     }
-    function reqDetailHTML(e) {
+    function reqDetailHTML(e, panelId = requestPanelId(e.request_id)) {
       const attempts = e.attempts || [];
       const chain = attempts.length ? attempts.map((a, i) => {
         const aok = a.reason === "ok";
@@ -2478,7 +2617,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (e.competence) meta.push("competence " + esc(e.competence));
       if (e.candidate_count != null) meta.push(Number(e.candidate_count) + " candidates");
       if (e.compression_status) meta.push("compression " + esc(e.compression_status));
-      return '<div class="req-detail"><div class="req-detail-meta mono">' + meta.join(" · ") + "</div>" +
+      return '<div class="req-detail" id="' + panelId + '" role="region" aria-label="Request attempt details"><div class="req-detail-meta mono">' + meta.join(" · ") + "</div>" +
         '<div class="req-chain">' + chain + "</div></div>";
     }
 
@@ -2511,6 +2650,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      renderPaidModelBanner();
 	      renderPruneBanner();
 	      renderNewModelsBanner();
+	      syncNoticeCenter();
 	      renderProfileList(); renderActiveProfile(); renderFilterBar(); renderSelected(); renderExcluded(); renderAvailable();
 	      renderProviders(); renderFusion(); renderSettings(); renderCompression(); renderLicense(); renderHealth(); renderPerformance(); renderAudit(); renderNavCounts();
       syncLongRunningActions();
@@ -2525,6 +2665,34 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     const PAID_MODEL_TOAST_KEY = "ficelle.seenPaidModelToast";
     const readDismissed = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
     const writeDismissed = (key, value) => { try { localStorage.setItem(key, value); } catch { /* private mode: the banner simply comes back */ } };
+    let noticeCenterExpanded = false;
+    function syncNoticeCenter() {
+      const center = $("noticeCenter"), stack = $("noticeStack"), toggle = $("noticeCenterToggle");
+      if (!center || !stack || !toggle) return;
+      const visible = [...stack.querySelectorAll(".update-banner")].filter((banner) => !banner.hidden);
+      stack.querySelectorAll(".is-primary-notice").forEach((banner) => banner.classList.remove("is-primary-notice"));
+      const priority = (banner) => banner.classList.contains("is-error") ? 4
+        : banner.classList.contains("is-prune") ? 3
+        : banner.classList.contains("is-progress") ? 2
+        : banner.classList.contains("is-fresh") ? 1 : 2;
+      visible.sort((a, b) => priority(b) - priority(a))[0]?.classList.add("is-primary-notice");
+      center.hidden = visible.length === 0;
+      if (visible.length <= 1) noticeCenterExpanded = false;
+      const collapsed = visible.length > 1 && !noticeCenterExpanded;
+      center.classList.toggle("is-collapsed", collapsed);
+      toggle.hidden = visible.length <= 1;
+      toggle.setAttribute("aria-expanded", noticeCenterExpanded ? "true" : "false");
+      const label = $("noticeCenterLabel"), action = $("noticeCenterAction");
+      if (label) label.textContent = visible.length + " system notices";
+      if (action) action.textContent = noticeCenterExpanded ? "Show less" : "Show all";
+    }
+    function initNoticeCenter() {
+      const stack = $("noticeStack"), toggle = $("noticeCenterToggle");
+      if (!stack || !toggle) return;
+      toggle.addEventListener("click", () => { noticeCenterExpanded = !noticeCenterExpanded; syncNoticeCenter(); });
+      new MutationObserver(syncNoticeCenter).observe(stack, { subtree: true, attributes: true, attributeFilter: ["hidden"] });
+      syncNoticeCenter();
+    }
     let shownPaidModelToast = null;
     function latestPaidModelNotice() {
       return (state?.notices?.paid_models || [])[0] || null;
@@ -2751,10 +2919,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
        this reloads the full state only once that marker actually moves.
 
        The heavy endpoint is deliberately not the thing being polled. /admin/state is ~3 MB,
-       rebuilds the catalog and admin projections, and runs due quota probes on the request
-       thread — admin_notices_payload's own docstring calls it "intentionally not polled", and
-       /admin/status.json was already hardened so a timer could not spend free quota by being
-       read. Putting it on an interval would have reopened exactly that hole, for a catalog
+       and rebuilds the catalog and admin projections on the request thread —
+       admin_notices_payload's own docstring calls it "intentionally not polled". Both it and
+       /admin/status.json are read-only, so explicit quota probes stay behind their guarded POST.
+       Putting the heavy state endpoint on an interval would still waste local work for a catalog
        that is republished at most hourly. */
     let resyncInFlight = false;
     // The catalog identity currently on screen. A full-state payload carries the same published
@@ -2924,7 +3092,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 
     /* ---------- view router ---------- */
     const viewMeta = {
-	      routing: { eyebrow: "Models local control", title: "Routing", desc: "Map your free provider models onto the virtual models your apps call. The top working model wins each request." },
+      routing: { eyebrow: "Local model control", title: "Routing", desc: "Map your free provider models onto the virtual models your apps call. The top working model wins each request." },
 	      providers: { eyebrow: "Catalog", title: "Providers", desc: "Where Ficelle pulls free, zero-price models from. Connect a key to unlock a provider's catalog." },
 		      fusion: { eyebrow: "Compound model", title: "Fusion", desc: "Configure auto-fusion and inspect its metadata-only observability in one place." },
       settings: { eyebrow: "Configure", title: "Settings", desc: "Global routing controls: how many upstream models Ficelle tries per request, how long failures are benched, and network time limits. These apply across every virtual model." },
@@ -2964,6 +3132,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (currentNavItem && window.matchMedia("(max-width: 1080px)").matches) {
         currentNavItem.scrollIntoView({ block: "nearest", inline: "center" });
       }
+      requestAnimationFrame(syncNavOverflow);
     }
     function viewActions(name) {
 	      const btn = (id, label, primary, icon, title) => '<button class="btn ' + (primary ? "primary" : "") + '" id="' + id + '"' + (title ? ' title="' + esc(title) + '"' : "") + ">" + (icon || "") + label + "</button>";
@@ -2973,7 +3142,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      if (name === "compression") return state?.pro_entitled ? btn("reloadCompressionBtn", "Reload", false, ic(ICONS.refresh)) + btn("saveCompressionBtn", "Save settings", true, ic(ICONS.save)) : "";
 	      if (name === "health") return btn("canaryBtn", "Run canary", true, ic(ICONS.canary));
       if (name === "audit") return btn("reloadAuditBtn", "Reload", false, ic(ICONS.refresh));
-      if (name === "requests") return btn("reloadRequestsBtn", "Reload", false, ic(ICONS.refresh)) + '<button class="btn' + (requestsLive ? " primary" : "") + '" id="liveRequestsBtn" type="button" title="Stream new requests as they are routed, without reloading the page." aria-pressed="' + (requestsLive ? "true" : "false") + '">' + liveLabel() + "</button>";
+      if (name === "requests") return btn("reloadRequestsBtn", "Reload", false, ic(ICONS.refresh)) + requestLiveButtonHTML();
       if (name === "export") return btn("buildExportBtn", "Build snippet", true, ic(ICONS.export));
       return "";
     }
@@ -3398,8 +3567,19 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
 
     /* ---------- boot ---------- */
+    function syncNavOverflow() {
+      const nav = $("nav"), shell = nav?.closest(".nav-shell");
+      if (!nav || !shell) return;
+      const maxScroll = Math.max(0, nav.scrollWidth - nav.clientWidth);
+      shell.classList.toggle("can-scroll-start", nav.scrollLeft > 4);
+      shell.classList.toggle("can-scroll-end", nav.scrollLeft < maxScroll - 4);
+    }
     function initNav() {
+      const nav = $("nav");
       document.querySelectorAll(".nav-item").forEach((b) => b.addEventListener("click", () => setView(b.dataset.nav)));
+      nav?.addEventListener("scroll", syncNavOverflow, { passive: true });
+      window.addEventListener("resize", syncNavOverflow);
+      requestAnimationFrame(syncNavOverflow);
       $("railHealth").addEventListener("click", () => setView("health"));
       document.querySelector(".skip-link").addEventListener("click", (event) => {
         event.preventDefault();
@@ -3489,7 +3669,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     // Lets pro-views.js trigger one render after it registers its implementations (any load order).
     proViews.__boot = () => render();
 
-    initTheme(); initNav(); initStaticControls();
+    initTheme(); initNav(); initNoticeCenter(); initStaticControls();
     // A deep-linked key means the user just bought Pro — land on the License view to unlock.
     setView(deepLinkedKey ? "license" : (location.hash || "#/routing").replace("#/", ""));
 
@@ -3531,6 +3711,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         while (Date.now() < deadline) {
           try {
             await loadState();
+            $("bootNotice").classList.remove("is-waiting");
             $("bootNotice").hidden = true;
             if ($("bootStatus").textContent) $("bootStatus").textContent = "Ficelle service ready.";
             return;

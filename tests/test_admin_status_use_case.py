@@ -94,8 +94,7 @@ def test_fusion_admin_status_filters_and_redacts_last_run_metadata():
     assert "secret-token-123" not in repr(last_run)
 
 
-def test_admin_state_builder_assembles_operator_payload_and_runs_quota_probe():
-    calls: list[str] = []
+def test_admin_state_builder_assembles_operator_payload_without_running_quota_probe():
     stale_row_states: list[dict] = []
     catalog = {"models": [{"id": "m1", "invokable": True}]}
     state = {"last_routes": {"ficelle/auto-fast": {"status": "ok"}}}
@@ -103,8 +102,6 @@ def test_admin_state_builder_assembles_operator_payload_and_runs_quota_probe():
     builder = AdminStateBuilder(
         AdminStateBuildPorts(
             load_or_refresh_catalog=lambda _config: catalog,
-            run_due_quota_probes=lambda _config, _catalog: calls.append("quota")
-            or {"status": "ok"},
             load_runtime_state=lambda: state,
             normalized_virtual_profiles=lambda _config: {"ficelle/auto-fast": {"mode": "auto"}},
             build_admin_status=lambda _catalog, _config, _state: {
@@ -137,7 +134,6 @@ def test_admin_state_builder_assembles_operator_payload_and_runs_quota_probe():
 
     payload = builder.build({"host": "127.0.0.2", "port": 9999, "catalog_ttl_seconds": 60})
 
-    assert calls == ["quota"]
     assert payload["catalog"]["scored"] is True
     assert payload["virtual_profiles"] == {"ficelle/auto-fast": {"mode": "auto"}}
     # Carried into the operator payload beside the profiles it annotates: the dashboard needs

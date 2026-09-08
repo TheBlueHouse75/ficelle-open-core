@@ -23,17 +23,26 @@
         <div class="page-actions" id="viewActions"></div>
       </header>
 
-      <section class="update-banner" id="updateBanner" hidden aria-live="polite"></section>
-      <!-- Runtime strict-zero guard: a provider declared one catalog model paid. The model is
-           already quarantined; this notice explains the automatic routing change. -->
-      <section class="update-banner is-error" id="paidModelBanner" hidden aria-live="assertive"></section>
-      <!-- A prune is the only edit Ficelle makes to a virtual model on its own, so it says so
-           here once and sends the user to the lane it shortened. Dismissed per audit id, so
-           the next prune speaks up again. -->
-      <section class="update-banner is-prune" id="pruneBanner" hidden aria-live="polite"></section>
-      <!-- The other direction: models a provider started offering for free. Nothing changed
-           locally, so this only reports — and hands over the filtered list to pick from. -->
-      <section class="update-banner is-fresh" id="newModelsBanner" hidden aria-live="polite"></section>
+      <section class="notice-center" id="noticeCenter" hidden aria-label="System notices">
+        <button class="notice-summary" id="noticeCenterToggle" type="button" aria-expanded="false" aria-controls="noticeStack">
+          <span class="notice-summary-signal" aria-hidden="true"></span>
+          <span id="noticeCenterLabel">System notices</span>
+          <span class="notice-summary-action" id="noticeCenterAction">Show all</span>
+        </button>
+        <div class="notice-stack" id="noticeStack">
+          <section class="update-banner" id="updateBanner" hidden aria-live="polite"></section>
+          <!-- Runtime strict-zero guard: a provider declared one catalog model paid. The model is
+               already quarantined; this notice explains the automatic routing change. -->
+          <section class="update-banner is-error" id="paidModelBanner" hidden aria-live="assertive"></section>
+          <!-- A prune is the only edit Ficelle makes to a virtual model on its own, so it says so
+               here once and sends the user to the lane it shortened. Dismissed per audit id, so
+               the next prune speaks up again. -->
+          <section class="update-banner is-prune" id="pruneBanner" hidden aria-live="polite"></section>
+          <!-- The other direction: models a provider started offering for free. Nothing changed
+               locally, so this only reports — and hands over the filtered list to pick from. -->
+          <section class="update-banner is-fresh" id="newModelsBanner" hidden aria-live="polite"></section>
+        </div>
+      </section>
       <!-- The visible notice stays inside the busy main region; its live equivalent is
            outside that region so assistive technology can announce it immediately. -->
       <div class="empty boot-notice" id="bootNotice" hidden aria-hidden="true"></div>
@@ -196,13 +205,26 @@
         <div class="health-grid view-kpi-spacing" id="requestsSummary"></div>
         <div class="card req-timeline-card">
           <div class="card-head">
-            <div><h2>Request volume</h2><div class="ch-sub">Success vs error over the selected window. Hover a bar for counts.</div></div>
+            <div><h2>Request volume</h2><div class="ch-sub">Success vs error over the selected window. Hover or focus a bar for counts; use arrow keys to move.</div></div>
             <div class="req-window" id="requestsWindow"></div>
           </div>
           <div class="card-body"><div id="requestsTimeline"></div></div>
         </div>
         <div class="req-filters" id="requestsFilters" role="group" aria-label="Request filters"></div>
-        <div class="req-list" id="requestsList"></div>
+        <div class="req-table">
+          <div class="req-list-head" aria-hidden="true">
+            <span>Time</span>
+            <span>Virtual model</span>
+            <span>Provider</span>
+            <span>Upstream</span>
+            <span>Status</span>
+            <span>Outcome</span>
+            <span>Latency</span>
+            <span>Flags</span>
+          </div>
+          <div class="req-list" id="requestsList" role="list" aria-label="Recent routed requests"></div>
+          <div class="req-list-footer" id="requestsListFooter" hidden></div>
+        </div>
       </section>
 
       <!-- ============ Health view ============ -->
@@ -267,54 +289,56 @@
         <span class="ep-hint">For clients whose endpoint field wants the whole path</span>
       </button>
 
-      <nav class="nav" id="nav">
-        <div class="nav-label">Workspace</div>
-        <button class="nav-item active" data-nav="routing" aria-current="page">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><path d="M7 10v4a2 2 0 0 0 2 2h5"/></svg>
-          <span class="nav-text">Routing</span>
-        </button>
-        <button class="nav-item" data-nav="providers">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
-          <span class="nav-text">Providers</span>
-        </button>
-        <button class="nav-item" data-nav="fusion">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h5l3 5-3 5H4"/><path d="M20 7h-5l-3 5 3 5h5"/><path d="M9 12h6"/></svg>
-          <span class="nav-text">Fusion</span>
-        </button>
-        <button class="nav-item" data-nav="compression">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M7 12h10"/><path d="M10 17h4"/></svg>
-          <span class="nav-text">Compression</span>
-        </button>
-        <button class="nav-item" data-nav="settings">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-          <span class="nav-text">Settings</span>
-        </button>
-        <button class="nav-item" data-nav="license">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.5 12.5 8-8"/><path d="m16 4 3 3"/><path d="m19 7 2-2"/></svg>
-          <span class="nav-text" id="licenseNavText">Ficelle Pro</span>
-        </button>
-        <div class="nav-label">Observe</div>
-        <button class="nav-item" data-nav="health">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2 5 4-12 2 7h6"/></svg>
-          <span class="nav-text">Health</span>
-        </button>
-        <button class="nav-item" data-nav="performance">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V5M4 19h16M8 16v-5M12 16V8M16 16v-3M20 16V6"/></svg>
-          <span class="nav-text">Performance</span>
-        </button>
-        <button class="nav-item" data-nav="requests">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>
-          <span class="nav-text">Requests</span>
-        </button>
-        <button class="nav-item" data-nav="audit">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M3 12a9 9 0 0 1 9-9"/><circle cx="12" cy="12" r="2.5"/></svg>
-          <span class="nav-text">Audit</span>
-        </button>
-        <button class="nav-item" data-nav="export">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
-          <span class="nav-text">Export</span>
-        </button>
-      </nav>
+      <div class="nav-shell">
+        <nav class="nav" id="nav">
+          <div class="nav-label">Workspace</div>
+          <button class="nav-item active" data-nav="routing" aria-current="page">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><path d="M7 10v4a2 2 0 0 0 2 2h5"/></svg>
+            <span class="nav-text">Routing</span>
+          </button>
+          <button class="nav-item" data-nav="providers">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+            <span class="nav-text">Providers</span>
+          </button>
+          <button class="nav-item" data-nav="fusion">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h5l3 5-3 5H4"/><path d="M20 7h-5l-3 5 3 5h5"/><path d="M9 12h6"/></svg>
+            <span class="nav-text">Fusion</span>
+          </button>
+          <button class="nav-item" data-nav="compression">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M7 12h10"/><path d="M10 17h4"/></svg>
+            <span class="nav-text">Compression</span>
+          </button>
+          <button class="nav-item" data-nav="settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            <span class="nav-text">Settings</span>
+          </button>
+          <button class="nav-item" data-nav="license">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.5 12.5 8-8"/><path d="m16 4 3 3"/><path d="m19 7 2-2"/></svg>
+            <span class="nav-text" id="licenseNavText">Ficelle Pro</span>
+          </button>
+          <div class="nav-label">Observe</div>
+          <button class="nav-item" data-nav="health">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2 5 4-12 2 7h6"/></svg>
+            <span class="nav-text">Health</span>
+          </button>
+          <button class="nav-item" data-nav="performance">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V5M4 19h16M8 16v-5M12 16V8M16 16v-3M20 16V6"/></svg>
+            <span class="nav-text">Performance</span>
+          </button>
+          <button class="nav-item" data-nav="requests">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h12M8 12h12M8 18h12"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>
+            <span class="nav-text">Requests</span>
+          </button>
+          <button class="nav-item" data-nav="audit">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M3 12a9 9 0 0 1 9-9"/><circle cx="12" cy="12" r="2.5"/></svg>
+            <span class="nav-text">Audit</span>
+          </button>
+          <button class="nav-item" data-nav="export">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+            <span class="nav-text">Export</span>
+          </button>
+        </nav>
+      </div>
 
       <div class="nav-spacer"></div>
 

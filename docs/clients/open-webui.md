@@ -31,7 +31,8 @@ and Ficelle binds to the host's loopback only. Two working setups:
   the alias to the bridge gateway IP, an address a loopback-only bind never
   accepts. Binding Ficelle to a non-loopback address instead is possible but
   changes its security posture and transport exposure — prefer `--network host`.
-  Every listener still requires the same API token.
+  The forwarded loopback listener needs no Ficelle token; a deliberate
+  non-loopback bind requires the owner API token.
 
 ## Notes
 

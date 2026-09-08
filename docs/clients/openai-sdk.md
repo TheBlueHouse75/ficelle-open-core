@@ -1,21 +1,16 @@
 # OpenAI SDK and custom scripts on Ficelle
 
-Anything that speaks the OpenAI chat-completions API is a Ficelle client with a
-two-line change: the base URL and Ficelle's owner API token. Load it without
-copying it into source code:
-
-```bash
-export FICELLE_API_KEY="$(ficelle access-token api)"
-```
+Anything that speaks the OpenAI chat-completions API is a Ficelle client. The
+default loopback listener needs no Ficelle token; SDKs that require a non-empty
+API-key setting can use a non-secret local value. Non-loopback binds require the
+owner token returned by `ficelle access-token api`.
 
 ## Python
 
 ```python
-import os
-
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8646/v1", api_key=os.environ["FICELLE_API_KEY"])
+client = OpenAI(base_url="http://127.0.0.1:8646/v1", api_key="ficelle-local")
 
 response = client.chat.completions.create(
     model="ficelle/auto-tools",
@@ -31,7 +26,7 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: "http://127.0.0.1:8646/v1",
-  apiKey: process.env.FICELLE_API_KEY,
+  apiKey: "ficelle-local",
 });
 
 const response = await client.chat.completions.create({
@@ -46,7 +41,6 @@ console.log(response.choices[0].message.content);
 ```bash
 curl -s http://127.0.0.1:8646/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $FICELLE_API_KEY" \
   -d '{"model":"ficelle/auto-fast","messages":[{"role":"user","content":"hello"}]}'
 ```
 
@@ -62,4 +56,4 @@ curl -s http://127.0.0.1:8646/v1/chat/completions \
   request to force it.
 - Environment-variable form, for tools that read the standard names:
   `export OPENAI_BASE_URL=http://127.0.0.1:8646/v1` and
-  `export OPENAI_API_KEY="$(ficelle access-token api)"`.
+  `export OPENAI_API_KEY=ficelle-local` on loopback.
