@@ -106,8 +106,10 @@ def model_matches_profile_requirements(
 ) -> bool:
     if model_excluded_from_profile(model, profile):
         return False
-    requirements = profile.get("requirements") if isinstance(profile.get("requirements"), dict) else {}
+    raw_requirements = profile.get("requirements")
+    requirements = raw_requirements if isinstance(raw_requirements, dict) else {}
     min_context = safe_int(requirements.get("min_context"), default_min_context)
+    min_completion_tokens = max(0, safe_int(requirements.get("min_completion_tokens"), 0))
     if requirements.get("free", True) and not free_access_eligible(model):
         return False
     if requirements.get("tools", True) and not bool(model.get("supports_tools")):
@@ -130,7 +132,10 @@ def model_matches_profile_requirements(
     params_any = safe_string_list(requirements.get("supported_parameters_any"))
     if params_any and not model_has_any(model, "supported_parameters", params_any):
         return False
-    return safe_int(model.get("context_length"), 0) >= min_context
+    return (
+        safe_int(model.get("context_length"), 0) >= min_context
+        and safe_int(model.get("max_completion_tokens"), 0) >= min_completion_tokens
+    )
 
 
 def profile_capability_metadata(requirements: dict[str, Any]) -> dict[str, Any]:
@@ -176,12 +181,15 @@ def profile_capability_metadata(requirements: dict[str, Any]) -> dict[str, Any]:
         capabilities.append("vision")
     capabilities.extend(modality for modality in ("audio", "video") if modality in input_modalities)
 
+    min_completion_tokens = max(0, safe_int(requirements.get("min_completion_tokens"), 0))
     metadata: dict[str, Any] = {
         "context_length": safe_int(requirements.get("min_context"), 0),
         "supports_tools": tools,
         "supports_streaming": True,
         "capabilities": capabilities,
     }
+    if min_completion_tokens:
+        metadata["max_completion_tokens"] = min_completion_tokens
     if structured:
         metadata["supports_structured_outputs"] = True
     if input_modalities:

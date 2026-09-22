@@ -62,17 +62,55 @@ def test_bundled_status_reports_verified_and_provisional_models():
     status = coding_certification.public_status()
 
     assert status["status"] == "bundled"
-    assert status["certification_count"] == 9
+    assert status["certification_count"] == 10
     assert status["provisional_count"] == 0
-    assert status["qualification_count"] == 9
-    assert status["manifest_id"] == "2026-09-03-coding-pool-v3"
+    assert status["qualification_count"] == 10
+    assert status["manifest_id"] == "2026-09-17-coding-pool-v3"
+
+
+def test_bundled_manifest_stays_bound_to_the_process_policy(monkeypatch, tmp_path):
+    loaded = coding_certification.cached_manifest()
+    replacement = tmp_path / "auto-coding-manifest.json"
+    replacement.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(coding_certification, "BUILTIN_MANIFEST_PATH", replacement)
+
+    assert loaded is not None
+    assert coding_certification.cached_manifest() is loaded
+
+
+def test_bundled_manifest_verifies_union_alpha():
+    manifest = coding_certification.cached_manifest()
+
+    assert manifest is not None
+    row = coding_certification.certification_for_model(
+        {"source": "openrouter", "upstream_id": "stealth/union-alpha"}, manifest
+    )
+    assert row is not None
+    assert row["tier"] == "verified"
+    assert row["upstream_model_id"] == "stealth/union-alpha"
+    assert row["quality_score"] == 66.6667
+    assert row["benchmarks"][0]["pass_at_1"] == pytest.approx(2 / 3)
+    assert row["benchmarks"][0]["resolved_rate"] == pytest.approx(2 / 3)
+    kilo_row = coding_certification.certification_for_model(
+        {"source": "kilo", "upstream_id": "stealth/union-alpha"}, manifest
+    )
+    assert kilo_row is not None
+    assert kilo_row["tier"] == "verified"
+    assert coding_certification.certification_for_model(
+        {"source": "orcarouter", "upstream_id": "stealth/union-alpha-free"}, manifest
+    ) is None
 
 
 def test_bundled_manifest_verifies_qwen_aliases():
     manifest = coding_certification.cached_manifest()
 
     assert manifest is not None
-    for upstream_id in ("qwen/qwen3.8-27b", "qwen/qwen3.8-27b-free"):
+    for upstream_id in (
+        "@cf/qwen/qwen3.8-27b",
+        "qwen/qwen3.8-27b",
+        "qwen/qwen3.8-27b:free",
+        "qwen/qwen3.8-27b-free",
+    ):
         row = coding_certification.certification_for_model(
             {"source": "provider", "upstream_id": upstream_id}, manifest
         )
@@ -80,6 +118,22 @@ def test_bundled_manifest_verifies_qwen_aliases():
         assert row["tier"] == "verified"
         assert row["benchmarks"][0]["pass_at_1"] == pytest.approx(2 / 3)
         assert row["benchmarks"][0]["resolved_rate"] == 1.0
+
+
+def test_bundled_manifest_verifies_gemma_provider_aliases():
+    manifest = coding_certification.cached_manifest()
+
+    assert manifest is not None
+    for upstream_id in (
+        "@cf/google/gemma-4-26b-a4b-it",
+        "google/gemma-4-26b-a4b-it:free",
+        "models/gemma-4-26b-a4b-it",
+    ):
+        row = coding_certification.certification_for_model(
+            {"source": "provider", "upstream_id": upstream_id}, manifest
+        )
+        assert row is not None
+        assert row["tier"] == "verified"
 
 
 @pytest.mark.parametrize(

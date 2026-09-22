@@ -1180,7 +1180,6 @@ def build_admin_runtime_section(
 def build_admin_profile_row(
     *,
     profile: dict[str, Any],
-    candidates: list[dict[str, Any]],
     selected: dict[str, Any] | None,
     selected_origin: str | None,
     selected_score: dict[str, Any],
@@ -1193,11 +1192,11 @@ def build_admin_profile_row(
     last_route: dict[str, Any],
 ) -> dict[str, Any]:
     return {
-        "status": "ok" if candidates else "fail",
+        "status": "ok" if route_candidates else "fail",
         "mode": profile.get("mode"),
         "manual_models_count": len(profile.get("models") or []),
         "auto_tail": bool(profile.get("auto_tail", True)),
-        "candidate_count": len(candidates),
+        "candidate_count": len(route_candidates),
         "selected_model": selected.get("id") if selected else None,
         "selected_upstream": selected.get("upstream_id") if selected else None,
         "selected_origin": selected_origin,
@@ -1229,6 +1228,7 @@ def build_admin_profile_rows(
     *,
     profiles: dict[str, Any],
     available_models: list[dict[str, Any]],
+    policy_models: list[dict[str, Any]],
     state: dict[str, Any],
     last_routes: dict[str, Any],
     candidates_for_profile: CandidatesForProfile,
@@ -1248,7 +1248,7 @@ def build_admin_profile_rows(
         route_candidates = route_competent_candidates(policy_profile_id, candidates, state)
         policy_candidates = route_competent_candidates(
             policy_profile_id,
-            available_models,
+            policy_models,
             state,
         )
         selected = route_candidates[0] if route_candidates else None
@@ -1262,7 +1262,6 @@ def build_admin_profile_rows(
         last_route = last_routes.get(profile_id)
         rows[profile_id] = build_admin_profile_row(
             profile=profile,
-            candidates=candidates,
             selected=selected,
             selected_origin=selected_profile_origin(profile, selected),
             selected_score=selected_score,
@@ -1310,7 +1309,7 @@ def build_admin_performance_history_rows(
         rows[profile_id] = {
             "profile_id": profile_id,
             "mode": profile.get("mode"),
-            "candidate_count": len(candidates),
+            "candidate_count": len(route_candidates),
             "selected_model": selected.get("id") if selected else None,
             "selected_upstream": selected.get("upstream_id") if selected else None,
             "selected_source": selected.get("source") if selected else None,
@@ -1405,6 +1404,7 @@ def build_admin_status_document(
     profile_rows = build_admin_profile_rows(
         profiles=profiles,
         available_models=availability.available_models,
+        policy_models=availability.invokable_models,
         state=state,
         last_routes=runtime_snapshot.last_routes,
         candidates_for_profile=ports.candidates_for_profile,

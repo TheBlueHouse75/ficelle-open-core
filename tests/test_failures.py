@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from ficelle.failures import (
+    CONTEXT_LENGTH_EXCEEDED_MARKERS,
     ACCOUNT_RATE_LIMIT_TEXT_MARKERS,
     BENCHMARK_ROUTE_BLOCKING_REASONS,
     NO_MODEL_FAULT_FAILURE_REASONS,
+    PRODUCTION_PROFILE_FAILURE_REASONS,
+    CONTEXT_DIVERTING_FAILURE_REASONS,
     FALSE_FREE_PAYMENT_DEMAND_MARKERS,
     ERROR_CODE_STATUSES,
     FALSE_FREE_TEXT_MARKERS,
@@ -23,6 +28,8 @@ from ficelle.failures import (
     cooldown_policy_for_reason,
     exception_is_tls_failure,
     model_not_found_body,
+    rejected_request_tokens,
+    request_exceeds_context,
     route_log_failure_status,
     safe_error_body,
     status_for_error_codes,
@@ -204,6 +211,61 @@ def test_saturated_model_pool_is_model_scoped_not_a_provider_outage():
     assert policy.record_provider_error is False
 
 
+def test_structured_upstream_rate_limit_marker_requires_exact_code_and_type():
+    markers = FailureMarkers().with_extra(
+        upstream_rate_limit_error_codes=(("3505", "backend_out_of_capacity"),)
+    )
+    exact = (
+        '{"object":"error","message":"Not enough capacity available for this request, '
+        'please retry later.","type":"backend_out_of_capacity","param":null,'
+        '"code":"3505","raw_status_code":429}'
+    )
+
+    assert classify_failure(429, exact, markers=markers) == "rate_limited_upstream"
+    assert (
+        classify_failure(
+            429,
+            '{"error":{"type":"backend_out_of_capacity","code":"3505"}}',
+            markers=markers,
+        )
+        == "rate_limited_upstream"
+    )
+    policy = cooldown_policy_for_reason("rate_limited_upstream", source="mistral")
+    assert policy.model_cooldown is True
+    assert policy.provider_cooldown is False
+    assert policy.record_provider_error is False
+
+    # The structural pair is deliberately exact: an account-level 429 and a quota verdict retain
+    # their existing provider/quota scope instead of inheriting this adapter-specific rule.
+    assert classify_failure(429, "rate limit exceeded for your account", markers=markers) == "rate_limited"
+    assert (
+        classify_failure(
+            429,
+            '{"error":{"type":"backend_out_of_capacity","code":"3505",'
+            '"message":"capacity unavailable for your account"}}',
+            markers=markers,
+        )
+        == "rate_limited"
+    )
+    assert (
+        classify_failure(
+            429,
+            "quota exceeded: credits exhausted",
+            normalized_free_access=quota_free_access(),
+            markers=markers,
+        )
+        == "quota_exhausted"
+    )
+    assert (
+        classify_failure(
+            429,
+            '{"error":{"type":"backend_out_of_capacity","code":"3506"}}',
+            markers=markers,
+        )
+        == "rate_limited"
+    )
+
+
 def test_a_403_naming_a_model_that_must_be_switched_on_does_not_cool_the_provider():
     """A per-model entitlement is not a rejected key, and must not bench a working account.
 
@@ -290,6 +352,91 @@ def test_tokens_per_minute_rejection_is_model_scoped_not_a_paid_signal():
 
     # The upgrade link these messages carry must not turn the rejection into a paid signal.
     assert classify_failure(413, f"{tpm}, see https://console.groq.com/settings/billing") == "request_too_large"
+
+
+# --- L4-R? nex-agi 266,645-token incident: the request itself was too big for the model ---------
+
+
+def test_a_context_length_rejection_is_retryable_on_a_larger_candidate_without_cooling():
+    """The exact incident: a 266,645-token request sent to a 262,144-context model. The upstream's
+    own words are prose, not a structured code, so this has to be a marker match — narrow enough
+    that it never fires on an unrelated 400 (see the two tests below)."""
+    incident = (
+        "The request is 266645 tokens long and exceeds this model's context length of 262144 tokens."
+    )
+
+    assert classify_failure(400, incident) == "context_length_exceeded"
+    assert rejected_request_tokens(incident) == 266645
+
+    policy = cooldown_policy_for_reason("context_length_exceeded")
+    assert policy.model_cooldown is False
+    assert policy.record_provider_error is False
+    assert "context_length_exceeded" in NO_MODEL_FAULT_FAILURE_REASONS
+    # Retryable, unlike `bad_upstream_request`: a candidate with a bigger context window can
+    # still answer this exact body.
+    from ficelle.failures import NON_RETRYABLE_FAILURE_REASONS
+
+    assert "context_length_exceeded" not in NON_RETRYABLE_FAILURE_REASONS
+    assert CONTEXT_DIVERTING_FAILURE_REASONS == frozenset({"context_length_exceeded"})
+
+
+def test_a_context_length_rejection_also_classifies_on_413_and_on_422():
+    """Some gateways answer a context-length rejection with 413 or 422 rather than 400; the marker
+    match has to apply on every request-rejection status a provider might choose, not just 400."""
+    assert classify_failure(413, "Your prompt is too long for this model's context window.") == (
+        "context_length_exceeded"
+    )
+    assert classify_failure(422, "maximum context length exceeded for this model") == "context_length_exceeded"
+
+
+def test_context_length_markers_never_widen_an_unrelated_request_rejection():
+    """An ordinary malformed-body 400 must keep classifying as `bad_upstream_request`: the marker
+    set is whole phrases ("context length", "too many tokens", …), not bare words like "token" or
+    "large", so a ordinary validation error never gets misread as a context-size problem."""
+    assert classify_failure(400, "This request is not valid. Additional info: Provider returned error") == (
+        "bad_upstream_request"
+    )
+    assert classify_failure(422, "messages.1: tool_call_id not found") == "bad_upstream_request"
+    # A TPM rejection ("too large", not "too many tokens") keeps its own, differently-scoped reason.
+    tpm = "Request too large for model llama-3.3-70b on tokens per minute (TPM): Limit 8000, Requested 95722"
+    assert classify_failure(413, tpm) == "request_too_large"
+
+
+@pytest.mark.parametrize("marker", CONTEXT_LENGTH_EXCEEDED_MARKERS)
+def test_every_context_length_marker_classifies_on_its_own(marker):
+    # Each phrase must earn its place: a 400 carrying only that phrase is a context rejection.
+    assert classify_failure(400, f"rejected: {marker}.") == "context_length_exceeded"
+
+
+def test_rejected_request_tokens_returns_none_without_a_stated_size():
+    assert rejected_request_tokens("upstream rejected the request") is None
+    assert rejected_request_tokens("") is None
+
+
+def test_rejected_request_tokens_is_the_larger_figure_whatever_the_phrasing():
+    # OpenAI names the limit first and the request second; the request is always the larger.
+    openai_style = (
+        "This model's maximum context length is 8192 tokens. "
+        "However, your messages resulted in 10,000 tokens."
+    )
+    assert rejected_request_tokens(openai_style) == 10000
+
+
+def test_request_exceeds_context_names_a_run_every_attempt_of_which_was_too_big():
+    """The pool-narrowing counterpart to `caller_rejected_request`: a run where every candidate was
+    excluded or rejected for context length gets a 400 naming the request's size, not a 502 that
+    reads as an outage."""
+    errors = [{"reason": "context_length_exceeded", "detail": "request needs ~266645 tokens, model context is 262144"}]
+
+    assert request_exceeds_context(errors) is True
+    assert upstream_failure_status(errors) == 400
+    payload = build_upstream_failure_error("ficelle/auto-long", "req-ctx", 1, [], errors)
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert "266645" in payload["error"]["message"]
+
+    # A mixed run (one attempt failed for another reason) is not this verdict.
+    mixed = errors + [{"reason": "server_error"}]
+    assert request_exceeds_context(mixed) is False
 
 
 def test_false_free_markers_ignore_urls():
@@ -618,10 +765,114 @@ def test_only_structured_private_assistant_field_rejections_get_contract_failove
             ]
         },
         {"error": {"message": "extra_forbidden reasoning_content: Extra inputs are not permitted"}},
+        # A negative for the client-metadata reading too: `message_id` is only excused, an
+        # ordinary field like `content` on any role stays a genuinely malformed body.
+        {
+            "detail": [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "messages", 3, "user", "content"],
+                    "msg": "Extra inputs are not permitted",
+                }
+            ]
+        },
     ]
 
     for payload in cases:
         assert classify_failure(422, json.dumps(payload)) == "bad_upstream_request"
+
+
+def test_a_forbidden_client_message_id_fails_over_without_cooling():
+    """Hermes stamps `message_id` on every user message; Mistral's schema rejects it as extra.
+
+    That is a provider-strictness mismatch, not a malformed body: most providers ignore the field
+    outright, so a sibling candidate remains answerable with the unchanged history. Real body from
+    request b784a0ab3f624260adc72b84e4ebddad (2026-09-11 17:06:27).
+    """
+    mistral_422 = json.dumps(
+        {
+            "detail": [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "messages", 10, "user", "message_id"],
+                    "msg": "Extra inputs are not permitted",
+                    "input": "1547981489512120481",
+                }
+            ]
+        }
+    )
+
+    assert classify_failure(422, mistral_422) == "bad_upstream_contract"
+    policy = cooldown_policy_for_reason("bad_upstream_contract", source="mistral")
+    assert policy.model_cooldown is False
+    assert policy.provider_cooldown is False
+    assert policy.quarantine is None
+
+
+def test_a_forbidden_client_message_id_without_a_role_segment_fails_over_without_cooling():
+    """Some providers report the rejection without a role in the `loc` path at all: `location[-2]`
+    is then the message index, not a role. `message_id` must still be excused in that shape.
+    """
+    upstream_422 = json.dumps(
+        {
+            "detail": [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "messages", 10, "message_id"],
+                    "msg": "Extra inputs are not permitted",
+                }
+            ]
+        }
+    )
+
+    assert classify_failure(422, upstream_422) == "bad_upstream_contract"
+
+    # The negative lock: the same roleless shape, but for an ordinary field, stays a genuinely
+    # malformed body — the roleless allowance is specific to CLIENT_MESSAGE_METADATA_FIELDS.
+    upstream_422_content = json.dumps(
+        {
+            "detail": [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "messages", 10, "content"],
+                    "msg": "Extra inputs are not permitted",
+                }
+            ]
+        }
+    )
+
+    assert classify_failure(422, upstream_422_content) == "bad_upstream_request"
+
+
+def test_multiple_forbidden_client_message_ids_fail_over_without_cooling():
+    """The same rejection can list one `extra_forbidden` entry per offending message.
+
+    Real body from the same day (2026-09-11 14:02:58): Mistral names both message 1 and message 30.
+    """
+    mistral_422 = json.dumps(
+        {
+            "detail": [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "messages", 1, "user", "message_id"],
+                    "msg": "Extra inputs are not permitted",
+                    "input": "1547981489512120400",
+                },
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "messages", 30, "user", "message_id"],
+                    "msg": "Extra inputs are not permitted",
+                    "input": "1547981489512120481",
+                },
+            ]
+        }
+    )
+
+    assert classify_failure(422, mistral_422) == "bad_upstream_contract"
+    policy = cooldown_policy_for_reason("bad_upstream_contract", source="mistral")
+    assert policy.model_cooldown is False
+    assert policy.provider_cooldown is False
+    assert policy.quarantine is None
 
 
 def test_caller_caused_policies_record_the_failure_without_cooling():
@@ -817,6 +1068,7 @@ def test_no_model_fault_failures_are_the_only_ones_exempt_from_the_streak():
         "bad_upstream_contract",
         "client_disconnected",
         "request_deadline_exceeded",
+        "context_length_exceeded",
     }
     # `service_restarting` is not a member and needs no exemption: the loop records it as
     # `attempted: False` and breaks, so it never reaches a cooldown or a scoring streak. What it
@@ -873,6 +1125,25 @@ def test_transient_policy_is_model_scoped_only():
     assert policy.quota_cooldown is False
     assert policy.quarantine is None
     assert policy.model_cooldown is True
+
+
+def test_runaway_output_cooldown_is_model_scoped_only():
+    # The model answered -- it just kept going past the profile's completion budget. That is
+    # answerable by the model, so it is cooled like any other transient model-side failure, but
+    # never quarantined or promoted to a provider-wide cooldown: a sibling model behind the same
+    # provider is not implicated by this one running away.
+    policy = cooldown_policy_for_reason("runaway_output", source="openrouter")
+
+    assert policy.record_provider_error is False
+    assert policy.provider_cooldown is False
+    assert policy.quota_cooldown is False
+    assert policy.quarantine is None
+    assert policy.model_cooldown is True
+
+
+def test_runaway_output_is_not_exempt_from_production_profile_evidence():
+    assert "runaway_output" not in NO_MODEL_FAULT_FAILURE_REASONS
+    assert "runaway_output" in PRODUCTION_PROFILE_FAILURE_REASONS
 
 
 def test_error_payload_helpers_redact_and_omit_trace():
@@ -990,3 +1261,85 @@ def test_rejected_sampling_parameters_names_only_refused_present_knobs():
     # Several knobs at once, deduplicated to what the body carries.
     multi = '{"message":"top_k and min_p are not supported by this model"}'
     assert set(rejected_sampling_parameters(multi, {"top_k": 1, "min_p": 0.1, "top_p": 0.9})) == {"top_k", "min_p"}
+
+
+# --- Incident 2026-09-11: OpenRouter agentic-harness gate must quarantine, not cool -----------
+
+
+def test_an_openrouter_agentic_harness_gate_quarantines_the_model_not_the_provider():
+    """Live incident, 2026-09-11 11:13 UTC: `thinkingmachines/inkling-small:free` answered this 403
+    while every other OpenRouter model kept serving requests. The generic 403 fallback
+    (`auth_or_credit`) cooled all of OpenRouter for an hour; the provider-specific marker must win
+    instead and quarantine only the gated model.
+    """
+    body = (
+        '{"error":{"message":"thinkingmachines/inkling-small:free is only available on agentic '
+        'harnesses. Try plugging it into a coding agent or productivity app listed on '
+        'https://openrouter.ai/apps","code":403,"metadata":{"routing_funnel":[{"step":"Initial '
+        'Endpoints","endpoint_count":1}],"failed_routing_step":"Gate Free Endpoints by Agentic '
+        'Harness"}}}'
+    )
+    markers = FailureMarkers().with_extra(model_not_entitled=("only available on agentic harnesses",))
+
+    reason = classify_failure(
+        403,
+        body,
+        markers=markers,
+        upstream_model_id="thinkingmachines/inkling-small:free",
+    )
+
+    assert reason == "model_not_found"
+    policy = cooldown_policy_for_reason(reason, source="openrouter")
+    assert policy.provider_cooldown is False
+    assert policy.quarantine is not None
+    assert policy.quarantine.reason == "model_not_found"
+
+
+def test_an_agentic_harness_403_that_does_not_name_the_model_stays_auth_or_credit():
+    """The same marker, on a body that never names the model asked for, is not evidence of an
+    entitlement gate for THIS request — a dead key must still cool the whole provider."""
+    body = '{"error":{"message":"only available on agentic harnesses","code":403}}'
+    markers = FailureMarkers().with_extra(model_not_entitled=("only available on agentic harnesses",))
+
+    reason = classify_failure(
+        403,
+        body,
+        markers=markers,
+        upstream_model_id="thinkingmachines/inkling-small:free",
+    )
+
+    assert reason == "auth_or_credit"
+
+
+# --- Incident 2026-09-11: Groq's unknown message property is a contract mismatch, not a bad body -
+
+
+_GROQ_UNKNOWN_MESSAGE_PROPERTY_BODY = (
+    "{\"error\":{\"message\":\"'messages.29' : for 'role:user' the following must be satisfied"
+    "[('messages.29' : property 'message_id' is unsupported)]\",\"type\":\"invalid_request_error\"}}"
+)
+
+
+def test_groq_rejecting_an_unknown_message_property_diverts_without_cooling():
+    """Groq validates message keys strictly and rejects `message_id`, a field Hermes adds; most
+    providers ignore unknown message keys. That is the provider's strictness, not a malformed
+    request, so a sibling source must get its turn instead of the run ending early."""
+    reason = classify_failure(400, _GROQ_UNKNOWN_MESSAGE_PROPERTY_BODY)
+
+    assert reason == "bad_upstream_contract"
+    policy = cooldown_policy_for_reason(reason, source="groq")
+    assert policy.model_cooldown is False
+    assert "bad_upstream_contract" in SOURCE_DIVERTING_FAILURE_REASONS
+
+
+def test_an_unrelated_400_still_classifies_as_a_terminal_bad_request():
+    """The narrow `property '<x>' is unsupported` pattern must not widen to generic 400 prose."""
+    reason = classify_failure(400, '{"error":{"message":"invalid JSON body","type":"invalid_request_error"}}')
+
+    assert reason == "bad_upstream_request"
+
+
+def test_an_unrelated_unsupported_property_is_a_terminal_bad_request():
+    body = '{"error":{"message":"property \'foo\' is unsupported"}}'
+
+    assert classify_failure(400, body) == "bad_upstream_request"

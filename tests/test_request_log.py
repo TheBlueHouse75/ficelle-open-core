@@ -567,6 +567,42 @@ def test_only_whitelisted_fields_are_stored(paths):
     assert "SECRET" not in dump and "SECRETTOKEN" not in dump and "SECRETHDR" not in dump
 
 
+def test_error_detail_survives_ingestion_on_a_bad_upstream_request_attempt(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [_line(
+        "r1", now=now,
+        attempts=[{
+            "model": "m",
+            "reason": "bad_upstream_request",
+            "status": 400,
+            "error_detail": "invalid request: missing field [redacted]",
+        }],
+    )])
+    rows = rl.query(store_path=db, source_path=log)
+    assert rows[0]["attempts"] == [{
+        "model": "m",
+        "reason": "bad_upstream_request",
+        "status": 400,
+        "error_detail": "invalid request: missing field [redacted]",
+    }]
+
+
+def test_prompt_size_route_fields_survive_ingestion(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [
+        _line("sized", now=now, prompt_tokens_estimate=266645, excluded_for_context=4),
+        _line("older", now=now, offset=-5.0),
+    ])
+    rows = {row["request_id"]: row for row in rl.query(store_path=db, source_path=log)}
+    assert rows["sized"]["prompt_tokens_estimate"] == 266645
+    assert rows["sized"]["excluded_for_context"] == 4
+    # A row written before these fields existed stays readable, with nothing invented.
+    assert rows["older"]["prompt_tokens_estimate"] is None
+    assert rows["older"]["excluded_for_context"] is None
+
+
 def test_timeout_diagnostics_are_whitelisted_inside_attempts(paths):
     log, db = paths
     now = time.time()
@@ -601,6 +637,31 @@ def test_timeout_diagnostics_are_whitelisted_inside_attempts(paths):
         "read_timeout_source": "request_deadline",
         "request_budget_remaining_seconds": 20.25,
         "timeout_phase": "response_headers",
+    }
+
+
+def test_completion_chars_survives_ingestion_on_a_runaway_output_attempt(paths):
+    log, db = paths
+    now = time.time()
+    _write(log, [_line(
+        "r1", now=now,
+        attempts=[{
+            "model": "m",
+            "reason": "runaway_output",
+            "status": 200,
+            "stream_started": True,
+            "completion_chars": 400123,
+        }],
+    )])
+
+    attempt = rl.query(store_path=db, source_path=log)[0]["attempts"][0]
+
+    assert attempt == {
+        "model": "m",
+        "reason": "runaway_output",
+        "status": 200,
+        "stream_started": True,
+        "completion_chars": 400123,
     }
 
 

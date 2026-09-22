@@ -48,6 +48,33 @@ CLOUDFLARE_ACCOUNT_ID_ENV = "CLOUDFLARE_ACCOUNT_ID"
 CLOUDFLARE_ACCOUNT_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
 CLOUDFLARE_MAX_CATALOG_PAGES = 100
 CLOUDFLARE_CATALOG_PAGE_SIZE = 100
+GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR = "skip_thought_signature_validator"
+MINISTRAL_MODEL_PREFIXES = ("ministral-3b", "ministral-8b", "ministral-14b")
+
+
+def _is_gemini_thought_signature_model(model: dict[str, Any]) -> bool:
+    upstream_id = model.get("upstream_id") or model.get("id")
+    if not isinstance(upstream_id, str):
+        return False
+    return any(part.startswith("gemini-") for part in upstream_id.lower().strip("/").split("/"))
+
+
+def _is_confirmed_ministral_model(model: dict[str, Any]) -> bool:
+    upstream_id = model.get("upstream_id") or model.get("id")
+    if not isinstance(upstream_id, str):
+        return False
+    model_name = upstream_id.lower().strip("/").rsplit("/", 1)[-1]
+    return any(
+        model_name == prefix or model_name.startswith(f"{prefix}-")
+        for prefix in MINISTRAL_MODEL_PREFIXES
+    )
+
+
+def _is_standard_user_message(message: Any) -> bool:
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    return isinstance(content, str) or (isinstance(content, list) and bool(content))
 
 
 @dataclass(frozen=True)
@@ -58,11 +85,88 @@ class OpenAICompatibleCatalogAdapter:
         model: dict[str, Any],
         provider_cfg: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """The provider request-adaptation seam (L3-R4). Identity by default: a dialect
-        transform may only be installed here once a live compatibility probe proved the
-        exact target model accepts it losslessly — never a silent rewrite of the client's
-        tool schemas, required fields, or nullability."""
-        return payload
+        """Apply the narrow, live-proven provider request compatibility rewrites.
+
+        Mistral's confirmed Ministral models reject an explicitly disabled ``reasoning`` object;
+        that one field is removed from a copied body. Other providers, other Mistral models, Google
+        models other than Gemini, and Gemini bodies without an unsigned current-turn tool step keep
+        object identity. Gemini requires a thought signature on the first parallel function call,
+        but permits its official validator-skip sentinel for tool history from another model.
+        Preserve any supplied signature rather than replacing it.
+        """
+        if self.source == "mistral" and _is_confirmed_ministral_model(model):
+            reasoning = payload.get("reasoning")
+            if isinstance(reasoning, dict) and reasoning.get("enabled") is False:
+                adapted_payload = dict(payload)
+                adapted_payload.pop("reasoning", None)
+                return adapted_payload
+
+        if self.source != "gemini" or not _is_gemini_thought_signature_model(model):
+            return payload
+
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return payload
+
+        latest_user_message_index = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if _is_standard_user_message(message)
+            ),
+            default=-1,
+        )
+        if latest_user_message_index < 0:
+            return payload
+
+        adapted_payload: dict[str, Any] | None = None
+        adapted_messages: list[Any] | None = None
+        for message_index in range(latest_user_message_index + 1, len(messages)):
+            message = messages[message_index]
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+
+            first_function_call_index = next(
+                (
+                    index
+                    for index, tool_call in enumerate(tool_calls)
+                    if isinstance(tool_call, dict) and tool_call.get("type") == "function"
+                ),
+                None,
+            )
+            if first_function_call_index is None:
+                continue
+            first_function_call = tool_calls[first_function_call_index]
+            assert isinstance(first_function_call, dict)
+            extra_content = first_function_call.get("extra_content")
+            google_content = extra_content.get("google") if isinstance(extra_content, dict) else None
+            thought_signature = (
+                google_content.get("thought_signature") if isinstance(google_content, dict) else None
+            )
+            if isinstance(thought_signature, str) and thought_signature.strip():
+                continue
+
+            if adapted_payload is None:
+                adapted_payload = dict(payload)
+                adapted_messages = list(messages)
+                adapted_payload["messages"] = adapted_messages
+            assert adapted_messages is not None
+            adapted_tool_calls = list(tool_calls)
+            adapted_function_call = dict(first_function_call)
+            adapted_extra_content = dict(extra_content) if isinstance(extra_content, dict) else {}
+            adapted_google_content = dict(google_content) if isinstance(google_content, dict) else {}
+            adapted_google_content["thought_signature"] = GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+            adapted_extra_content["google"] = adapted_google_content
+            adapted_function_call["extra_content"] = adapted_extra_content
+            adapted_tool_calls[first_function_call_index] = adapted_function_call
+            adapted_message = dict(message)
+            adapted_message["tool_calls"] = adapted_tool_calls
+            adapted_messages[message_index] = adapted_message
+
+        return adapted_payload if adapted_payload is not None else payload
 
     source: str
 
@@ -82,6 +186,12 @@ class OpenAICompatibleCatalogAdapter:
         return headers
 
     def failure_markers(self) -> FailureMarkers:
+        if self.source == "mistral":
+            return DEFAULT_FAILURE_MARKERS.with_extra(
+                # Mistral's exact 429 verdict means the selected Ministral serving pool is at
+                # capacity; it is model-scoped even when the response message is terse.
+                upstream_rate_limit_error_codes=(("3505", "backend_out_of_capacity"),),
+            )
         if self.source == "cloudflare":
             return DEFAULT_FAILURE_MARKERS.with_extra(
                 false_free=(
@@ -109,6 +219,15 @@ class OpenAICompatibleCatalogAdapter:
                     "subscription required",
                     "upgrade for access",
                 )
+            )
+        if self.source == "openrouter":
+            # OpenRouter gates some free endpoints to registered agentic harnesses. A plain API
+            # key gets a 403 naming that one model id while every sibling keeps answering, so it
+            # must classify as `model_not_found` (quarantine) rather than the generic 403 reading
+            # that would cool the whole provider — see incident: one gated free model cooled all
+            # of OpenRouter for an hour (2026-09-11).
+            return DEFAULT_FAILURE_MARKERS.with_extra(
+                model_not_entitled=("only available on agentic harnesses",),
             )
         return DEFAULT_FAILURE_MARKERS
 
@@ -263,7 +382,14 @@ class OpenAICompatibleCatalogAdapter:
         task_name = str(task.get("name") or "") if isinstance(task, dict) else ""
         schema = model.get("schema") if isinstance(model.get("schema"), dict) else {}
         input_schema = schema.get("input") if isinstance(schema, dict) else None
-        supports_chat = self._json_schema_declares_property(input_schema, "messages")
+        # The live `/ai/models/search` rows carry no `schema` at all (verified 11/09/2026), so
+        # the task name is the only chat signal there. A schema, when present, still decides:
+        # a row that describes a prompt-only input is not a chat model whatever its task says.
+        supports_chat = (
+            self._json_schema_declares_property(input_schema, "messages")
+            if isinstance(input_schema, dict)
+            else task_name == "Text Generation"
+        )
         capabilities = model.get("capabilities")
         normalized_capabilities = dict(capabilities) if isinstance(capabilities, dict) else {}
         normalized_capabilities["completion_chat"] = supports_chat
@@ -950,11 +1076,16 @@ class OpenAICompatibleCatalogAdapter:
             per_page = self._safe_optional_int(result_info.get("per_page")) or len(result)
             if current_page != page or per_page <= 0:
                 return [], "invalid Cloudflare catalog pagination"
-            if total_count is not None:
-                if len(models) == total_count:
+            if total_count is not None and len(models) == total_count:
+                return models, None
+            # `total_count` is not a completeness proof: live, Cloudflare reports 306 while
+            # serving 65 rows under `include_deprecated=false` (verified 11/09/2026). A page
+            # shorter than `per_page` is the end of what the account can see; an empty first
+            # page against a positive count is the one shape that still reads as truncated.
+            if not result:
+                if models:
                     return models, None
-                if len(models) > total_count or not result:
-                    return [], "incomplete Cloudflare catalog pagination"
-            elif not result or len(result) < per_page:
+                return [], "incomplete Cloudflare catalog pagination"
+            if len(result) < per_page:
                 return models, None
         return [], "Cloudflare catalog pagination exceeded safety limit"

@@ -212,7 +212,6 @@
       display: grid; gap: 3px; width: 100%; text-align: left;
       padding: 10px 11px; margin-bottom: 6px;
       border-radius: var(--radius-xs); border: 1px solid var(--border);
-      border-left-color: var(--brand-line);
       background: color-mix(in srgb, var(--surface-1) 78%, transparent); cursor: pointer;
       transition: background 0.2s var(--ease), border-color 0.2s var(--ease), transform 0.2s var(--ease);
     }
@@ -251,7 +250,6 @@
       border-color: var(--brand-line);
       color: var(--text);
     }
-    .nav-item.active::before { content: ""; position: absolute; left: -1px; top: 22%; bottom: 22%; width: 2px; border-radius: 2px; background: var(--brand); box-shadow: var(--glow); }
     .nav-item.active svg { opacity: 1; color: var(--brand); }
     .nav-spacer { flex: 1; }
     .nav-shell { min-width: 0; }
@@ -279,7 +277,7 @@
     }
     .theme-seg button svg { width: 15px; height: 15px; }
     .theme-seg button:hover { color: var(--text); }
-    .theme-seg button.active { background: var(--surface-3); color: var(--brand); box-shadow: var(--shadow-card); }
+    .theme-seg button.active { background: var(--surface-3); color: var(--brand); }
 
     /* ============ Page header ============ */
     .page-head {
@@ -288,8 +286,8 @@
       padding: 18px 22px 20px 26px; margin-bottom: 18px;
       background: color-mix(in srgb, var(--surface-1) 88%, transparent);
       border: 1px solid var(--border);
-      border-radius: 4px var(--radius-lg) 4px var(--radius-lg);
-      box-shadow: var(--shadow-card), inset 3px 0 0 var(--brand);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-card);
       backdrop-filter: blur(22px) saturate(1.08);
     }
     .page-eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; color: var(--brand); margin-bottom: 7px; }
@@ -406,7 +404,7 @@
     .card {
       position: relative;
       background: linear-gradient(145deg, color-mix(in srgb, var(--surface-1) 96%, white 1%), color-mix(in srgb, var(--surface-1) 92%, var(--bg-0))); border: 1px solid var(--border);
-      border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg); box-shadow: var(--shadow-card); overflow: clip;
+      border-radius: var(--radius-lg); box-shadow: var(--shadow-card); overflow: clip;
     }
     .card::before { content: ""; position: absolute; z-index: 1; top: -1px; left: 8%; right: 42%; height: 1px; background: linear-gradient(90deg, transparent, var(--brand-line), transparent); pointer-events: none; }
     .card-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 16px 18px; border-bottom: 1px solid var(--border); }
@@ -451,7 +449,7 @@
       display: grid;
       grid-template-columns: minmax(250px, 0.8fr) minmax(300px, 1.1fr) minmax(300px, 1.1fr);
       gap: 14px; align-items: stretch;
-      height: clamp(720px, calc(100dvh - 180px), 1040px);
+      height: max(720px, calc(100dvh - 210px));
     }
     .ws-col { min-width: 0; display: flex; flex-direction: column; min-height: 0; }
     /* Keep the three column headers' separators aligned even when the narrow column's
@@ -488,7 +486,7 @@
     }
     .profile-tab:hover { background: var(--surface-2); transform: translateX(2px); }
     .profile-tab:active { transform: translateX(1px) scale(0.992); }
-    .profile-tab.active { border-color: var(--brand-line); background: var(--brand-wash); box-shadow: inset 3px 0 0 var(--brand); }
+    .profile-tab.active { border-color: var(--brand-line); background: var(--brand-wash); }
     .profile-tab .pt-name { font-weight: 620; font-size: 13.5px; }
     .profile-tab .pt-id { grid-column: 1 / -1; font-family: var(--font-mono); font-size: 10.5px; color: var(--brand); }
     .profile-tab .pt-meta { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-muted); }
@@ -513,6 +511,8 @@
     .profile-dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 20px; }
 
     .editor-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+    .min-context-setting { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-soft); }
+    .min-context-setting select { padding: 5px 8px; border: 1px solid var(--border); border-radius: var(--radius-xs); background: var(--surface-1); color: var(--text); font-size: 12.5px; }
     .stream-policy-setting { display: grid; gap: 8px; margin-bottom: 14px; padding: 11px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-1); }
     .stream-policy-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
     .stream-policy-head label { color: var(--text-soft); font-size: 12px; font-weight: 650; }
@@ -528,57 +528,28 @@
     .switch .track {
       width: 38px; height: 22px; border-radius: 999px; position: relative; flex: none;
       border: 1px solid color-mix(in srgb, var(--border-strong) 88%, transparent);
-      background:
-        radial-gradient(120% 140% at 30% 0%, rgba(255,255,255,0.08), transparent 56%),
-        linear-gradient(180deg, color-mix(in srgb, var(--surface-3) 88%, black 4%), color-mix(in srgb, var(--surface-2) 88%, black 12%));
-      box-shadow:
-        inset 0 1px 1px rgba(255,255,255,0.05),
-        inset 0 -1px 3px rgba(0,0,0,0.35);
-      transition: background 0.18s var(--ease), border-color 0.18s var(--ease), box-shadow 0.18s var(--ease), transform 0.18s var(--ease);
-    }
-    .switch .track::before {
-      content: "";
-      position: absolute;
-      inset: 1px;
-      border-radius: inherit;
-      background: linear-gradient(180deg, rgba(255,255,255,0.05), transparent 58%);
-      pointer-events: none;
+      background: var(--surface-2);
+      transition: background 0.18s var(--ease), border-color 0.18s var(--ease), transform 0.18s var(--ease);
     }
     .switch .track::after {
       content: "";
       position: absolute; top: 2px; left: 2px;
       width: 16px; height: 16px; border-radius: 999px;
-      background:
-        radial-gradient(circle at 30% 25%, rgba(255,255,255,0.95), rgba(255,255,255,0.45) 34%, rgba(255,255,255,0.15) 52%, rgba(255,255,255,0.02) 70%),
-        linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 90%, white 10%), color-mix(in srgb, var(--surface-3) 94%, black 2%));
-      box-shadow:
-        0 1px 0 rgba(255,255,255,0.24),
-        0 5px 10px -5px rgba(0,0,0,0.72);
-      transition: transform 0.18s var(--ease), background 0.18s var(--ease), box-shadow 0.18s var(--ease);
+      background: var(--surface-1);
+      transition: transform 0.18s var(--ease), background 0.18s var(--ease);
     }
     .switch input:checked + .track {
-      background:
-        radial-gradient(120% 140% at 30% 0%, color-mix(in srgb, var(--brand) 24%, transparent), transparent 58%),
-        linear-gradient(180deg, color-mix(in srgb, var(--brand) 28%, var(--surface-2)), color-mix(in srgb, var(--brand) 18%, var(--surface-3)));
+      background: color-mix(in srgb, var(--brand) 26%, var(--surface-2));
       border-color: color-mix(in srgb, var(--brand) 60%, transparent);
-      box-shadow:
-        inset 0 1px 1px rgba(255,255,255,0.08),
-        inset 0 -1px 3px rgba(0,0,0,0.28),
-        0 0 0 1px color-mix(in srgb, var(--brand) 22%, transparent);
     }
     .switch input:checked + .track::after {
       transform: translateX(16px);
-      background:
-        radial-gradient(circle at 30% 25%, color-mix(in srgb, var(--brand) 20%, white), color-mix(in srgb, var(--brand) 8%, white) 34%, color-mix(in srgb, var(--brand) 28%, white) 52%, transparent 70%),
-        linear-gradient(180deg, color-mix(in srgb, var(--brand) 14%, white), color-mix(in srgb, var(--brand) 38%, var(--brand-soft)));
+      background: color-mix(in srgb, var(--brand) 30%, var(--surface-1));
     }
     .switch input:focus-visible + .track {
-      box-shadow:
-        0 0 0 3px color-mix(in srgb, var(--brand) 18%, transparent),
-        inset 0 1px 1px rgba(255,255,255,0.06),
-        inset 0 -1px 3px rgba(0,0,0,0.34);
+      outline: 2px solid color-mix(in srgb, var(--brand) 70%, transparent);
+      outline-offset: 2px;
     }
-    .switch:hover .track { transform: translateY(-1px); }
     .switch:hover input:checked + .track { border-color: color-mix(in srgb, var(--brand) 66%, transparent); }
     .switch:hover input:not(:checked) + .track { border-color: var(--border-strong); }
     .dimple-toggle {
@@ -587,60 +558,39 @@
       padding: 9px 12px;
       border: 1px solid var(--border);
       border-radius: var(--radius-sm);
-      background: linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 92%, white 2%), color-mix(in srgb, var(--surface-2) 88%, var(--bg-0)));
+      background: var(--surface-1);
       color: var(--text-soft);
       cursor: pointer;
-      transition: transform 0.18s var(--ease), border-color 0.18s var(--ease), background 0.18s var(--ease), box-shadow 0.18s var(--ease), color 0.18s var(--ease);
+      transition: border-color 0.18s var(--ease), background 0.18s var(--ease), color 0.18s var(--ease);
     }
-    .dimple-toggle:hover { transform: translateY(-1px); border-color: var(--border-strong); box-shadow: 0 12px 28px -26px color-mix(in srgb, var(--brand) 60%, transparent); }
+    .dimple-toggle:hover { border-color: var(--border-strong); }
     .dimple-toggle:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
     .dimple-track {
       position: relative;
       width: 40px; height: 24px; flex: none;
       border-radius: 999px;
       border: 1px solid color-mix(in srgb, var(--border-strong) 86%, transparent);
-      background:
-        radial-gradient(120% 140% at 28% 0%, rgba(255,255,255,0.08), transparent 58%),
-        linear-gradient(180deg, color-mix(in srgb, var(--surface-3) 90%, black 5%), color-mix(in srgb, var(--surface-2) 86%, black 10%));
-      box-shadow:
-        inset 0 1px 1px rgba(255,255,255,0.05),
-        inset 0 -1px 3px rgba(0,0,0,0.38);
+      background: var(--surface-2);
       overflow: hidden;
     }
     .dimple-knob {
       position: absolute; top: 2px; left: 2px;
       width: 18px; height: 18px; border-radius: 999px;
-      background:
-        radial-gradient(circle at 30% 25%, rgba(255,255,255,0.96), rgba(255,255,255,0.5) 32%, rgba(255,255,255,0.14) 52%, rgba(255,255,255,0.02) 72%),
-        linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 96%, white 4%), color-mix(in srgb, var(--surface-3) 96%, black 4%));
-      box-shadow:
-        0 1px 0 rgba(255,255,255,0.26),
-        0 6px 11px -6px rgba(0,0,0,0.74);
-      transition: transform 0.18s var(--ease), background 0.18s var(--ease), box-shadow 0.18s var(--ease);
+      background: var(--surface-1);
+      transition: transform 0.18s var(--ease), background 0.18s var(--ease);
     }
     .dimple-label { min-width: 0; }
     .dimple-state { color: var(--text-muted); font-size: 11.5px; line-height: 1.35; }
     .dimple-toggle.is-on {
       border-color: color-mix(in srgb, var(--brand) 45%, transparent);
       color: var(--text);
-      background:
-        radial-gradient(120% 140% at 28% 0%, color-mix(in srgb, var(--brand) 14%, transparent), transparent 56%),
-        linear-gradient(180deg, color-mix(in srgb, var(--brand) 12%, var(--surface-1)), color-mix(in srgb, var(--brand) 8%, var(--surface-2)));
-      box-shadow: inset 3px 0 0 var(--brand);
+      background: color-mix(in srgb, var(--brand) 10%, var(--surface-1));
     }
     .dimple-toggle.is-on .dimple-track {
       border-color: color-mix(in srgb, var(--brand) 58%, transparent);
-      background:
-        radial-gradient(120% 140% at 28% 0%, color-mix(in srgb, var(--brand) 24%, transparent), transparent 56%),
-        linear-gradient(180deg, color-mix(in srgb, var(--brand) 26%, var(--surface-2)), color-mix(in srgb, var(--brand) 18%, var(--surface-3)));
-      box-shadow:
-        inset 0 1px 1px rgba(255,255,255,0.08),
-        inset 0 -1px 3px rgba(0,0,0,0.28),
-        0 0 0 1px color-mix(in srgb, var(--brand) 20%, transparent);
+      background: color-mix(in srgb, var(--brand) 24%, var(--surface-2));
     }
-    .dimple-toggle.is-on .dimple-knob { transform: translateX(16px); background:
-        radial-gradient(circle at 30% 25%, color-mix(in srgb, var(--brand) 20%, white), color-mix(in srgb, var(--brand) 8%, white) 32%, color-mix(in srgb, var(--brand) 28%, white) 52%, transparent 72%),
-        linear-gradient(180deg, color-mix(in srgb, var(--brand) 16%, white), color-mix(in srgb, var(--brand) 42%, var(--brand-soft))); }
+    .dimple-toggle.is-on .dimple-knob { transform: translateX(16px); background: color-mix(in srgb, var(--brand) 32%, var(--surface-1)); }
     .dimple-toggle.is-connecting,
     .dimple-toggle.is-polling {
       border-color: color-mix(in srgb, var(--brand) 34%, var(--border));
@@ -650,8 +600,6 @@
     .dimple-toggle.is-paused .dimple-state { color: var(--text-muted); }
     .dimple-toggle.is-connecting .dimple-track,
     .dimple-toggle.is-polling .dimple-track { border-color: color-mix(in srgb, var(--brand) 42%, transparent); }
-    .dimple-toggle.is-connecting .dimple-knob,
-    .dimple-toggle.is-polling .dimple-knob { box-shadow: 0 1px 0 rgba(255,255,255,0.24), 0 6px 11px -6px rgba(0,0,0,0.74), 0 0 0 3px color-mix(in srgb, var(--brand) 14%, transparent); }
     .dimple-toggle.is-paused { color: var(--text-soft); }
     .dimple-toggle.is-paused .dimple-track { opacity: 0.88; }
     .dimple-toggle.is-paused .dimple-knob { opacity: 0.92; }
@@ -834,6 +782,8 @@
     .key-input, .key-mask { flex: 1 1 180px; min-width: 0; padding: 6px 9px; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius-xs); }
     .key-input { font: inherit; font-size: 12px; color: var(--text); }
     .key-input:focus { outline: none; border-color: var(--brand); }
+    .key-input.mono { font-family: var(--font-mono); }
+    .account-form .pill-row-label { white-space: nowrap; }
     .key-mask { letter-spacing: 3px; color: var(--text-muted); user-select: none; }
     /* Generic hide utility, toggled from JS (key form reveal, provider model filter).
        !important so it wins over component display rules (.provider-model-row is a grid). */
@@ -1012,7 +962,6 @@
       background: var(--brand-wash);
       border-color: var(--brand-line);
       color: var(--text);
-      box-shadow: inset 3px 0 0 var(--brand);
     }
     .settings-index-button span { font-size: 13px; font-weight: 650; }
     .settings-index-button small {
@@ -1175,7 +1124,7 @@
       display: flex;
       flex-direction: column;
       gap: 8px;
-      --req-flags-w: 82px;
+      --req-flags-w: 104px;
       --req-grid-cols: 86px minmax(90px, 1fr) minmax(74px, 0.8fr) minmax(120px, 1.6fr) 54px minmax(110px, 1.3fr) 62px var(--req-flags-w);
     }
     .req-list-head {
@@ -1219,9 +1168,8 @@
     .req-select { min-height: 40px; padding: 0 15px; border-radius: var(--radius-pill); border: 1px solid var(--border); background: var(--surface-1); color: var(--text); font: inherit; font-size: 12.5px; cursor: pointer; }
     .req-select:focus-visible { outline: none; border-color: color-mix(in srgb, var(--brand) 50%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 14%, transparent); }
 
-    /* Width of the right-hand flag gutter: enough for the "fallback" pill plus the stream
-       marker, reserved on every row so the columns line up whether a row carries one or not.
-       Widen it if a flag is ever added — `.req-flags` overflows leftward rather than clipping. */
+    /* Reserve a fixed right-hand gutter for the fallback pill and stream marker so rows stay
+       aligned whether they carry one or both flags. */
     .req-list { display: flex; flex-direction: column; gap: 8px; }
     .req-item { display: flex; flex-direction: column; }
     /* Every row is its own grid, so the flag gutter must be a FIXED track: sized to content
@@ -1238,7 +1186,8 @@
     .req-reason { color: var(--text-soft); }
     .req-errtype { color: var(--danger); font-family: var(--font-mono); font-size: 11px; }
     .req-lat { color: var(--text-soft); text-align: right; font-variant-numeric: tabular-nums; }
-    .req-flags { display: flex; gap: 6px; align-items: center; justify-content: flex-end; overflow: visible; }
+    .req-flags { display: flex; gap: 6px; align-items: center; justify-content: flex-end; }
+    .req-row > .req-flags { min-width: max-content; overflow: visible; text-overflow: clip; white-space: normal; }
     .req-flags .badge { padding: 2px 7px; font-size: 11px; }
     .req-stream { color: var(--info); font-size: 14px; line-height: 1; }
     /* A row pushed in by the live tail announces itself once, then settles into the list. */
@@ -1304,7 +1253,6 @@
       .nav-label, .nav-item .nav-count { display: none; }
       .nav-item { width: auto; flex: 0 0 auto; gap: 7px; padding: 7px 10px; scroll-snap-align: start; }
       .nav-item:hover { transform: translateY(-1px); }
-      .nav-item.active::before { left: 18%; right: 18%; top: auto; bottom: -1px; width: auto; height: 2px; }
       .nav-spacer { display: none; }
       .rail-foot { grid-column: 3; grid-row: 1; min-width: 0; flex-direction: row; align-items: center; border-top: 0; padding: 0; margin-left: auto; }
       .health-pill { width: auto; }
@@ -1316,6 +1264,12 @@
       .compression-retrieve-form { grid-template-columns: 1fr; }
       .req-list-head { top: 120px; }
       .toast { right: 16px; }
+    }
+    @media (max-width: 860px) {
+      .req-table { --req-grid-cols: 72px minmax(0, 1fr) 52px 58px var(--req-flags-w); }
+      .req-list-head > :nth-child(2), .req-list-head > :nth-child(3), .req-list-head > :nth-child(6) { display: none; }
+      .req-row .req-profile, .req-row .req-prov, .req-row .req-reason { display: none; }
+      .req-row { grid-template-columns: var(--req-grid-cols); }
     }
     @media (max-width: 820px) {
       .workspace { grid-template-columns: 1fr; }
@@ -1332,10 +1286,6 @@
       .settings-index-button { flex: 0 0 auto; min-width: 156px; scroll-snap-align: start; }
       .settings-grid { grid-template-columns: 1fr; }
       .setting-wide { grid-column: auto; }
-      .req-table { --req-grid-cols: 72px minmax(0, 1fr) 52px 58px var(--req-flags-w); }
-      .req-list-head > :nth-child(2), .req-list-head > :nth-child(3), .req-list-head > :nth-child(6) { display: none; }
-      .req-row .req-profile, .req-row .req-prov, .req-row .req-reason { display: none; }
-      .req-row { grid-template-columns: var(--req-grid-cols); }
     }
     @media (max-width: 700px) {
       .page-head { flex-direction: column; align-items: flex-start; }

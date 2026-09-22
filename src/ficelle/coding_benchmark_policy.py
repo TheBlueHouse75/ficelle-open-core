@@ -129,10 +129,10 @@ _MUTABLE_MODEL_PATTERNS = (
     re.compile(r"(^|/)(?:free|auto)$", re.IGNORECASE),
 )
 
-# Ox Alpha is published under this exact upstream id by several providers. The ``stealth``
-# namespace is otherwise opaque and remains rejected: this narrow exception records the public
-# model name without allowing a provider's arbitrary ``stealth/*`` alias into certification.
-_PINNED_OPAQUE_MODEL_IDS = frozenset({"stealth/ox-alpha"})
+# These exact upstream ids are the public names several providers publish under the otherwise
+# opaque ``stealth`` namespace. The namespace remains rejected: only these pinned spellings may
+# enter certification, never a provider's arbitrary ``stealth/*`` alias.
+_PINNED_OPAQUE_MODEL_IDS = frozenset({"stealth/ox-alpha", "stealth/union-alpha"})
 
 
 def canonical_repository(value: str) -> str:

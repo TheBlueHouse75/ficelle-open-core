@@ -30,6 +30,7 @@ import threading
 import functools
 import tempfile
 import time
+import traceback
 import uuid
 import weakref
 from collections import deque
@@ -78,6 +79,7 @@ from ficelle.domain_models import (
     SelectionResult,
 )
 from ficelle.failures import (
+    estimated_tokens_for_chars,
     DROPPABLE_SAMPLING_PARAMETERS,
     BENCHMARK_ROUTE_BLOCKING_REASONS,
     PRODUCTION_PROFILE_FAILURE_REASONS,
@@ -101,6 +103,7 @@ from ficelle.failures import (
 from ficelle.retry_hints import retry_hint
 from ficelle.provider_admission import PROVIDER_ADMISSION_LEDGER, ProviderAdmissionRefused
 from ficelle.provider_credentials import (
+    PROVIDER_ACCOUNT_ID_VALIDATORS,
     PROVIDER_ENV_ALIASES,
     PROVIDER_KEY_VALIDATORS,
     PROVIDER_SERVICE_ALIASES,
@@ -228,10 +231,14 @@ from ficelle.use_cases.chat_completion import (
     ChatCompletionAttemptPorts,
     ChatCompletionRouteTelemetry,
     ChatCompletionRouter,
+    CompletionBudgetExceeded,
     CompressionRoutePlan,
+    DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR,
     StreamingResponseStartInput,
+    assistant_output_chars,
     build_no_attempt_route_log,
     build_streaming_response_start,
+    non_streaming_completion_chars,
     normalize_chat_completion_request,
     prepare_compression_route_body as prepare_chat_compression_route_body,
 )
@@ -804,6 +811,19 @@ _CATALOG_PUBLISH_THREAD_LOCK = threading.RLock()
 # Held from background transition-thread creation until that worker exits; it only
 # deduplicates license-transition refreshes and does not serialize general catalog writes.
 _LICENSE_TRANSITION_REFRESH_IN_FLIGHT_LOCK = threading.Lock()
+# `RouterHandler.config` is `self.server.config`: one dict shared by every handler thread
+# (each request runs on its own thread) and by the background refresh/benchmark loops. Admin
+# writes (save_virtual_profiles, save_fusion_config, save_router_settings, the profile-prune
+# sweep, the provider enable/disable toggle) mutate that live dict in place, while every
+# `/v1/models*` GET walks it with `copy.deepcopy` in `effective_runtime_config` /
+# `config_without_provider_pack`. A deepcopy that is mid-walk when another thread inserts a
+# key (e.g. a provider row gaining `enabled` for the first time) raises `RuntimeError:
+# dictionary changed size during iteration` — the 11 Sep incident: concurrent Hermes GETs to
+# `/v1/models/ficelle/auto-compression` returned silent 500s. RLock because a writer's own
+# helper (e.g. `normalize_config_fusion`) may re-read the live config while the writer still
+# holds the lock. Keep critical sections tiny: lock, mutate or copy, release — never hold this
+# across the on-disk `ConfigStore` write, which has its own lock and would otherwise nest.
+LIVE_CONFIG_LOCK = threading.RLock()
 
 FONTS_DIR = PACKAGE_DIR / "assets" / "fonts"
 LOGOS_DIR = PACKAGE_DIR / "assets" / "logos"
@@ -1063,6 +1083,7 @@ DEFAULT_PROFILE_REQUIREMENTS = {
     "free": True,
     "tools": True,
     "min_context": 64000,
+    "min_completion_tokens": 0,
     "structured": None,
     "input_modalities": [],
     "input_modalities_any": [],
@@ -1076,7 +1097,7 @@ VIRTUAL_MODEL_REQUIREMENTS = {
     "ficelle/auto-orchestrator": {"structured": True},
     "ficelle/auto-fast": {"structured": True},
     "ficelle/auto-json": {"structured": True},
-    "ficelle/auto-compression": {"structured": None},
+    "ficelle/auto-compression": {"structured": None, "min_completion_tokens": 12_000},
     "ficelle/auto-reasoning": {"supported_parameters_any": ["reasoning", "include_reasoning"]},
     "ficelle/auto-multimodal": {"input_modalities_any": ["image", "video", "audio"]},
     "ficelle/auto-vision": {"input_modalities": ["image"]},
@@ -1461,6 +1482,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8646,
     "min_context_length": 64000,
+    # Margin applied to the estimated prompt size before `exclude_undersized_candidates` rules a
+    # candidate out (never to `CONTEXT_HEADROOM_FACTOR`'s demotion-only margin). 1.15 covers the
+    # p90 of measured estimate-vs-actual ratios on this install (see chat_completion.py's
+    # DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR docstring for the underlying numbers) at almost no
+    # cost in eligible candidates. Not exposed in the admin dashboard.
+    "context_estimate_safety_factor": DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR,
     "catalog_ttl_seconds": 3600,
     "request_timeout_policy_version": REQUEST_TIMEOUT_POLICY_VERSION,
     # Read-inactivity budget, not a wall-clock target. Provider inference may legitimately spend
@@ -1472,6 +1499,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # starts. 120s is above every observed successful `auto-fast` answer on this install and
     # still bounds a mute upstream. Every other profile inherits the global budget.
     "request_timeout_seconds_by_profile": {"ficelle/auto-fast": 120},
+    # Compression summaries are the one profile Hermes deliberately never bounds with
+    # `max_tokens`, so a model that starts repeating or looping has nothing else to stop it
+    # short of the global upstream-response-size guard. 400k chars is roughly 100k tokens: 2.5x
+    # the largest legitimate summary (a 131k-context request staying under the 30% budget Hermes
+    # targets) and 3.7x the largest one measured on this install (27k completion tokens, the
+    # 9.5 MB SSE answer of 11/09/2026), while the runaway that motivated this guard passed it in
+    # the first minutes of its ten. Every other profile is unbounded until it earns its own entry.
+    "max_completion_chars_by_profile": {"ficelle/auto-compression": 400_000},
     "max_attempts_per_request": 4,
     # Total wall-clock budget for one request, across every attempt. This remains the hard bound
     # when a provider keeps the socket active or a sequence of fallbacks consumes multiple read
@@ -1496,6 +1531,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "tls_error": 180,
         "timeout": 300,
         "unavailable": 600,
+        # The model answered, but kept generating well past what any legitimate answer for the
+        # profile needs. Model-scoped, not provider-scoped (`cooldown_policy_for_reason`'s
+        # default branch already yields that): a sibling model behind the same provider is not
+        # implicated by this one looping.
+        "runaway_output": 600,
     },
     "quota_probe_backoff_seconds": list(DEFAULT_QUOTA_PROBE_BACKOFF_SECONDS),
     "quota_probe_timeout_seconds": 10,
@@ -2168,7 +2208,11 @@ def effective_runtime_config(
     entitled: bool | None = None,
 ) -> dict[str, Any]:
     is_entitled = license_ops.is_entitled() if entitled is None else entitled
-    effective = config_without_provider_pack(config) if PROVIDER_PACK and not is_entitled else copy.deepcopy(config)
+    if PROVIDER_PACK and not is_entitled:
+        effective = config_without_provider_pack(config)
+    else:
+        with LIVE_CONFIG_LOCK:
+            effective = copy.deepcopy(config)
     if not is_entitled:
         profiles = effective.get("virtual_profiles") if isinstance(effective.get("virtual_profiles"), dict) else {}
         effective["virtual_profiles"] = {
@@ -2180,7 +2224,8 @@ def effective_runtime_config(
 
 
 def config_without_provider_pack(config: dict[str, Any]) -> dict[str, Any]:
-    filtered = copy.deepcopy(config)
+    with LIVE_CONFIG_LOCK:
+        filtered = copy.deepcopy(config)
     providers = filtered.get("providers") if isinstance(filtered.get("providers"), dict) else {}
     filtered["providers"] = {
         provider_id: provider
@@ -2323,6 +2368,7 @@ def safe_profile_requirements(raw: Any, config: dict[str, Any]) -> dict[str, Any
         "free": True,
         "tools": True,
         "min_context": max(base_min_context, requested_min_context),
+        "min_completion_tokens": max(0, safe_int(requirements.get("min_completion_tokens"), 0)),
         "structured": structured if isinstance(structured, bool) else None,
         "input_modalities": safe_string_list(requirements.get("input_modalities")),
         "input_modalities_any": safe_string_list(requirements.get("input_modalities_any")),
@@ -2401,7 +2447,12 @@ def normalize_virtual_profile(
         raise ValueError(f"base_profile for {profile_id} must be a built-in virtual model")
     policy_profile_id = base_profile if custom else canonical_virtual_model_id(profile_id)
     requirements = safe_profile_requirements(profile.get("requirements"), config)
+    requested_min_completion_tokens = requirements["min_completion_tokens"]
     requirements.update(VIRTUAL_MODEL_REQUIREMENTS.get(policy_profile_id, {}))
+    requirements["min_completion_tokens"] = max(
+        requested_min_completion_tokens,
+        safe_int(requirements.get("min_completion_tokens"), 0),
+    )
     normalized = {
         "mode": mode,
         "models": model_ids,
@@ -2514,9 +2565,10 @@ def save_virtual_profiles(config: dict[str, Any], profiles: dict[str, Any]) -> d
 
     runtime_config_store().update(apply_profiles)
 
-    config["allow_paid_fallback"] = False
-    config["virtual_profiles"] = profiles
-    normalize_config_fusion(config, strict=False)
+    with LIVE_CONFIG_LOCK:
+        config["allow_paid_fallback"] = False
+        config["virtual_profiles"] = profiles
+        normalize_config_fusion(config, strict=False)
     return profiles
 
 
@@ -2756,9 +2808,10 @@ def prune_stale_profile_models(
     saved = saved_config.get("virtual_profiles") or {}
     # Mirror the write onto the caller's config, the same way save_virtual_profiles does:
     # the daemon loop and every request handler share this one dict.
-    config["virtual_profiles"] = saved
-    config["allow_paid_fallback"] = False
-    normalize_config_fusion(config, strict=False)
+    with LIVE_CONFIG_LOCK:
+        config["virtual_profiles"] = saved
+        config["allow_paid_fallback"] = False
+        normalize_config_fusion(config, strict=False)
     row = write_admin_audit(
         "admin.profiles.prune",
         before={"virtual_profiles": outcome["before"]},
@@ -3094,10 +3147,11 @@ def save_fusion_config(config: dict[str, Any], fusion: dict[str, Any]) -> dict[s
 
     runtime_config_store().update(apply_fusion)
 
-    config["allow_paid_fallback"] = False
-    config["fusion"] = fusion
-    experimental_config = config.get("experimental") if isinstance(config.get("experimental"), dict) else {}
-    config["experimental"] = {**experimental_config, "auto_fusion": fusion["enabled"]}
+    with LIVE_CONFIG_LOCK:
+        config["allow_paid_fallback"] = False
+        config["fusion"] = fusion
+        experimental_config = config.get("experimental") if isinstance(config.get("experimental"), dict) else {}
+        config["experimental"] = {**experimental_config, "auto_fusion": fusion["enabled"]}
     return fusion
 
 
@@ -3267,6 +3321,7 @@ def save_router_settings(config: dict[str, Any], settings: dict[str, Any]) -> di
             update_config=runtime_config_store().update,
             apply_verified_capability_ttl=apply_verified_capability_ttl,
             apply_route_on_capability_reference=apply_route_on_capability_reference,
+            live_config_lock=LIVE_CONFIG_LOCK,
         ),
     )
     # The other moment an operator is looking at the config: a setting that is silently doing
@@ -5068,6 +5123,33 @@ def resolve_provider_parameter(name: str) -> str | None:
     return None
 
 
+def provider_account_id_row(source: str, provider_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Extra auth-row fields for a provider that needs a non-secret account id.
+
+    Mirrors the adapter's own precedence (config override, then process env, then `.env`)
+    so the dashboard names the location a value is actually read from. The value itself is
+    shown: it is an account identifier, not a credential. Empty for other providers.
+    """
+    env_name = str(provider_cfg.get("account_id_env") or "").strip()
+    if not env_name:
+        return {}
+    value: str | None = None
+    location: str | None = None
+    if str(provider_cfg.get("account_id") or "").strip():
+        value, location = str(provider_cfg["account_id"]).strip(), "config"
+    else:
+        value = resolve_provider_parameter(env_name)
+        if value:
+            location = "env" if (os.getenv(env_name) or "").strip() else ".env"
+    validator = PROVIDER_ACCOUNT_ID_VALIDATORS.get(source)
+    return {
+        "account_id_env": env_name,
+        "account_id": value,
+        "account_id_source": location,
+        "account_id_valid": bool(value) and (validator(value) if validator else True),
+    }
+
+
 def provider_primary_service(source: str, config: dict[str, Any]) -> str:
     """The canonical service name a provider's key is written under — its primary env
     alias (e.g. ``OPENROUTER_API_KEY``). Reads pick it up as the first service tried."""
@@ -5149,6 +5231,7 @@ def provider_auth_ports() -> ProviderAuthPorts:
             require_base_url=require_base_url,
         ),
         credential_source_label=credential_source_label,
+        account_id_row=provider_account_id_row,
     )
 
 
@@ -5244,8 +5327,10 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
             "failures": safe_int(raw_value.get("failures"), 0),
             **failure_ledger_summary(raw_value, now),
             "latency_ewma": raw_value.get("latency_ewma"),
-            # Telemetry only (never scored): wall-clock latency conflates queueing with generation.
+            # Wall-clock latency conflates queueing with generation; these two now feed the
+            # speed score in model_scoring.py rather than being telemetry-only.
             "completion_tokens_per_second": raw_value.get("completion_tokens_per_second"),
+            "first_delta_ewma": raw_value.get("first_delta_ewma"),
             "last_success_at": raw_value.get("last_success_at"),
             "last_failure_at": raw_value.get("last_failure_at"),
             "last_failure_reason": safe_detail(raw_value.get("last_failure_reason")),
@@ -5809,13 +5894,6 @@ def fallback_attempt_rows(last_route: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         rows.append(row)
     return rows[:5]
-
-
-def estimated_tokens_for_chars(char_count: Any) -> int:
-    chars = safe_int(char_count, 0)
-    if chars <= 0:
-        return 0
-    return max(1, math.ceil(chars / 4))
 
 
 def safe_compression_metadata(raw: Any) -> dict[str, Any]:
@@ -6670,40 +6748,64 @@ def upstream_post(
     return response
 
 
+def completion_budget_transport_limit(max_completion_chars: int) -> int:
+    """Bound JSON retained while waiting to measure a completion exactly.
+
+    A non-BMP character can occupy two ``\\uXXXX`` escapes (twelve bytes), and the fixed
+    allowance covers the response envelope. Exact assistant-output counting still decides the
+    normal case; this is the fail-closed bound for an unfinished or pathologically large object.
+    """
+    return min(
+        MAX_UPSTREAM_RESPONSE_BYTES,
+        max(64 * 1024, max_completion_chars * 12 + 64 * 1024),
+    )
+
+
 def buffer_bounded_upstream_response(
     response: Any,
     *,
     deadline_monotonic: float | None = None,
     retention_leases: list[OutputRetentionLease] | None = None,
+    max_completion_chars: int | None = None,
 ) -> Any:
     """Buffer a logical non-streaming response without trusting its size metadata.
 
     ``deadline_monotonic`` bounds a drip-feeding body to the request budget (L2-R2): a
     provider emitting one byte before every read-idle timeout would otherwise keep the
     buffering alive past the configured request deadline."""
+    response_byte_limit = MAX_UPSTREAM_RESPONSE_BYTES
+    if max_completion_chars is not None:
+        response_byte_limit = completion_budget_transport_limit(max_completion_chars)
+
+    def response_too_large() -> Exception:
+        if max_completion_chars is not None and response_byte_limit < MAX_UPSTREAM_RESPONSE_BYTES:
+            return CompletionBudgetExceeded(
+                f"buffered response exceeded the transport guard for the "
+                f"{max_completion_chars}-character profile budget"
+            )
+        return UpstreamResponseTooLarge(
+            f"upstream response passed the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
+        )
+
     raw_length = str((getattr(response, "headers", {}) or {}).get("Content-Length") or "").strip()
     if raw_length:
         try:
             declared_length = int(raw_length)
         except ValueError:
             declared_length = None
-        if declared_length is not None and declared_length > MAX_UPSTREAM_RESPONSE_BYTES:
+        if declared_length is not None and declared_length > response_byte_limit:
             response.close()
-            raise UpstreamResponseTooLarge(
-                f"upstream declared {declared_length} bytes, above the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
-            )
+            raise response_too_large()
 
     lease = OUTPUT_RETENTION_ADMISSION.acquire()
     iter_content = getattr(response, "iter_content", None)
     if not callable(iter_content):
         content = bytes(getattr(response, "content", b""))
-        if len(content) > MAX_UPSTREAM_RESPONSE_BYTES:
+        if len(content) > response_byte_limit:
             close = getattr(response, "close", None)
             if callable(close):
                 close()
-            raise UpstreamResponseTooLarge(
-                f"upstream response passed the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
-            )
+            raise response_too_large()
         if not lease.try_reserve(len(content)):
             close = getattr(response, "close", None)
             if callable(close):
@@ -6730,10 +6832,8 @@ def buffer_bounded_upstream_response(
                     continue
                 record_response_first_byte(response)
                 total += len(chunk)
-                if total > MAX_UPSTREAM_RESPONSE_BYTES:
-                    raise UpstreamResponseTooLarge(
-                        f"upstream response passed the {MAX_UPSTREAM_RESPONSE_BYTES}-byte limit"
-                    )
+                if total > response_byte_limit:
+                    raise response_too_large()
                 if not lease.try_reserve(len(chunk)):
                     raise UpstreamResponseBudgetExceeded(
                         "upstream response capacity is exhausted; retry later"
@@ -7355,6 +7455,7 @@ def quarantine_ports() -> QuarantinePorts:
     return QuarantinePorts(
         safe_detail=safe_detail,
         now_iso=now_iso,
+        now_seconds=time.time,
         cooldown_key=cooldown_key,
     )
 
@@ -7556,6 +7657,7 @@ def update_success_stats(
     latency_seconds: float,
     *,
     origin: str = FAILURE_ORIGIN_REQUEST,
+    first_delta_seconds: float | None = None,
 ) -> None:
     update_success_stats_use_case(
         state,
@@ -7563,6 +7665,7 @@ def update_success_stats(
         latency_seconds,
         ports=cooldown_stats_ports(),
         origin=origin,
+        first_delta_seconds=first_delta_seconds,
     )
 
 
@@ -7878,16 +7981,24 @@ def record_success_with_telemetry(
 
     route_log = telemetry.route_log if isinstance(telemetry.route_log, dict) else {}
     usage = route_log.get("usage") if isinstance(route_log.get("usage"), dict) else {}
-    # Generation throughput, measured only where the answer reported its own token count. Telemetry
-    # only: nothing scores on it yet, and a provider that reports no usage must not look slow.
+    # Generation throughput, measured only where the answer reported its own token count. This
+    # and `first_delta_seconds` below now feed the speed score in `model_scoring.py`.
     tokens_per_second = completion_tokens_per_second(
         usage.get("completion_tokens"),
         latency_seconds,
         route_log.get("first_byte_seconds"),
     )
+    first_delta_seconds = route_log.get("first_delta_seconds")
 
     def mutate(state: dict[str, Any]) -> None:
-        record_success_in_state_use_case(state, model, latency_seconds, ports=cooldown_success_ports())
+        record_success_in_state_use_case(
+            state,
+            model,
+            latency_seconds,
+            ports=cooldown_success_ports(),
+            first_delta_seconds=first_delta_seconds if isinstance(first_delta_seconds, (int, float)) else None,
+            started_at=telemetry.attempt_started_at,
+        )
         update_throughput_stats_use_case(state, model, tokens_per_second, ports=cooldown_stats_ports())
         apply_last_route(state)
 
@@ -8049,7 +8160,7 @@ def cooldown_success_ports() -> CooldownSuccessPorts:
 
 def record_success(
     model: dict[str, Any],
-    latency_seconds: float,
+    latency_seconds: float | None,
     *,
     origin: str = FAILURE_ORIGIN_REQUEST,
 ) -> None:
@@ -9005,6 +9116,36 @@ def request_timeout_seconds_for_profile(requested_model: str, config: dict[str, 
     return request_timeout_policy_for_profile(requested_model, config)[0]
 
 
+def completion_char_budget_for_profile(config: dict[str, Any], requested_model: str) -> int | None:
+    """The per-profile completion character budget, or ``None`` when the profile is unbounded.
+
+    Mirrors `request_timeout_policy_for_profile`'s profile -> base-profile fallback: an
+    operator's entry for the exact virtual model id wins, then its base profile's entry, then no
+    budget at all. Chars, not bytes: SSE framing multiplies bytes several times over the content
+    it carries, so a byte budget would be a poor proxy for how much output a model actually
+    produced.
+    """
+    per_profile = config.get("max_completion_chars_by_profile")
+    if not isinstance(per_profile, dict):
+        return None
+
+    def resolved(raw_value: Any) -> int | None:
+        parsed = safe_int(raw_value, -1)
+        return parsed if parsed > 0 else None
+
+    profile_id = canonical_virtual_model_id(requested_model)
+    raw_value = per_profile.get(profile_id)
+    if raw_value is not None:
+        return resolved(raw_value)
+    profile = normalized_virtual_profiles(config).get(profile_id)
+    base_profile = virtual_profile_policy_id(requested_model, profile)
+    if base_profile != profile_id:
+        raw_value = per_profile.get(base_profile)
+        if raw_value is not None:
+            return resolved(raw_value)
+    return None
+
+
 def runtime_timeout_policy_payload(config: dict[str, Any]) -> dict[str, Any]:
     """The effective, read-only timeout policy used by live chat attempts."""
     profiles = {}
@@ -9190,6 +9331,7 @@ def invoke_model(
     remaining_budget_seconds: float | None = None,
     deadline_monotonic: float | None = None,
     retention_leases: list[OutputRetentionLease] | None = None,
+    max_completion_chars: int | None = None,
 ) -> requests.Response:
     source = str(model.get("source"))
     access = provider_access_for(source, config)
@@ -9329,6 +9471,11 @@ def invoke_model(
                 response,
                 deadline_monotonic=deadline_monotonic,
                 retention_leases=retention_leases,
+                max_completion_chars=(
+                    max_completion_chars
+                    if not bool(payload.get("stream")) and 200 <= response.status_code < 300
+                    else None
+                ),
             )
             observe_reasoning_trace(model, response)
     except RequestDeadlineExceeded as exc:
@@ -10096,6 +10243,60 @@ def sse_error_event(code: str, detail: str | None = None) -> bytes:
     return b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n"
 
 
+def sse_event_content_chars(parsed: dict[str, Any]) -> int:
+    """Chars of assistant-visible content carried by one parsed SSE data object.
+
+    Sums `choices[*].delta.content`, `.reasoning` and `.reasoning_content` — every field a
+    streaming chat delta can use to carry text. Used to budget completion length in characters
+    rather than bytes: SSE framing multiplies the wire size several times over the content it
+    actually carries, so bytes are a poor proxy for how much a model has generated.
+    """
+    total = 0
+    choices = parsed.get("choices")
+    if not isinstance(choices, list):
+        return total
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        total += assistant_output_chars(delta)
+    return total
+
+
+def complete_sse_events_content_chars(events: bytes) -> int | None:
+    """Count complete SSE events, or return ``None`` when one cannot be measured safely."""
+    total = 0
+    for event in events.split(b"\n\n"):
+        if not event:
+            continue
+        data_lines: list[bytes] = []
+        for raw_line in event.split(b"\n"):
+            line = raw_line.strip()
+            if not line or line.startswith(b":"):
+                continue
+            field, delimiter, value = line.partition(b":")
+            if field in {b"event", b"id", b"retry"}:
+                continue
+            if field != b"data" or not delimiter:
+                return None
+            data_lines.append(value.lstrip())
+        if not data_lines:
+            continue
+        payload = b"\n".join(data_lines).strip()
+        if not payload or payload == b"[DONE]":
+            continue
+        try:
+            parsed = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        total += sse_event_content_chars(parsed)
+    return total
+
+
 def sse_data_objects(text: str) -> Iterator[dict[str, Any]]:
     """Yield the parsed JSON object of each SSE event, in order.
 
@@ -10275,6 +10476,17 @@ def sse_chunk_carries_deliverable(chunk: bytes) -> bool:
     )
 
 
+def sse_chunk_carries_substantive_delta(chunk: bytes) -> bool:
+    """True when streamed bytes carry caller-visible output, including reasoning progress."""
+    markers = DELIVERABLE_FIELD_MARKERS + (b'"reasoning"', b'"reasoning_content"')
+    if not any(marker in chunk for marker in markers):
+        return False
+    return any(
+        sse_payload_carries_assistant_output(parsed, include_reasoning=True)
+        for parsed in sse_data_objects(chunk.decode("utf-8", errors="replace"))
+    )
+
+
 def compression_stream_precommit_event_decision(event: bytes) -> tuple[str, dict[str, Any] | None]:
     """Classify one complete SSE event as ``commit``, ``retry`` or ``wait``."""
     error = sse_event_error_payload(event)
@@ -10297,6 +10509,22 @@ def stream_precommit_event_decision(
     if stream_commit_policy == "first_complete_event":
         return "commit", None
     return compression_stream_precommit_event_decision(event)
+
+
+def split_complete_sse_events(carry: bytes, chunk: bytes) -> tuple[bytes, bytes]:
+    """(complete events, new carry) for one more relayed chunk.
+
+    Chunk boundaries do not respect SSE events, so the tail after the last blank line is carried
+    to the next call. A trailing lone CR is kept out of the normalization so a CRLF split across
+    chunks is still seen as one line ending.
+    """
+    buffered = carry + chunk
+    trailing_cr = b""
+    if buffered.endswith(b"\r"):
+        buffered, trailing_cr = buffered[:-1], b"\r"
+    buffered = buffered.replace(b"\r\n", b"\n").replace(b"\r", b"\n") + trailing_cr
+    events, _, new_carry = buffered.rpartition(b"\n\n")
+    return events, new_carry
 
 
 def normalize_incremental_sse_fragment(chunk: bytes, pending_cr: bool) -> tuple[bytes, bool]:
@@ -10572,10 +10800,20 @@ def stream_chunks_to_writer(
     expected_choice_count: int = 1,
     stream_commit_policy: str = "immediate",
     write_terminal_error: Any | None = None,
+    started_monotonic: float | None = None,
+    max_completion_chars: int | None = None,
 ) -> dict[str, Any]:
     if stream_commit_policy not in STREAM_COMMIT_POLICIES:
         raise ValueError(f"unsupported stream_commit_policy: {stream_commit_policy}")
     response_committed = False
+    # Time from request start to the first *substantive* delta reaching the client — distinct
+    # from `first_byte_seconds`, which measures the first upstream byte and can be a keepalive
+    # or an empty delta. A model that goes silent for minutes before answering must not score
+    # the same as one that answers in seconds; this is what tells them apart.
+    first_delta_seconds: float | None = None
+
+    def rounded_first_delta() -> float | None:
+        return round(first_delta_seconds, 4) if first_delta_seconds is not None else None
     # True only while a call into `write_chunk`/`flush` is in flight — the delivery side. An
     # exception raised under this flag never came from the upstream, which is what matters here: a
     # client-side abort must not cool a model that was answering correctly. It is deliberately the
@@ -10597,6 +10835,30 @@ def stream_chunks_to_writer(
     precommit_scan_buffer = bytearray()
     precommit_scan_offset = 0
     precommit_pending_cr = False
+    # Content characters delivered so far, counted from complete SSE events (see
+    # `sse_event_content_chars`). Counting parses every event, so it only runs for a profile
+    # that has a budget; an unbudgeted profile pays nothing and reports no figure.
+    completion_chars = 0
+    completion_char_carry = b""
+    completion_transport_limit = (
+        completion_budget_transport_limit(max_completion_chars)
+        if max_completion_chars is not None
+        else None
+    )
+    runaway_output_detail: str | None = None
+
+    def counted_completion_chars() -> int | None:
+        return completion_chars if max_completion_chars is not None else None
+
+    def mark_first_delta() -> None:
+        nonlocal first_delta_seconds
+        if first_delta_seconds is not None or started_monotonic is None:
+            return
+        try:
+            first_delta_seconds = time.monotonic() - started_monotonic
+        except Exception:
+            # Telemetry must never interrupt a response already on its way to the client.
+            pass
 
     def emit_terminal_error(reason: str, detail: str | None) -> None:
         # Best-effort — the client may already be gone (broken pipe); the failure is still
@@ -10629,6 +10891,10 @@ def stream_chunks_to_writer(
         nonlocal normalization_valid
         nonlocal normalization_carry
         nonlocal error_event_seen
+        nonlocal first_delta_seconds
+        nonlocal completion_chars
+        nonlocal completion_char_carry
+        nonlocal runaway_output_detail
 
         # The writer may emit HTTP headers before attempting the first body write. Mark
         # the response as committed before calling it so a body failure cannot trigger a
@@ -10641,19 +10907,18 @@ def stream_chunks_to_writer(
         bytes_sent += len(outbound_chunk)
         if expect_sse_done and not deliverable_sent:
             try:
-                buffered = deliverable_carry + outbound_chunk
-                trailing_cr = b""
-                if buffered.endswith(b"\r"):
-                    buffered, trailing_cr = buffered[:-1], b"\r"
-                buffered = buffered.replace(b"\r\n", b"\n").replace(b"\r", b"\n") + trailing_cr
-                scan, _, deliverable_carry = buffered.rpartition(b"\n\n")
-                if scan and sse_chunk_carries_deliverable(scan):
-                    deliverable_sent = True
+                scan, deliverable_carry = split_complete_sse_events(deliverable_carry, outbound_chunk)
+                if scan:
+                    if sse_chunk_carries_substantive_delta(scan):
+                        mark_first_delta()
+                    if sse_chunk_carries_deliverable(scan):
+                        deliverable_sent = True
                 elif len(deliverable_carry) > SSE_TERMINAL_TAIL_BYTES:
                     # One frame wider than the carry window cannot be parsed here. Calling
                     # it empty would bench a model that may well have answered, so the
                     # check gives up in the model's favour and the attempt stands.
                     deliverable_sent = True
+                    mark_first_delta()
             except Exception:
                 # This runs inside the write window, where any throw is classified as
                 # `client_disconnected`, truncates a healthy relay and appends a bogus
@@ -10661,6 +10926,7 @@ def stream_chunks_to_writer(
                 # reasoning observer follows by swallowing its own parse errors.
                 deliverable_sent = True
                 deliverable_carry = b""
+                mark_first_delta()
         stream_tail = (stream_tail + outbound_chunk)[-SSE_TERMINAL_TAIL_BYTES:]
         if expect_sse_done and normalization_valid:
             try:
@@ -10676,6 +10942,44 @@ def stream_chunks_to_writer(
                 # Validation can withhold normalization, but must never interrupt the relay.
                 normalization_valid = False
                 normalization_carry = b""
+        if expect_sse_done and max_completion_chars is not None:
+            try:
+                events_text, completion_char_carry = split_complete_sse_events(completion_char_carry, outbound_chunk)
+                if events_text:
+                    event_chars = complete_sse_events_content_chars(events_text)
+                    if event_chars is None:
+                        completion_chars = max(completion_chars, max_completion_chars + 1)
+                        runaway_output_detail = (
+                            "upstream emitted an SSE event that could not be measured safely "
+                            f"within the profile's {max_completion_chars}-char budget"
+                        )
+                    else:
+                        completion_chars += event_chars
+                if (
+                    completion_transport_limit is not None
+                    and len(completion_char_carry) > completion_transport_limit
+                ):
+                    completion_chars = max(completion_chars, max_completion_chars + 1)
+                    runaway_output_detail = (
+                        "upstream streamed one incomplete SSE event past the transport guard "
+                        f"for the profile's {max_completion_chars}-char budget"
+                    )
+            except Exception:
+                # A budget observer must fail closed: disabling it would let the rest of a
+                # looping completion run until the much larger generic transport ceiling.
+                completion_chars = max(completion_chars, max_completion_chars + 1)
+                runaway_output_detail = (
+                    "upstream completion could not be measured safely within the profile's "
+                    f"{max_completion_chars}-char budget"
+                )
+            if (
+                runaway_output_detail is None
+                and completion_chars > max_completion_chars
+            ):
+                runaway_output_detail = (
+                    f"upstream streamed {completion_chars} chars of output past the "
+                    f"profile's {max_completion_chars}-char budget"
+                )
         flush()
         writing_to_client = False
 
@@ -10687,6 +10991,76 @@ def stream_chunks_to_writer(
     # than only its last line. Legal multiline `data:` events can span chunks; parsing either
     # half independently would bench a model that did reply.
     deliverable_carry = b""
+    if not expect_sse_done and max_completion_chars is not None:
+        # A provider may ignore `stream: true` and answer with one JSON document. Unlike SSE,
+        # that document has no legal terminal error frame once its HTTP 200 bytes are exposed,
+        # so validate and measure it before the first write. The profile-derived transport guard
+        # bounds both memory and an upstream that never completes the object.
+        buffered_json = bytearray()
+        try:
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                if (
+                    completion_transport_limit is not None
+                    and len(buffered_json) + len(chunk) > completion_transport_limit
+                ):
+                    return {
+                        "status": "fail",
+                        "reason": "runaway_output",
+                        "stream_started": False,
+                        "chunk_count": 0,
+                        "bytes_sent": 0,
+                        "error_type": "RunawayOutput",
+                        "message": (
+                            "upstream JSON stream passed the transport guard for the profile's "
+                            f"{max_completion_chars}-char budget"
+                        ),
+                        "completion_chars": max_completion_chars + 1,
+                    }
+                buffered_json.extend(chunk)
+        except Exception as exc:
+            result = {
+                "status": "fail",
+                "reason": "pre_stream_failure",
+                "stream_started": False,
+                "chunk_count": 0,
+                "bytes_sent": 0,
+                "error_type": type(exc).__name__,
+                "message": safe_detail(exc),
+            }
+            if exception_chain_contains_timeout(exc):
+                result["timeout_phase"] = "response_body"
+            return result
+        if buffered_json:
+            try:
+                buffered_payload = json.loads(buffered_json.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+                return {
+                    "status": "fail",
+                    "reason": "pre_stream_failure",
+                    "stream_started": False,
+                    "chunk_count": 0,
+                    "bytes_sent": 0,
+                    "error_type": type(exc).__name__,
+                    "message": "upstream returned an invalid non-SSE stream body",
+                }
+            completion_chars = non_streaming_completion_chars(buffered_payload)
+            if completion_chars > max_completion_chars:
+                return {
+                    "status": "fail",
+                    "reason": "runaway_output",
+                    "stream_started": False,
+                    "chunk_count": 0,
+                    "bytes_sent": 0,
+                    "error_type": "RunawayOutput",
+                    "message": (
+                        f"upstream produced {completion_chars} chars of output past the "
+                        f"profile's {max_completion_chars}-char budget"
+                    ),
+                    "completion_chars": completion_chars,
+                }
+        chunks = [bytes(buffered_json)] if buffered_json else []
     try:
         for chunk in chunks:
             if not chunk:
@@ -10765,6 +11139,11 @@ def stream_chunks_to_writer(
                     }
             for outbound_chunk in outbound_chunks:
                 relay_chunk(outbound_chunk)
+            if runaway_output_detail is not None:
+                # Stop pulling from `chunks`: the upstream may still be streaming megabytes
+                # more, and the budget has already been crossed. Closing the underlying
+                # response is the caller's job (its own finally/close path around this call).
+                break
     except Exception as exc:
         if writing_to_client:
             reason = "client_disconnected"
@@ -10787,12 +11166,28 @@ def stream_chunks_to_writer(
             "error_type": type(exc).__name__,
             "message": detail,
         }
+        if response_committed:
+            result["first_delta_seconds"] = rounded_first_delta()
+            result["completion_chars"] = counted_completion_chars()
         if not writing_to_client and exception_chain_contains_timeout(exc):
             # Requests wraps urllib3.ReadTimeoutError as ConnectionError while consuming
             # Response.iter_content(). The chain retains the actual timeout even though
             # the public exception name no longer does.
             result["timeout_phase"] = "response_body"
         return result
+    if runaway_output_detail is not None:
+        emit_terminal_error("runaway_output", runaway_output_detail)
+        return {
+            "status": "fail",
+            "reason": "runaway_output",
+            "stream_started": True,
+            "chunk_count": chunk_count,
+            "bytes_sent": bytes_sent,
+            "error_type": "RunawayOutput",
+            "message": runaway_output_detail,
+            "completion_chars": counted_completion_chars(),
+            "first_delta_seconds": rounded_first_delta(),
+        }
     if not response_committed:
         return {
             "status": "fail",
@@ -10827,6 +11222,8 @@ def stream_chunks_to_writer(
             "bytes_sent": bytes_sent,
             "error_type": "upstream_error_after_content",
             "message": detail,
+            "completion_chars": counted_completion_chars(),
+            "first_delta_seconds": rounded_first_delta(),
         }
     ended_with_done = sse_stream_ended_with_done(stream_tail) if expect_sse_done else False
     finish_reason = (
@@ -10869,6 +11266,8 @@ def stream_chunks_to_writer(
                     "bytes_sent": bytes_sent,
                     "error_type": type(exc).__name__,
                     "message": safe_detail(exc),
+                    "completion_chars": counted_completion_chars(),
+                    "first_delta_seconds": rounded_first_delta(),
                 }
             stream_tail = (stream_tail + done_event)[-SSE_TERMINAL_TAIL_BYTES:]
             normalized_done = True
@@ -10886,6 +11285,8 @@ def stream_chunks_to_writer(
                 "bytes_sent": bytes_sent,
                 "error_type": "missing_done",
                 "message": detail,
+                "completion_chars": counted_completion_chars(),
+                "first_delta_seconds": rounded_first_delta(),
             }
     result = {
         "status": "ok",
@@ -10895,8 +11296,10 @@ def stream_chunks_to_writer(
         "bytes_sent": bytes_sent,
         "finish_reason": finish_reason,
         "usage": usage_from_sse_tail(stream_tail),
+        "first_delta_seconds": rounded_first_delta(),
     }
     if expect_sse_done:
+        result["completion_chars"] = counted_completion_chars()
         # Only an SSE body can be read for an assistant message. A provider answering a stream
         # request with a plain JSON body is exempt from the `[DONE]` contract for exactly the
         # same reason, and reporting nothing here lets the reader's default credit it — the
@@ -11834,6 +12237,7 @@ def connectors_contract_payload(config: dict[str, Any]) -> dict[str, Any]:
             "state_endpoint": "/admin/state",
             "settings_endpoint": "/admin/settings",
             "credential_key_endpoint_template": "/admin/providers/{provider}/key",
+            "provider_account_id_endpoint_template": "/admin/providers/{provider}/account-id",
         },
     }
 
@@ -12492,6 +12896,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(404, not_found_body("GET", path, target_base_url(self.config)))
         except Exception as exc:
+            self._log_unhandled_error(exc, method="GET", path=self.path)
             self._send_json(500, safe_error_body(exc))
 
     def _send_request_body_unavailable(self, exc: Exception) -> None:
@@ -12514,6 +12919,13 @@ class RouterHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _log_unhandled_error(self, exc: Exception, *, method: str, path: str) -> None:
+        """One stderr line plus traceback for an unhandled 500; frames only, never the body."""
+        sys.stderr.write(
+            f"ficelle: {method} {path} failed: {type(exc).__name__}: {safe_detail(exc)}\n"
+        )
+        sys.stderr.write(traceback.format_exc())
+
     def _send_unhandled_post_error(self, exc: Exception) -> None:
         """The last-resort answer of a POST route that raised: 500 for whatever Ficelle failed at.
 
@@ -12525,6 +12937,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         """
         if isinstance(exc, RequestBodyUnavailable):
             raise exc
+        self._log_unhandled_error(exc, method="POST", path=self.path)
         self._send_protocol_json(500, safe_error_body(exc))
 
     def do_POST(self) -> None:  # noqa: N802
@@ -12655,6 +13068,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except update_service.UpdateError as exc:
+                self._log_unhandled_error(exc, method="POST", path=self.path)
                 self._send_json(500, {"error": {"message": str(exc), "type": "update_error"}})
             except Exception as exc:
                 self._send_unhandled_post_error(exc)
@@ -12919,8 +13333,11 @@ class RouterHandler(BaseHTTPRequestHandler):
 
                 runtime_config_store().update(apply_toggle)
                 # Keep the live config in step so the change takes effect without a restart,
-                # the same way the other admin saves do.
-                provider["enabled"] = enabled
+                # the same way the other admin saves do. This can insert a brand-new "enabled"
+                # key on a provider row that never had one, which is exactly the mutation a
+                # concurrent deepcopy in effective_runtime_config must not observe mid-walk.
+                with LIVE_CONFIG_LOCK:
+                    provider["enabled"] = enabled
                 write_admin_audit(
                     "admin.providers.toggle",
                     before={"enabled": before_enabled},
@@ -12928,6 +13345,55 @@ class RouterHandler(BaseHTTPRequestHandler):
                     metadata={"source": source, "enabled": enabled},
                 )
                 self._send_json(200, {"source": source, "enabled": enabled})
+            except ValueError as exc:
+                self._send_json(400, bad_request_body(exc))
+            except Exception as exc:
+                self._send_unhandled_post_error(exc)
+            return
+
+        if path.startswith("/admin/providers/") and path.endswith("/account-id"):
+            # The non-secret half of a templated-URL provider (Cloudflare's account id). The
+            # key form alone left such a provider stuck at "missing or invalid
+            # CLOUDFLARE_ACCOUNT_ID" with no way to fix it from the dashboard. The value is
+            # written to FICELLE_HOME/.env, which the running service reads on the next
+            # resolution, so no restart is needed. A process-environment value still wins,
+            # and the returned row names that source so the form can say so.
+            try:
+                if not self._admin_write_authorized():
+                    self._send_json(403, {"error": {"code": "forbidden", "message": "admin token required"}})
+                    return
+                source = path[len("/admin/providers/"):-len("/account-id")].strip("/")
+                body = self._read_body()
+                providers = self.config.get("providers")
+                provider_cfg = providers.get(source) if isinstance(providers, dict) else None
+                if not isinstance(provider_cfg, dict):
+                    raise ValueError(f"unknown provider: {source}")
+                env_name = str(provider_cfg.get("account_id_env") or "").strip()
+                if not env_name:
+                    raise ValueError(f"provider {source} does not use an account id")
+                if body.get("remove"):
+                    removed = env_file_delete_key(CREDENTIAL_ENV_FILE, env_name)
+                else:
+                    account_id = str(body.get("account_id") or "").strip()
+                    if not account_id:
+                        raise ValueError("account_id is required")
+                    validator = PROVIDER_ACCOUNT_ID_VALIDATORS.get(source)
+                    if validator and not validator(account_id):
+                        raise ValueError(f"invalid {source} account id format")
+                    env_file_set_key(CREDENTIAL_ENV_FILE, env_name, account_id)
+                    removed = False
+                try:
+                    refresh_catalog(self.config)
+                except CatalogRefreshRejectedError:
+                    # The value is stored; the rejected rebuild kept the previous catalog.
+                    pass
+                auth = provider_auth_row(source, self.config)
+                write_admin_audit(
+                    "admin.providers.set_account_id",
+                    after={"removed": removed, "resolved_from": auth.get("account_id_source")},
+                    metadata={"source": source, "variable": env_name},
+                )
+                self._send_json(200, {"source": source, "removed": removed, "auth": auth})
             except ValueError as exc:
                 self._send_json(400, bad_request_body(exc))
             except Exception as exc:
@@ -13497,6 +13963,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 load_catalog=lambda _config: load_or_refresh_catalog(
                     self.config,
                     entitled=entitled,
+                    effective_config=effective_config,
                 ),
                 select_candidates=select_models,
                 select_result=select_models_result,
@@ -13637,6 +14104,10 @@ class RouterHandler(BaseHTTPRequestHandler):
                                 write_anthropic_terminal_error
                                 if anthropic_surface and expect_sse_done
                                 else None
+                            ),
+                            started_monotonic=getattr(response, "_ficelle_request_started_monotonic", None),
+                            max_completion_chars=completion_char_budget_for_profile(
+                                effective_config, requested_model
                             ),
                         )
                         if anthropic_surface and not expect_sse_done:
@@ -13797,6 +14268,9 @@ class RouterHandler(BaseHTTPRequestHandler):
                         model, request_body, config=effective_config
                     ),
                     learn_unsupported_parameters=learn_unsupported_parameters,
+                    completion_char_budget_for_profile=lambda profile: completion_char_budget_for_profile(
+                        effective_config, profile
+                    ),
                     build_success_headers=chat_success_response_headers,
                     build_failure_error=build_upstream_failure_error,
                     build_failure_headers=chat_failure_response_headers,

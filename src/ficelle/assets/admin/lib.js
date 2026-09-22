@@ -135,6 +135,7 @@ export const REASON_LABELS = {
   truncated_before_content: "Token budget too small",
   bad_upstream_request: "Invalid request body",
   bad_upstream_contract: "Provider/model request contract",
+  context_length_exceeded: "Context too small",
   malformed_tool_call: "Tool call without a name",
   client_disconnected: "Client hung up",
   service_restarting: "Ficelle was restarting",
@@ -162,6 +163,7 @@ export const REASON_LABELS = {
   upstream_failure: "Upstream failure",
   no_available_model: "No available model",
   mid_stream_failure: "Mid-stream failure",
+  runaway_output: "Runaway output",
 };
 export const REASON_DESCRIPTIONS = {
   empty_assistant_message: "The provider returned success, but no usable assistant text was found.",
@@ -169,6 +171,7 @@ export const REASON_DESCRIPTIONS = {
   truncated_before_content: "The request's max_tokens ran out before the model emitted any content, typically because a reasoning model spent the budget on reasoning tokens. Request-side limit: the model is not cooled.",
   bad_upstream_request: "The provider rejected the request body itself (HTTP 400/422), typically a malformed tool_call or an unsupported field. Request-side problem: no other candidate is tried and the model is not cooled.",
   bad_upstream_contract: "One model rejected an otherwise valid request option or required a private provider field. Ficelle keeps the request unchanged, tries the next candidate, and cools neither the model nor the provider.",
+  context_length_exceeded: "The request does not fit this model's context window. Ficelle retries on a candidate whose context is at least the size the provider named; the model is not cooled. If every attempt ends this way, no eligible model is large enough for this request.",
   malformed_tool_call: "Ficelle refused the request before calling any provider: a tool call replayed in the conversation history carries no function name, which every provider rejects. The error names the offending message index — fix the client that built the history, or start a new conversation. No model was picked, called, or cooled.",
   client_disconnected: "The client closed the connection before Ficelle could answer — mid-stream, or while a fallback attempt was still being chosen. Client-side abort: the model is not cooled.",
   service_restarting: "Ficelle was stopping (service restart or update) and did not start further fallback attempts for this request. Nothing upstream failed and no model is cooled.",
@@ -193,6 +196,7 @@ export const REASON_DESCRIPTIONS = {
   benchmark_failed: "The model failed a capability check for this route.",
   failed_capability_check: "The model failed the latest capability check for this virtual model.",
   failed_benchmark: "The model failed the latest benchmark for this virtual model.",
+  runaway_output: "The model generated past the profile's completion character budget. Ficelle stopped the answer, cooled the model, and used fallback when the response had not yet been committed.",
 };
 export function reasonLabel(reason) { return REASON_LABELS[String(reason || "")] || String(reason || "cooldown"); }
 export function reasonDescription(reason) { return REASON_DESCRIPTIONS[String(reason || "")] || reasonLabel(reason); }

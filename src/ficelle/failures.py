@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -27,12 +28,14 @@ FailureReason = Literal[
     "bad_upstream_contract",
     "bad_upstream_request",
     "billing_or_paid",
+    "context_length_exceeded",
     "model_not_found",
     "no_free_quota",
     "quota_exhausted",
     "rate_limited",
     "rate_limited_upstream",
     "request_too_large",
+    "runaway_output",
     "server_error",
     "tls_error",
     "unavailable",
@@ -299,8 +302,16 @@ def provider_error_codes(text: str) -> tuple[str, ...]:
         # fits well under the size limit. Letting it out turns a failover into a 500, since the chat
         # path calls `classify_failure` outside the try/except that wraps `invoke_model`.
         return ()
-    error = payload.get("error") if isinstance(payload, dict) else None
-    return error_object_codes(error) if isinstance(error, dict) else ()
+    if not isinstance(payload, dict):
+        return ()
+    nested_error = payload.get("error")
+    # OpenAI-compatible providers use both shapes in practice: the canonical
+    # ``{"error": {...}}`` envelope and a bare serialized error object. Mistral's
+    # SDK exposes the latter for HTTP failures, including its stable capacity
+    # code/type pair. Read the same two structural fields from either shape;
+    # arbitrary nested metadata remains deliberately out of scope.
+    error = nested_error if isinstance(nested_error, dict) else payload
+    return error_object_codes(error)
 
 
 def status_for_error_codes(*values: Any) -> int | None:
@@ -387,6 +398,9 @@ class FailureMarkers:
     model_not_found: tuple[str, ...] = MODEL_NOT_FOUND_TEXT_MARKERS
     model_not_entitled: tuple[str, ...] = MODEL_NOT_ENTITLED_TEXT_MARKERS
     upstream_rate_limit: tuple[str, ...] = UPSTREAM_RATE_LIMIT_TEXT_MARKERS
+    # Exact ``error.code``/``error.type`` pairs for a provider-specific model-pool saturation
+    # verdict. Each pair is ordered as (code, type), matching ``error_object_codes``.
+    upstream_rate_limit_error_codes: tuple[tuple[str, str], ...] = ()
 
     def with_extra(
         self,
@@ -397,6 +411,7 @@ class FailureMarkers:
         model_not_found: tuple[str, ...] = (),
         model_not_entitled: tuple[str, ...] = (),
         upstream_rate_limit: tuple[str, ...] = (),
+        upstream_rate_limit_error_codes: tuple[tuple[str, str], ...] = (),
     ) -> "FailureMarkers":
         return FailureMarkers(
             false_free=self.false_free + false_free,
@@ -409,6 +424,9 @@ class FailureMarkers:
             model_not_found=self.model_not_found + model_not_found,
             model_not_entitled=self.model_not_entitled + model_not_entitled,
             upstream_rate_limit=self.upstream_rate_limit + upstream_rate_limit,
+            upstream_rate_limit_error_codes=(
+                self.upstream_rate_limit_error_codes + upstream_rate_limit_error_codes
+            ),
         )
 
 
@@ -450,6 +468,11 @@ NO_MODEL_FAULT_FAILURE_REASONS = frozenset(
         # loop breaks immediately, so it reaches no state writer at all and needs no exemption. Its
         # consequences live in `TERMINAL_ENDINGS` below.
         "request_deadline_exceeded",
+        # The request does not fit this candidate's context window. Every candidate with the same
+        # (or smaller) context would reject the identical body, which says nothing about this
+        # model's health — so no cooldown and no scoring streak. It stays retryable (see
+        # CONTEXT_DIVERTING_FAILURE_REASONS) because a larger-context candidate can still answer.
+        "context_length_exceeded",
     }
 )
 
@@ -522,6 +545,13 @@ NON_RETRYABLE_FAILURE_REASONS = frozenset({"bad_upstream_request"})
 # why it lives here as a reason rather than as a key.
 SOURCE_DIVERTING_FAILURE_REASONS = frozenset({"bad_upstream_contract"})
 
+# Mirrors SOURCE_DIVERTING_FAILURE_REASONS for the other fact that invalidates part of the
+# remaining attempt window without cooling anything: the request's own size, not the source, rules
+# candidates out. The attempt loop reads this to re-plan the window against every candidate whose
+# known `context_length` is at least as large as the (possibly upstream-corrected) request size,
+# rather than against a source name.
+CONTEXT_DIVERTING_FAILURE_REASONS = frozenset({"context_length_exceeded"})
+
 # Attempt reasons that judge the MODEL on the profile it was asked to serve, rather than the
 # provider or the transport: the upstream answered, and what came back was unusable as an answer.
 # A real request ending this way writes `failed` capability evidence (`record_production_profile_failure`),
@@ -530,14 +560,23 @@ SOURCE_DIVERTING_FAILURE_REASONS = frozenset({"bad_upstream_contract"})
 # every candidate it touched. Written as a subtraction rather than by hand so that stays true when
 # either set moves.
 PRODUCTION_PROFILE_FAILURE_REASONS = (
-    frozenset({"empty_assistant_message", "upstream_finish_error"}) - NO_MODEL_FAULT_FAILURE_REASONS
+    frozenset({"empty_assistant_message", "upstream_finish_error", "runaway_output"})
+    - NO_MODEL_FAULT_FAILURE_REASONS
 )
 assert PRODUCTION_PROFILE_FAILURE_REASONS, "no model-answerable reason left to write production evidence from"
 
 # Fields providers disagree on because the OpenAI chat-completions schema does not define them. One
 # upstream may demand a field while another rejects the same field as extra; neither verdict applies
 # to every candidate in a heterogeneous pool. `reasoning_replay` exists because of exactly that gap.
+# Reserved for the `assistant` role: a replayed reasoning trace only ever rides on assistant turns.
 NON_STANDARD_REQUEST_FIELDS = ("reasoning_content", "reasoning_details", "thinking_blocks")
+
+# Client-injected metadata Hermes stamps on messages of ANY role, not just `assistant` — unlike
+# NON_STANDARD_REQUEST_FIELDS above, which a rejection only excuses on that one role. Most providers
+# ignore it; Mistral and Groq reject it outright (Mistral structurally, on a `user` message; Groq via
+# the prose matched by `_rejects_unknown_message_property`). Kept to the exact field observed so an
+# unrelated `extra_forbidden` on, say, `content` still reads as a genuinely malformed body.
+CLIENT_MESSAGE_METADATA_FIELDS = ("message_id",)
 
 # ...but naming the field is not enough: `reasoning_content must be a string` is a verdict on a value
 # that WAS sent, and the next candidate would reject it just the same. The retryable reading needs
@@ -575,12 +614,19 @@ def _demands_missing_field(lower: str) -> bool:
     return False
 
 
-def _forbids_nonstandard_assistant_field(text: str) -> bool:
-    """True for a structured schema rejection of known provider-private assistant metadata.
+def _forbids_nonstandard_message_field(text: str) -> bool:
+    """True for a structured schema rejection of known provider-private message metadata.
 
     Pydantic/FastAPI identifies an unknown field with ``type: extra_forbidden`` and a typed
     ``loc`` path. Both are required: matching prose would let a caller merely mention these words
     and turn a genuinely malformed body into a failover. A wrong value type stays terminal too.
+
+    Two families of field are recognised, deliberately not merged into one: `NON_STANDARD_REQUEST_FIELDS`
+    only excuses a rejection on the `assistant` role, while `CLIENT_MESSAGE_METADATA_FIELDS` is
+    tolerated on any role's message — including a `loc` that omits the role segment entirely
+    (``["messages", <int>, "message_id"]``, where `location[-2]` is the message index, not a role).
+    Naming an unlisted field, on any role, keeps the terminal reading — this must never widen into
+    "any unknown key is a contract mismatch".
     """
     if len(text) > ERROR_BODY_PARSE_LIMIT:
         return False
@@ -597,13 +643,20 @@ def _forbids_nonstandard_assistant_field(text: str) -> bool:
         location = detail.get("loc")
         if not isinstance(location, list) or len(location) < 4:
             continue
-        if location[-2] != "assistant" or location[-1] not in NON_STANDARD_REQUEST_FIELDS:
+        field, role = location[-1], location[-2]
+        is_assistant_only_field = role == "assistant" and field in NON_STANDARD_REQUEST_FIELDS
+        is_any_role_metadata_field = field in CLIENT_MESSAGE_METADATA_FIELDS
+        if not (is_assistant_only_field or is_any_role_metadata_field):
             continue
         try:
             messages_index = location.index("messages")
         except ValueError:
             continue
-        if any(type(part) is int for part in location[messages_index + 1 : -2]):
+        # The role-bearing shape is [..., <int>, <role>, field]: the int sits before location[-2].
+        # The roleless metadata shape is [..., <int>, field]: location[-2] IS that int, so the
+        # slice has to reach one place further to still see it.
+        end = -2 if is_assistant_only_field else -1
+        if any(type(part) is int for part in location[messages_index + 1 : end]):
             return True
     return False
 
@@ -642,6 +695,75 @@ def _rejects_model_specific_request_option(lower: str) -> bool:
     return any(option in lower for option in MODEL_SPECIFIC_REQUEST_OPTIONS) and any(
         marker in lower for marker in MODEL_SPECIFIC_OPTION_REJECTION_MARKERS
     )
+
+
+# A provider can validate message keys strictly (Groq: `property 'message_id' is unsupported`)
+# while every sibling ignores the same extra field Hermes adds. That is a provider-strictness
+# mismatch, not a malformed body, so it belongs with the other `bad_upstream_contract` readings
+# rather than the terminal `bad_upstream_request`. Keep both the sanctioned Hermes field and its
+# message path in the match: a caller typo in a top-level property remains a terminal bad request.
+_UNKNOWN_MESSAGE_PROPERTY_PATTERN = re.compile(
+    r"messages(?:\.\d+|\[\d+\])[^\n]{0,256}property 'message_id' is unsupported"
+)
+
+
+def _rejects_unknown_message_property(lower: str) -> bool:
+    return bool(_UNKNOWN_MESSAGE_PROPERTY_PATTERN.search(lower))
+
+
+def estimated_tokens_for_chars(char_count: Any) -> int:
+    """The chars/4 token heuristic every size estimate in Ficelle shares (0 for nothing)."""
+    try:
+        chars = int(char_count)
+    except (TypeError, ValueError):
+        return 0
+    if chars <= 0:
+        return 0
+    return max(1, math.ceil(chars / 4))
+
+
+# Prose an upstream uses to reject a request because it does not fit the model's context window.
+# Unlike `request_too_large` (a per-minute throughput limit that recharges on its own), a context
+# rejection is permanent for THIS candidate — but not for the pool: a candidate with a larger
+# context window can still answer the same request. Kept deliberately narrow (whole phrases, not
+# bare "token" or "large") so an unrelated 400/422/413 keeps its existing classification.
+CONTEXT_LENGTH_EXCEEDED_MARKERS = (
+    "context length",
+    "context window",
+    "maximum context",
+    "context_length_exceeded",
+    "too many tokens",
+    "exceeds the model's maximum",
+    "prompt is too long",
+    "input is too long",
+)
+
+
+def _mentions_context_length_exceeded(lower: str) -> bool:
+    return any(marker in lower for marker in CONTEXT_LENGTH_EXCEEDED_MARKERS)
+
+
+# Every "N tokens" figure a rejection states. Providers order them both ways ("request is 266645
+# tokens ... context length of 262144 tokens" vs "maximum context length is 8192 tokens. However,
+# your messages resulted in 10000 tokens"), and in a context rejection the request's size is
+# always the larger of the two, so the maximum is the request size whatever the phrasing.
+_REJECTED_REQUEST_TOKENS_PATTERN = re.compile(r"(\d[\d,]*)\s*tokens?\b", re.IGNORECASE)
+
+
+def rejected_request_tokens(text: str) -> int | None:
+    """The request size an upstream's own context-length rejection states, if any.
+
+    Lets the attempt loop learn the request's real size from the provider's own words instead of
+    trusting only Ficelle's char/4 estimate, and narrow the remaining pool to candidates whose
+    known context is large enough.
+    """
+    sizes: list[int] = []
+    for figure in _REJECTED_REQUEST_TOKENS_PATTERN.findall(str(text or "")[:PROSE_SCAN_LIMIT]):
+        try:
+            sizes.append(int(figure.replace(",", "")))
+        except ValueError:
+            continue
+    return max(sizes) if sizes else None
 
 
 def rejected_sampling_parameters(text: str, body: dict[str, Any] | None = None) -> tuple[str, ...]:
@@ -776,6 +898,20 @@ def _body_names_our_model(lower_without_urls: str, upstream_model_id: str | None
     return len(normalized) >= 4 and normalized in lower_without_urls
 
 
+def _matches_structured_error_code(
+    error_codes: tuple[str, ...], configured_pairs: tuple[tuple[str, str], ...]
+) -> bool:
+    """Match an adapter's exact ``error.code``/``error.type`` verdict.
+
+    ``error_object_codes`` keeps the two fields in a stable ``(code, type)`` order. Requiring both
+    values, in their respective positions, prevents an unrelated 429/account or quota payload from
+    inheriting a provider-specific model-pool classification merely because one word overlaps.
+    """
+    if len(error_codes) < 2:
+        return False
+    return error_codes[:2] in configured_pairs
+
+
 def classify_failure(
     status_code: int | None,
     text: str,
@@ -831,7 +967,7 @@ def classify_failure(
     if (
         status_code in REQUEST_REJECTION_STATUSES
         and (named_status is None or named_status in REQUEST_REJECTION_STATUSES)
-        and _forbids_nonstandard_assistant_field(text)
+        and _forbids_nonstandard_message_field(text)
     ):
         return "bad_upstream_contract"
     lower_without_urls = _URL_PATTERN.sub(" ", lower)
@@ -849,6 +985,14 @@ def classify_failure(
         # request body is not what this 400 is about, and the model does belong on cooldown.
         return "unavailable"
     if status_code == 429:
+        names_account_scope = any(
+            marker in lower_without_urls for marker in ACCOUNT_RATE_LIMIT_TEXT_MARKERS
+        )
+        if not names_account_scope and _matches_structured_error_code(
+            resolved_error_codes,
+            marker_set.upstream_rate_limit_error_codes,
+        ):
+            return "rate_limited_upstream"
         # A 429 that names the shared pool behind one model id is MODEL-scoped: the account is fine
         # and every sibling model keeps answering, so it must not cool the provider. Matched on the
         # URL-stripped text like the false-free markers, since these messages link to a settings page.
@@ -856,7 +1000,6 @@ def classify_failure(
         # upstream limit. Fail closed to the provider-scoped policy unless the body names the exact
         # model Ficelle called.
         names_model = _body_names_our_model(lower_without_urls, upstream_model_id)
-        names_account_scope = any(marker in lower_without_urls for marker in ACCOUNT_RATE_LIMIT_TEXT_MARKERS)
         if (
             names_model
             and not names_account_scope
@@ -870,6 +1013,12 @@ def classify_failure(
     # because these messages often point at an upgrade page; URL stripping already covers the link
     # itself, but the surrounding prose can name the plan too.
     if status_code == 413:
+        # A provider can also answer 413 when the body itself is too big for the model's context
+        # window, not its per-minute throughput — checked first so that reading stays available
+        # for the pool-narrowing retry (see CONTEXT_DIVERTING_FAILURE_REASONS) rather than the
+        # short, model-scoped `request_too_large` cooldown a TPM limit earns.
+        if _mentions_context_length_exceeded(lower):
+            return "context_length_exceeded"
         return "request_too_large"
     # The provider's own code fields skip both marker rules: they carry its verdict, not the caller's
     # vocabulary, so `status_for_error_codes` reads them directly — and its own precedence keeps a
@@ -921,8 +1070,16 @@ def classify_failure(
         # assistant metadata, or it disables an option other candidates accept. The structured
         # mirror image — forbidding that metadata — returned before the prose scans above so the
         # rejected field's echoed value could not masquerade as a billing or quota verdict.
-        if _demands_missing_field(lower) or _rejects_model_specific_request_option(lower):
+        if (
+            _demands_missing_field(lower)
+            or _rejects_model_specific_request_option(lower)
+            or _rejects_unknown_message_property(lower)
+        ):
             return "bad_upstream_contract"
+        # Last of the specific readings: the body itself would fit another candidate's larger
+        # context window, so it is not the generic, non-retryable `bad_upstream_request`.
+        if _mentions_context_length_exceeded(lower):
+            return "context_length_exceeded"
         return "bad_upstream_request"
     return "unavailable"
 
@@ -988,6 +1145,8 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
         actions.append("The upstream rejected the request body itself (HTTP 400/422) — inspect the payload the client sent, typically a malformed tool_call or an unsupported field. No model was cooled and no other candidate was tried: every one of them would reject the same body.")
     if reason_counts.get("bad_upstream_contract"):
         actions.append("One upstream rejected a request option or provider-private field that another candidate may handle. Ficelle kept the request unchanged and preferred a different provider for the next attempt when one was available. No model was cooled.")
+    if reason_counts.get("context_length_exceeded"):
+        actions.append("The request does not fit this candidate's context window. Ficelle raises the required context from the upstream's own stated size and retries on a larger-context candidate automatically; no model was cooled. If every attempt shows this reason, no candidate in the pool has a large enough context for this request — add one or shorten the request.")
     if reason_counts.get("client_disconnected"):
         actions.append("The client closed the connection while the answer was streaming; the upstream was healthy and was not cooled. Look at the client's timeout or cancel behaviour, not at the model.")
     if reason_counts.get("service_restarting"):
@@ -996,6 +1155,8 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
         actions.append("The completion token budget ran out before the model emitted any content; reasoning models spend it on reasoning tokens first. Raise max_tokens on the request. No model was cooled: this is a request-side limit, not an upstream failure.")
     if reason_counts.get("empty_assistant_message") or reason_counts.get("invalid_success_json"):
         actions.append("Inspect route logs and verified capabilities; this upstream returned HTTP 200 without a usable assistant message.")
+    if reason_counts.get("runaway_output"):
+        actions.append("The model generated past the profile's completion character budget, so Ficelle stopped the answer and cooled the model. A buffered response can fail over to another candidate; an already-committed stream ends with a terminal error because fallback is no longer safe. If this is a legitimate answer shape for the profile, raise its entry in max_completion_chars_by_profile.")
     if not actions:
         actions.append("Inspect ~/.ficelle/logs/routes.jsonl with the request_id, then clear cooldowns only after the upstream issue is understood.")
     return actions
@@ -1028,20 +1189,30 @@ def capacity_dimension(status_code: int | None, text: str) -> str | None:
     return "capacity.unknown"
 
 
-def caller_rejected_request(errors: list[dict[str, Any]]) -> bool:
-    """True when every attempt failed because the upstream refused the request body itself.
+def every_attempt_failed_with(errors: list[dict[str, Any]], reason: str) -> bool:
+    """True when the run had attempts and every one of them ended with `reason`.
 
-    The payload is the problem, so no candidate could have done better: the caller gets the
-    upstream's own 400 instead of a 502 that reads as "Ficelle is broken".
+    The verdicts below turn a whole-run failure into a precise client status (400/422) instead of
+    a 502 that reads as "Ficelle is broken" when the request itself is the problem.
     """
-    return bool(errors) and all(row.get("reason") == "bad_upstream_request" for row in errors)
+    return bool(errors) and all(row.get("reason") == reason for row in errors)
+
+
+def caller_rejected_request(errors: list[dict[str, Any]]) -> bool:
+    """Every attempt: the upstream refused the request body itself."""
+    return every_attempt_failed_with(errors, "bad_upstream_request")
 
 
 def request_feature_incompatible(errors: list[dict[str, Any]]) -> bool:
-    """True when every candidate was excluded for an unsupported tool-schema feature
-    (L3-R4): nothing was sent upstream, and the precise 422 tells the caller which request
-    feature to change instead of a 502 that reads as an outage."""
-    return bool(errors) and all(row.get("reason") == "unsupported_tool_schema" for row in errors)
+    """Every candidate was excluded for an unsupported tool-schema feature (L3-R4), so nothing
+    was sent upstream and the 422 names which request feature to change."""
+    return every_attempt_failed_with(errors, "unsupported_tool_schema")
+
+
+def request_exceeds_context(errors: list[dict[str, Any]]) -> bool:
+    """Every attempt: the request does not fit the candidate's context window, whether the
+    static pre-filter excluded it or the upstream rejected it live."""
+    return every_attempt_failed_with(errors, "context_length_exceeded")
 
 
 def upstream_failure_status(errors: list[dict[str, Any]], *, terminal_reason: str | None = None) -> int:
@@ -1064,7 +1235,7 @@ def upstream_failure_status(errors: list[dict[str, Any]], *, terminal_reason: st
     attempted_errors = [error for error in errors if error.get("attempted") is not False]
     if request_feature_incompatible(attempted_errors):
         return 422
-    if caller_rejected_request(attempted_errors):
+    if caller_rejected_request(attempted_errors) or request_exceeds_context(attempted_errors):
         return 400
     ending = TERMINAL_ENDINGS.get(terminal_reason or "")
     if ending is not None and ending.http_status is not None:
@@ -1157,6 +1328,12 @@ def build_upstream_failure_error(
     elif caller_rejected_request(attempted_errors):
         upstream_detail = attempted_details[-1].get("detail") if attempted_details else ""
         message = "upstream rejected this request as invalid" + (f": {upstream_detail}" if upstream_detail else "")
+        error_type = "invalid_request_error"
+    elif request_exceeds_context(attempted_errors):
+        context_detail = attempted_details[-1].get("detail") if attempted_details else ""
+        message = "this request does not fit any available model's context window" + (
+            f": {context_detail}" if context_detail else ""
+        )
         error_type = "invalid_request_error"
     elif ending is not None and ending.error_type is not None:
         # The run was cut short by an ending Ficelle owns, so the payload must not read as a

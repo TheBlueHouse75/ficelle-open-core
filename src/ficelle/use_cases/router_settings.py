@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -34,6 +35,9 @@ class RouterSettingsSavePorts:
     update_config: Callable[[Callable[[dict[str, Any]], None]], dict[str, Any]]
     apply_verified_capability_ttl: Callable[[dict[str, Any]], int]
     apply_route_on_capability_reference: Callable[[dict[str, Any]], bool]
+    # Held only while the live in-memory config is mutated, never across `update_config`'s
+    # disk write: readers deep-copying that dict on request threads must not queue behind I/O.
+    live_config_lock: AbstractContextManager[Any] = field(default_factory=nullcontext)
 
 
 def settings_int(
@@ -305,9 +309,10 @@ def save_router_settings(
 
     ports.update_config(apply_settings)
 
-    config["allow_paid_fallback"] = False
-    for key, value in normalized.items():
-        config[key] = value
-    ports.apply_verified_capability_ttl(config)
-    ports.apply_route_on_capability_reference(config)
+    with ports.live_config_lock:
+        config["allow_paid_fallback"] = False
+        for key, value in normalized.items():
+            config[key] = value
+        ports.apply_verified_capability_ttl(config)
+        ports.apply_route_on_capability_reference(config)
     return normalized

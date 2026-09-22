@@ -168,14 +168,25 @@ def test_policy_rejects_mutable_or_opaque_model_ids(model_id):
         policy.validate_model_identity("openrouter", model_id)
 
 
-def test_policy_allows_the_exact_pinned_ox_alpha_identity_only():
-    assert policy.validate_model_identity("nous", "stealth/ox-alpha") == (
-        "nous",
-        "stealth/ox-alpha",
-    )
+@pytest.mark.parametrize(
+    "model_id",
+    ["stealth/ox-alpha", "stealth/union-alpha"],
+)
+def test_policy_allows_exact_pinned_stealth_identities(model_id):
+    assert policy.validate_model_identity("nous", model_id) == ("nous", model_id)
 
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "stealth/ox-alpha-preview",
+        "stealth/union-alpha-preview",
+        "stealth/union-alpha-free",
+    ],
+)
+def test_policy_rejects_unpinned_stealth_spellings(model_id):
     with pytest.raises(policy.CodingBenchmarkPolicyError, match="mutable or opaque"):
-        policy.validate_model_identity("nous", "stealth/ox-alpha-preview")
+        policy.validate_model_identity("nous", model_id)
 
 
 def test_policy_rejects_a_changed_secondary_source():
