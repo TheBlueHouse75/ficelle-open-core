@@ -166,6 +166,12 @@ class CatalogRefreshRunner:
                     "key_source": auth_row.get("key_source"),
                     "key_preview": auth_row.get("key_preview"),
                     "key_url": self.ports.provider_key_url(str(source)),
+                    # Non-secret account id state (Cloudflare): persisted with the row because a
+                    # fresh cached catalog is served as-is, without re-resolving auth per read.
+                    "account_id_env": auth_row.get("account_id_env"),
+                    "account_id": auth_row.get("account_id"),
+                    "account_id_source": auth_row.get("account_id_source"),
+                    "account_id_valid": auth_row.get("account_id_valid"),
                     "error": error,
                     "enabled": enabled,
                     "source_type": provider_diagnostics.get("source_type"),

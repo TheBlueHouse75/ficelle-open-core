@@ -7,6 +7,7 @@ from ficelle.use_cases.model_scoring import (
     ModelScoreExplanationPorts,
     ModelScoringPorts,
     benchmark_adjustment_parts,
+    first_delta_score_for_model,
     latency_score_for_model,
     model_score_explanation,
     raw_benchmark_row,
@@ -17,6 +18,7 @@ from ficelle.use_cases.model_scoring import (
     score_row_status,
     stale_failed_profile_evidence,
     success_rate_for_model,
+    throughput_score_for_model,
 )
 from ficelle.use_cases.quality_feedback import quality_feedback_scoring_state
 
@@ -245,6 +247,75 @@ def test_latency_score_returns_neutral_value_for_invalid_latency() -> None:
     assert latency_score_for_model(model, state, ports=_ports()) == 0.5
 
 
+def test_first_delta_score_prefers_first_delta_ewma_over_total_latency() -> None:
+    model = {"source": "openrouter", "upstream_id": "free"}
+    fast_first_delta = {"stats": {"openrouter::free": {"latency_ewma": 15, "first_delta_ewma": 3}}}
+    slow_first_delta = {"stats": {"openrouter::free": {"latency_ewma": 15, "first_delta_ewma": 150}}}
+
+    assert first_delta_score_for_model(model, fast_first_delta, ports=_ports()) > first_delta_score_for_model(
+        model, slow_first_delta, ports=_ports()
+    )
+
+
+def test_first_delta_score_stays_neutral_when_only_total_latency_is_known() -> None:
+    model = {"source": "openrouter", "upstream_id": "free"}
+    only_latency = {"stats": {"openrouter::free": {"latency_ewma": 60}}}
+    legacy_only = {"successes": {"openrouter::free": {"latency_seconds": 60}}}
+
+    # Total latency is a different quantity: a slow-but-unmeasured model is not punished on the
+    # first-delta curve until a real first delta has been observed.
+    assert first_delta_score_for_model(model, only_latency, ports=_ports()) == 0.5
+    assert first_delta_score_for_model(model, legacy_only, ports=_ports()) == 0.5
+
+
+def test_first_delta_and_throughput_score_are_neutral_without_any_data() -> None:
+    model = {"source": "openrouter", "upstream_id": "free"}
+    state: dict[str, Any] = {"stats": {"openrouter::free": {}}}
+
+    assert first_delta_score_for_model(model, state, ports=_ports()) == 0.5
+    assert throughput_score_for_model(model, state, ports=_ports()) == 0.5
+
+
+def test_throughput_score_rewards_faster_generation() -> None:
+    model = {"source": "openrouter", "upstream_id": "free"}
+    slow = {"stats": {"openrouter::free": {"completion_tokens_per_second": 5}}}
+    fast = {"stats": {"openrouter::free": {"completion_tokens_per_second": 60}}}
+
+    assert throughput_score_for_model(model, fast, ports=_ports()) > throughput_score_for_model(
+        model, slow, ports=_ports()
+    )
+
+
+def test_throughput_score_is_neutral_for_missing_or_non_positive_values() -> None:
+    model = {"source": "openrouter", "upstream_id": "free"}
+    missing = {"stats": {"openrouter::free": {}}}
+    zero = {"stats": {"openrouter::free": {"completion_tokens_per_second": 0}}}
+
+    assert throughput_score_for_model(model, missing, ports=_ports()) == 0.5
+    assert throughput_score_for_model(model, zero, ports=_ports()) == 0.5
+
+
+def test_slow_first_delta_loses_the_ranking_despite_equal_total_latency() -> None:
+    """This is the bug that motivated the speed score: `nvidia/nemotron-3-ultra-550b` answered
+    in over 120s to first token (past Hermes' abort window) while `latency_ewma` alone looked
+    identical to a model that streams promptly, so it kept winning auto-compression and auto-fast.
+    """
+    slow_starter = {"source": "openrouter", "upstream_id": "slow-starter"}
+    fast_starter = {"source": "openrouter", "upstream_id": "fast-starter"}
+    base_stats = {"successes": 3, "failures": 1, "latency_ewma": 20}
+    state = {
+        "stats": {
+            "openrouter::slow-starter": {**base_stats, "first_delta_ewma": 150},
+            "openrouter::fast-starter": {**base_stats, "first_delta_ewma": 3},
+        }
+    }
+
+    for profile_id in ("ficelle/auto-compression", "ficelle/auto-fast"):
+        slow_score = model_score_explanation(profile_id, slow_starter, state, ports=_score_explanation_ports())
+        fast_score = model_score_explanation(profile_id, fast_starter, state, ports=_score_explanation_ports())
+        assert fast_score["score_total"] > slow_score["score_total"], profile_id
+
+
 def test_runtime_profile_row_uses_canonical_profile_and_returns_copy() -> None:
     model = {"source": "openrouter", "upstream_id": "free"}
     row = {"status": "pass", "fresh": True}
@@ -445,6 +516,12 @@ def test_model_score_explanation_combines_profile_weights_evidence_and_failure_p
     assert score["score_total_raw"] == 92.875
     assert score["success_rate"] == 0.625
     assert score["latency_score"] == 0.5
+    # No first_delta_ewma and no throughput recorded: both stay neutral, so speed_score collapses
+    # to the latency term. auto-multimodal's own weights do not use speed_score at all, so
+    # score_base is unaffected by this change — these fields are asserted for coverage only.
+    assert score["first_delta_score"] == 0.5
+    assert score["throughput_score"] == 0.5
+    assert score["speed_score"] == 0.5
     assert score["context_score"] == 0.5
     assert score["evidence_status"] == "fresh"
     assert score["last_evidence_at"] == "newer"

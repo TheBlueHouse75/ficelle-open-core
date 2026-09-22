@@ -148,6 +148,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (req.tools !== false && !m.supports_tools) return false;
       if (req.structured === true && !m.supports_structured_outputs) return false;
       if (req.structured === false && m.supports_structured_outputs) return false;
+      if (Number(m.max_completion_tokens || 0) < Number(req.min_completion_tokens || 0)) return false;
       if (!incAll(m.input_modalities, req.input_modalities)) return false;
       if (!incAny(m.input_modalities, req.input_modalities_any)) return false;
       if (!incAll(m.output_modalities, req.output_modalities)) return false;
@@ -167,16 +168,17 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         return String(a.id || "").localeCompare(String(b.id || ""));
       });
     }
+    function policyCandidateIdSet(profileId) {
+      if (profilePolicyId(profileId) !== "ficelle/auto-coding") return null;
+      const policyIds = state?.profiles?.[profilePolicyId(profileId)]?.policy_candidate_ids;
+      return new Set(Array.isArray(policyIds) ? policyIds.map(String) : []);
+    }
     function candidatePreview(profileId) {
       const profile = draftProfiles[profileId] || {};
       const excluded = new Set(excludedModelIds(profile));
       let eligible = (state?.catalog?.models || []).filter((m) => m.invokable && !excluded.has(String(m.id)) && !modelQuarantine(m) && !modelCooldown(m) && !providerCooldown(m.source) && !modelQuotaCooldown(m) && matchesReq(m, profile.requirements || {}));
-      if (profilePolicyId(profileId) === "ficelle/auto-coding") {
-        const policyIds = state?.profiles?.[profilePolicyId(profileId)]?.policy_candidate_ids;
-        if (!Array.isArray(policyIds)) return [];
-        const policyIdSet = new Set(policyIds.map(String));
-        eligible = eligible.filter((model) => policyIdSet.has(String(model.id)));
-      }
+      const policyIds = policyCandidateIdSet(profileId);
+      if (policyIds) eligible = eligible.filter((model) => policyIds.has(String(model.id)));
       if (profile.mode !== "manual_order") return sortByScore(profileId, eligible);
       const byId = new Map(eligible.map((m) => [m.id, m])); const head = []; const seen = new Set();
       for (const id of profile.models || []) { const m = byId.get(id); if (!m || seen.has(m.id)) continue; head.push(m); seen.add(m.id); }
@@ -441,6 +443,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (s) {
         push("Success rate", Math.round(pct(s.successes, s.requests)) + "% &middot; " + Number(s.successes || 0) + "/" + Number(s.requests || 0) + " calls");
         if (s.latency_ewma != null) push("Avg latency", Number(s.latency_ewma).toFixed(2) + "s");
+        if (s.first_delta_ewma != null) push("First token", Number(s.first_delta_ewma).toFixed(2) + "s");
         // Kept apart: a caller-caused failure (a too-small max_tokens) updates the last reason
         // without entering the ledger, so pairing them would blame the penalty on the wrong event.
         // Splitting them also surfaces those failures, which carry no penalty at all.
@@ -799,12 +802,24 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("customProfileActions").hidden = !custom;
       ["editCustomProfileBtn", "duplicateCustomProfileBtn"].forEach((id) => { $(id).disabled = locked; });
       ["autoModeBtn", "manualModeBtn", "autoTailToggle", "clearProfileBtn"].forEach((id) => { $(id).disabled = locked; });
+      const minContext = p.requirements?.min_context || contextFloor();
+      const minContextSelect = $("minContextSelect");
+      minContextSelect.innerHTML = minContextOptions(minContext).map(([v, label]) => '<option value="' + v + '">' + esc(label) + "</option>").join("");
+      minContextSelect.value = String(minContext);
+      minContextSelect.disabled = locked;
     }
 
     function renderSelected() {
       const models = modelMap(); const p = currentProfile(); const list = $("selectedList");
       const selectedIds = (p.models || []).filter((id) => !isExcludedFromProfile(id, p));
-      if (!selectedIds.length) { list.innerHTML = '<div class="empty">No models picked. This virtual model runs fully automatic — Ficelle ranks every usable model for you.</div>'; }
+      if (!selectedIds.length) {
+        if (profilePolicyId(activeProfile) === "ficelle/auto-coding") {
+          const count = candidatePreview(activeProfile).length;
+          list.innerHTML = '<div class="empty"><strong>Automatic coding pool.</strong><br>No manual order is pinned. This profile preview contains ' + count + ' usable benchmark-qualified provider deployment' + (count === 1 ? '' : 's') + ', shown in the routing preview and Qualified deployments list.</div>';
+        } else {
+          list.innerHTML = '<div class="empty">No models picked. This virtual model runs fully automatic — Ficelle ranks every usable model for you.</div>';
+        }
+      }
       else {
         list.innerHTML = selectedIds.map((id, i) => {
           const m = models.get(id);
@@ -841,6 +856,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const f = modelFilters;
       const fresh = newModelIds();
       let models = [...(state.catalog?.models || [])];
+      const policyIds = policyCandidateIdSet(activeProfile);
+      if (policyIds) models = models.filter((model) => policyIds.has(String(model.id)));
       if (f.providers.size) models = models.filter((m) => f.providers.has(m.source));
       if (f.newOnly) models = models.filter((m) => fresh.has(m.id));
       models = models.filter((m) => matchesReq(m, currentProfile().requirements || {}));
@@ -849,7 +866,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       models = f.sortKey === "score" ? sortByScore(activeProfile, models) : sortModels(f.sortKey, f.sortDir, models);
       if (f.sortKey === "score" && f.sortDir === "asc") models.reverse();
       if (q) models = models.filter((m) => [m.name, m.id, m.source, m.upstream_id, m.modality, ...(m.input_modalities || []), ...(m.supported_parameters || [])].join(" ").toLowerCase().includes(q));
-      $("modelCountBadge").textContent = models.length + " models";
+      const coding = policyIds !== null;
+      $("availableModelsTitle").textContent = coding ? "Qualified deployments" : "Available models";
+      $("availableModelsSubtitle").textContent = coding
+        ? "Only benchmark-qualified models currently present in provider catalogs. Configure order, exclude, or restore."
+        : "Drag into your order, add, exclude, or restore per virtual model.";
+      $("modelCountBadge").textContent = models.length + (coding ? " qualified" : " models");
       const list = $("availableList");
       list.innerHTML = models.length ? models.map((m, i) => modelCard(m, "available", i)).join("") : '<div class="empty">' + emptyAvailableNotice() + "</div>";
       bindModelCard(list); bindDrag(list, "available");
@@ -894,6 +916,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         else if (req.tools !== false && !m.supports_tools) names.add("tool calling");
         else if (req.structured === true && !m.supports_structured_outputs) names.add("JSON output");
         else if (req.structured === false && m.supports_structured_outputs) names.add("no JSON output");
+        else if (Number(m.max_completion_tokens || 0) < Number(req.min_completion_tokens || 0)) names.add("completion length");
         else listRequirementGaps(m, req).forEach((n) => names.add(n));
       });
       return [...names].join(", ");
@@ -985,11 +1008,31 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     const DIR_ASC = '<path d="M12 19V5M6 11l6-6 6 6"/>';
     let openFilter = null;
 
+    const contextFloor = () => Number(state?.config?.min_context_length || 64000);
     function contextTiers() {
-      const floor = Number(state?.config?.min_context_length || 64000);
+      const floor = contextFloor();
       const tiers = [[0, "Any context"]];
       for (const t of [256000, 512000, 1000000]) if (t > floor) tiers.push([t, "≥ " + formatContext(t)]);
       return tiers;
+    }
+    // Options for a profile's own requirements.min_context select — distinct from contextTiers(),
+    // which filters the available-models column and always starts at "Any context". Here the
+    // floor itself is a selectable option (it is what an unset/default profile enforces), and a
+    // hand-edited config value outside the usual tiers (e.g. 500000 set by hand in config.json)
+    // is inserted so it stays visible and selectable instead of silently snapping to a tier.
+    function minContextOptions(current) {
+      const floor = contextFloor();
+      const options = [[floor, "Default (≥ " + formatContext(floor) + ")"]];
+      for (const t of [128000, 200000, 256000, 512000, 1000000]) {
+        if (t > floor) options.push([t, "≥ " + formatContext(t)]);
+      }
+      const cur = Number(current);
+      if (cur > 0 && !options.some(([v]) => v === cur)) {
+        const idx = options.findIndex(([v]) => v > cur);
+        const entry = [cur, "≥ " + formatContext(cur)];
+        if (idx === -1) options.push(entry); else options.splice(idx, 0, entry);
+      }
+      return options;
     }
     function fltTriggerLabel(id) {
       const f = modelFilters;
@@ -1283,6 +1326,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (qc) return { state: "quota", label: "Free quota paused" };
       if (p.invokable) return { state: "connected", label: "Connected" };
       if (credentialsUnreadable(p.auth_reason)) return { state: "credential_error", label: "Credentials unreadable" };
+      // A stored key that still cannot be used because the provider's account id is
+      // missing or malformed: "No API key" would send the operator back to the key form.
+      if (p.key_source && p.account_id_env && !p.account_id_valid) return { state: "no_key", label: "No account ID" };
       return { state: "no_key", label: "No API key" };
     }
     const STATUS_DOT_TONE = { connected: "ok", no_key: "muted" }; // default warn
@@ -1418,6 +1464,21 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
             '<input type="password" class="key-input" data-key-input="' + esc(src) + '" placeholder="Paste ' + esc(providerLabel(src)) + ' API key" autocomplete="off" spellcheck="false" />' +
             '<button class="btn ghost sm" data-set-key="' + esc(src) + '">Save key</button>' +
           "</div>";
+      // Providers that template a non-secret account id into their URL (Cloudflare) need it
+      // beside the key, or the key form alone leaves them stuck on a missing-account reason.
+      // The value is shown in clear: it is an identifier, not a credential. A `.env` value
+      // is Ficelle-owned and removable; `env` and `config` sources are stated but not editable
+      // from here, since a process-environment value would keep winning over the file.
+      const accountSourceChip = p.account_id_source ? '<span class="badge mono" title="Where Ficelle reads this account id">' + esc(p.account_id_source) + "</span>" : "";
+      const accountForm = p.account_id_env
+        ? '<div class="provider-chips key-form account-form">' +
+            '<span class="pill-row-label">Account ID</span>' +
+            '<input type="text" class="key-input mono" data-account-input="' + esc(src) + '" value="' + esc(p.account_id || "") + '" placeholder="Paste ' + esc(p.account_id_env) + '" autocomplete="off" spellcheck="false" />' +
+            accountSourceChip +
+            '<button class="btn ghost sm" data-set-account="' + esc(src) + '">Save</button>' +
+            (p.account_id_source === ".env" ? '<button class="btn ghost sm" data-remove-account="' + esc(src) + '">Remove</button>' : "") +
+          "</div>"
+        : "";
       return '<div class="provider-detail-stack">' +
         '<article class="card provider-card">' +
           '<div class="provider-top"><div class="provider-head">' + providerLogo(src) + '<div><div class="provider-name">' + esc(providerLabel(src)) + '</div><div class="provider-url">' + esc(p.catalog_url || "catalog unavailable") + '</div></div></div>' + stateBadge + "</div>" +
@@ -1431,6 +1492,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           (p.invokable ? "" : '<div class="provider-chips"><span class="badge" style="color:var(--text-muted)">' + esc(p.auth_reason || "Add this provider key to use its models") + "</span></div>") +
           (actions ? '<div class="provider-chips">' + actions + "</div>" : "") +
           keyForm +
+          accountForm +
         "</article>" +
         providerModelList(p, true) +
       "</div>";
@@ -1443,6 +1505,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       root.querySelectorAll("[data-enable-provider]").forEach((b) => b.addEventListener("click", () => toggleProvider(b.dataset.enableProvider, true, b)));
       root.querySelectorAll("[data-set-key]").forEach((b) => b.addEventListener("click", () => setProviderKey(b.dataset.setKey)));
       root.querySelectorAll("[data-remove-key]").forEach((b) => b.addEventListener("click", () => removeProviderKey(b.dataset.removeKey)));
+      root.querySelectorAll("[data-set-account]").forEach((b) => b.addEventListener("click", () => setProviderAccountId(b.dataset.setAccount)));
+      root.querySelectorAll("[data-remove-account]").forEach((b) => b.addEventListener("click", () => removeProviderAccountId(b.dataset.removeAccount)));
       root.querySelectorAll("[data-replace-key]").forEach((b) => b.addEventListener("click", () => {
         const form = b.closest(".key-form");
         if (!form) return;
@@ -2616,6 +2680,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const meta = ["request " + esc(e.request_id)];
       if (e.competence) meta.push("competence " + esc(e.competence));
       if (e.candidate_count != null) meta.push(Number(e.candidate_count) + " candidates");
+      if (e.prompt_tokens_estimate != null) meta.push("~" + formatContext(e.prompt_tokens_estimate) + " tok");
+      if (e.excluded_for_context > 0) meta.push(Number(e.excluded_for_context) + " too small for prompt");
       if (e.compression_status) meta.push("compression " + esc(e.compression_status));
       return '<div class="req-detail" id="' + panelId + '" role="region" aria-label="Request attempt details"><div class="req-detail-meta mono">' + meta.join(" · ") + "</div>" +
         '<div class="req-chain">' + chain + "</div></div>";
@@ -3497,6 +3563,31 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const p = await r.json(); if (!r.ok) throw new Error([p?.error?.message, p?.error?.hint].filter(Boolean).join(" — ") || "failed"); if (input) input.value = ""; showToast(providerLabel(src) + " key saved."); await loadState();
       } catch (e) { showToast(e.message || String(e)); }
     }
+    async function postProviderAccountId(src, body) {
+      const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/account-id", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify(body) });
+      const p = await r.json();
+      if (!r.ok) throw new Error(p?.error?.message || "failed");
+      return p;
+    }
+    async function setProviderAccountId(src) {
+      const input = $("providerGrid").querySelector('[data-account-input="' + src + '"]');
+      const accountId = (input?.value || "").trim();
+      if (!accountId) { showToast("Paste an account id first."); return; }
+      try {
+        const p = await postProviderAccountId(src, { account_id: accountId });
+        // The file was written either way; say so when a process-environment value still wins.
+        const resolvedFrom = p.auth?.account_id_source;
+        showToast(providerLabel(src) + " account id saved" + (resolvedFrom && resolvedFrom !== ".env" ? " — a " + resolvedFrom + " value still takes precedence." : "."), resolvedFrom && resolvedFrom !== ".env" ? "warn" : undefined);
+        await loadState();
+      } catch (e) { showToast(e.message || String(e), "error"); }
+    }
+    async function removeProviderAccountId(src) {
+      try {
+        await postProviderAccountId(src, { remove: true });
+        showToast(providerLabel(src) + " account id removed.");
+        await loadState();
+      } catch (e) { showToast(e.message || String(e), "error"); }
+    }
     async function removeProviderKey(src) {
       try { const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/key", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify({ remove: true }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed");
@@ -3606,6 +3697,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         setProfile({ stream_commit_policy: e.target.value });
       });
       $("clearProfileBtn").addEventListener("click", () => setProfile({ mode: "auto", models: [], excluded_models: [] }));
+      $("minContextSelect").addEventListener("change", (e) => setProfile({ requirements: { min_context: Number(e.target.value) } }));
       $("newCustomProfileBtn").addEventListener("click", () => openCustomProfileDialog());
       $("editCustomProfileBtn").addEventListener("click", () => openCustomProfileDialog(activeProfile));
       $("duplicateCustomProfileBtn").addEventListener("click", () => duplicateCustomProfile().catch((e) => showToast(e.message || String(e), "error")));

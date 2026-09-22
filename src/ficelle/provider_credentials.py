@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ficelle.providers.base import ProviderAccess
+from ficelle.providers.openai_compatible import CLOUDFLARE_ACCOUNT_ID_PATTERN
 
 
 ProviderAccessResult = Callable[[str, dict[str, Any]], ProviderAccess]
@@ -117,6 +118,12 @@ PROVIDER_SERVICE_ALIASES: dict[str, list[str]] = {
 }
 PROVIDER_KEY_VALIDATORS: dict[str, Callable[[Any], bool]] = {
     "openrouter": is_usable_openrouter_key,
+}
+# Non-secret account identifiers a provider templates into its URL. The adapter already
+# fails closed on a malformed value; validating on write too turns a typo into a 400 the
+# dashboard form can show instead of a silently unusable provider.
+PROVIDER_ACCOUNT_ID_VALIDATORS: dict[str, Callable[[str], bool]] = {
+    "cloudflare": lambda value: bool(CLOUDFLARE_ACCOUNT_ID_PATTERN.fullmatch(value)),
 }
 
 

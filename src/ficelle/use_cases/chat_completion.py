@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Mapping
@@ -31,6 +33,7 @@ except ImportError:  # pragma: no cover - exercised only in core-only installs
     plan_chat_compression = None
     put_original = None
 from ficelle.failures import (
+    estimated_tokens_for_chars,
     rejected_sampling_parameters,
     NO_MODEL_FAULT_FAILURE_REASONS,
     NON_RETRYABLE_FAILURE_REASONS,
@@ -41,10 +44,13 @@ from ficelle.failures import (
     exception_is_tls_failure,
     first_exception_errno,
     model_not_found_body,
+    rejected_request_tokens,
+    request_exceeds_context,
     status_for_error_codes,
     route_log_failure_status,
     upstream_failure_status,
     upstream_retry_after_seconds,
+    CONTEXT_DIVERTING_FAILURE_REASONS,
 )
 from ficelle.provider_admission import ProviderAdmissionRefused
 from ficelle.provider_credentials import ProviderCredentialsUnavailable
@@ -114,6 +120,19 @@ class ChatCompletionAttemptPlan:
     # precise 422 naming the feature. An exclusion a run could route around costs that run nothing
     # and is not one of its failure reasons.
     excluded_errors: list[dict[str, Any]] = field(default_factory=list)
+    # The request's estimated size (char/4 heuristic, plus its explicit completion allowance) and how many
+    # candidates the static context-length pre-filter dropped. Carried into telemetry so an
+    # incident like the one this exists for is diagnosable from the route log alone, without
+    # reproducing the request.
+    prompt_tokens_estimate: int = 0
+    # Lower bound used only for hard exclusion. Inline media accounting varies by provider, so
+    # the dense upper estimate above may order candidates but must not rule one out by itself.
+    context_exclusion_tokens_estimate: int = 0
+    excluded_for_context: int = 0
+    # How many eligible candidates `prefer_context_headroom` pushed behind ones with more headroom
+    # for this request. Distinct from `excluded_for_context`: none of these were ruled out, only
+    # reordered, so a route log reading both can tell a demoted attempt from a dropped one.
+    demoted_for_context: int = 0
 
 
 @dataclass(frozen=True)
@@ -135,6 +154,7 @@ class ChatCompletionLastRouteRecord:
 class ChatCompletionRouteTelemetry:
     last_route: ChatCompletionLastRouteRecord
     route_log: dict[str, Any]
+    attempt_started_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +247,10 @@ class SuccessRouteLogInput:
     compression: dict[str, Any] | None = None
     stream_started: bool | None = None
     usage: dict[str, int] | None = None
+    prompt_tokens_estimate: int = 0
+    excluded_for_context: int = 0
+    demoted_for_context: int = 0
+    attempt_started_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -248,6 +272,9 @@ class FailureRouteLogInput:
     # because the row recording it is `attempted: False` and every scan that filters those out
     # would answer as if the run had simply run out of candidates.
     terminal_reason: str | None = None
+    prompt_tokens_estimate: int = 0
+    excluded_for_context: int = 0
+    demoted_for_context: int = 0
 
 
 @dataclass(frozen=True)
@@ -450,6 +477,11 @@ class ChatCompletionAttemptPorts:
     learn_unsupported_parameters: Callable[[dict[str, Any], tuple[str, ...]], None] = (
         lambda _model, _parameters: None
     )
+    completion_char_budget_for_profile: Callable[[str], int | None] = lambda _profile: None
+
+
+class CompletionBudgetExceeded(Exception):
+    """A buffered upstream body exceeded its profile-derived transport guard."""
 
 
 COMPRESSION_PENDING_MARKER = "<<ficelle:compressed:pending>>"
@@ -496,6 +528,194 @@ def detect_tool_schema_features(body: dict[str, Any]) -> set[str]:
         parameters = function.get("parameters") if isinstance(function, dict) else None
         walk(parameters, depth=0)
     return features
+
+
+# Inline-media accounting varies: some upstreams tokenize the data URI while others decode it into
+# modality tokens first. Keep both bounds so dense transport accounting can prefer larger contexts
+# without making that provider-dependent worst case a hard exclusion.
+BASE64_CHARS_PER_TOKEN = 2.5
+DECODED_MEDIA_BYTES_PER_TOKEN = 160
+
+
+def _dense_base64_chars(messages: Any) -> int:
+    """Length of the base64 media payloads carried by `messages`' multipart content.
+
+    Walks the structure the same way `detect_tool_schema_features` walks tool schemas, rather than
+    regex-scanning the serialized JSON: a `data:...;base64,` string a user pastes as plain text
+    content is prose, not a real media payload, and a structural walk never confuses the two.
+
+    `image_url` is accepted both as `{"url": ...}` and as a bare string, since both forms appear in
+    the wild; either way, the payload is counted as soon as `;base64,` shows up in the URL, without
+    requiring the `data:` scheme prefix some callers omit.
+    """
+    total = 0
+    if not isinstance(messages, list):
+        return total
+    marker = ";base64,"
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict):
+                url = image_url.get("url")
+            elif isinstance(image_url, str):
+                url = image_url
+            else:
+                url = None
+            if isinstance(url, str) and marker in url:
+                total += len(url) - url.index(marker) - len(marker)
+            input_audio = part.get("input_audio")
+            data = input_audio.get("data") if isinstance(input_audio, dict) else None
+            if isinstance(data, str):
+                total += len(data)
+    return total
+
+
+def estimate_request_tokens(body: dict[str, Any]) -> int:
+    """Token estimate for request parts that consume the upstream context window.
+
+    This is the upper estimate used for telemetry and context-headroom ordering. Base64 media is
+    priced densely because some upstreams count the wire representation before modality decoding.
+
+    Never zero, so a candidate with a known context figure is never trivially eligible.
+    """
+    chars = 0
+    for key in ("messages", "tools", "system", "response_format"):
+        value = body.get(key)
+        if value is None:
+            continue
+        chars += len(json.dumps(value, ensure_ascii=False))
+    dense_chars = _dense_base64_chars(body.get("messages"))
+    sparse_tokens = estimated_tokens_for_chars(chars - dense_chars)
+    dense_tokens = math.ceil(dense_chars / BASE64_CHARS_PER_TOKEN)
+    return max(1, sparse_tokens + dense_tokens)
+
+
+def estimate_request_tokens_for_exclusion(body: dict[str, Any]) -> int:
+    """Lower prompt estimate safe enough for hard context exclusion.
+
+    Providers that decode inline media account modality tokens rather than base64 text. Reserving a
+    conservative allowance from decoded bytes avoids excluding their valid requests; the dense
+    upper estimate still demotes tight candidates before invocation.
+    """
+    chars = 0
+    for key in ("messages", "tools", "system", "response_format"):
+        value = body.get(key)
+        if value is not None:
+            chars += len(json.dumps(value, ensure_ascii=False))
+    media_chars = _dense_base64_chars(body.get("messages"))
+    text_tokens = estimated_tokens_for_chars(chars - media_chars)
+    media_tokens = math.ceil((media_chars * 3 / 4) / DECODED_MEDIA_BYTES_PER_TOKEN)
+    return max(1, text_tokens + media_tokens)
+
+
+def requested_completion_tokens(body: dict[str, Any]) -> int:
+    """Return the caller's explicit completion allowance across OpenAI aliases.
+
+    ``max_completion_tokens`` is the current field and takes precedence when both are present;
+    ``max_tokens`` remains supported for older OpenAI-compatible clients.
+    """
+    if body.get("max_completion_tokens") is not None:
+        return _safe_int(body.get("max_completion_tokens"), 0)
+    return _safe_int(body.get("max_tokens"), 0)
+
+
+def required_context_tokens(body: dict[str, Any]) -> int:
+    """The context window a candidate needs for this request: prompt estimate plus the completion
+    budget the caller asked for."""
+    return estimate_request_tokens(body) + requested_completion_tokens(body)
+
+
+# The chars/4 estimate in `estimate_request_tokens` undercounts code and non-ASCII text, so a
+# candidate whose context only just clears `required_tokens` is a tokenizer-variance rejection
+# away from failing for real. Below this headroom a candidate is demoted behind ones with room to
+# spare, never excluded outright — the estimate is not trusted enough to rule a model out on it.
+CONTEXT_HEADROOM_FACTOR = 2.0
+
+# Config `context_estimate_safety_factor` default (see router.DEFAULT_CONFIG, single source of
+# truth: imported from here rather than redeclared there). Production measurements (596 orchestrator
+# requests, 2026-09-11) put the chars/4 estimate at up to 1.13x the real prompt size at p90 — 1.15
+# covers that with almost no eligible-candidate cost. Unlike `CONTEXT_HEADROOM_FACTOR`, this factor
+# EXCLUDES a candidate outright in `exclude_undersized_candidates`, so it stays close to what
+# production actually shows rather than the wide margin a demotion-only factor can afford.
+DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR = 1.15
+
+
+def context_fits(candidate: dict[str, Any], required_tokens: int, factor: float = 1.0) -> bool:
+    """Whether a candidate's KNOWN context holds `required_tokens * factor`. Unknown context (0)
+    always fits: absence of a figure is not evidence the model is too small."""
+    context_length = _safe_int(candidate.get("context_length"), 0)
+    return context_length == 0 or context_length >= required_tokens * factor
+
+
+def candidate_context_too_small(candidate: dict[str, Any], required_tokens: int, factor: float = 1.0) -> bool:
+    return not context_fits(candidate, required_tokens, factor)
+
+
+def prefer_context_headroom(
+    required_tokens: int,
+    candidates: list[dict[str, Any]],
+    *,
+    completion_tokens: int = 0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Stable partition into (candidates with real headroom for this request, candidates that only
+    just fit), each group in its original order, so a small request comes back unchanged."""
+    comfortable: list[dict[str, Any]] = []
+    tight: list[dict[str, Any]] = []
+    estimated_prompt_tokens = max(0, required_tokens - completion_tokens)
+    headroom_requirement = estimated_prompt_tokens * CONTEXT_HEADROOM_FACTOR + completion_tokens
+    for candidate in candidates:
+        (comfortable if context_fits(candidate, headroom_requirement) else tight).append(candidate)
+    return comfortable, tight
+
+
+def excluded_candidate_row(candidate: dict[str, Any], reason: str, detail: str) -> dict[str, Any]:
+    """The error row a candidate leaves behind when a pre-filter drops it before any attempt."""
+    return {
+        "model": candidate.get("id"),
+        "upstream": candidate.get("upstream_id"),
+        "source": candidate.get("source"),
+        "reason": reason,
+        "detail": detail,
+    }
+
+
+def exclude_undersized_candidates(
+    required_tokens: int,
+    candidates: list[dict[str, Any]],
+    *,
+    safety_factor: float = DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR,
+    completion_tokens: int = 0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a scored pool into candidates whose known context can hold this request, and error
+    rows for the ones that cannot.
+
+    The per-profile `min_context` (`routing_policy.model_matches_profile_requirements`) is a
+    static floor; this is the per-request check it cannot make. See docs/components/router.md.
+
+    `safety_factor` (config `context_estimate_safety_factor`) inflates only the estimated prompt
+    before the exclusion check. The caller's explicit completion allowance is already exact and
+    must not receive tokenizer-estimate headroom.
+    """
+    eligible: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    estimated_prompt_tokens = max(0, required_tokens - completion_tokens)
+    safety_requirement = estimated_prompt_tokens * safety_factor + completion_tokens
+    for candidate in candidates:
+        if candidate_context_too_small(candidate, safety_requirement):
+            context_length = _safe_int(candidate.get("context_length"), 0)
+            excluded.append(excluded_candidate_row(
+                candidate,
+                "context_length_exceeded",
+                f"request needs ~{required_tokens} tokens, model context is {context_length}",
+            ))
+            continue
+        eligible.append(candidate)
+    return eligible, excluded
 
 
 def declared_unsupported_schema_features(source: Any, config: dict[str, Any]) -> set[str]:
@@ -549,13 +769,11 @@ def exclude_incompatible_candidates(
         if not incompatible:
             eligible.append(candidate)
             continue
-        excluded.append({
-            "model": candidate.get("id"),
-            "upstream": candidate.get("upstream_id"),
-            "source": candidate.get("source"),
-            "reason": "unsupported_tool_schema",
-            "detail": "unsupported tool-schema features: " + ", ".join(sorted(incompatible)),
-        })
+        excluded.append(excluded_candidate_row(
+            candidate,
+            "unsupported_tool_schema",
+            "unsupported tool-schema features: " + ", ".join(sorted(incompatible)),
+        ))
     return eligible, excluded
 
 
@@ -878,6 +1096,7 @@ def evaluate_non_streaming_success_response(
     requested_model_is_virtual: bool,
     detect_success_error: SuccessErrorDetector,
     has_deliverable: DeliverablePredicate,
+    max_completion_chars: int | None = None,
 ) -> NonStreamingAttemptDecision:
     status_code = int(response.status_code)
     latency = round(latency_seconds, 4)
@@ -924,6 +1143,20 @@ def evaluate_non_streaming_success_response(
             retry=requested_model_is_virtual,
         )
 
+    completion_chars = non_streaming_completion_chars(payload)
+    if max_completion_chars is not None and completion_chars > max_completion_chars:
+        return _non_streaming_failure(
+            model,
+            status=status_code,
+            reason="runaway_output",
+            latency_seconds=latency,
+            cooldown_reason="runaway_output",
+            cooldown_detail=(
+                f"completion reached the {max_completion_chars}-character profile limit"
+            ),
+            retry=requested_model_is_virtual,
+        )
+
     if not has_deliverable(payload):
         # A reasoning model can burn the whole completion budget on reasoning tokens and stop before
         # emitting any assistant content. That is the caller's max_tokens being too small, not a
@@ -957,6 +1190,63 @@ def evaluate_non_streaming_success_response(
         attempt_update={"status": status_code, "reason": "ok", "latency_seconds": latency},
         usage=normalized_token_usage(payload.get("usage")),
     )
+
+
+def assistant_output_chars(holder: Any) -> int:
+    """Count generated text across supported OpenAI-compatible assistant shapes."""
+    if not isinstance(holder, dict):
+        return 0
+    total = 0
+    for key in ("content", "reasoning", "reasoning_content", "refusal"):
+        value = holder.get(key)
+        if isinstance(value, str):
+            total += len(value)
+        elif isinstance(value, list):
+            total += sum(
+                len(item["text"])
+                for item in value
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            )
+    for call_key in ("tool_calls",):
+        calls = holder.get(call_key)
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                total += len(arguments)
+            elif isinstance(arguments, dict):
+                total += len(json.dumps(arguments, ensure_ascii=False))
+    legacy_function = holder.get("function_call")
+    if isinstance(legacy_function, dict):
+        arguments = legacy_function.get("arguments")
+        if isinstance(arguments, str):
+            total += len(arguments)
+        elif isinstance(arguments, dict):
+            total += len(json.dumps(arguments, ensure_ascii=False))
+    audio = holder.get("audio")
+    if isinstance(audio, dict) and isinstance(audio.get("transcript"), str):
+        total += len(audio["transcript"])
+    return total
+
+
+def non_streaming_completion_chars(payload: Any) -> int:
+    """Count generated assistant output in an OpenAI-style buffered response."""
+    if not isinstance(payload, dict):
+        return 0
+    total = 0
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return total
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        total += assistant_output_chars(message)
+    return total
 
 
 def normalized_token_usage(raw: Any) -> dict[str, int] | None:
@@ -1022,6 +1312,11 @@ def evaluate_streaming_result(
 ) -> StreamingAttemptDecision:
     reason = str(stream_result.get("reason") or "stream_failure")
     stream_started = bool(stream_result.get("stream_started"))
+    # The stream reader's own classification, separate from `reason`: `error_type` is the
+    # provider's error `type`/`code`, `message` its text. Read once, used for the logical-status
+    # recovery below and mirrored into the attempt like `evaluate_invocation_exception` does.
+    error_code = str(stream_result.get("error_type") or "").strip()
+    message = str(stream_result.get("message") or "").strip()
     classified_status: int | None = None
     if (
         stream_result.get("status") == "error"
@@ -1033,7 +1328,6 @@ def evaluate_streaming_result(
         # HTTP status at 200. The stream reader has not committed that event to the client and keeps
         # its canonical `type`/`code` as `error_type`; recover the logical status here so this path
         # earns the same auth/rate-limit/request-contract verdict as a non-streaming wrapped error.
-        error_code = str(stream_result.get("error_type") or "").strip()
         classified_status = status_for_error_codes(error_code)
         if classified_status is None:
             try:
@@ -1043,7 +1337,6 @@ def evaluate_streaming_result(
             if 100 <= numeric_status <= 599:
                 classified_status = numeric_status
         if classified_status is not None:
-            message = str(stream_result.get("message") or "")
             reason = classify(classified_status, f"{error_code}: {message}".strip(), model)
     attempt_status = classified_status or response_status
     attempt_update = {
@@ -1054,9 +1347,23 @@ def evaluate_streaming_result(
         "stream_chunk_count": _safe_int(stream_result.get("chunk_count"), 0),
         "stream_bytes_sent": _safe_int(stream_result.get("bytes_sent"), 0),
     }
+    first_delta = _non_negative_seconds(stream_result.get("first_delta_seconds"))
+    if first_delta is not None:
+        attempt_update["first_delta_seconds"] = first_delta
     timeout_phase = stream_result.get("timeout_phase")
     if timeout_phase in {"connect", "response_headers", "response_body"}:
         attempt_update["timeout_phase"] = timeout_phase
+    if stream_result.get("status") != "ok":
+        # Only a failed attempt carries the reader's classification: a success never does.
+        if error_code:
+            attempt_update["error_type"] = error_code
+        if message:
+            attempt_update["error_detail"] = sanitize_error_detail(message, UPSTREAM_DETAIL_LIMIT)
+    # Present on every streamed result once the writer counted content (ok and failed alike);
+    # absent for callers that never turned counting on.
+    stream_completion_chars = stream_result.get("completion_chars")
+    if stream_completion_chars is not None:
+        attempt_update["completion_chars"] = _safe_int(stream_completion_chars, 0)
     # The error object is the same six facts on every failure path below, so it is built
     # once here where they are all final.
     error = {
@@ -1067,6 +1374,23 @@ def evaluate_streaming_result(
         "reason": reason,
         "stream_started": stream_started,
     }
+
+    if reason == "runaway_output":
+        # An SSE response is already committed when the guard trips, so it cannot fall back. A
+        # provider that ignored `stream: true` is buffered before the first write, however, and
+        # can safely divert to the next virtual-profile candidate.
+        return StreamingAttemptDecision(
+            outcome=(
+                "mid_stream_failure"
+                if stream_started
+                else "retryable_failure" if requested_model_is_virtual else "terminal_failure"
+            ),
+            attempt_update=attempt_update,
+            error=error,
+            cooldown_reason="runaway_output",
+            cooldown_detail=message or "streamed completion exceeded the profile's character budget",
+            cooldown_status="stream_error",
+        )
 
     if stream_result.get("status") == "ok":
         streamed_choice = {"choices": [{"finish_reason": stream_result.get("finish_reason") or ""}]}
@@ -1169,6 +1493,11 @@ def evaluate_upstream_failure_response(
     reason = classify(status_code, text, model)
     hint = retry_hint(getattr(response, "headers", None), text) if status_code in {429, 503} else None
     attempt_update = {"status": status_code, "reason": reason, "latency_seconds": round(latency_seconds, 4)}
+    if text:
+        # Mirror the classified body into the route log so a failed attempt carries the same
+        # upstream text the client-facing `error["detail"]` already shows, redacted and capped
+        # like every other error_detail (see evaluate_invocation_exception).
+        attempt_update["error_detail"] = sanitize_error_detail(text, UPSTREAM_DETAIL_LIMIT)
     error = {
         "model": model.get("id"),
         "upstream": model.get("upstream_id"),
@@ -1209,7 +1538,10 @@ def evaluate_invocation_exception(
     # the redaction regexes here or anywhere else.
     error_detail = sanitize_error_detail(detail, UPSTREAM_DETAIL_LIMIT)
     error_errno = first_exception_errno(exc)
-    if deadline_exceeded:
+    if isinstance(exc, CompletionBudgetExceeded):
+        reason = error_reason = "runaway_output"
+        status = "response_too_large"
+    elif deadline_exceeded:
         # Ficelle's own request budget ended the attempt (L2-R2): named distinctly so the
         # route row states which budget ended the request, and never blamed on the model.
         reason = status = error_reason = "request_deadline_exceeded"
@@ -1266,12 +1598,16 @@ def build_success_route_log(row: SuccessRouteLogInput) -> dict[str, Any]:
         "duration_seconds": round(row.duration_seconds, 4),
         "stream": row.stream,
         "compression": row.compression,
+        "prompt_tokens_estimate": row.prompt_tokens_estimate,
+        "excluded_for_context": row.excluded_for_context,
+        "demoted_for_context": row.demoted_for_context,
     }
     if row.stream_started is not None:
         route_log["stream_started"] = row.stream_started
     selected_attempt = row.attempts[-1] if row.attempts else {}
-    if isinstance(selected_attempt.get("first_byte_seconds"), (int, float)):
-        route_log["first_byte_seconds"] = selected_attempt["first_byte_seconds"]
+    for timing in ("first_byte_seconds", "first_delta_seconds"):
+        if isinstance(selected_attempt.get(timing), (int, float)):
+            route_log[timing] = selected_attempt[timing]
     if selected_attempt.get("admission_source") in {"declared_rpm", "provider_headers"}:
         route_log["admission_source"] = selected_attempt["admission_source"]
     if row.usage is not None:
@@ -1304,6 +1640,7 @@ def build_success_route_telemetry(row: SuccessRouteLogInput) -> ChatCompletionRo
             compression=row.compression,
         ),
         route_log=build_success_route_log(row),
+        attempt_started_at=row.attempt_started_at,
     )
 
 
@@ -1346,7 +1683,11 @@ def failure_route_reason(errors: list[dict[str, Any]], terminal_reason: str | No
     """
     if terminal_reason in TERMINAL_ENDINGS:
         return str(terminal_reason)
-    return "bad_upstream_request" if caller_rejected_request(errors) else "upstream_failure"
+    if caller_rejected_request(errors):
+        return "bad_upstream_request"
+    if request_exceeds_context(errors):
+        return "context_length_exceeded"
+    return "upstream_failure"
 
 
 def build_failure_route_log(row: FailureRouteLogInput) -> dict[str, Any]:
@@ -1363,6 +1704,9 @@ def build_failure_route_log(row: FailureRouteLogInput) -> dict[str, Any]:
         "duration_seconds": round(row.duration_seconds, 4),
         "stream": row.stream,
         "compression": row.compression,
+        "prompt_tokens_estimate": row.prompt_tokens_estimate,
+        "excluded_for_context": row.excluded_for_context,
+        "demoted_for_context": row.demoted_for_context,
     }
 
 
@@ -1401,8 +1745,9 @@ def build_mid_stream_failure_route_log(row: MidStreamFailureRouteLogInput) -> di
         "compression": row.compression,
     }
     selected_attempt = row.attempts[-1] if row.attempts else {}
-    if isinstance(selected_attempt.get("first_byte_seconds"), (int, float)):
-        route_log["first_byte_seconds"] = selected_attempt["first_byte_seconds"]
+    for timing in ("first_byte_seconds", "first_delta_seconds"):
+        if isinstance(selected_attempt.get(timing), (int, float)):
+            route_log[timing] = selected_attempt[timing]
     return route_log
 
 
@@ -1526,10 +1871,17 @@ def build_streaming_response_start(
     )
 
 
-def add_first_byte_telemetry(attempt_update: dict[str, Any], response: Any) -> None:
-    raw = getattr(response, "_ficelle_first_byte_seconds", None)
+def _non_negative_seconds(raw: Any) -> float | None:
+    """A Ficelle-owned timing as a rounded float, or None when it was never measured."""
     if isinstance(raw, (int, float)) and math.isfinite(float(raw)) and float(raw) >= 0:
-        attempt_update["first_byte_seconds"] = round(float(raw), 4)
+        return round(float(raw), 4)
+    return None
+
+
+def add_first_byte_telemetry(attempt_update: dict[str, Any], response: Any) -> None:
+    first_byte = _non_negative_seconds(getattr(response, "_ficelle_first_byte_seconds", None))
+    if first_byte is not None:
+        attempt_update["first_byte_seconds"] = first_byte
     admission_source = getattr(response, "_ficelle_admission_source", None)
     if admission_source in {"declared_rpm", "provider_headers"}:
         attempt_update["admission_source"] = admission_source
@@ -1550,9 +1902,9 @@ def add_transport_timeout_telemetry(attempt_update: dict[str, Any], subject: Any
         "_ficelle_stale_latency_seconds": "stale_latency_seconds",
     }
     for attribute, field in numeric_fields.items():
-        raw = getattr(subject, attribute, None)
-        if isinstance(raw, (int, float)) and math.isfinite(float(raw)) and float(raw) >= 0:
-            attempt_update[field] = round(float(raw), 4)
+        seconds = _non_negative_seconds(getattr(subject, attribute, None))
+        if seconds is not None:
+            attempt_update[field] = seconds
     source = getattr(subject, "_ficelle_read_timeout_source", None)
     if source in {"global", "profile_override", "base_profile_override", "explicit", "request_deadline"}:
         attempt_update["read_timeout_source"] = source
@@ -1580,6 +1932,7 @@ class ChatCompletionRouter:
         max_attempts_for_request: MaxAttemptsCalculator,
         prepare_compression_route_body: CompressionPlanner,
         now: Clock,
+        wall_clock: Clock = time.time,
         pause: Callable[[float], None] | None = None,
         select_result: ResultSelector | None = None,
         selection_retry_after: Callable[[SelectionResult, dict[str, Any]], int | None] | None = None,
@@ -1595,6 +1948,7 @@ class ChatCompletionRouter:
         self.max_attempts_for_request = max_attempts_for_request
         self.prepare_compression_route_body = prepare_compression_route_body
         self.now = now
+        self.wall_clock = wall_clock
         self.pause = pause or (lambda _seconds: None)
         self.select_result = select_result
         self.selection_retry_after = selection_retry_after
@@ -1693,16 +2047,49 @@ class ChatCompletionRouter:
         # Filtered before the diversity cap sees the pool, so the window is cut from candidates
         # that can actually be tried. The pool goes through the same filter or the loop's dynamic
         # re-planning would re-offer a candidate the plan just excluded.
-        eligible, excluded = exclude_incompatible_candidates(compression_plan.body, candidates, self.config)
-        attempt_candidates = attempts_with_source_diversity(eligible, max_attempt_count, self.config)
+        eligible, incompatible_excluded = exclude_incompatible_candidates(compression_plan.body, candidates, self.config)
+        # Sized against the routed (post-compression) body, since that is what is actually sent —
+        # compression can shrink a request that would otherwise still exceed every candidate.
+        prompt_tokens_estimate = required_context_tokens(compression_plan.body)
+        completion_tokens = requested_completion_tokens(compression_plan.body)
+        context_exclusion_tokens_estimate = (
+            estimate_request_tokens_for_exclusion(compression_plan.body) + completion_tokens
+        )
+        # Below 1.0 the estimate no longer over-provisions headroom, so a missing, non-numeric,
+        # or sub-1.0 config value falls back to the default rather than being floored to 1.0.
+        configured_safety_factor = _safe_float(self.config.get("context_estimate_safety_factor"), 0.0)
+        context_estimate_safety_factor = (
+            configured_safety_factor if configured_safety_factor >= 1.0 else DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR
+        )
+        eligible, undersized_excluded = exclude_undersized_candidates(
+            context_exclusion_tokens_estimate,
+            eligible,
+            safety_factor=context_estimate_safety_factor,
+            completion_tokens=completion_tokens,
+        )
+        excluded = incompatible_excluded + undersized_excluded
+        # Demotion, not exclusion: a candidate that only just fits stays eligible, but is tried
+        # only after ones with real headroom for this request. `prefer_context_headroom` is a
+        # stable partition, so a small request — where nothing is demoted — comes back unchanged.
+        comfortable, tight = prefer_context_headroom(
+            prompt_tokens_estimate,
+            eligible,
+            completion_tokens=completion_tokens,
+        )
+        headroom_ordered = comfortable + tight
+        attempt_candidates = attempts_with_source_diversity(headroom_ordered, max_attempt_count, self.config)
         return ChatCompletionAttemptPlan(
             candidates=attempt_candidates,
             candidate_count=candidate_count,
             routed_body=compression_plan.body,
             compression_metadata=compression_plan.metadata,
             requested_model_is_virtual=self.is_virtual_model(request.requested_model),
-            candidate_pool=eligible,
+            candidate_pool=headroom_ordered,
             excluded_errors=excluded if not eligible else [],
+            prompt_tokens_estimate=prompt_tokens_estimate,
+            context_exclusion_tokens_estimate=context_exclusion_tokens_estimate,
+            excluded_for_context=len(undersized_excluded),
+            demoted_for_context=len(tight),
         )
 
     def run_attempts(
@@ -1747,6 +2134,11 @@ class ChatCompletionRouter:
         # a `shared_account:` key blocks candidates of several.
         ruled_out_sources: set[str] = set()
         ruled_out_quota_keys: set[str] = set()
+        # The request's known size, raised only when an upstream itself rejects a candidate for
+        # context length: starts at the plan's estimate and grows to whatever the rejection proves
+        # (the upstream's own stated size, or the failing candidate's own context, whichever is
+        # larger) so a re-plan never offers a candidate already known too small.
+        required_context = plan.context_exclusion_tokens_estimate or plan.prompt_tokens_estimate
         # Raised when a new fact invalidates the remaining window, so it is re-planned once per
         # useful diversion rather than once per attempt.
         divert_pending = False
@@ -1759,6 +2151,8 @@ class ChatCompletionRouter:
             # Read per candidate on each re-plan. Each attempt contributes at most one key, so the
             # `any` is bounded by the window and never by the pool — a few hundred string
             # comparisons on the worst request, against one HTTP round trip per attempt.
+            if candidate_context_too_small(candidate, required_context):
+                return True
             return str(candidate.get("source") or "") in ruled_out_sources or any(
                 ports.quota_cooldown_matches_model(key, candidate) for key in ruled_out_quota_keys
             )
@@ -1839,6 +2233,18 @@ class ChatCompletionRouter:
                 ):
                     ruled_out_sources.add(rejected_source)
                     divert_pending = True
+                # A candidate rejected the request for its context length: its own context is now
+                # known too small, and the upstream's own stated request size (if it gave one) is
+                # ground truth stronger than Ficelle's char/4 estimate. Neither fact blocks a
+                # SOURCE — a sibling model of the same provider with a larger context can still
+                # answer — so it raises `required_context` instead of `ruled_out_sources`, which
+                # `is_ruled_out` reads directly.
+                if str(last_attempt.get("reason") or "") in CONTEXT_DIVERTING_FAILURE_REASONS:
+                    last_error = errors[-1] if errors else {}
+                    reported_tokens = rejected_request_tokens(str(last_error.get("detail") or "")) or 0
+                    failing_context = _safe_int(model.get("context_length"), 0)
+                    required_context = max(required_context, reported_tokens, failing_context + 1)
+                    divert_pending = True
                 # Once per new fact: an iteration that records no attempt row of its own leaves the
                 # reason standing on the last one, and re-planning twice on it would re-cut the window
                 # under a smaller cap.
@@ -1896,6 +2302,7 @@ class ChatCompletionRouter:
                 considered += 1
                 considered_ids.add(str(model.get("id") or ""))
             started = self.now()
+            attempt_started_at = self.wall_clock()
             attempt = {
                 "model": model.get("id"),
                 "upstream": model.get("upstream_id"),
@@ -1906,12 +2313,20 @@ class ChatCompletionRouter:
             # it and the streaming consumer stops at the absolute deadline.
             remaining_budget = deadline - self.now() if deadline is not None else None
             try:
+                invocation_budgets: dict[str, Any] = {
+                    "remaining_budget_seconds": remaining_budget,
+                    "deadline_monotonic": deadline,
+                }
+                completion_char_budget = ports.completion_char_budget_for_profile(
+                    request.requested_model
+                )
+                if completion_char_budget is not None:
+                    invocation_budgets["max_completion_chars"] = completion_char_budget
                 response = ports.invoke_model(
                     model,
                     attempt_body,
                     self.config,
-                    remaining_budget_seconds=remaining_budget,
-                    deadline_monotonic=deadline,
+                    **invocation_budgets,
                 )
             except Exception as exc:
                 latency = self.now() - started
@@ -1985,6 +2400,9 @@ class ChatCompletionRouter:
                         requested_model_is_virtual=plan.requested_model_is_virtual,
                         detect_success_error=ports.detect_success_error,
                         has_deliverable=ports.has_deliverable,
+                        max_completion_chars=ports.completion_char_budget_for_profile(
+                            request.requested_model
+                        ),
                     )
                     add_first_byte_telemetry(success_decision.attempt_update, response)
                     if success_decision.outcome != "success":
@@ -2039,6 +2457,10 @@ class ChatCompletionRouter:
                                 stream=False,
                                 compression=plan.compression_metadata,
                                 usage=success_decision.usage,
+                                prompt_tokens_estimate=plan.prompt_tokens_estimate,
+                                excluded_for_context=plan.excluded_for_context,
+                                demoted_for_context=plan.demoted_for_context,
+                                attempt_started_at=attempt_started_at,
                             )
                         )
                     )
@@ -2100,6 +2522,10 @@ class ChatCompletionRouter:
                                 stream_started=True,
                                 compression=plan.compression_metadata,
                                 usage=stream_decision.usage,
+                                prompt_tokens_estimate=plan.prompt_tokens_estimate,
+                                excluded_for_context=plan.excluded_for_context,
+                                demoted_for_context=plan.demoted_for_context,
+                                attempt_started_at=attempt_started_at,
                             )
                         )
                     )
@@ -2214,6 +2640,9 @@ class ChatCompletionRouter:
                     errors=errors,
                     compression=plan.compression_metadata,
                     terminal_reason=terminal_reason,
+                    prompt_tokens_estimate=plan.prompt_tokens_estimate,
+                    excluded_for_context=plan.excluded_for_context,
+                    demoted_for_context=plan.demoted_for_context,
                 )
             )
         )

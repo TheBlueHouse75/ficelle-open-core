@@ -332,7 +332,7 @@ def certification_for_model(model: Mapping[str, Any], manifest: Mapping[str, Any
     return certification_index(manifest).get(certification_identity(model))
 
 
-def cached_manifest() -> dict[str, Any] | None:
+def _load_builtin_manifest() -> dict[str, Any] | None:
     try:
         return validate_manifest(
             strict_json_loads(BUILTIN_MANIFEST_PATH.read_bytes()),
@@ -340,6 +340,20 @@ def cached_manifest() -> dict[str, Any] | None:
         )
     except (CodingCertificationError, OSError):
         return None
+
+
+_BUILTIN_MANIFEST = _load_builtin_manifest()
+
+
+def cached_manifest() -> dict[str, Any] | None:
+    """Return the manifest validated with the policy loaded by this process.
+
+    Core assets are immutable in installed releases. Keeping the validated value for the process
+    lifetime also preserves that invariant in an editable checkout: a source update cannot pair a
+    new manifest on disk with an old in-memory benchmark policy and temporarily empty the coding
+    pool. A service restart activates both parts together.
+    """
+    return _BUILTIN_MANIFEST
 
 
 def public_status() -> dict[str, Any]:

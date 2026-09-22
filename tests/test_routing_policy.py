@@ -16,6 +16,7 @@ def model_row(**overrides):
     row = {
         "id": "ficelle/openrouter/example",
         "context_length": 131_072,
+        "max_completion_tokens": 32_768,
         "supports_tools": True,
         "supports_structured_outputs": True,
         "input_modalities": ["text", "image"],
@@ -51,6 +52,7 @@ def test_policy_requirements_accept_matching_model():
         supported_parameters=["tools"],
         supported_parameters_any=["response_format", "reasoning"],
         min_context=128_000,
+        min_completion_tokens=12_000,
     )
 
     assert matches(model_row(), profile) is True
@@ -76,6 +78,7 @@ def test_policy_requirements_reject_missing_capabilities_and_small_context():
     assert matches(model_row(supported_parameters=["tools"]), profile_requirements(supported_parameters=["response_format"])) is False
     assert matches(model_row(supported_parameters=["tools"]), profile_requirements(supported_parameters_any=["reasoning"])) is False
     assert matches(model_row(context_length=32_000), profile_requirements(min_context=128_000)) is False
+    assert matches(model_row(max_completion_tokens=8_192), profile_requirements(min_completion_tokens=12_000)) is False
 
 
 def test_catalog_denies_structured_output_mirrors_the_routing_filter():

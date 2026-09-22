@@ -216,7 +216,9 @@
     },
     {
       "aliases": [
-        "qwen/qwen3.8-27b"
+        "@cf/qwen/qwen3.8-27b",
+        "qwen/qwen3.8-27b",
+        "qwen/qwen3.8-27b:free"
       ],
       "benchmarks": [
         {
@@ -473,6 +475,7 @@
     },
     {
       "aliases": [
+        "@cf/google/gemma-4-26b-a4b-it",
         "google/gemma-4-26b-a4b-it:free"
       ],
       "benchmarks": [
@@ -816,9 +819,108 @@
       "quality_score": 66.6667,
       "tier": "verified",
       "upstream_model_id": "tencent/hy3-free"
+    },
+    {
+      "aliases": [],
+      "benchmarks": [
+        {
+          "attempts_per_task": 2,
+          "command_fingerprint": "sha256:d2a326ab36f4a19affbc2708294d1300ad92e4895f0e6d153be76e8e14a144cf",
+          "completed_count": 3,
+          "completion_token_budget": 12000,
+          "efficiency": {
+            "completion_tokens": 1434,
+            "duration_seconds": 199.7703320980072,
+            "mean_duration_seconds": 66.59011069933574,
+            "measured_task_count": 3,
+            "prompt_tokens": 17099,
+            "total_tokens": 18533
+          },
+          "evidence_kind": "calibration_run",
+          "harness_commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+          "harness_error_count": 0,
+          "harness_exit_code": 0,
+          "harness_repository": "https://github.com/Aider-AI/aider",
+          "model_settings_fingerprint": "sha256:2b9125abf7530a112d7934a947d6f5e9d71482f798fff83f7ed1b1ae4c7bf56e",
+          "model_verdict_count": 3,
+          "name": "aider-practical",
+          "observed_at": "2026-09-17T18:29:20.985370+00:00",
+          "official_result_fingerprint": "sha256:f77a4ecdf4fc0a22a6dc510c5167b5cacc1e31f922aafd34df251228fa29ae28",
+          "pass_at_1": 0.66666667,
+          "policy_fingerprint": "sha256:fef7966539bb11130e79e1797a75f8c4e70561e3183792cb1d8e1df7f4ce2195",
+          "provider": "openrouter",
+          "provider_error_count": 0,
+          "reference_agent": "aider",
+          "reference_agent_commit": "5dc9490bb35f9729ef2c95d00a19ccd30c26339c",
+          "relay_audit": {
+            "chat_completion_count": 6,
+            "model_failure_incident_count": 0,
+            "provider_incident_count": 0,
+            "schema_version": 2,
+            "task_count": 3,
+            "unresolved_model_failure_count": 0,
+            "unresolved_provider_error_count": 0
+          },
+          "relay_timeout_seconds": 900,
+          "resolved_rate": 0.66666667,
+          "results": [
+            {
+              "attempt_count": 1,
+              "completion_tokens": 313,
+              "duration_seconds": 32.729456424713135,
+              "first_passed": true,
+              "passed": true,
+              "prompt_tokens": 1299,
+              "status": "passed",
+              "task_id": "go/exercises/practice/crypto-square"
+            },
+            {
+              "attempt_count": 2,
+              "completion_tokens": 798,
+              "duration_seconds": 115.58495044708252,
+              "first_passed": false,
+              "passed": false,
+              "prompt_tokens": 14003,
+              "status": "failed",
+              "task_id": "java/exercises/practice/bank-account"
+            },
+            {
+              "attempt_count": 1,
+              "completion_tokens": 323,
+              "duration_seconds": 51.45592522621155,
+              "first_passed": true,
+              "passed": true,
+              "prompt_tokens": 1797,
+              "status": "passed",
+              "task_id": "python/exercises/practice/affine-cipher"
+            }
+          ],
+          "run_mode": "calibration",
+          "run_record_fingerprint": "sha256:8027edb64693a3d88e1a966219c81047c617cc4719e1b23e18fecaf2a8e5f04b",
+          "settings_fingerprint": "sha256:4cbf54261e6becc5a88afca97bcd8f0e58d81dd9d1e45b2c7922385984d98f48",
+          "source_revisions": [
+            {
+              "commit": "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f",
+              "name": "polyglot-benchmark",
+              "repository": "https://github.com/Aider-AI/polyglot-benchmark"
+            }
+          ],
+          "suite_version": "practical-2026-09-02",
+          "task_count": 3,
+          "timed_out": false,
+          "upstream_model_id": "stealth/union-alpha",
+          "wall_clock_timeout_seconds": 2700
+        }
+      ],
+      "certified_at": "2026-09-17T18:31:40.370943+00:00",
+      "compatibility_canary_version": "coding-compatibility-v1",
+      "provider": "openrouter",
+      "quality_score": 66.6667,
+      "tier": "verified",
+      "upstream_model_id": "stealth/union-alpha"
     }
   ],
-  "manifest_id": "2026-09-03-coding-pool-v3",
+  "manifest_id": "2026-09-17-coding-pool-v3",
   "policy_version": "coding-v3",
   "priors": [],
   "provisionals": [],

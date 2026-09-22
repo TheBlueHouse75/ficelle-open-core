@@ -81,6 +81,7 @@ class CooldownReadPorts:
 class QuarantinePorts:
     safe_detail: SafeDetail
     now_iso: NowIso
+    now_seconds: Callable[[], float]
     cooldown_key: Callable[[dict[str, Any]], str]
 
 
@@ -223,6 +224,7 @@ def quarantine_row(
         "reason": reason,
         "note": ports.safe_detail(note),
         "set_at": ports.now_iso(),
+        "set_at_ts": ports.now_seconds(),
         "source": source,
         "manual": manual,
         "model_id": model.get("id"),
@@ -652,6 +654,7 @@ def _record_success(
     *,
     ports: CooldownStatsPorts,
     origin: str = FAILURE_ORIGIN_REQUEST,
+    first_delta_seconds: float | None = None,
 ) -> None:
     now_epoch = ports.now_epoch()
     record["requests"] = ports.safe_int(record.get("requests"), 0) + 1
@@ -661,11 +664,17 @@ def _record_success(
     record["scored_successes"] = round(_safe_number(record.get("scored_successes")) + 1.0, 6)
     if origin == FAILURE_ORIGIN_REQUEST:
         record["latency_ewma"] = _latency_ewma(record.get("latency_ewma"), latency_seconds)
+        # Time to the first substantive delta the client received. A non-streamed answer delivers
+        # everything at once, so when nothing was measured its first delta is its whole latency.
+        first_delta = _safe_timestamp(latency_seconds if first_delta_seconds is None else first_delta_seconds)
+        if first_delta is not None:
+            record["first_delta_ewma"] = _latency_ewma(record.get("first_delta_ewma"), first_delta)
     else:
         # A capability probe asks for a handful of tokens, so its latency says nothing about how
         # long this model takes on a real request — but it fed the same EWMA the latency score
         # reads, making a model that has only ever been probed look the fastest in the pool. The
-        # success itself still counts: answering a probe is evidence the model works.
+        # success itself still counts: answering a probe is evidence the model works. Same reasoning
+        # keeps a probe out of `first_delta_ewma`.
         record["probe_latency_ewma"] = _latency_ewma(record.get("probe_latency_ewma"), latency_seconds)
     record["last_success_at"] = ports.now_iso()
 
@@ -692,11 +701,12 @@ def update_success_stats(
     *,
     ports: CooldownStatsPorts,
     origin: str = FAILURE_ORIGIN_REQUEST,
+    first_delta_seconds: float | None = None,
 ) -> None:
     stats = state.setdefault("stats", {})
     key = ports.cooldown_key(model)
     record = stats.setdefault(key, {})
-    _record_success(record, latency_seconds, ports=ports, origin=origin)
+    _record_success(record, latency_seconds, ports=ports, origin=origin, first_delta_seconds=first_delta_seconds)
 
 
 def completion_tokens_per_second(
@@ -708,8 +718,8 @@ def completion_tokens_per_second(
 
     Wall-clock latency conflates queueing with generation: a model that waits 40s and then writes
     900 tokens in 10s is not the same upstream as one that starts instantly and crawls, yet both
-    read as 50s. Subtracting time-to-first-byte isolates the part the model controls. Telemetry
-    only for now — nothing scores on it.
+    read as 50s. Subtracting time-to-first-byte isolates the part the model controls. This, and
+    `first_delta_ewma`, feed the speed score in `model_scoring.py`.
     """
     tokens = _safe_number(completion_tokens)
     latency = _safe_number(latency_seconds)
@@ -846,11 +856,13 @@ def set_provider_cooldown_in_state(
     cooldowns = state.setdefault("provider_cooldowns", {})
     seconds_map = config.get("cooldown_seconds") or {}
     seconds = int(seconds_map.get(reason) or seconds_map.get("unavailable") or 600)
+    now_ts = ports.now_seconds()
     cooldowns[source] = {
-        "until": ports.now_seconds() + seconds,
+        "until": now_ts + seconds,
         "reason": reason,
         "detail": ports.safe_detail(detail),
         "set_at": ports.now_iso(),
+        "set_at_ts": now_ts,
     }
     return source
 
@@ -918,6 +930,7 @@ def set_quota_cooldown_in_state(
         "reason": "quota_exhausted",
         "until": now_ts + interval,
         "set_at": set_at,
+        "set_at_ts": now_ts,
         "last_probe_at": last_probe_at,
         "next_probe_at": now_ts + interval,
         "probe_interval_seconds": interval,
@@ -978,13 +991,63 @@ def source_has_active_quota_cooldown(state: dict[str, Any], source: str, *, port
     return False
 
 
+def cooldown_predates_request(row: Any, started_at: float | None, *, ports: CooldownSuccessPorts) -> bool:
+    """Whether `row` was already written when a request that started at `started_at` began.
+
+    A success only disproves what was already true when it left: a request that started at
+    `now - latency_seconds` says nothing about a cooldown a *later* failure wrote, so lifting
+    that row is not self-healing, it is erasing evidence.
+
+    Rows written since this rule carry `set_at_ts`; older rows fall back to parsing their ISO
+    `set_at`; a row with neither usable stamp — and a caller that cannot say when it started —
+    keeps the previous behaviour and is lifted, so the self-heal never regresses into a stuck
+    cooldown.
+    """
+    if started_at is None or not isinstance(row, dict):
+        return True
+    written_at = ports.safe_float(row.get("set_at_ts"), 0.0)
+    if written_at <= 0.0:
+        written_at = parse_iso_timestamp(row.get("set_at")) or 0.0
+    if written_at <= 0.0:
+        return True
+    return written_at <= started_at
+
+
+def lift_if_predates(container: Any, key: str, started_at: float | None, *, ports: CooldownSuccessPorts) -> bool:
+    """Pop `container[key]` when it predates a request that started at `started_at`
+    (`cooldown_predates_request`), so a success only lifts what it actually disproves.
+
+    Shared by the model, provider, and quota cooldown sites in `record_success_in_state`; the
+    quarantine site stays inline because it also branches on the row's `reason`.
+    """
+    if not isinstance(container, dict) or not cooldown_predates_request(container.get(key), started_at, ports=ports):
+        return False
+    container.pop(key, None)
+    return True
+
+
+def diagnostic_predates_request(row: Any, started_at: float | None) -> bool:
+    """Whether an error row was already present when this successful request started.
+
+    Error rows use ``seen_at`` rather than cooldowns' ``set_at``. A later concurrent failure is
+    not disproved by an older in-flight success and its diagnostic must survive alongside the
+    cooldown. Legacy or incomplete rows retain the previous self-healing behaviour.
+    """
+    if started_at is None or not isinstance(row, dict):
+        return True
+    written_at = parse_iso_timestamp(row.get("seen_at")) or 0.0
+    return written_at <= 0.0 or written_at <= started_at
+
+
 def record_success_in_state(
     state: dict[str, Any],
     model: dict[str, Any],
-    latency_seconds: float,
+    latency_seconds: float | None,
     *,
     ports: CooldownSuccessPorts,
     origin: str = FAILURE_ORIGIN_REQUEST,
+    first_delta_seconds: float | None = None,
+    started_at: float | None = None,
 ) -> None:
     """Record a success, and — unless the caller is a probe — lift the blocks it disproves.
 
@@ -1008,35 +1071,49 @@ def record_success_in_state(
     key = ports.cooldown_key(model)
     clear_cooldowns = origin == FAILURE_ORIGIN_REQUEST
     source = str(model.get("source") or "").strip()
+    if started_at is None and latency_seconds is not None:
+        # Backward-compatible fallback for probes and older call sites. Request routing passes the
+        # wall-clock timestamp captured before invocation so state-store wait time cannot move it.
+        started_at = ports.now_seconds() - max(0.0, ports.safe_float(latency_seconds, 0.0))
+
     successes = state.setdefault("successes", {})
     successes[key] = {
         "last_success_at": ports.now_iso(),
         "latency_seconds": latency_seconds,
     }
     if clear_cooldowns:
-        cooldowns = state.get("cooldowns")
-        if isinstance(cooldowns, dict):
-            cooldowns.pop(key, None)
-        provider_cooldowns = state.get("provider_cooldowns")
-        if isinstance(provider_cooldowns, dict) and source:
-            provider_cooldowns.pop(source, None)
+        lift_if_predates(state.get("cooldowns"), key, started_at, ports=ports)
+        if source:
+            lift_if_predates(state.get("provider_cooldowns"), source, started_at, ports=ports)
     quota_cooldowns = state.get("quota_cooldowns")
     if isinstance(quota_cooldowns, dict):
         for quota_key, raw in list(quota_cooldowns.items()):
-            if isinstance(raw, dict) and ports.quota_cooldown_matches_model(str(quota_key), model):
-                quota_cooldowns.pop(quota_key, None)
-    if not source_has_active_quota_cooldown(state, source, ports=ports):
+            if not isinstance(raw, dict) or not ports.quota_cooldown_matches_model(str(quota_key), model):
+                continue
+            lift_if_predates(quota_cooldowns, quota_key, started_at, ports=ports)
+    provider_errors = state.get("provider_errors") if isinstance(state.get("provider_errors"), dict) else {}
+    if (
+        not source_has_active_quota_cooldown(state, source, ports=ports)
+        and diagnostic_predates_request(provider_errors.get(source), started_at)
+    ):
         ports.clear_provider_error_in_state(state, source)
+    # A model that just answered is demonstrably serveable again: the catalog-drift
+    # quarantine self-heals on its own success (L4-R3). Billing and manual quarantines
+    # require explicit resolution and stay untouched. Same antecedence guard as the
+    # cooldowns above: a quarantine set by a later failure is not disproved by this success.
     quarantine = state.get("quarantine")
     if isinstance(quarantine, dict):
         row = quarantine.get(key)
-        # A model that just answered is demonstrably serveable again: the catalog-drift
-        # quarantine self-heals on its own success (L4-R3). Billing and manual quarantines
-        # require explicit resolution and stay untouched.
-        if isinstance(row, dict) and str(row.get("reason") or "") == "model_not_found":
+        if (
+            isinstance(row, dict)
+            and str(row.get("reason") or "") == "model_not_found"
+            and cooldown_predates_request(row, started_at, ports=ports)
+        ):
             quarantine.pop(key, None)
-    ports.clear_model_error_in_state(state, model)
-    ports.update_success_stats(state, model, latency_seconds, origin=origin)
+    model_errors = state.get("model_errors") if isinstance(state.get("model_errors"), dict) else {}
+    if diagnostic_predates_request(model_errors.get(key), started_at):
+        ports.clear_model_error_in_state(state, model)
+    ports.update_success_stats(state, model, latency_seconds, origin=origin, first_delta_seconds=first_delta_seconds)
     if source:
         ports.update_provider_success_stats(state, source, latency_seconds)
 
@@ -1187,6 +1264,9 @@ def set_cooldown_in_state(
         "reason": reason,
         "detail": ports.safe_detail(detail),
         "set_at": ports.now_iso(),
+        # Epoch twin of `set_at`, so a success can compare its own start against this write
+        # without re-parsing ISO text on every clear (`cooldown_predates_request`).
+        "set_at_ts": now_ts,
     }
     if seconds != base_seconds:
         # Stated in the row so an operator reading state sees an escalation rather than a

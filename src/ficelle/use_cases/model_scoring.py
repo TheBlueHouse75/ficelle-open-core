@@ -54,6 +54,15 @@ MIN_SCORED_OBSERVATIONS = 1.0
 # Latency at which a model scores exactly 0.5, and the scale of the whole curve. Free upstreams
 # routinely answer in tens of seconds, so it is deliberately generous.
 LATENCY_REFERENCE_SECONDS = 15.0
+# Time-to-first-delta at which a model scores exactly 0.5. A host such as Hermes gives up on a
+# streamed compression after roughly two minutes of silence, so this is set tight relative to
+# LATENCY_REFERENCE_SECONDS: a model can have an acceptable total latency and still be worthless if
+# the client aborts before the first token ever arrives.
+FIRST_DELTA_REFERENCE_SECONDS = 5.0
+# Generation throughput at which a model scores exactly 0.5. Free-tier pools skew slower as the
+# fast/high-budget models run out of credit, so this stays low enough to still discriminate among
+# the tokens/s the remaining pool actually delivers.
+THROUGHPUT_REFERENCE_TOKENS_PER_SECOND = 20.0
 
 
 def _safe_float(value: Any) -> float:
@@ -64,8 +73,8 @@ def _safe_float(value: Any) -> float:
     return number if number > 0 else 0.0
 
 
-def latency_score_from_seconds(seconds: float) -> float:
-    """Map a latency to (0, 1]: 0s => 1.0, 15s => 0.5, and strictly decreasing after that.
+def latency_score_from_seconds(seconds: float, reference_seconds: float = LATENCY_REFERENCE_SECONDS) -> float:
+    """Map a latency to (0, 1]: 0s => 1.0, `reference_seconds` => 0.5, strictly decreasing after.
 
     The former scale was `1 - seconds/30` clamped at zero, so every model slower than 30s scored
     exactly 0 and the 26-35 latency points of the profile weights stopped discriminating in a pool
@@ -73,7 +82,20 @@ def latency_score_from_seconds(seconds: float) -> float:
     `auto-fast` on its success rate alone. This form never saturates, so a slow model always ranks
     behind a slower one.
     """
-    return LATENCY_REFERENCE_SECONDS / (LATENCY_REFERENCE_SECONDS + max(0.0, seconds))
+    return reference_seconds / (reference_seconds + max(0.0, seconds))
+
+
+def _stats_record(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> dict[str, Any]:
+    return ((state.get("stats") or {}).get(ports.cooldown_key(model)) or {}) if isinstance(state, dict) else {}
+
+
+def _positive_stat(record: dict[str, Any], field: str) -> float | None:
+    """A stored measurement as a float, or None when the model was never measured for it."""
+    try:
+        number = float(record.get(field))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def success_rate_for_model(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> float:
@@ -102,7 +124,7 @@ def success_rate_for_model(model: dict[str, Any], state: dict[str, Any], *, port
 
 
 def latency_score_for_model(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> float:
-    record = ((state.get("stats") or {}).get(ports.cooldown_key(model)) or {}) if isinstance(state, dict) else {}
+    record = _stats_record(model, state, ports=ports)
     latency = record.get("latency_ewma")
     if latency is None:
         legacy = ((state.get("successes") or {}).get(ports.cooldown_key(model)) or {}) if isinstance(state, dict) else {}
@@ -114,6 +136,22 @@ def latency_score_for_model(model: dict[str, Any], state: dict[str, Any], *, por
         # worth against one measured at the reference.
         return 0.5
     return latency_score_from_seconds(seconds)
+
+
+def first_delta_score_for_model(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> float:
+    # Neutral until measured: total latency is a different quantity, and scoring it on the much
+    # tighter first-delta curve would quietly punish every model that simply has no history yet.
+    seconds = _positive_stat(_stats_record(model, state, ports=ports), "first_delta_ewma")
+    if seconds is None:
+        return 0.5
+    return latency_score_from_seconds(seconds, FIRST_DELTA_REFERENCE_SECONDS)
+
+
+def throughput_score_for_model(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> float:
+    tps = _positive_stat(_stats_record(model, state, ports=ports), "completion_tokens_per_second")
+    if tps is None:
+        return 0.5
+    return tps / (tps + THROUGHPUT_REFERENCE_TOKENS_PER_SECOND)
 
 
 def runtime_profile_row(
@@ -354,9 +392,18 @@ def model_score_explanation(
     ports: ModelScoreExplanationPorts,
 ) -> dict[str, Any]:
     requested_model = ports.evidence.canonical_virtual_model_id(requested_model)
-    record = ((state.get("stats") or {}).get(ports.scoring.cooldown_key(model)) or {}) if isinstance(state, dict) else {}
+    record = _stats_record(model, state, ports=ports.scoring)
     success_rate = success_rate_for_model(model, state, ports=ports.scoring)
     latency_score = latency_score_for_model(model, state, ports=ports.scoring)
+    first_delta_score = first_delta_score_for_model(model, state, ports=ports.scoring)
+    throughput_score = throughput_score_for_model(model, state, ports=ports.scoring)
+    # Total latency alone barely discriminates once every free model answers in tens of seconds,
+    # and it hides two failure modes total latency cannot see: a host such as Hermes aborts a
+    # compression after roughly two minutes without a delta, so a model that answers late is
+    # worthless to it even when its total latency looks acceptable; and with big free models
+    # increasingly out of credit, the pool that is left skews slower, so raw generation throughput
+    # now matters for telling apart what remains.
+    speed_score = 0.5 * latency_score + 0.3 * first_delta_score + 0.2 * throughput_score
     context_length = ports.scoring.safe_int(model.get("context_length"), 0)
     context_score = min(1.0, context_length / 1_000_000) if context_length > 0 else 0.0
     structured = bool(model.get("supports_structured_outputs"))
@@ -368,15 +415,15 @@ def model_score_explanation(
     multimodal = image_in or video_in or audio_in
 
     if requested_model == "ficelle/auto-orchestrator":
-        score = (success_rate * 42) + (tool_bonus * 18) + ((1.0 if structured else 0.0) * 18) + (context_score * 14) + (latency_score * 8)
+        score = (success_rate * 42) + (tool_bonus * 18) + ((1.0 if structured else 0.0) * 18) + (context_score * 14) + (speed_score * 8)
     elif requested_model == "ficelle/auto-fast":
-        score = (success_rate * 45) + (latency_score * 35) + (tool_bonus * 10) + (context_score * 10)
+        score = (success_rate * 45) + (speed_score * 35) + (tool_bonus * 10) + (context_score * 10)
     elif requested_model == "ficelle/auto-json":
-        score = (success_rate * 40) + ((1.0 if structured else 0.0) * 30) + (tool_bonus * 15) + (latency_score * 10) + (context_score * 5)
+        score = (success_rate * 40) + ((1.0 if structured else 0.0) * 30) + (tool_bonus * 15) + (speed_score * 10) + (context_score * 5)
     elif requested_model == "ficelle/auto-compression":
-        score = (success_rate * 42) + (latency_score * 26) + (context_score * 18) + (tool_bonus * 4)
+        score = (success_rate * 42) + (speed_score * 26) + (context_score * 18) + (tool_bonus * 4)
     elif requested_model == "ficelle/auto-long":
-        score = (success_rate * 35) + (context_score * 35) + (tool_bonus * 15) + ((1.0 if structured else 0.0) * 10) + (latency_score * 5)
+        score = (success_rate * 35) + (context_score * 35) + (tool_bonus * 15) + ((1.0 if structured else 0.0) * 10) + (speed_score * 5)
     elif requested_model == "ficelle/auto-reasoning":
         score = (success_rate * 35) + ((1.0 if reasoning else 0.0) * 30) + (tool_bonus * 15) + ((1.0 if structured else 0.0) * 10) + (context_score * 10)
     elif requested_model == "ficelle/auto-multimodal":
@@ -388,7 +435,7 @@ def model_score_explanation(
     elif requested_model == "ficelle/auto-audio":
         score = (success_rate * 35) + ((1.0 if audio_in else 0.0) * 35) + (tool_bonus * 10) + ((1.0 if structured else 0.0) * 10) + (context_score * 10)
     else:
-        score = (success_rate * 45) + (tool_bonus * 20) + ((1.0 if structured else 0.0) * 15) + (latency_score * 10) + (context_score * 10)
+        score = (success_rate * 45) + (tool_bonus * 20) + ((1.0 if structured else 0.0) * 15) + (speed_score * 10) + (context_score * 10)
 
     parts = benchmark_adjustment_parts(requested_model, model, state, ports=ports.evidence)
     # Recency-weighted, and answered by a success of the same standing (`cooldowns.failure_ledger`):
@@ -427,6 +474,9 @@ def model_score_explanation(
         "failure_penalty": round(failure_penalty, 1),
         "success_rate": round(success_rate, 4),
         "latency_score": round(latency_score, 4),
+        "first_delta_score": round(first_delta_score, 4),
+        "throughput_score": round(throughput_score, 4),
+        "speed_score": round(speed_score, 4),
         "context_score": round(context_score, 4),
         "evidence_status": parts["evidence_status"],
         "evidence_reason": parts["evidence_reason"],

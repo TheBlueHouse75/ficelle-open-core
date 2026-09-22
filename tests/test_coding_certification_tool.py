@@ -432,6 +432,7 @@ def test_bundled_manifest_is_valid():
         "models/gemma-4-26b-a4b-it",
         "stepfun/step-3.7-flash:free",
         "tencent/hy3-free",
+        "stealth/union-alpha",
     ]
     assert manifest["priors"] == []
     assert manifest["provisionals"] == []

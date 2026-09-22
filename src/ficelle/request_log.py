@@ -33,7 +33,7 @@ from typing import Any
 
 from ficelle.runtime_paths import RuntimePaths
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Retention bounds for the derived index (the JSONL source keeps everything).
 MAX_ROWS = 100_000
@@ -86,6 +86,8 @@ _COLUMNS = (
     "completion_tokens",
     "prompt_price",
     "completion_price",
+    "prompt_tokens_estimate",
+    "excluded_for_context",
     "attempts_json",
     "delivery_corrected",
 )
@@ -120,6 +122,7 @@ _ATTEMPT_KEYS = (
     "stream_started",
     "stream_chunk_count",
     "stream_bytes_sent",
+    "completion_chars",
 )
 
 
@@ -633,6 +636,8 @@ def _row_from_log_line(raw: Any) -> dict[str, Any] | None:
         "completion_tokens": _token_count(usage.get("completion_tokens")),
         "prompt_price": _price_per_token(reference.get("prompt")),
         "completion_price": _price_per_token(reference.get("completion")),
+        "prompt_tokens_estimate": _safe_int(raw.get("prompt_tokens_estimate"), None),
+        "excluded_for_context": _safe_int(raw.get("excluded_for_context"), None),
         "attempts_json": json.dumps(attempts, ensure_ascii=False, sort_keys=True),
         "delivery_corrected": 0,
     }
@@ -805,6 +810,8 @@ def _create_requests_table(conn: sqlite3.Connection) -> None:
           completion_tokens INTEGER,
           prompt_price REAL,
           completion_price REAL,
+          prompt_tokens_estimate INTEGER,
+          excluded_for_context INTEGER,
           attempts_json TEXT,
           delivery_corrected INTEGER NOT NULL DEFAULT 0
         )
@@ -878,6 +885,8 @@ def _public_row(row: sqlite3.Row) -> dict[str, Any]:
         "compression_status": row["compression_status"],
         "prompt_tokens": row["prompt_tokens"],
         "completion_tokens": row["completion_tokens"],
+        "prompt_tokens_estimate": row["prompt_tokens_estimate"],
+        "excluded_for_context": row["excluded_for_context"],
         "attempts": attempts,
     }
 

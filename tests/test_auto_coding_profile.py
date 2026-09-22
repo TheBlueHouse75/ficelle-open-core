@@ -92,6 +92,9 @@ def test_bundled_pool_routes_qualified_models_and_rejects_laguna():
     )
     kimi_k3 = model("nvidia", "moonshotai/kimi-k3", "ficelle/nvidia/moonshotai/kimi-k3")
     qwen_3_8 = model("groq", "qwen/qwen3.8-27b", "ficelle/groq/qwen/qwen3.8-27b")
+    union_alpha = model(
+        "openrouter", "stealth/union-alpha", "ficelle/openrouter/stealth/union-alpha"
+    )
     laguna = model("kilo", "laguna-s-2-1", "ficelle/kilo/laguna-s-2-1")
 
     kept, fallback = router.route_competence_gate_result(
@@ -103,6 +106,7 @@ def test_bundled_pool_routes_qualified_models_and_rejects_laguna():
             gemini_3_6_flash,
             kimi_k3,
             qwen_3_8,
+            union_alpha,
             laguna,
         ],
         {},
@@ -114,6 +118,7 @@ def test_bundled_pool_routes_qualified_models_and_rejects_laguna():
         gemini_3_6_flash,
         kimi_k3,
         qwen_3_8,
+        union_alpha,
     ]
     assert fallback is False
 

@@ -89,6 +89,9 @@
                     <button type="button" id="manualModeBtn">Manual order</button>
                   </div>
                   <label class="switch" id="autoTailWrap"><input type="checkbox" id="autoTailToggle"><span class="track"></span> Auto-fill the rest</label>
+                  <label class="min-context-setting" for="minContextSelect" title="Models declaring less context than this are not eligible for this virtual model.">Minimum context
+                    <select id="minContextSelect"></select>
+                  </label>
                   <button class="btn ghost sm" type="button" id="clearProfileBtn">Reset</button>
                   <div class="custom-profile-actions" id="customProfileActions" hidden>
                     <button class="btn ghost sm" type="button" id="editCustomProfileBtn">Edit details</button>
@@ -122,7 +125,7 @@
           <section class="ws-col">
             <div class="card">
               <div class="card-head">
-                <div><h2>Available models</h2><div class="ch-sub">Drag into your order, add, exclude, or restore per virtual model.</div></div>
+                <div><h2 id="availableModelsTitle">Available models</h2><div class="ch-sub" id="availableModelsSubtitle">Drag into your order, add, exclude, or restore per virtual model.</div></div>
                 <span class="badge" id="modelCountBadge">0 models</span>
               </div>
               <div class="card-body">

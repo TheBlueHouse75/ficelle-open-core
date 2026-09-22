@@ -1249,7 +1249,6 @@ def test_admin_profile_row_preserves_selected_contract_fields():
             "auto_tail": False,
             "requirements": {"tools": True},
         },
-        candidates=[{"id": "ficelle/openrouter/manual-a"}],
         selected={"id": "ficelle/openrouter/manual-a", "upstream_id": "manual-a"},
         selected_origin="manual",
         selected_score={"score_total": 91.5, "latency": 0.3},
@@ -1288,7 +1287,6 @@ def test_admin_profile_row_preserves_selected_contract_fields():
 def test_admin_profile_row_reports_fail_without_candidates():
     row = build_admin_profile_row(
         profile={"mode": "auto"},
-        candidates=[],
         selected=None,
         selected_origin=None,
         selected_score={},
@@ -1311,6 +1309,25 @@ def test_admin_profile_row_reports_fail_without_candidates():
     assert row["failed_profile_candidates"] == [{"model_id": "ficelle/openrouter/nope"}]
     assert row["route_candidate_ids"] == []
     assert row["policy_candidate_ids"] == []
+
+
+def test_admin_profile_row_counts_only_candidates_the_profile_can_route():
+    row = build_admin_profile_row(
+        profile={"mode": "auto"},
+        selected={"id": "certified", "upstream_id": "certified"},
+        selected_origin="auto",
+        selected_score={"score_total": 80},
+        selected_verified={},
+        selected_competence="verified",
+        route_candidates=[{"id": "certified"}],
+        policy_candidates=[{"id": "certified"}],
+        top_candidates=[],
+        failed_candidates=[],
+        last_route={},
+    )
+
+    assert row["status"] == "ok"
+    assert row["candidate_count"] == 1
 
 
 def test_selected_profile_origin_reports_manual_auto_tail_and_auto():
@@ -1348,14 +1365,21 @@ def test_admin_profile_rows_assembles_selected_and_failed_evidence():
         "id": "ficelle/openrouter/failed-a",
         "upstream_id": "failed-a",
     }
+    paused = {
+        "id": "ficelle/openrouter/paused-a",
+        "upstream_id": "paused-a",
+    }
 
     rows = build_admin_profile_rows(
         profiles=profiles,
         available_models=[selected, failed],
+        policy_models=[selected, failed, paused],
         state={"marker": True},
         last_routes={"ficelle/auto-fast": {"status": "ok", "request_id": "req-1"}},
         candidates_for_profile=lambda profile_id, available, state, profile: available,
-        route_competent_candidates=lambda profile_id, candidates, state: [selected],
+        route_competent_candidates=lambda profile_id, candidates, state: [
+            model for model in candidates if not model["id"].endswith("failed-a")
+        ],
         candidate_rank_rows=lambda profile_id, candidates, profile, state: [
             {"model_id": model["id"]}
             for model in candidates
@@ -1380,7 +1404,10 @@ def test_admin_profile_rows_assembles_selected_and_failed_evidence():
     assert row["selected_verified_status"] == "verified"
     assert row["selected_competence"] == "verified"
     assert row["route_candidate_ids"] == ["ficelle/openrouter/manual-a"]
-    assert row["policy_candidate_ids"] == ["ficelle/openrouter/manual-a"]
+    assert row["policy_candidate_ids"] == [
+        "ficelle/openrouter/manual-a",
+        "ficelle/openrouter/paused-a",
+    ]
     assert row["last_route"] == {"status": "ok", "request_id": "req-1"}
     assert row["top_candidates"] == [
         {"model_id": "ficelle/openrouter/manual-a"},
@@ -1444,7 +1471,7 @@ def test_admin_performance_history_rows_preserves_route_and_compression_fields()
 
     row = rows["ficelle/auto-fast"]
     assert row["profile_id"] == "ficelle/auto-fast"
-    assert row["candidate_count"] == 2
+    assert row["candidate_count"] == 1
     assert row["selected_model"] == "ficelle/openrouter/model-a"
     assert row["selected_upstream"] == "model-a"
     assert row["selected_source"] == "openrouter"

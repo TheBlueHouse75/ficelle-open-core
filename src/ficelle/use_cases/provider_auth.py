@@ -11,6 +11,10 @@ from ficelle.providers.base import ProviderAccess
 class ProviderAuthPorts:
     provider_access: Callable[[str, dict[str, Any], bool], ProviderAccess]
     credential_source_label: Callable[[str | None], str | None]
+    # Non-secret provider parameters (an account id templated into the base URL). Returns the
+    # extra row fields for providers that declare one, `{}` for every other provider, so the
+    # dashboard can offer the field only where the key alone cannot make the provider work.
+    account_id_row: Callable[[str, dict[str, Any]], dict[str, Any]] = lambda _source, _cfg: {}
 
 
 def provider_auth_row(source: str, config: dict[str, Any], *, ports: ProviderAuthPorts) -> dict[str, Any]:
@@ -26,7 +30,7 @@ def provider_auth_row(source: str, config: dict[str, Any], *, ports: ProviderAut
     # answer the same question, and every time each composed its own predicate they drifted.
     invokable = enabled and access.can_invoke
     base_url_for_row = access.base_url or provider_cfg.get("base_url")
-    return auth_row(
+    row = auth_row(
         invokable,
         access.key,
         access.reason if enabled else "disabled",
@@ -34,6 +38,8 @@ def provider_auth_row(source: str, config: dict[str, Any], *, ports: ProviderAut
         credential_source_label=ports.credential_source_label,
         key_reason=access.key_reason or (access.reason if access.key else None),
     )
+    row.update(ports.account_id_row(source, provider_cfg))
+    return row
 
 
 def auth_status(config: dict[str, Any], *, ports: ProviderAuthPorts) -> dict[str, dict[str, Any]]:
