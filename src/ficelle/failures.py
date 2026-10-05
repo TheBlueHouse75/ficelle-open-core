@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import math
 import re
@@ -30,6 +31,7 @@ FailureReason = Literal[
     "billing_or_paid",
     "context_length_exceeded",
     "model_not_found",
+    "network_unreachable",
     "no_free_quota",
     "quota_exhausted",
     "rate_limited",
@@ -389,6 +391,50 @@ def exception_is_tls_failure(exc: BaseException) -> bool:
     )
 
 
+# The socket errors that describe this machine's own network rather than one remote host: no
+# route out at all, or the interface is down. `EHOSTUNREACH` is deliberately absent — it can name
+# a single unreachable provider while the rest of the internet answers.
+LOCAL_NETWORK_ERRNOS = frozenset({errno.ENETUNREACH, errno.ENETDOWN})
+
+
+def exception_is_network_unreachable(exc: BaseException) -> bool:
+    """Whether this transport exception means the provider's host could not even be looked up or
+    routed to — DNS resolution failed, or the local network is down.
+
+    An ISP outage surfaces exactly this way for every provider at once (`requests` wraps urllib3's
+    `NameResolutionError`, which wraps a `socket.gaierror`). Matched by class name like
+    `exception_is_tls_failure`, because `gaierror` carries `EAI_*` codes that collide with ordinary
+    errno values and so cannot be read through `first_exception_errno`.
+    """
+    return any(
+        getattr(current, "errno", None) in LOCAL_NETWORK_ERRNOS
+        or any(base.__name__ in {"gaierror", "NameResolutionError"} for base in type(current).__mro__)
+        for current in walk_exception_chain(exc)
+    )
+
+
+_REQUEST_TOKEN_LIMIT_PATTERN = re.compile(r"limit\W+(\d+)\W+requested\W+(\d+)", re.IGNORECASE)
+
+
+def request_token_limit_from_detail(detail: Any) -> int | None:
+    """The per-minute token limit a 413 names, when this one request alone already exceeds it.
+
+    Groq answers "... tokens per minute (TPM): Limit 7000, Requested 19244" when the request is
+    larger than the whole per-minute budget. Unlike a window that is merely used up, that request
+    can never pass however long Ficelle waits, so the limit is worth remembering as a size cap.
+    `None` when the body names no such pair, or the request fits and only the window was spent.
+    """
+    match = _REQUEST_TOKEN_LIMIT_PATTERN.search(str(detail or ""))
+    if match is None:
+        return None
+    try:
+        limit, requested = int(match.group(1)), int(match.group(2))
+    except ValueError:
+        # Untrusted upstream text can exceed Python's integer-conversion digit limit.
+        return None
+    return limit if 0 < limit < requested else None
+
+
 @dataclass(frozen=True)
 class FailureMarkers:
     false_free: tuple[str, ...] = FALSE_FREE_TEXT_MARKERS
@@ -397,6 +443,15 @@ class FailureMarkers:
     free_tier_zero_allocation: tuple[str, ...] = FREE_TIER_ZERO_ALLOCATION_MARKERS
     model_not_found: tuple[str, ...] = MODEL_NOT_FOUND_TEXT_MARKERS
     model_not_entitled: tuple[str, ...] = MODEL_NOT_ENTITLED_TEXT_MARKERS
+    # The REQUEST-rejection (400/422) twin of `model_not_entitled` above, kept as a SEPARATE field
+    # rather than reused: that field's generic 403 defaults ("must enable", "request access") are
+    # only safe because the 403 branch fail-closes on two extra conditions (the body names our
+    # model, and carries no account-scope wording) that make sense for an ambiguous 403 but do not
+    # apply here — a Nous tag-requirement 400 never names the model at all. Sharing the field would
+    # let those same generic phrases misclassify an unrelated 400/422 as a quarantine with no guard
+    # left to catch it, so this one starts empty and is populated only by a provider adapter that
+    # registers an exact, narrow phrase (see the "nous" case in `failure_markers()`).
+    model_not_entitled_request_rejection: tuple[str, ...] = ()
     upstream_rate_limit: tuple[str, ...] = UPSTREAM_RATE_LIMIT_TEXT_MARKERS
     # Exact ``error.code``/``error.type`` pairs for a provider-specific model-pool saturation
     # verdict. Each pair is ordered as (code, type), matching ``error_object_codes``.
@@ -410,6 +465,7 @@ class FailureMarkers:
         free_tier_zero_allocation: tuple[str, ...] = (),
         model_not_found: tuple[str, ...] = (),
         model_not_entitled: tuple[str, ...] = (),
+        model_not_entitled_request_rejection: tuple[str, ...] = (),
         upstream_rate_limit: tuple[str, ...] = (),
         upstream_rate_limit_error_codes: tuple[tuple[str, str], ...] = (),
     ) -> "FailureMarkers":
@@ -423,6 +479,9 @@ class FailureMarkers:
             free_tier_zero_allocation=self.free_tier_zero_allocation + free_tier_zero_allocation,
             model_not_found=self.model_not_found + model_not_found,
             model_not_entitled=self.model_not_entitled + model_not_entitled,
+            model_not_entitled_request_rejection=(
+                self.model_not_entitled_request_rejection + model_not_entitled_request_rejection
+            ),
             upstream_rate_limit=self.upstream_rate_limit + upstream_rate_limit,
             upstream_rate_limit_error_codes=(
                 self.upstream_rate_limit_error_codes + upstream_rate_limit_error_codes
@@ -475,6 +534,11 @@ NO_MODEL_FAULT_FAILURE_REASONS = frozenset(
         "context_length_exceeded",
     }
 )
+
+
+# What the score and the failure ledger skip: the no-fault reasons, plus a lost network route,
+# which is still cooled provider-wide but says nothing about any model.
+UNSCORED_FAILURE_REASONS = NO_MODEL_FAULT_FAILURE_REASONS | {"network_unreachable"}
 
 
 @dataclass(frozen=True)
@@ -551,6 +615,22 @@ SOURCE_DIVERTING_FAILURE_REASONS = frozenset({"bad_upstream_contract"})
 # known `context_length` is at least as large as the (possibly upstream-corrected) request size,
 # rather than against a source name.
 CONTEXT_DIVERTING_FAILURE_REASONS = frozenset({"context_length_exceeded"})
+
+# Attempt reasons the same model weights would repeat behind ANY provider: the upstream answered,
+# and what came back holds no answer for this body. The attempt loop reads it only for the current
+# request, to take every other source of that upstream model out of the remaining window: on
+# 25/09/2026 `ling-3.0-flash-fin` truncated before content via Nous, then again via OpenRouter, and
+# the two identical failures spent half of a four-attempt window. Unlike
+# PRODUCTION_PROFILE_FAILURE_REASONS this may hold no-fault reasons: a too-small `max_tokens` is not
+# the model's fault, yet the same model given the same budget truncates the same way.
+UPSTREAM_MODEL_DIVERTING_FAILURE_REASONS = frozenset(
+    {"truncated_before_content", "empty_assistant_message", "runaway_output"}
+)
+
+# Attempt reasons that say the upstream was momentarily out of capacity rather than wrong about the
+# request: a short wait can turn any of them into an answer. The attempt loop reads it to decide
+# whether a window lost entirely to them earns one delayed second pass.
+CAPACITY_FAILURE_REASONS = frozenset({"rate_limited", "rate_limited_upstream", "server_error"})
 
 # Attempt reasons that judge the MODEL on the profile it was asked to serve, rather than the
 # provider or the transport: the upstream answered, and what came back was unusable as an answer.
@@ -673,6 +753,12 @@ MODEL_SPECIFIC_OPTION_REJECTION_MARKERS = (
 )
 MODEL_SPECIFIC_REQUEST_OPTIONS = ("top_k",)
 
+# The mirror image: an always-reasoning model refusing a caller that turned reasoning off. Observed
+# on OpenRouter `stealth/space-bunny-alpha` for Hermes' short auxiliary `auto-fast` calls, where the
+# 400 used to end the request on its first candidate while every non-reasoning sibling would have
+# answered. Matched on the exact observed wording, both halves required.
+MANDATORY_REASONING_REJECTION_MARKERS = ("reasoning is mandatory", "cannot be disabled")
+
 # Sampling knobs that shape *how* a model draws tokens, never *what* is asked of it. Only these
 # may be dropped and retried when a provider rejects them by name: removing one changes the
 # sampling distribution, not the request's meaning. Messages, tools, tool_choice, schemas,
@@ -705,6 +791,21 @@ def _rejects_model_specific_request_option(lower: str) -> bool:
 _UNKNOWN_MESSAGE_PROPERTY_PATTERN = re.compile(
     r"messages(?:\.\d+|\[\d+\])[^\n]{0,256}property 'message_id' is unsupported"
 )
+
+
+def _rejects_disabled_reasoning(lower: str) -> bool:
+    return all(marker in lower for marker in MANDATORY_REASONING_REJECTION_MARKERS)
+
+
+def contract_rejection_is_model_scoped(detail: str) -> bool:
+    """Whether a `bad_upstream_contract` rejection concerns only the model that returned it.
+
+    Most contract rejections come from the provider's own request validation, which every model
+    behind that endpoint applies alike, so the attempt loop diverts the whole source. An
+    always-reasoning model refusing disabled reasoning is the exception: its siblings on the same
+    provider accept the very same body, so only that upstream model leaves the window.
+    """
+    return _rejects_disabled_reasoning(str(detail or "").lower())
 
 
 def _rejects_unknown_message_property(lower: str) -> bool:
@@ -791,11 +892,12 @@ def rejected_sampling_parameters(text: str, body: dict[str, Any] | None = None) 
 # (gateway wrapper, then the real upstream's), so the useful half is at the end.
 UPSTREAM_DETAIL_LIMIT = 400
 
-# Provider-wide by construction, not by classification: a TLS handshake that fails describes the
-# transport to the provider's host, never one model id, so `tls_error` joins the two reasons the
-# body can state. It is raised by the invocation path (`evaluate_invocation_exception`), never by
-# `classify_failure` — an upstream that answered HTTP already completed its handshake.
-PROVIDER_SCOPED_COOLDOWN_REASONS = {"rate_limited", "auth_or_credit", "tls_error"}
+# Provider-wide by construction, not by classification: a TLS handshake that fails, or a host that
+# cannot be resolved or routed to, describes the transport to the provider's host, never one model
+# id, so `tls_error` and `network_unreachable` join the two reasons the body can state. They are
+# raised by the invocation path (`evaluate_invocation_exception`), never by `classify_failure` — an
+# upstream that answered HTTP was already reached.
+PROVIDER_SCOPED_COOLDOWN_REASONS = {"rate_limited", "auth_or_credit", "tls_error", "network_unreachable"}
 PROVIDER_ERROR_REASONS = PROVIDER_SCOPED_COOLDOWN_REASONS | {"quota_exhausted", "no_free_quota"}
 
 BENCHMARK_ROUTE_BLOCKING_REASONS = {
@@ -971,6 +1073,17 @@ def classify_failure(
     ):
         return "bad_upstream_contract"
     lower_without_urls = _URL_PATTERN.sub(" ", lower)
+    if status_code in REQUEST_REJECTION_STATUSES and any(
+        marker in lower_without_urls for marker in marker_set.model_not_entitled_request_rejection
+    ):
+        # Same verdict as the 403 `model_not_entitled` branch below (`model_not_found`: quarantine
+        # only this model, never a provider cooldown, and stays retryable so the run diverts to the
+        # next candidate instead of ending as a terminal `bad_upstream_request`) — see the incident
+        # this generalizes from and the field's own comment for why it is not shared with that
+        # branch. Registered for Nous: "This request is not valid ... Additional info: missing
+        # tags" / "missing user tag" on a subset of its free models (stepfun/step-3.7-flash:free,
+        # upstage/solar-pro4:free), while every sibling free model on the same account answers fine.
+        return "model_not_found"
     has_quota_marker = any(marker in lower for marker in marker_set.quota_exhausted)
     if has_quota_marker and access.get("eligible") is True and access.get("mode") == "quota_free":
         if status_code in {402, 429}:
@@ -1073,6 +1186,7 @@ def classify_failure(
         if (
             _demands_missing_field(lower)
             or _rejects_model_specific_request_option(lower)
+            or _rejects_disabled_reasoning(lower)
             or _rejects_unknown_message_property(lower)
         ):
             return "bad_upstream_contract"

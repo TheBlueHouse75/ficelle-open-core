@@ -44,6 +44,7 @@ LastRouteFallbackRows: TypeAlias = Callable[[dict[str, Any]], list[dict[str, Any
 SafeInt: TypeAlias = Callable[[Any, int], int]
 ModelOnCooldown: TypeAlias = Callable[[dict[str, Any], dict[str, Any]], tuple[bool, str | None]]
 ModelIsQuarantined: TypeAlias = Callable[[dict[str, Any], dict[str, Any]], bool]
+ModelMatchesProfileRequirements: TypeAlias = Callable[[dict[str, Any], dict[str, Any]], bool]
 StateRows: TypeAlias = Callable[[dict[str, Any]], list[dict[str, Any]]]
 NormalizeVirtualProfiles: TypeAlias = Callable[[dict[str, Any]], dict[str, Any]]
 RuntimeStateTransform: TypeAlias = Callable[[dict[str, Any]], dict[str, Any]]
@@ -123,6 +124,7 @@ class PerformanceCandidateRankRows(Protocol):
 class AdminStatusBuildPorts:
     model_on_cooldown: ModelOnCooldown
     model_is_quarantined: ModelIsQuarantined
+    model_matches_profile_requirements: ModelMatchesProfileRequirements
     normalized_virtual_profiles: NormalizeVirtualProfiles
     redact_runtime_state: RuntimeStateTransform
     candidates_for_profile: CandidatesForProfile
@@ -1177,6 +1179,45 @@ def build_admin_runtime_section(
     )
 
 
+def build_profile_candidate_exclusions(
+    *,
+    requirements_eligible: list[dict[str, Any]],
+    policy_candidates: list[dict[str, Any]],
+    state: dict[str, Any],
+    model_on_cooldown: ModelOnCooldown,
+    model_is_quarantined: ModelIsQuarantined,
+) -> dict[str, int]:
+    """Explain the gap between "matches this profile's requirements" and "routable now".
+
+    ``requirements_eligible`` is every invokable model matching the profile's requirements,
+    independent of live cooldown/quarantine/competence state (unlike ``policy_candidate_ids``,
+    whose competence gate runs over the whole invokable catalog and conflates that gap with
+    over-exclusion — see docs/components/admin-and-observability.md).
+    Buckets are mutually exclusive and evaluated in the same order the router itself applies
+    them: cooldown, then quarantine, then the competence/benchmark gate (a survivor absent from
+    ``policy_candidates``, the gate's own verdict). A survivor the gate accepts but the profile
+    still leaves out — a manual-order list without auto-tail — is in no bucket: it is neither
+    failing nor verified-out, only unlisted.
+    """
+    verified_ids = {str(model.get("id") or "") for model in policy_candidates}
+    cooldown = 0
+    quarantine = 0
+    not_verified = 0
+    for model in requirements_eligible:
+        if model_on_cooldown(model, state)[0]:
+            cooldown += 1
+        elif model_is_quarantined(model, state):
+            quarantine += 1
+        elif str(model.get("id") or "") not in verified_ids:
+            not_verified += 1
+    return {
+        "requirements_eligible": len(requirements_eligible),
+        "cooldown": cooldown,
+        "quarantine": quarantine,
+        "not_verified": not_verified,
+    }
+
+
 def build_admin_profile_row(
     *,
     profile: dict[str, Any],
@@ -1190,6 +1231,7 @@ def build_admin_profile_row(
     top_candidates: list[dict[str, Any]],
     failed_candidates: list[dict[str, Any]],
     last_route: dict[str, Any],
+    candidate_exclusions: dict[str, int],
 ) -> dict[str, Any]:
     return {
         "status": "ok" if route_candidates else "fail",
@@ -1211,6 +1253,7 @@ def build_admin_profile_row(
         "failed_profile_candidates": failed_candidates,
         "last_route": last_route,
         "requirements": profile.get("requirements") or {},
+        "candidate_exclusions": candidate_exclusions,
     }
 
 
@@ -1238,6 +1281,9 @@ def build_admin_profile_rows(
     model_score_explanation: SelectedModelRow,
     model_route_competence: SelectedModelValue,
     failed_profile_evidence_row: FailedProfileEvidenceRow,
+    model_matches_profile_requirements: ModelMatchesProfileRequirements,
+    model_on_cooldown: ModelOnCooldown,
+    model_is_quarantined: ModelIsQuarantined,
 ) -> dict[str, Any]:
     rows: dict[str, Any] = {}
     for profile_id, profile in profiles.items():
@@ -1250,6 +1296,20 @@ def build_admin_profile_rows(
             policy_profile_id,
             policy_models,
             state,
+        )
+        # Unlike `available_models`/`candidates` (already stripped of cooldown/quarantine) and
+        # `policy_models` (every invokable model, requirements unchecked), this is every
+        # invokable model that matches the profile regardless of live cooldown/quarantine state,
+        # so the exclusion buckets below can attribute the gap correctly.
+        requirements_eligible = [
+            model for model in policy_models if model_matches_profile_requirements(model, profile)
+        ]
+        candidate_exclusions = build_profile_candidate_exclusions(
+            requirements_eligible=requirements_eligible,
+            policy_candidates=policy_candidates,
+            state=state,
+            model_on_cooldown=model_on_cooldown,
+            model_is_quarantined=model_is_quarantined,
         )
         selected = route_candidates[0] if route_candidates else None
         selected_verified = verified_capability_row(policy_profile_id, selected, state) if selected else {}
@@ -1269,6 +1329,7 @@ def build_admin_profile_rows(
             selected_competence=model_route_competence(policy_profile_id, selected, state) if selected else None,
             route_candidates=route_candidates,
             policy_candidates=policy_candidates,
+            candidate_exclusions=candidate_exclusions,
             top_candidates=candidate_rank_rows(profile_id, candidates, profile, state),
             failed_candidates=failed_candidates,
             last_route=last_route if isinstance(last_route, dict) else {},
@@ -1414,6 +1475,9 @@ def build_admin_status_document(
         model_score_explanation=ports.model_score_explanation,
         model_route_competence=ports.model_route_competence,
         failed_profile_evidence_row=ports.failed_profile_evidence_row,
+        model_matches_profile_requirements=ports.model_matches_profile_requirements,
+        model_on_cooldown=ports.model_on_cooldown,
+        model_is_quarantined=ports.model_is_quarantined,
     )
 
     recovery_snapshot = build_admin_recovery_snapshot(

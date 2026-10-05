@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import json
+import socket
 
 import pytest
 
@@ -26,8 +28,10 @@ from ficelle.failures import (
     caller_rejected_request,
     classify_failure,
     cooldown_policy_for_reason,
+    exception_is_network_unreachable,
     exception_is_tls_failure,
     model_not_found_body,
+    request_token_limit_from_detail,
     rejected_request_tokens,
     request_exceeds_context,
     route_log_failure_status,
@@ -112,11 +116,12 @@ def test_transient_failures_return_transient_reasons():
 
 
 def test_failure_reason_sets_match_routing_contracts():
-    assert PROVIDER_SCOPED_COOLDOWN_REASONS == {"rate_limited", "auth_or_credit", "tls_error"}
+    assert PROVIDER_SCOPED_COOLDOWN_REASONS == {"rate_limited", "auth_or_credit", "tls_error", "network_unreachable"}
     assert PROVIDER_ERROR_REASONS == {
         "rate_limited",
         "auth_or_credit",
         "tls_error",
+        "network_unreachable",
         "quota_exhausted",
         "no_free_quota",
     }
@@ -715,6 +720,23 @@ def test_a_model_specific_sampling_rejection_fails_over_without_cooling():
     assert policy.quarantine is None
 
 
+def test_an_always_reasoning_model_refusing_disabled_reasoning_fails_over():
+    """OpenRouter's space-bunny-alpha 400s a caller that turned reasoning off.
+
+    Hermes' auxiliary `auto-fast` calls do, and the terminal reading ended them on the first of 14
+    candidates although any non-reasoning sibling answers the same body.
+    """
+    openrouter_400 = (
+        '{"error":{"message":"Reasoning is mandatory for this endpoint and cannot be disabled.",'
+        '"code":400,"metadata":{"provider_name":null}}}'
+    )
+
+    assert classify_failure(400, openrouter_400) == "bad_upstream_contract"
+    assert classify_failure(400, '{"error":{"message":"reasoning.effort is invalid"}}') == (
+        "bad_upstream_request"
+    )
+
+
 def test_a_forbidden_private_assistant_field_fails_over_without_cooling():
     """One provider may reject reasoning metadata another candidate needs and accepts.
 
@@ -1026,6 +1048,36 @@ def test_a_tls_failure_is_recognized_through_its_wrappers():
     assert exception_is_tls_failure(SSLFakeError("certificate verify failed"))
     assert exception_is_tls_failure(ConnectionError("wrapped", SSLFakeError("certificate verify failed")))
     assert not exception_is_tls_failure(ConnectionError("connection refused"))
+
+
+def test_a_lost_network_route_is_recognized_through_its_wrappers():
+    """An ISP outage (2026-09-28, 03:01) reached the router as `requests` -> urllib3
+    `NameResolutionError` -> `socket.gaierror` for every provider at once."""
+
+    class NameResolutionError(Exception):
+        pass
+
+    dns_failure = ConnectionError("wrapped", NameResolutionError("Failed to resolve", socket.gaierror(8, "nodename nor servname")))
+    assert exception_is_network_unreachable(dns_failure)
+    assert exception_is_network_unreachable(ConnectionError("wrapped", OSError(errno.ENETUNREACH, "Network is unreachable")))
+    # A host that refuses or drops the connection was reached: that stays the model's `unavailable`.
+    assert not exception_is_network_unreachable(ConnectionError("wrapped", ConnectionRefusedError(errno.ECONNREFUSED, "refused")))
+    assert not exception_is_network_unreachable(ConnectionError("wrapped", OSError(errno.EHOSTUNREACH, "No route to host")))
+
+
+def test_a_413_names_a_limit_only_when_the_request_alone_exceeds_it():
+    groq = (
+        'HTTP 413: {"error":{"message":"Request too large for model `qwen/qwen3.8-27b` in organization `org_x` '
+        'service tier `on_demand` on input tokens per minute (ITPM): Limit 7000, Requested 19244, please reduce"}}'
+    )
+    assert request_token_limit_from_detail(groq) == 7000
+    # The request fits the limit, so only this minute's window was spent: it recharges, no cap to learn.
+    assert request_token_limit_from_detail(groq.replace("Requested 19244", "Requested 5200")) is None
+    assert request_token_limit_from_detail("HTTP 413: request entity too large") is None
+
+
+def test_an_excessive_token_count_in_a_413_does_not_break_fallback():
+    assert request_token_limit_from_detail("Limit 7000, Requested " + "9" * 5000) is None
 
 
 def test_model_not_found_body_is_one_wording_for_every_route():
@@ -1343,3 +1395,57 @@ def test_an_unrelated_unsupported_property_is_a_terminal_bad_request():
     body = '{"error":{"message":"property \'foo\' is unsupported"}}'
 
     assert classify_failure(400, body) == "bad_upstream_request"
+
+
+# --- Incident 2026-09-25: Nous Portal's tag-requirement 400 must quarantine, not cool ----------
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "This request is not valid. Check the model name and other parameters. Additional info: missing tags",
+        "This request is not valid. Check the model name and other parameters. Additional info: missing user tag",
+    ],
+    ids=("missing-tags", "missing-user-tag"),
+)
+def test_a_nous_tag_requirement_400_quarantines_the_model_not_the_provider(message):
+    """Nous Portal rejects a subset of its free models (stepfun/step-3.7-flash:free,
+    upstage/solar-pro4:free) with HTTP 400 unless the request carries its required `tags`, and
+    then unless one of them is `user=`; every sibling free model on the same account answers fine
+    either way. This is the REQUEST-rejection twin of the `model_not_entitled` 403 case above: the
+    same `model_not_found` verdict, so only the named model is quarantined — never a Nous provider
+    cooldown — and the reason stays retryable instead of ending the run as the terminal
+    `bad_upstream_request` it used to classify as.
+    """
+    body = json.dumps({"status": 400, "message": message})
+    markers = FailureMarkers().with_extra(
+        model_not_entitled_request_rejection=(
+            "additional info: missing tags",
+            "additional info: missing user tag",
+        ),
+    )
+
+    reason = classify_failure(400, body, markers=markers)
+
+    assert reason == "model_not_found"
+    policy = cooldown_policy_for_reason(reason, source="nous")
+    assert policy.provider_cooldown is False
+    assert policy.model_cooldown is False
+    assert policy.quarantine is not None
+    assert policy.quarantine.reason == "model_not_found"
+
+
+def test_an_unrelated_400_merely_mentioning_tags_is_not_the_nous_gate():
+    """The marker is the exact "additional info: missing tag(s)" phrasing Nous uses for this
+    verdict, not the bare words "missing"/"tags" — a genuinely malformed body that happens to
+    mention tags elsewhere must keep classifying as the terminal `bad_upstream_request`, since this
+    field carries no names-the-model guard to catch a looser match."""
+    markers = FailureMarkers().with_extra(
+        model_not_entitled_request_rejection=(
+            "additional info: missing tags",
+            "additional info: missing user tag",
+        ),
+    )
+    body = json.dumps({"error": {"message": "invalid schema for function 'tags' — missing property"}})
+
+    assert classify_failure(400, body, markers=markers) == "bad_upstream_request"

@@ -39,8 +39,12 @@ from ficelle.failures import (
     NON_RETRYABLE_FAILURE_REASONS,
     SOURCE_DIVERTING_FAILURE_REASONS,
     TERMINAL_ENDINGS,
+    UPSTREAM_MODEL_DIVERTING_FAILURE_REASONS,
+    CAPACITY_FAILURE_REASONS,
     UPSTREAM_DETAIL_LIMIT,
     caller_rejected_request,
+    contract_rejection_is_model_scoped,
+    exception_is_network_unreachable,
     exception_is_tls_failure,
     first_exception_errno,
     model_not_found_body,
@@ -64,6 +68,16 @@ from ficelle.use_cases.benchmark import finish_reason_is_error, finish_reason_is
 
 DEFAULT_CHAT_COMPLETION_MODEL = "ficelle/auto-tools"
 MAX_INLINE_RETRY_AFTER_SECONDS = 60
+# The delayed second pass over a window lost entirely to capacity failures (see `run_attempts`).
+# Free pools recharge in seconds, and a small pool — a core-only install sees OpenRouter and Nous
+# alone — can burn its whole window inside one burst. The wait honors the largest Retry-After the
+# pass saw, bounded so a request never parks for long; only the best few models are asked again.
+CAPACITY_RETRY_PASS_DEFAULT_WAIT_SECONDS = 10
+CAPACITY_RETRY_PASS_MIN_WAIT_SECONDS = 5
+CAPACITY_RETRY_PASS_MAX_WAIT_SECONDS = 30
+CAPACITY_RETRY_PASS_MAX_MODELS = 2
+# Budget the pass must leave for the retried attempts themselves once the wait is paid.
+CAPACITY_RETRY_PASS_MIN_REMAINING_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -718,6 +732,33 @@ def exclude_undersized_candidates(
     return eligible, excluded
 
 
+def exclude_over_token_limit_candidates(
+    prompt_tokens: int,
+    candidates: list[dict[str, Any]],
+    request_token_limit: Callable[[dict[str, Any]], int | None],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a pool into candidates this request's size can pass, and error rows for the ones a
+    learned per-minute token cap rules out (`record_request_token_limit_in_state`).
+
+    Unlike the context check, the cap is the provider's own figure for this account, learned from a
+    413 that already refused a bigger request, so the estimate is compared without a safety factor:
+    an underestimate costs at most the one attempt the cap used to cost on every request.
+    """
+    eligible: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for candidate in candidates:
+        limit = request_token_limit(candidate)
+        if limit is not None and prompt_tokens > limit:
+            excluded.append(excluded_candidate_row(
+                candidate,
+                "request_too_large",
+                f"request needs ~{prompt_tokens} tokens, provider allows {limit} per minute",
+            ))
+            continue
+        eligible.append(candidate)
+    return eligible, excluded
+
+
 def declared_unsupported_schema_features(source: Any, config: dict[str, Any]) -> set[str]:
     """The tool-schema features a provider declares it cannot take (L3-R4).
 
@@ -897,6 +938,11 @@ def attempts_with_source_diversity(
             break
         selected.append(candidate)
     return selected
+
+
+def upstream_model_key(upstream_id: Any) -> str:
+    """The upstream model an id names, whichever provider serves it (`x:free` and `x` alike)."""
+    return str(upstream_id or "").strip().lower().removesuffix(":free")
 
 
 def attempts_after_source_rejection(
@@ -1509,12 +1555,15 @@ def evaluate_upstream_failure_response(
     if hint is not None:
         attempt_update.update({"retry_after_seconds": hint.seconds, "retry_after_source": hint.source})
         error.update({"retry_after_seconds": hint.seconds, "retry_after_source": hint.source})
+    # Size evidence can follow long model/account names. The state writer must parse it before
+    # redacting and truncating its diagnostic copy, or the learned cap silently disappears.
+    cooldown_text = text if reason == "request_too_large" else text[:250]
     return UpstreamFailureDecision(
         outcome="retryable_failure" if _should_retry(reason, requested_model_is_virtual) else "terminal_failure",
         attempt_update=attempt_update,
         error=error,
         cooldown_reason=reason,
-        cooldown_detail=f"HTTP {status_code}: {text[:250]}",
+        cooldown_detail=f"HTTP {status_code}: {cooldown_text}",
         cooldown_status=status_code,
         retry_after_seconds=hint.seconds if hint is not None else None,
         retry_after_source=hint.source if hint is not None else None,
@@ -1555,6 +1604,12 @@ def evaluate_invocation_exception(
         # A handshake that fails describes the transport to the provider's host, never one model
         # id, so it is provider-scoped too — with a much shorter window than a dead credential.
         reason = error_reason = "tls_error"
+        status = "exception"
+    elif exception_is_network_unreachable(exc):
+        # The provider's host could not be resolved or routed to: nothing reached it, so no model
+        # is to blame. Provider-scoped and short, and unscored (UNSCORED_FAILURE_REASONS) — an ISP
+        # outage used to cool every model a request touched for 600s.
+        reason = error_reason = "network_unreachable"
         status = "exception"
     else:
         reason = "timeout" if timeout else "unavailable"
@@ -1936,6 +1991,7 @@ class ChatCompletionRouter:
         pause: Callable[[float], None] | None = None,
         select_result: ResultSelector | None = None,
         selection_retry_after: Callable[[SelectionResult, dict[str, Any]], int | None] | None = None,
+        request_token_limit: Callable[[dict[str, Any]], int | None] | None = None,
     ) -> None:
         self.config = config
         self.load_catalog = load_catalog
@@ -1952,6 +2008,7 @@ class ChatCompletionRouter:
         self.pause = pause or (lambda _seconds: None)
         self.select_result = select_result
         self.selection_retry_after = selection_retry_after
+        self.request_token_limit = request_token_limit or (lambda _candidate: None)
 
     def start(
         self,
@@ -2067,7 +2124,12 @@ class ChatCompletionRouter:
             safety_factor=context_estimate_safety_factor,
             completion_tokens=completion_tokens,
         )
-        excluded = incompatible_excluded + undersized_excluded
+        eligible, over_limit_excluded = exclude_over_token_limit_candidates(
+            context_exclusion_tokens_estimate - completion_tokens,
+            eligible,
+            self.request_token_limit,
+        )
+        excluded = incompatible_excluded + undersized_excluded + over_limit_excluded
         # Demotion, not exclusion: a candidate that only just fits stays eligible, but is tried
         # only after ones with real headroom for this request. `prefer_context_headroom` is a
         # stable partition, so a small request — where nothing is demoted — comes back unchanged.
@@ -2134,6 +2196,9 @@ class ChatCompletionRouter:
         # a `shared_account:` key blocks candidates of several.
         ruled_out_sources: set[str] = set()
         ruled_out_quota_keys: set[str] = set()
+        # Upstream models whose own answer was unusable (UPSTREAM_MODEL_DIVERTING_FAILURE_REASONS):
+        # another provider serving the same weights would answer the same body the same way.
+        ruled_out_upstreams: set[str] = set()
         # The request's known size, raised only when an upstream itself rejects a candidate for
         # context length: starts at the plan's estimate and grows to whatever the rejection proves
         # (the upstream's own stated size, or the failing candidate's own context, whichever is
@@ -2152,6 +2217,8 @@ class ChatCompletionRouter:
             # `any` is bounded by the window and never by the pool — a few hundred string
             # comparisons on the worst request, against one HTTP round trip per attempt.
             if candidate_context_too_small(candidate, required_context):
+                return True
+            if upstream_model_key(candidate.get("upstream_id")) in ruled_out_upstreams:
                 return True
             return str(candidate.get("source") or "") in ruled_out_sources or any(
                 ports.quota_cooldown_matches_model(key, candidate) for key in ruled_out_quota_keys
@@ -2202,7 +2269,65 @@ class ChatCompletionRouter:
             capacity_retried_ids.add(model_id)
             return seconds
 
-        while pending or retry_same_model is not None:
+        capacity_pass_started = False
+
+        def capacity_retry_pass() -> list[dict[str, Any]]:
+            """The window is spent and every attempt hit a capacity limit: wait once, ask again.
+
+            Moving on to the next candidate beats waiting while the window lasts (see
+            `inline_capacity_retry_delay`); this runs only once it is gone, when the alternative is
+            a 502 with most of the request budget unused. The candidates are the same ones, asked in
+            the same order despite the cooldowns their first failure wrote — the cooldowns steer the
+            NEXT request, while this one has already paid for the evidence that the limits are
+            short-lived. Nothing has reached the caller, so a retry here is never a faked one.
+            """
+            nonlocal capacity_pass_started
+            if capacity_pass_started or not plan.requested_model_is_virtual or not attempts:
+                return []
+            if not self.config.get("capacity_retry_pass", True):
+                return []
+            if any(str(row.get("reason") or "") not in CAPACITY_FAILURE_REASONS for row in attempts):
+                return []
+            capacity_pass_started = True
+            hinted = [
+                seconds
+                for row in attempts
+                if (seconds := _safe_int(row.get("retry_after_seconds"), 0)) > 0
+            ]
+            wait = max(max(hinted, default=CAPACITY_RETRY_PASS_DEFAULT_WAIT_SECONDS), CAPACITY_RETRY_PASS_MIN_WAIT_SECONDS)
+            # A provider that asked for longer than the pass may wait would only answer 429 again.
+            if wait > CAPACITY_RETRY_PASS_MAX_WAIT_SECONDS:
+                return []
+            if deadline is not None and deadline - self.now() <= wait + CAPACITY_RETRY_PASS_MIN_REMAINING_SECONDS:
+                return []
+            if ports.terminal_reason() is not None:
+                return []
+            by_id = {str(candidate.get("id") or ""): candidate for candidate in [*plan.candidates, *candidate_pool]}
+            retried: list[dict[str, Any]] = []
+            for row in attempts:
+                model_id = str(row.get("model") or "")
+                candidate = by_id.get(model_id)
+                if candidate is None or model_id in capacity_retried_ids or candidate in retried:
+                    continue
+                retried.append(candidate)
+                if len(retried) >= CAPACITY_RETRY_PASS_MAX_MODELS:
+                    break
+            # Waited in one-second steps so a stopping service or a caller that hung up ends the
+            # wait: the shutdown drain is shorter than the longest wait, and the loop's own
+            # terminal check right after this names the ending properly.
+            waited = 0.0
+            while retried and waited < wait and ports.terminal_reason() is None:
+                step = min(1.0, wait - waited)
+                self.pause(step)
+                waited += step
+            return retried
+
+        while True:
+            if not pending and retry_same_model is None:
+                # The window is spent; the capacity pass may pause, then hand back a second one.
+                pending = capacity_retry_pass()
+                if not pending:
+                    break
             is_retry = retry_same_model is not None
             if is_retry:
                 model = retry_same_model
@@ -2226,13 +2351,33 @@ class ChatCompletionRouter:
                 # attempt budget (`considered + pending <= planned`) reasoning about a set that cannot
                 # move.
                 last_attempt = attempts[-1] if attempts else {}
+                last_reason = str(last_attempt.get("reason") or "")
                 rejected_source = str(last_attempt.get("source") or "")
+                model_scoped_contract = (
+                    last_reason in SOURCE_DIVERTING_FAILURE_REASONS
+                    and contract_rejection_is_model_scoped(str((errors[-1] if errors else {}).get("detail") or ""))
+                )
                 if (
-                    str(last_attempt.get("reason") or "") in SOURCE_DIVERTING_FAILURE_REASONS
+                    last_reason in SOURCE_DIVERTING_FAILURE_REASONS
+                    and not model_scoped_contract
                     and rejected_source not in ruled_out_sources
                 ):
                     ruled_out_sources.add(rejected_source)
                     divert_pending = True
+                rejected_upstream = upstream_model_key(last_attempt.get("upstream"))
+                if (
+                    (last_reason in UPSTREAM_MODEL_DIVERTING_FAILURE_REASONS or model_scoped_contract)
+                    and rejected_upstream
+                    and rejected_upstream not in ruled_out_upstreams
+                ):
+                    ruled_out_upstreams.add(rejected_upstream)
+                    # Only when a sibling source of it is still on offer: re-planning is not neutral
+                    # (see `rule_out`), and a model the pool serves once needs no exclusion.
+                    divert_pending = divert_pending or any(
+                        str(candidate.get("id") or "") not in considered_ids
+                        and upstream_model_key(candidate.get("upstream_id")) == rejected_upstream
+                        for candidate in candidate_pool
+                    )
                 # A candidate rejected the request for its context length: its own context is now
                 # known too small, and the upstream's own stated request size (if it gave one) is
                 # ground truth stronger than Ficelle's char/4 estimate. Neither fact blocks a
@@ -2308,6 +2453,8 @@ class ChatCompletionRouter:
                 "upstream": model.get("upstream_id"),
                 "source": model.get("source"),
             }
+            if capacity_pass_started:
+                attempt["capacity_retry_pass"] = True
             # The remaining request budget constrains the in-flight attempt (L2-R2), not
             # only the decision to start one: the invocation derives its read timeout from
             # it and the streaming consumer stops at the absolute deadline.

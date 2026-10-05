@@ -6,10 +6,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from ficelle.failures import (
-    NO_MODEL_FAULT_FAILURE_REASONS,
     MODEL_NOT_SERVEABLE_NOTE,
     PROVIDER_SCOPED_COOLDOWN_REASONS,
+    UNSCORED_FAILURE_REASONS,
     CooldownPolicy,
+    request_token_limit_from_detail,
 )
 from ficelle.state_store import parse_iso_timestamp
 
@@ -624,10 +625,9 @@ def _record_failure(
     record["failures"] = ports.safe_int(record.get("failures"), 0) + 1
     _decay_scored_counters(record, now_epoch)
     # A failure the model is not answerable for — a caller's own bad request, Ficelle's own deadline
-    # or restart — stays visible in the lifetime totals but must drag neither the score nor the
-    # ledger: none of these reasons cools, so there is no escalation to feed either. See
-    # NO_MODEL_FAULT_FAILURE_REASONS.
-    if reason not in NO_MODEL_FAULT_FAILURE_REASONS:
+    # or restart, this machine's lost network — stays visible in the lifetime totals but must drag
+    # neither the score nor the model's ledger. See UNSCORED_FAILURE_REASONS.
+    if reason not in UNSCORED_FAILURE_REASONS:
         record["scored_failures"] = round(_safe_number(record.get("scored_failures")) + 1.0, 6)
         # The ledger row is keyed on the ATTEMPT reason when the caller observed one. Several
         # distinct endings share one cooldown reason — an empty assistant message, a bad
@@ -1164,6 +1164,48 @@ def prune_provider_scoped_model_cooldowns_in_state(state: dict[str, Any]) -> Non
             del cooldowns[key]
 
 
+# A provider can raise an account's limit and nothing else lifts a learned cap, so it expires; the
+# next 413 re-learns it at the cost of one attempt.
+REQUEST_TOKEN_LIMIT_TTL_SECONDS = 7 * 86_400
+
+
+def record_request_token_limit_in_state(
+    state: dict[str, Any],
+    model: dict[str, Any],
+    detail: str | None,
+    *,
+    ports: CooldownWritePorts,
+) -> None:
+    """Remember the per-minute token limit a 413 named, when the request alone exceeded it.
+
+    The short `request_too_large` cooldown is right for a spent window, which recharges, and wrong
+    for a request bigger than the whole window, which never passes: Groq's free tier (7000 input
+    tokens a minute) was offered every compression of 19k-47k tokens, wasting one of its four
+    attempts each time. `plan_attempts` reads the cap back through `request_token_limit`.
+    """
+    limit = request_token_limit_from_detail(detail)
+    if limit is None:
+        return
+    state.setdefault("request_token_limits", {})[ports.cooldown_key(model)] = {
+        "limit": limit,
+        "set_at": ports.now_iso(),
+        "set_at_ts": ports.now_seconds(),
+    }
+
+
+def learned_request_token_limit(state: dict[str, Any], model: dict[str, Any], now_ts: float) -> int | None:
+    """The cap `record_request_token_limit_in_state` learned for this model, while still trusted."""
+    limits = state.get("request_token_limits")
+    row = limits.get(cooldown_key(model)) if isinstance(limits, dict) else None
+    if not isinstance(row, dict):
+        return None
+    set_at = _safe_timestamp(row.get("set_at_ts"))
+    if set_at is None or now_ts - set_at > REQUEST_TOKEN_LIMIT_TTL_SECONDS:
+        return None
+    limit = _safe_number(row.get("limit"))
+    return int(limit) if limit > 0 else None
+
+
 def set_cooldown_in_state(
     state: dict[str, Any],
     model: dict[str, Any],
@@ -1241,6 +1283,8 @@ def set_cooldown_in_state(
             quarantine.source,
             quarantine.fallback_note,
         )
+    if reason == "request_too_large":
+        record_request_token_limit_in_state(state, model, detail, ports=ports)
     applied = AppliedCooldown(provider_source=provider_source, quota_key=quota_key)
     if not policy.model_cooldown:
         return applied

@@ -24,6 +24,7 @@ import sysconfig
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from contextlib import contextmanager
@@ -41,6 +42,7 @@ from packaging.version import InvalidVersion, Version
 from ficelle import __version__ as CORE_VERSION
 from ficelle.json_store import atomic_write_json, load_json
 from ficelle.probe_lock import file_lock
+from ficelle.redaction import sanitize_error_detail
 from ficelle.runtime_paths import RuntimePaths
 from ficelle.url_security import uses_secure_http_transport
 
@@ -411,6 +413,53 @@ def _open_secure_url(
     ).open(request, timeout=timeout)
 
 
+# What a Pro user can do about a refused Pro artifact. Without it the update ended on a bare
+# `download failed (HTTPError)` and a machine whose license was gone stayed on 0.3.7 for a month.
+PRO_LICENSE_ACTION = (
+    "run `ficelle license refresh`, or `ficelle license activate` with a valid license key, "
+    "then retry the update"
+)
+PRO_BEARER_ACTION = (
+    "ask your deployment administrator to renew FICELLE_UPDATE_PRO_TOKEN, then retry the update"
+)
+# The license service's refusals of an update credential: missing, unknown or revoked activation,
+# or a subscription that no longer serves downloads.
+PRO_REFUSAL_STATUSES = frozenset({401, 402, 403, 404})
+
+
+def _pro_refusal_message(summary: str, reason: str, action: str = PRO_LICENSE_ACTION) -> str:
+    # Both check and apply expose at most 240 characters; keep the recovery action intact.
+    detail = sanitize_error_detail(reason, min(120, 240 - len(summary) - len(action) - 4))
+    return f"{summary}: {detail or 'authorization unavailable'}; {action}"
+
+
+def _ensure_live_entitlement() -> None:
+    """Renew a lapsed entitlement before it is handed to the Pro artifact download.
+
+    A daemon older than the auto-renewal never refreshed its token, so the first sign of a lapsed
+    or revoked license was the download refusal. Refreshing here repairs the lapsed case, and turns
+    the revoked one into the service's own reason at check time instead of a failed install.
+    """
+    from ficelle import license_ops
+
+    if license_ops.is_entitled():
+        return
+    try:
+        license_ops.refresh()
+    except (license_ops.LicenseOperationError, license_ops.ProPackUnavailable) as exc:
+        raise UpdateUnavailable(
+            _pro_refusal_message("Pro license refresh failed", str(exc))
+        ) from exc
+    except OSError as exc:
+        raise UpdateUnavailable(
+            "the Pro entitlement could not be refreshed or saved locally; "
+            "check Ficelle runtime directory permissions, then retry the update"
+        ) from exc
+    if not license_ops.is_entitled():
+        # Refresh may successfully cache a signed canceled/unpaid state to disable Pro.
+        raise UpdateUnavailable(f"the refreshed Pro entitlement is not active; {PRO_LICENSE_ACTION}")
+
+
 def _pro_update_token(artifact: ReleaseArtifact) -> str | None:
     if artifact.authorization == "none":
         return None
@@ -424,6 +473,7 @@ def _pro_update_token(artifact: ReleaseArtifact) -> str | None:
 
         if not _same_origin(artifact.url, license_ops.service_url()):
             raise UpdateUnavailable("the Pro artifact origin does not match the license service")
+        _ensure_live_entitlement()
         token = license_ops.cached_entitlement_token()
         if not token:
             raise UpdateUnavailable("the active Pro entitlement is not available for update")
@@ -581,25 +631,23 @@ def check_for_updates(
             latest_version = Version(manifest.version)
             available = latest_version > current_version
             pro_required = False
+            pro_message = "A compatible Pro artifact and update authorization are required for this installed Pro build."
             if available and _is_pro_installed():
                 if manifest.pro is None:
                     pro_required = True
                 else:
                     try:
                         _pro_update_token(manifest.pro)
-                    except UpdateUnavailable:
+                    except UpdateUnavailable as exc:
                         pro_required = True
+                        pro_message = str(exc)
             payload = {
                 **manifest.internal_dict(),
                 "status": "available" if available else "up_to_date",
                 "update_available": available,
                 "pro_update_required": pro_required,
                 "checked_at": _now_iso(),
-                "message": (
-                    "A compatible Pro artifact and update authorization are required for this installed Pro build."
-                    if pro_required
-                    else ""
-                ),
+                "message": pro_message if pro_required else "",
             }
             return _persist_checked_status(payload)
         except (UpdateError, InvalidVersion) as exc:
@@ -674,7 +722,11 @@ def queue_update() -> dict[str, Any]:
     current = read_update_status()
     if str(current.get("status")) in ACTIVE_UPDATE_STATUSES and not update_check_is_due(current):
         raise UpdateInProgress("another Ficelle update is already running")
-    if not bool(current.get("update_available")) or not current.get("core_wheel_url"):
+    if (
+        not bool(current.get("update_available"))
+        or not current.get("core_wheel_url")
+        or bool(current.get("pro_update_required"))
+    ):
         current = check_for_updates(force=True)
     with exclusive_update_lock(wait=False):
         current = read_update_status()
@@ -896,6 +948,19 @@ def _download_artifact(
     except UpdateError:
         path.unlink(missing_ok=True)
         raise
+    except urllib.error.HTTPError as exc:
+        path.unlink(missing_ok=True)
+        if authorization_token and exc.code in PRO_REFUSAL_STATUSES:
+            action = PRO_BEARER_ACTION if artifact.authorization == "bearer" else PRO_LICENSE_ACTION
+            raise UpdateUnavailable(
+                _pro_refusal_message(
+                    f"Pro update refused (HTTP {exc.code})",
+                    _service_error_text(exc, authorization_token=authorization_token),
+                    action,
+                )
+            ) from exc
+        exc.close()
+        raise UpdateError(f"release artifact download failed (HTTP {exc.code})") from exc
     except Exception as exc:
         path.unlink(missing_ok=True)
         raise UpdateError(f"release artifact download failed ({type(exc).__name__})") from exc
@@ -903,6 +968,20 @@ def _download_artifact(
         path.unlink(missing_ok=True)
         raise UpdateError("release artifact checksum mismatch")
     return path
+
+
+def _service_error_text(exc: urllib.error.HTTPError, *, authorization_token: str) -> str:
+    """The license service's own `{"error": ...}` reason, bounded; the status text otherwise."""
+    try:
+        with exc:
+            body = json.loads(exc.read(4096) or b"{}")
+    except Exception:
+        # A truncated or unreadable error body must not hide the authorization refusal.
+        body = {}
+    reason = body.get("error") if isinstance(body, dict) else None
+    reason = reason if isinstance(reason, str) and reason else str(exc.reason or "authorization refused")
+    # Signed entitlements and managed tokens need not match the generic secret patterns.
+    return sanitize_error_detail(reason.replace(authorization_token, "[redacted]"), 120) or "authorization refused"
 
 
 @dataclass(frozen=True)

@@ -31,6 +31,10 @@
         </button>
         <div class="notice-stack" id="noticeStack">
           <section class="update-banner" id="updateBanner" hidden aria-live="polite"></section>
+          <!-- Pro entitlement lapse (expired or in offline grace). No dismiss: routing is
+               actually degraded (provider pack disabled) or about to be, so this stays until
+               the entitlement is refreshed, unlike the notices below it. -->
+          <section class="update-banner is-error" id="licenseBanner" hidden aria-live="assertive"></section>
           <!-- Runtime strict-zero guard: a provider declared one catalog model paid. The model is
                already quarantined; this notice explains the automatic routing change. -->
           <section class="update-banner is-error" id="paidModelBanner" hidden aria-live="assertive"></section>
@@ -74,6 +78,7 @@
                 <span class="badge accent" id="eligibleBadge">0 usable</span>
               </div>
               <div class="card-body">
+                <div class="hint" id="candidateBreakdown"></div>
                 <div class="hint" id="profileHint"></div>
                 <div class="stream-policy-setting">
                   <div class="stream-policy-head">

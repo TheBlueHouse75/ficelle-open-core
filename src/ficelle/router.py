@@ -323,6 +323,7 @@ from ficelle.use_cases.cooldowns import (
     completion_tokens_per_second,
     cooldown_key as cooldown_key_use_case,
     failure_ledger_summary,
+    learned_request_token_limit,
     model_is_quarantined as model_is_quarantined_use_case,
     model_on_cooldown as model_on_cooldown_use_case,
     model_quarantine as model_quarantine_use_case,
@@ -1148,6 +1149,7 @@ DEFAULT_VIRTUAL_PROFILES["ficelle/auto-fast"].update(
 DEFAULT_VIRTUAL_PROFILES["ficelle/auto-compression"].update(
     {
         "mode": "manual_order",
+        "excluded_models": ["ficelle/nous/meituan/longcat-2.0:free"],
         "models": [
             "ficelle/openrouter/google/gemma-4-31b-it:free",
             "ficelle/nous/stepfun/step-3.7-flash:free",
@@ -1464,10 +1466,12 @@ CORE_PROVIDERS: dict[str, dict] = {
 LEGACY_REQUEST_TIMEOUT_SECONDS = 120
 LEGACY_REQUEST_DEADLINE_SECONDS = 300
 # 4 adds the `auto-fast` read-inactivity cap below; 5 replaces a stored `max_attempts_per_request:
-# 0`. Bumping the version is what re-runs `migrate_legacy_config_defaults` over configs that already
+# 0`; 6 lowers a stored `auto-compression` completion-char budget still at its legacy default.
+# Bumping the version is what re-runs `migrate_legacy_config_defaults` over configs that already
 # carry a full copy of the defaults. The stored key keeps its historical name: renaming it would
 # read as version 0 on every install and re-run every migration.
-REQUEST_TIMEOUT_POLICY_VERSION = 5
+REQUEST_TIMEOUT_POLICY_VERSION = 6
+LEGACY_MAX_COMPLETION_CHARS_BY_PROFILE = {"ficelle/auto-compression": 400_000}
 LEGACY_REQUEST_TIMEOUT_SECONDS_BY_PROFILE = {
     "ficelle/auto-fast": 30,
     "ficelle/auto-json": 45,
@@ -1501,13 +1505,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "request_timeout_seconds_by_profile": {"ficelle/auto-fast": 120},
     # Compression summaries are the one profile Hermes deliberately never bounds with
     # `max_tokens`, so a model that starts repeating or looping has nothing else to stop it
-    # short of the global upstream-response-size guard. 400k chars is roughly 100k tokens: 2.5x
-    # the largest legitimate summary (a 131k-context request staying under the 30% budget Hermes
-    # targets) and 3.7x the largest one measured on this install (27k completion tokens, the
-    # 9.5 MB SSE answer of 11/09/2026), while the runaway that motivated this guard passed it in
-    # the first minutes of its ten. Every other profile is unbounded until it earns its own entry.
-    "max_completion_chars_by_profile": {"ficelle/auto-compression": 400_000},
+    # short of the global upstream-response-size guard. 150k chars is 1.3x the largest legitimate
+    # summary measured over 800 successful compressions (116k chars / 30k tokens, 11/09/2026). The
+    # earlier 400k sat above real runaways: on 25/09/2026 four nex-n2.5-mini summaries looped to
+    # 324k-396k chars and were cut by Hermes' 600 s client timeout instead of this guard, so they
+    # never failed over nor cooled the model. Every other profile is unbounded until it earns its
+    # own entry.
+    "max_completion_chars_by_profile": {"ficelle/auto-compression": 150_000},
     "max_attempts_per_request": 4,
+    # One delayed second pass (a bounded wait, then the best two models again) when every attempt
+    # of the window hit a capacity limit. It matters most on a small pool — a core-only install
+    # routes over OpenRouter and Nous alone — where one rate-limit burst spends the whole window.
+    "capacity_retry_pass": True,
     # Total wall-clock budget for one request, across every attempt. This remains the hard bound
     # when a provider keeps the socket active or a sequence of fallbacks consumes multiple read
     # budgets. It is deliberately larger than the read-inactivity timeout so a slow first attempt
@@ -1529,6 +1538,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # expired intermediate, a proxy hiccup); short enough that a provider recovering inside a
         # minute is not benched for the 3600s an auth failure earns.
         "tls_error": 180,
+        # No DNS answer or no route out: on this side of the router, typically an ISP outage, so
+        # the host is retried within a minute of the line coming back.
+        "network_unreachable": 60,
         "timeout": 300,
         "unavailable": 600,
         # The model answered, but kept generating well past what any legitimate answer for the
@@ -2108,6 +2120,11 @@ def migrate_legacy_config_defaults(
         config["request_timeout_seconds"] = DEFAULT_CONFIG["request_timeout_seconds"]
     if existing.get("request_deadline_seconds") == LEGACY_REQUEST_DEADLINE_SECONDS:
         config["request_deadline_seconds"] = DEFAULT_CONFIG["request_deadline_seconds"]
+
+    def still_legacy(legacy_by_profile: dict[str, int], profile_id: str, value: Any) -> bool:
+        # Compared as integers: a hand-edited or re-serialized config may hold 45.0 or "400000".
+        return profile_id in legacy_by_profile and safe_int(value, -1) == legacy_by_profile[profile_id]
+
     profile_timeouts = existing.get("request_timeout_seconds_by_profile")
     if isinstance(profile_timeouts, dict):
         config["request_timeout_seconds_by_profile"] = {
@@ -2115,8 +2132,20 @@ def migrate_legacy_config_defaults(
             **{
                 profile_id: value
                 for profile_id, value in profile_timeouts.items()
-                if LEGACY_REQUEST_TIMEOUT_SECONDS_BY_PROFILE.get(profile_id) != value
+                if not still_legacy(LEGACY_REQUEST_TIMEOUT_SECONDS_BY_PROFILE, profile_id, value)
             },
+        }
+    # Only a value still at the legacy default moves; defaults for absent entries come from the
+    # config store's own merge, as for every other key.
+    completion_budgets = existing.get("max_completion_chars_by_profile")
+    if isinstance(completion_budgets, dict):
+        config["max_completion_chars_by_profile"] = {
+            profile_id: (
+                DEFAULT_CONFIG["max_completion_chars_by_profile"][profile_id]
+                if still_legacy(LEGACY_MAX_COMPLETION_CHARS_BY_PROFILE, profile_id, value)
+                else value
+            )
+            for profile_id, value in completion_budgets.items()
         }
     config["request_timeout_policy_version"] = REQUEST_TIMEOUT_POLICY_VERSION
 
@@ -5534,6 +5563,39 @@ def redact_runtime_state(state: Any) -> dict[str, Any]:
 ADMIN_NOTICE_LIMIT = 20
 
 
+def admin_license_notice() -> dict[str, Any] | None:
+    """Lightweight ``license`` notice for ``/admin/notices``: an entitlement past ``is_entitled``.
+
+    Absent (returns ``None``) on a core-only install, when the Pro pack has never been
+    activated (no cached entitlement to compare against — that is a setup state, not a lapse),
+    and while the cached entitlement is healthy. Never includes the license key or the signed
+    entitlement token (see ``license_ops.cached_entitlement_token``); only the redacted
+    timestamps the dashboard needs to explain the lapse and link to the License page's Refresh.
+    """
+    from ficelle.pro import pro_installed
+
+    if not pro_installed():
+        return None
+    try:
+        entitlement = license_ops.cached_entitlement()
+    except (license_ops.LicenseNotInstalled, license_ops.ProPackUnavailable, ImportError):
+        return None
+    if entitlement is None:
+        return None
+    if entitlement.in_offline_grace():
+        state = "offline_grace"
+    elif not license_ops.is_entitled():
+        # The routing gate itself, not the entitlement alone: a development pack serves regardless.
+        state = "expired"
+    else:
+        return None
+    return {
+        "state": state,
+        "grace_deadline": entitlement.grace_deadline,
+        "expires_at": entitlement.expires_at,
+    }
+
+
 def admin_notices_payload(state: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return lightweight automatic guard notices for dashboard polling.
 
@@ -5587,7 +5649,7 @@ def admin_notices_payload(state: dict[str, Any] | None = None) -> dict[str, Any]
         if isinstance(model, dict)
         if (model_id := safe_detail(model.get("id"), 250))
     }
-    return {
+    payload = {
         "paid_models": [row for _timestamp, row in rows[:ADMIN_NOTICE_LIMIT]],
         # Unlike the detailed paid-model banner, this projection uses every active guard:
         # an older quarantine must not survive in the independent arrivals banner.
@@ -5601,6 +5663,10 @@ def admin_notices_payload(state: dict[str, Any] | None = None) -> dict[str, Any]
             "model_count": len(models) if isinstance(models, list) else 0,
         },
     }
+    license_notice = admin_license_notice()
+    if license_notice is not None:
+        payload["license"] = license_notice
+    return payload
 
 
 def last_profile_prune_row(raw_value: Any) -> dict[str, Any]:
@@ -6258,6 +6324,7 @@ def admin_status_ports() -> AdminStatusBuildPorts:
     return AdminStatusBuildPorts(
         model_on_cooldown=model_on_cooldown,
         model_is_quarantined=model_is_quarantined,
+        model_matches_profile_requirements=model_matches_profile_requirements,
         normalized_virtual_profiles=normalized_virtual_profiles,
         redact_runtime_state=redact_runtime_state,
         candidates_for_profile=candidates_for_profile,
@@ -7360,6 +7427,13 @@ def schedule_quota_probes(config: dict[str, Any], catalog: dict[str, Any], *, ke
 
 def cooldown_key(model: dict[str, Any]) -> str:
     return cooldown_key_use_case(model)
+
+
+def request_token_limit_reader() -> Callable[[dict[str, Any]], int | None]:
+    """Learned token caps for one request, read from a single state snapshot."""
+    state = load_runtime_state()
+    now_ts = time.time()
+    return lambda model: learned_request_token_limit(state, model, now_ts)
 
 
 def cooldown_read_ports() -> CooldownReadPorts:
@@ -13981,6 +14055,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 now=time.monotonic,
                 pause=time.sleep,
                 selection_retry_after=selection_retry_after_seconds,
+                request_token_limit=request_token_limit_reader(),
             )
             def attempt_ports_factory(attempt_plan: ChatCompletionAttemptPlan) -> ChatCompletionAttemptPorts:
                 compression_metadata = attempt_plan.compression_metadata
@@ -14533,6 +14608,29 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
             record_catalog_refresh_error(None)
 
 
+LICENSE_REFRESH_CHECK_SECONDS = 6 * 3600
+LICENSE_REFRESH_RETRY_SECONDS = 3600
+
+
+def license_refresh_loop() -> None:
+    """Keep a Pro entitlement renewed while the daemon runs (see `license_ops.refresh_if_due`).
+
+    Nothing leaves the machine until a renewal is due; a failure retries hourly, well inside the
+    signed grace, and never touches routing.
+    """
+    while True:
+        delay = LICENSE_REFRESH_CHECK_SECONDS
+        try:
+            if license_ops.refresh_if_due() is not None:
+                print("ficelle: Pro license entitlement refreshed", flush=True)
+        except license_ops.ProPackUnavailable:
+            return
+        except Exception as exc:
+            print(f"ficelle: Pro license refresh failed: {safe_detail(exc)}", flush=True)
+            delay = LICENSE_REFRESH_RETRY_SECONDS
+        time.sleep(delay)
+
+
 # How long a SIGTERM waits for requests already in flight. launchd's default `ExitTimeOut` is 20s
 # and the plist sets none, so that is the whole budget: past it the process is SIGKILLed anyway.
 # Five seconds was well under it and cut multi-minute routes short for no gain; requests in flight
@@ -14543,7 +14641,10 @@ SHUTDOWN_DRAIN_SECONDS = 20.0
 
 def drain_inflight_requests(server: Any, timeout_seconds: float) -> int:
     """Wait up to `timeout_seconds` for handler threads to finish. Returns how many still ran."""
-    threads = [thread for thread in getattr(server, "_threads", None) or [] if thread.is_alive()]
+    # socketserver only swaps its class-level `_NoThreads` placeholder (truthy, not iterable) for a
+    # real `_Threads` list on the first request, so a server stopped before serving one has none.
+    tracked = getattr(server, "_threads", None)
+    threads = [thread for thread in tracked if thread.is_alive()] if isinstance(tracked, list) else []
     if not threads:
         return 0
     deadline = time.monotonic() + timeout_seconds
@@ -14647,6 +14748,7 @@ def serve(config: dict[str, Any]) -> None:
     # letting the Settings toggle take effect without a restart. Daemon so it dies with the process.
     threading.Thread(target=auto_benchmark_loop, args=(config,), name="ficelle-auto-benchmark", daemon=True).start()
     threading.Thread(target=update_service.update_check_loop, name="ficelle-update-check", daemon=True).start()
+    threading.Thread(target=license_refresh_loop, name="ficelle-license-refresh", daemon=True).start()
     # A SIGKILL between create and rename leaves a temp file behind for good; startup is the
     # natural moment to clear them, when no write of ours is in flight.
     swept = sweep_orphan_temp_files(ROUTER_DIR)
