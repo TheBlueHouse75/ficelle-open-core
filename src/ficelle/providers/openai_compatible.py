@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
 
+from ficelle import __version__
 from ficelle.config_store import deep_merge
 from ficelle.domain_models import ProviderBudget
 from ficelle.failures import DEFAULT_FAILURE_MARKERS, FailureMarkers
+from ficelle.license_ops import load_or_create_machine_fingerprint
 from ficelle.providers.base import (
     CatalogFetchContext,
     FREE_ACCESS_SCOPES,
@@ -43,6 +46,15 @@ OPENCODE_ZEN_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
+# Nous Portal requires an OpenAI-compatible `tags` array on some of its free models (observed on
+# stepfun/step-3.7-flash:free and upstage/solar-pro4:free — HTTP 400 "missing tags" with none, then
+# "missing user tag" once `product=`/`client=` tags are present but no `user=` one is), while other
+# free models on the same account (inclusionai/ling-3.0-flash-fin, poolside/laguna-s-2.1,
+# meituan/longcat-2.0) answer fine with or without them. Sent on every Nous request rather than
+# only on the models known to need it, since the requirement is per-model and Nous can add it to
+# another model at any time; the tags cost nothing on a model that does not need them.
+NOUS_TAG_PRODUCT = "product=ficelle"
+NOUS_TAG_CLIENT = f"client=ficelle-v{__version__}"
 CONTEXT_LENGTH_CATALOG_ALIASES = ("context_window", "max_context_length")
 CLOUDFLARE_ACCOUNT_ID_ENV = "CLOUDFLARE_ACCOUNT_ID"
 CLOUDFLARE_ACCOUNT_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -50,6 +62,46 @@ CLOUDFLARE_MAX_CATALOG_PAGES = 100
 CLOUDFLARE_CATALOG_PAGE_SIZE = 100
 GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR = "skip_thought_signature_validator"
 MINISTRAL_MODEL_PREFIXES = ("ministral-3b", "ministral-8b", "ministral-14b")
+
+
+def _nous_pseudonymous_user_id() -> str:
+    """A stable, non-reversible per-install id for Nous's required ``user=`` tag.
+
+    Derived from Ficelle's existing machine fingerprint
+    (`license_ops.load_or_create_machine_fingerprint`, persisted under `FICELLE_HOME`) rather than
+    minting a second identity file: that fingerprint is already the one stable per-install id
+    Ficelle keeps outside of user-supplied config. It is hashed rather than sent raw, so this tag
+    can never let Nous — or anyone reading Ficelle's traffic — correlate a request with the same
+    id used for Pro machine-activation limits, and it carries no email, name, hostname, or key
+    material.
+    """
+    fingerprint = load_or_create_machine_fingerprint()
+    return hashlib.sha256(f"ficelle-nous-user-tag:{fingerprint}".encode("utf-8")).hexdigest()[:32]
+
+
+def _merged_nous_tags(existing: Any) -> list[str]:
+    """The exact ``tags`` array to send with every Nous Portal request.
+
+    Always returns a NEW list. `adapt_chat_request` runs once per candidate over the same routed
+    body (fallback can reuse it across several attempts), so mutating a caller-supplied list in
+    place would accumulate tags across candidates instead of sending the same three every time. A
+    caller-supplied ``user=`` tag — Ficelle is not the only client that can relay through Nous — is
+    dropped rather than trusted, since only Ficelle's own pseudonymous id may go out under that
+    name; the two static tags are skipped if the caller already sent them verbatim, so nothing is
+    duplicated either way.
+    """
+    tags = [
+        tag
+        for tag in (existing if isinstance(existing, list) else [])
+        # Case-insensitive: Nous itself only documents lowercase `user=`, but a caller spelling it
+        # `User=`/`USER=` must still be dropped rather than sent alongside Ficelle's own tag.
+        if isinstance(tag, str) and not tag.lower().startswith("user=")
+    ]
+    for tag in (NOUS_TAG_PRODUCT, NOUS_TAG_CLIENT):
+        if tag not in tags:
+            tags.append(tag)
+    tags.append(f"user={_nous_pseudonymous_user_id()}")
+    return tags
 
 
 def _is_gemini_thought_signature_model(model: dict[str, Any]) -> bool:
@@ -87,13 +139,20 @@ class OpenAICompatibleCatalogAdapter:
     ) -> dict[str, Any]:
         """Apply the narrow, live-proven provider request compatibility rewrites.
 
-        Mistral's confirmed Ministral models reject an explicitly disabled ``reasoning`` object;
-        that one field is removed from a copied body. Other providers, other Mistral models, Google
-        models other than Gemini, and Gemini bodies without an unsigned current-turn tool step keep
-        object identity. Gemini requires a thought signature on the first parallel function call,
-        but permits its official validator-skip sentinel for tool history from another model.
-        Preserve any supplied signature rather than replacing it.
+        Nous Portal gets its own required ``tags`` array on every request (never any other
+        source), merged with whatever the caller already sent. Mistral's confirmed Ministral
+        models reject an explicitly disabled ``reasoning`` object; that one field is removed from
+        a copied body. Other providers, other Mistral models, Google models other than Gemini, and
+        Gemini bodies without an unsigned current-turn tool step keep object identity. Gemini
+        requires a thought signature on the first parallel function call, but permits its official
+        validator-skip sentinel for tool history from another model. Preserve any supplied
+        signature rather than replacing it.
         """
+        if self.source == "nous":
+            adapted_payload = dict(payload)
+            adapted_payload["tags"] = _merged_nous_tags(payload.get("tags"))
+            return adapted_payload
+
         if self.source == "mistral" and _is_confirmed_ministral_model(model):
             reasoning = payload.get("reasoning")
             if isinstance(reasoning, dict) and reasoning.get("enabled") is False:
@@ -228,6 +287,24 @@ class OpenAICompatibleCatalogAdapter:
             # of OpenRouter for an hour (2026-09-11).
             return DEFAULT_FAILURE_MARKERS.with_extra(
                 model_not_entitled=("only available on agentic harnesses",),
+            )
+        if self.source == "nous":
+            # Nous answers HTTP 400 "This request is not valid. Check the model name and other
+            # parameters. Additional info: missing tags" (and, once tags are present but lack a
+            # `user=` one, "... Additional info: missing user tag") for a subset of its free
+            # models, while every sibling free model on the same account answers fine either way.
+            # `adapt_chat_request` below now sends the required tags on every Nous request, so this
+            # is a backstop for a model that turns out to need something beyond that — quarantine
+            # only it, never cool Nous. Kept to the exact "additional info: ..." phrasing Nous uses
+            # for this verdict, not the bare "missing tags"/"missing user tag" words alone: this
+            # field carries no names-the-model guard (see its own comment in `failures.py`), so the
+            # fuller phrase is what keeps an unrelated 400 that merely mentions "tags" from also
+            # matching.
+            return DEFAULT_FAILURE_MARKERS.with_extra(
+                model_not_entitled_request_rejection=(
+                    "additional info: missing tags",
+                    "additional info: missing user tag",
+                ),
             )
         return DEFAULT_FAILURE_MARKERS
 

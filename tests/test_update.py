@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import subprocess
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -10,6 +13,7 @@ import pytest
 
 import ficelle
 from ficelle import license_ops, update
+from ficelle.runtime_paths import RuntimePaths
 
 
 # The manifests below must describe a release *newer* than the installed one, or the
@@ -39,7 +43,23 @@ class _Response:
 
 @pytest.fixture(autouse=True)
 def isolate_update_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(update, "update_status_path", lambda: tmp_path / "update-status.json")
+    monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(tmp_path)}))
+
+
+@pytest.fixture(autouse=True)
+def isolate_license(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never read this machine's real entitlement, nor renew it against the real service."""
+
+    def refuse_real_refresh(*_args: object) -> None:
+        raise AssertionError("a test reached the real license service")
+
+    monkeypatch.setattr(license_ops, "ENTITLEMENT_PATH", tmp_path / "entitlement.token")
+    monkeypatch.setattr(license_ops, "MACHINE_ID_PATH", tmp_path / "machine-id")
+    try:
+        licensing = license_ops._licensing()
+    except license_ops.ProPackUnavailable:
+        return
+    monkeypatch.setattr(licensing, "_default_poster", refuse_real_refresh)
 
 
 def compact_manifest(version: str = NEXT_VERSION) -> dict[str, object]:
@@ -119,19 +139,23 @@ def test_check_for_updates_persists_available_status_without_exposing_artifact_u
     assert update.update_status_path().stat().st_mode & 0o777 == 0o600
 
 
-def test_check_for_updates_accepts_entitlement_authorized_pro_artifact(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("authorization", ["none", "bearer", "entitlement"])
+def test_check_for_updates_accepts_available_pro_authorization_without_refresh(
+    monkeypatch: pytest.MonkeyPatch, authorization: str,
 ) -> None:
     payload = compact_manifest()
     payload["pro"] = {
         "wheel_url": f"https://install.ficelle.ai/ficelle_pro-{NEXT_VERSION}-py3-none-any.whl",
         "sha256": "d" * 64,
-        "authorization": "entitlement",
+        "authorization": authorization,
     }
     monkeypatch.setattr(update, "manifest_url", lambda: "https://install.ficelle.ai/manifest.json")
     monkeypatch.setattr(update, "_is_pro_installed", lambda: True)
     monkeypatch.setattr(license_ops, "service_url", lambda: "https://install.ficelle.ai")
+    monkeypatch.setattr(license_ops, "is_entitled", lambda: True)
+    monkeypatch.setattr(license_ops, "refresh", lambda: pytest.fail("live or managed authorization must not refresh"))
     monkeypatch.setattr(license_ops, "cached_entitlement_token", lambda: "signed-entitlement")
+    monkeypatch.setenv("FICELLE_UPDATE_PRO_TOKEN", "managed-update-token")
 
     status = update.check_for_updates(
         force=True,
@@ -140,6 +164,188 @@ def test_check_for_updates_accepts_entitlement_authorized_pro_artifact(
 
     assert status["pro_update_required"] is False
     assert update.public_update_status()["pro_artifact_available"] is True
+
+
+def _entitlement_pro_manifest() -> bytes:
+    payload = compact_manifest()
+    payload["pro"] = {
+        "wheel_url": f"https://install.ficelle.ai/ficelle_pro-{NEXT_VERSION}-py3-none-any.whl",
+        "sha256": "d" * 64,
+        "authorization": "entitlement",
+    }
+    return json.dumps(payload).encode()
+
+
+@pytest.mark.parametrize("entrypoint", ["check", "apply"])
+@pytest.mark.parametrize("refreshed_status", ["active", "canceled"])
+def test_lapsed_pro_update_uses_only_an_active_renewed_entitlement(
+    monkeypatch: pytest.MonkeyPatch, entrypoint: str, refreshed_status: str,
+) -> None:
+    """A successful refresh can sign a canceled subscription; neither path may download it."""
+    licensing = pytest.importorskip("ficelle_pro.licensing")
+    private_key, public_key = licensing.generate_dev_keypair()
+    monkeypatch.setattr(licensing, "LICENSE_PUBLIC_KEY_B64", public_key)
+    now = 1_000_000.0
+    monkeypatch.setattr(licensing.time, "time", lambda: now)
+    payload = {
+        "product": licensing.PRODUCT,
+        "status": "active",
+        "machine_activation_id": "review-activation",
+        "issued_at": now - 100,
+        "expires_at": now - 50,
+        "grace_deadline": now - 1,
+    }
+    licensing.store_entitlement_token(license_ops.ENTITLEMENT_PATH, licensing.sign_payload(payload, private_key))
+    payload.update({"status": refreshed_status, "issued_at": now, "expires_at": now + 100, "grace_deadline": now + 200})
+    renewed_token = licensing.sign_payload(payload, private_key)
+    refresh_calls: list[str] = []
+
+    def poster(url: str, body: dict[str, object], timeout: float) -> tuple[int, dict[str, str]]:
+        refresh_calls.append(url)
+        assert body["machine_activation_id"] == "review-activation"
+        assert "license_key" not in body
+        assert timeout == 15.0
+        return 200, {"entitlement": renewed_token}
+
+    monkeypatch.setattr(licensing, "_default_poster", poster)
+    monkeypatch.setattr(update, "manifest_url", lambda: "https://install.ficelle.ai/manifest.json")
+    monkeypatch.setattr(update, "_is_pro_installed", lambda: True)
+    monkeypatch.setattr(license_ops, "service_url", lambda: "https://install.ficelle.ai")
+    manifest_payload = json.loads(_entitlement_pro_manifest())
+    manifest_payload["core"]["sha256"] = hashlib.sha256(b"core-wheel").hexdigest()
+    manifest_bytes = json.dumps(manifest_payload).encode()
+    downloads: list[str | None] = []
+
+    if entrypoint == "check":
+        status = update.check_for_updates(force=True, opener=lambda _request, _timeout: _Response(manifest_bytes))
+        assert status["pro_update_required"] is (refreshed_status != "active")
+        assert update.check_for_updates(opener=lambda *_args: pytest.fail("cached check must not use the network")) == status
+    else:
+        manifest = update.parse_release_manifest(manifest_payload, source_url=update.manifest_url())
+        update._write_status({**manifest.internal_dict(), "status": "queued", "update_available": True})
+        monkeypatch.setattr(update, "_managed_service", lambda: (object(), True))
+
+        def download(request: urllib.request.Request, _timeout: float) -> _Response:
+            downloads.append(request.get_header("Authorization"))
+            # A bad Pro checksum stops before package or service mutation.
+            return _Response(b"core-wheel")
+
+        assert update.apply_update(opener=download) == 1
+        status = update.read_update_status()
+        assert downloads == ([None, f"Bearer {renewed_token}"] if refreshed_status == "active" else [])
+        if refreshed_status == "active":
+            assert status["message"] == "release artifact checksum mismatch"
+
+    if refreshed_status != "active":
+        assert "not active" in status["message"]
+        assert "ficelle license activate" in status["message"]
+    assert refresh_calls == ["https://install.ficelle.ai/api/license/refresh"]
+    assert license_ops.cached_entitlement_token() == renewed_token
+    assert renewed_token not in json.dumps(status)
+
+
+def test_a_revoked_license_is_named_at_check_time_with_the_way_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MacBook, 05/10/2026: the activation had been deleted on the service, the check still said
+    "update available", and every install ended on `download failed (HTTPError)`."""
+
+    def rejected() -> None:
+        raise license_ops.LicenseOperationError(
+            "license service rejected the request: license no longer exists; Bearer refresh-secret-123 " + "x" * 300
+        )
+
+    monkeypatch.setattr(update, "manifest_url", lambda: "https://install.ficelle.ai/manifest.json")
+    monkeypatch.setattr(update, "_is_pro_installed", lambda: True)
+    monkeypatch.setattr(license_ops, "service_url", lambda: "https://install.ficelle.ai")
+    monkeypatch.setattr(license_ops, "is_entitled", lambda now=None: False)
+    monkeypatch.setattr(license_ops, "refresh", rejected)
+
+    status = update.check_for_updates(force=True, opener=lambda _request, _timeout: _Response(_entitlement_pro_manifest()))
+
+    assert status["pro_update_required"] is True
+    assert "license no longer exists" in status["message"]
+    assert "ficelle license activate" in status["message"]
+    assert "refresh-secret-123" not in status["message"]
+    assert len(status["message"]) <= 240
+    assert status["message"].endswith("then retry the update")
+    assert update.apply_update(opener=lambda *_args: pytest.fail("refused license must not download")) == 1
+    assert update.read_update_status()["message"] == status["message"]
+
+
+@pytest.mark.parametrize("entrypoint", ["check", "apply"])
+def test_license_refresh_cache_failure_returns_an_actionable_update_status(
+    monkeypatch: pytest.MonkeyPatch, entrypoint: str,
+) -> None:
+    def unwritable() -> None:
+        raise PermissionError("private runtime path")
+
+    monkeypatch.setattr(update, "manifest_url", lambda: "https://install.ficelle.ai/manifest.json")
+    monkeypatch.setattr(update, "_is_pro_installed", lambda: True)
+    monkeypatch.setattr(license_ops, "service_url", lambda: "https://install.ficelle.ai")
+    monkeypatch.setattr(license_ops, "is_entitled", lambda: False)
+    monkeypatch.setattr(license_ops, "refresh", unwritable)
+    if entrypoint == "check":
+        status = update.check_for_updates(force=True, opener=lambda *_args: _Response(_entitlement_pro_manifest()))
+        assert status["pro_update_required"] is True
+    else:
+        manifest = update.parse_release_manifest(json.loads(_entitlement_pro_manifest()), source_url=update.manifest_url())
+        update._write_status({**manifest.internal_dict(), "status": "queued", "update_available": True})
+        assert update.apply_update(opener=lambda *_args: pytest.fail("uncached license must not download")) == 1
+        status = update.read_update_status()
+    assert "permissions" in status["message"]
+    assert "private runtime path" not in status["message"]
+
+
+@pytest.mark.parametrize("authorization", ["entitlement", "bearer"])
+@pytest.mark.parametrize("body_kind", ["json", "truncated"])
+def test_a_refused_pro_download_says_why_and_what_to_do(
+    tmp_path: Path, authorization: str, body_kind: str,
+) -> None:
+    credential = "signed-entitlement" if authorization == "entitlement" else "FICL-review-token-secret"
+    body = (
+        json.dumps({"error": f"unknown update authorization {credential}; sk-reviewSecret1234 " + "x" * 300}).encode()
+        if body_kind == "json"
+        else b'{"error": "' + b"x" * 4096
+    )
+
+    def refuse(request: object, _timeout: float) -> object:
+        raise urllib.error.HTTPError(
+            "https://install.ficelle.ai/api/releases/latest/wheel",
+            404,
+            f"Not Found {credential}",
+            {},
+            io.BytesIO(body),
+        )
+
+    pro = update.ReleaseArtifact(
+        distribution="ficelle-pro",
+        version=NEXT_VERSION,
+        url="https://install.ficelle.ai/api/releases/latest/wheel",
+        sha256="d" * 64,
+        filename=f"ficelle_pro-{NEXT_VERSION}-py3-none-any.whl",
+        authorization=authorization,
+    )
+
+    with pytest.raises(update.UpdateUnavailable) as refused:
+        update._download_artifact(pro, tmp_path, authorization_token=credential, opener=refuse)
+    message = str(refused.value)
+    assert "HTTP 404" in message
+    assert ("unknown update authorization" if body_kind == "json" else "Not Found") in message
+    assert credential not in message and "sk-reviewSecret1234" not in message
+    assert len(message) <= 240
+    assert message.endswith("then retry the update")
+    assert not (tmp_path / pro.filename).exists()
+    assert refused.value.__cause__.closed
+    if authorization == "entitlement":
+        assert "ficelle license refresh" in message
+        assert "ficelle license activate" in message
+    else:
+        assert "FICELLE_UPDATE_PRO_TOKEN" in message
+        assert "ficelle license" not in message
+    # The public Core artifact has no license to blame: it keeps the plain transport error.
+    with pytest.raises(update.UpdateError) as failed:
+        update._download_artifact(pro, tmp_path, opener=refuse)
+    assert not isinstance(failed.value, update.UpdateUnavailable)
+    assert str(failed.value) == "release artifact download failed (HTTP 404)"
 
 
 def test_check_for_updates_blocks_pro_artifact_from_another_origin(
@@ -162,7 +368,7 @@ def test_check_for_updates_blocks_pro_artifact_from_another_origin(
     )
 
     assert status["pro_update_required"] is True
-    assert "authorization" in status["message"]
+    assert "origin does not match the license service" in status["message"]
 
 
 def test_check_failure_without_writable_status_returns_a_safe_snapshot(
@@ -215,6 +421,31 @@ def test_queue_update_preserves_verified_artifact_details(monkeypatch: pytest.Mo
     queued = update.read_update_status()
     assert queued["core_wheel_url"].startswith("https://downloads.ficelle.ai/")
     assert queued["core_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize("authorization", ["entitlement", "bearer"])
+def test_install_retry_rechecks_repaired_pro_authorization(
+    monkeypatch: pytest.MonkeyPatch, authorization: str,
+) -> None:
+    payload = json.loads(_entitlement_pro_manifest())
+    payload["pro"]["authorization"] = authorization
+    monkeypatch.setattr(update, "manifest_url", lambda: "https://install.ficelle.ai/manifest.json")
+    monkeypatch.setattr(update, "_open_secure_url", lambda *_args: _Response(json.dumps(payload).encode()))
+    monkeypatch.setattr(update, "_is_pro_installed", lambda: True)
+    monkeypatch.setattr(license_ops, "service_url", lambda: "https://install.ficelle.ai")
+    monkeypatch.setattr(license_ops, "is_entitled", lambda: True)
+    monkeypatch.setattr(license_ops, "refresh", lambda: pytest.fail("authorization retry must use the repaired credential"))
+    token: list[str | None] = [None]
+    monkeypatch.setattr(license_ops, "cached_entitlement_token", lambda: token[0])
+    monkeypatch.delenv("FICELLE_UPDATE_PRO_TOKEN", raising=False)
+    assert update.check_for_updates(force=True)["pro_update_required"] is True
+
+    token[0] = "repaired-entitlement"
+    monkeypatch.setenv("FICELLE_UPDATE_PRO_TOKEN", "repaired-managed-token")
+    queued = update.queue_update()
+
+    assert queued["status"] == "queued"
+    assert queued["pro_update_required"] is False
 
 
 def test_download_artifact_verifies_sha256(tmp_path: Path) -> None:

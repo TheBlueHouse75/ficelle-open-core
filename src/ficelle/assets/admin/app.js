@@ -187,6 +187,24 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     }
     const candidateOrigin = (profile, m) => profile.mode !== "manual_order" ? "auto" : ((profile.models || []).includes(m.id) ? "manual" : "auto-fill");
     const eligibleCount = (profileId) => candidatePreview(profileId).length;
+    // Server-side pool breakdown (candidate_exclusions): why models that match this profile's
+    // requirements aren't routable right now, so "N usable" doesn't read as unexplained
+    // shrinkage (e.g. the whole Pro pack going into offline grace). live cooldown/quarantine and
+    // the competence/benchmark gate are excluded from route_candidate_ids for different reasons;
+    // this makes each reason legible instead of collapsing them into one count.
+    function candidateExclusionSummary(profileId) {
+      const row = state?.profiles?.[profilePolicyId(profileId)];
+      const exclusions = row?.candidate_exclusions;
+      if (!exclusions) return "";
+      const routable = Array.isArray(row.route_candidate_ids) ? row.route_candidate_ids.length : 0;
+      const total = Number(exclusions.requirements_eligible || 0);
+      if (!total) return "";
+      const parts = [routable + " routable of " + total];
+      if (exclusions.cooldown) parts.push(exclusions.cooldown + " cooling down");
+      if (exclusions.quarantine) parts.push(exclusions.quarantine + " quarantined");
+      if (exclusions.not_verified) parts.push(exclusions.not_verified + " not verified");
+      return parts.join(" &middot; ");
+    }
     function defaultReq() { return { free: true, tools: true, min_context: state?.config?.min_context_length || 64000, structured: null, input_modalities: [], input_modalities_any: [], output_modalities: [], output_modalities_any: [], supported_parameters: [], supported_parameters_any: [] }; }
     const currentProfile = () => draftProfiles[activeProfile] || { mode: "auto", models: [], excluded_models: [], auto_tail: true, requirements: defaultReq() };
     const uniqueStrings = (items) => Array.from(new Set((items || []).map(String).filter(Boolean)));
@@ -750,6 +768,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("activeProfileName").textContent = lab[0];
       $("activeProfileId").textContent = activeProfile;
       $("eligibleBadge").textContent = locked ? "Locked" : eligibleCount(activeProfile) + " usable";
+      $("candidateBreakdown").innerHTML = locked ? "" : candidateExclusionSummary(activeProfile);
       const manual = p.mode === "manual_order";
       const full = candidatePreview(activeProfile);
       const preview = full.slice(0, 4);
@@ -2713,6 +2732,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      if (!state) return;
 	      setProviderLabels(state.provider_labels);
 	      renderUpdateBanner();
+	      renderLicenseNoticeBanner();
 	      renderPaidModelBanner();
 	      renderPruneBanner();
 	      renderNewModelsBanner();
@@ -2794,6 +2814,30 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         label: "Review",
         onClick: () => reviewPaidModelNotice(notice),
       });
+    }
+    // No dismiss key, unlike the banners around it: the entitlement really is expired or about
+    // to be, and re-rendering it on every poll is the point — a stale, dismissed "Refresh" is
+    // exactly the silent-lapse failure mode from the September incident (routing quietly shrank
+    // from ~220 to ~26 models with no signal in the dashboard).
+    function renderLicenseNoticeBanner() {
+      const banner = $("licenseBanner");
+      if (!banner) return;
+      banner.hidden = true;
+      const notice = state?.notices?.license;
+      if (!notice) return;
+      const expired = notice.state === "expired";
+      banner.classList.toggle("is-error", expired);
+      banner.classList.toggle("is-prune", !expired);
+      banner.hidden = false;
+      const deadline = notice.grace_deadline ? timeAgo(Number(notice.grace_deadline) * 1000).label : null;
+      const title = expired ? "Ficelle Pro license expired" : "Ficelle Pro license needs a refresh";
+      const detail = expired
+        ? "The provider pack is disabled and routing is limited to core providers until the entitlement is refreshed."
+        : "Ficelle is serving Pro on its last cached entitlement" + (deadline ? " (offline grace ends " + esc(deadline) + ")" : "") + ". Refresh soon to avoid a routing drop.";
+      banner.innerHTML = '<div class="update-copy"><div class="update-title">' + esc(title) + '</div>' +
+        '<div class="update-detail">' + detail + '</div></div>' +
+        '<div class="update-actions"><button class="btn sm" type="button" id="licenseNoticeReviewBtn">Open License</button></div>';
+      $("licenseNoticeReviewBtn").addEventListener("click", () => { setView("license"); render(); });
     }
     function renderPruneBanner() {
       const banner = $("pruneBanner");
@@ -2912,8 +2956,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (available && status === "available") {
         banner.hidden = false;
         const version = esc(update.latest_version || "the latest release");
+        // The check names why a Pro build cannot update (revoked license, refused artifact) and
+        // how to fix it; the generic sentence is only a fallback for an older status file.
         const message = update.pro_update_required
-          ? "A compatible Pro artifact is required for this installed Pro build."
+          ? (update.message || "A compatible Pro artifact is required for this installed Pro build.")
           : "Install the verified release and restart the local service.";
         banner.innerHTML = '<div class="update-copy"><div class="update-title">Ficelle ' + version + ' is available</div><div class="update-detail">' + esc(message) + (update.release_url ? ' <a href="' + esc(update.release_url) + '" target="_blank" rel="noopener">Release notes</a>.' : "") + '</div></div>' +
           '<div class="update-actions">' + (update.pro_update_required ? '<span class="badge warn">Pro update needed</span>' : '<button class="btn primary sm" type="button" id="installUpdateBtn"' + (updateInstallInFlight ? " disabled" : "") + '>' + (updateInstallInFlight ? "Installing…" : "Install update") + '</button>') + '</div>';
@@ -2959,6 +3005,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const r = await fetch("/admin/notices", { cache: "no-store" });
         if (!r.ok) return;
         state.notices = await r.json();
+        renderLicenseNoticeBanner();
         renderPaidModelBanner();
         renderNewModelsBanner();
         maybeShowPaidModelToast();

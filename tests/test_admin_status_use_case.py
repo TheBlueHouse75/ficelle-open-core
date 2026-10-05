@@ -25,6 +25,7 @@ from ficelle.use_cases.admin_status import (
     build_admin_performance_history_rows,
     build_admin_profile_row,
     build_admin_profile_rows,
+    build_profile_candidate_exclusions,
     build_admin_recovery_snapshot,
     build_admin_runtime_section,
     build_admin_runtime_snapshot,
@@ -1241,6 +1242,45 @@ def test_candidate_rank_rows_assembles_manual_origin_and_route_metadata():
     assert rows[1]["route_eligible"] is False
 
 
+def test_candidate_exclusions_buckets_cooldown_quarantine_and_unverified_separately():
+    cooled = {"id": "model-cooled"}
+    quarantined = {"id": "model-quarantined"}
+    unverified = {"id": "model-unverified"}
+    routable = {"id": "model-routable"}
+
+    exclusions = build_profile_candidate_exclusions(
+        requirements_eligible=[cooled, quarantined, unverified, routable],
+        policy_candidates=[routable],
+        state={},
+        model_on_cooldown=lambda model, state: (model["id"] == "model-cooled", "cooldown"),
+        model_is_quarantined=lambda model, state: model["id"] == "model-quarantined",
+    )
+
+    assert exclusions == {
+        "requirements_eligible": 4,
+        "cooldown": 1,
+        "quarantine": 1,
+        "not_verified": 1,
+    }
+
+
+def test_a_verified_model_a_manual_list_leaves_out_is_not_called_unverified():
+    # A manual-order profile without auto-tail routes only its own list; the rest of the
+    # requirement-eligible pool passed the competence gate and must not read as a benchmark problem.
+    listed = {"id": "model-listed"}
+    unlisted = {"id": "model-unlisted"}
+
+    exclusions = build_profile_candidate_exclusions(
+        requirements_eligible=[listed, unlisted],
+        policy_candidates=[listed, unlisted],
+        state={},
+        model_on_cooldown=lambda model, state: (False, None),
+        model_is_quarantined=lambda model, state: False,
+    )
+
+    assert exclusions["not_verified"] == 0
+
+
 def test_admin_profile_row_preserves_selected_contract_fields():
     row = build_admin_profile_row(
         profile={
@@ -1259,6 +1299,7 @@ def test_admin_profile_row_preserves_selected_contract_fields():
         top_candidates=[{"model_id": "ficelle/openrouter/manual-a"}],
         failed_candidates=[],
         last_route={"status": "ok", "request_id": "req-1"},
+        candidate_exclusions={"requirements_eligible": 1, "cooldown": 0, "quarantine": 0, "not_verified": 0},
     )
 
     assert row == {
@@ -1281,6 +1322,7 @@ def test_admin_profile_row_preserves_selected_contract_fields():
         "failed_profile_candidates": [],
         "last_route": {"status": "ok", "request_id": "req-1"},
         "requirements": {"tools": True},
+        "candidate_exclusions": {"requirements_eligible": 1, "cooldown": 0, "quarantine": 0, "not_verified": 0},
     }
 
 
@@ -1297,6 +1339,7 @@ def test_admin_profile_row_reports_fail_without_candidates():
         top_candidates=[],
         failed_candidates=[{"model_id": "ficelle/openrouter/nope"}],
         last_route={},
+        candidate_exclusions={"requirements_eligible": 0, "cooldown": 0, "quarantine": 0, "not_verified": 0},
     )
 
     assert row["status"] == "fail"
@@ -1324,6 +1367,7 @@ def test_admin_profile_row_counts_only_candidates_the_profile_can_route():
         top_candidates=[],
         failed_candidates=[],
         last_route={},
+        candidate_exclusions={"requirements_eligible": 1, "cooldown": 0, "quarantine": 0, "not_verified": 0},
     )
 
     assert row["status"] == "ok"
@@ -1395,6 +1439,9 @@ def test_admin_profile_rows_assembles_selected_and_failed_evidence():
             if model["id"].endswith("failed-a")
             else {}
         ),
+        model_matches_profile_requirements=lambda model, profile: True,
+        model_on_cooldown=lambda model, state: (False, None),
+        model_is_quarantined=lambda model, state: False,
     )
 
     row = rows["ficelle/auto-fast"]
@@ -1416,6 +1463,13 @@ def test_admin_profile_rows_assembles_selected_and_failed_evidence():
     assert row["failed_profile_candidates"] == [
         {"model_id": "ficelle/openrouter/failed-a", "reason": "semantic_failure"}
     ]
+    assert row["candidate_exclusions"] == {
+        "requirements_eligible": 3,
+        "cooldown": 0,
+        "quarantine": 0,
+        # `failed-a` fails the gate; `paused-a` passes it and is only outside the manual list.
+        "not_verified": 1,
+    }
 
 
 def test_admin_performance_history_rows_preserves_route_and_compression_fields():
@@ -1548,6 +1602,7 @@ def make_admin_status_ports() -> AdminStatusBuildPorts:
     return AdminStatusBuildPorts(
         model_on_cooldown=lambda item, state: (False, None),
         model_is_quarantined=lambda item, state: False,
+        model_matches_profile_requirements=lambda item, profile: True,
         normalized_virtual_profiles=lambda config: {"ficelle/auto-fast": {"mode": "auto", "requirements": {}}},
         redact_runtime_state=lambda state: state,
         candidates_for_profile=lambda profile_id, available, state, profile: available,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import platform
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -249,6 +250,24 @@ def refresh() -> Any:
         raise LicenseOperationError(str(exc)) from exc
     licensing.store_entitlement_token(ENTITLEMENT_PATH, token)
     return entitlement
+
+
+def refresh_if_due(now: float | None = None) -> Any | None:
+    """Refresh the cached entitlement once half of its signed validity has elapsed.
+
+    The offline grace after ``expires_at`` only covers brief outages (licensing PRD R9): an online
+    daemon has to renew on its own, or a paid machine silently falls back to core-only routing when
+    the grace ends — which is what happened on 22/09/2026, 33 days after activation. Half the window
+    leaves room for many failed attempts whatever validity the service signs. Returns the new
+    Entitlement, or None when nothing is cached or nothing is due; raises like ``refresh``.
+    """
+    cached = _licensing().load_cached_entitlement(_entitlement_read_path())
+    if cached is None:
+        return None
+    now = time.time() if now is None else now
+    if now < cached.issued_at + (cached.expires_at - cached.issued_at) / 2:
+        return None
+    return refresh()
 
 
 def deactivate() -> bool:
