@@ -50,15 +50,19 @@ merely tool-capable model.
 
 ## Recipes
 
-- [Codex CLI](codex.md)
 - [Continue](continue.md)
-- [Cursor](cursor.md)
 - [Open WebUI](open-webui.md)
 - [OpenAI SDK and custom scripts](openai-sdk.md)
-- [Claude Code](claude-code.md) — protocol status and what works today
+- [Claude Code](claude-code.md), through the native Anthropic Messages edge
 - Hermes uses a packaged optional connector instead of a paste-in recipe. Run Ficelle standalone
   first, then `ficelle connectors install hermes`. `ficelle connectors export hermes` prints the
   recommended YAML.
+
+### Not supported today
+
+- [Codex CLI](codex.md): Codex only speaks the OpenAI Responses API, which Ficelle does not serve.
+- [Cursor](cursor.md): Cursor sends every request through its own servers, which cannot reach a
+  router on `127.0.0.1`.
 
 ## Verify any client in one request
 

@@ -1,32 +1,38 @@
-# Cursor on Ficelle
+# Cursor and Ficelle
 
-Use Ficelle as Cursor's OpenAI-compatible endpoint for chat.
+**Not supported today.** Cursor cannot use a Ficelle router running on your machine.
+This is a property of how Cursor is built, not a Ficelle bug.
 
-Config format from Cursor's settings as of 2026-08; not yet validated against a
-live install — and this client carries a real caveat, read it before filing a
-router bug.
+Checked on 11/11/2026 against
+[Cursor's API keys documentation](https://cursor.com/docs/settings/api-keys).
 
-## Configure
+## Why it does not work
 
-In **Cursor Settings → Models**:
+- **Every request goes through Cursor's servers.** Cursor's documentation states that
+  all requests are routed through its servers for final prompt building, and that a
+  custom key is sent to its backend with each request. The call to the model provider
+  therefore starts from Cursor's infrastructure, not from your laptop.
+- **Those servers cannot reach `127.0.0.1`.** Ficelle listens on loopback by default.
+  From Cursor's backend, `http://127.0.0.1:8646/v1` is its own machine, not yours, so no
+  base-URL override can point it at your router.
+- **Custom keys only cover chat.** Even for providers Cursor supports, a custom key only
+  applies to chat models; Tab completion keeps using Cursor's built-in models.
+- The same page now documents keys for a fixed list of providers (OpenAI, Anthropic,
+  Google, Azure OpenAI, AWS Bedrock) and no longer documents a custom base-URL override.
 
-1. Add the model id `ficelle/auto-tools` as a custom model name.
-2. Run `ficelle access-token api`, then enable the **OpenAI API key** override
-   and paste that owner token. Treat it as a local secret.
-3. Enable **Override OpenAI Base URL** and set `http://127.0.0.1:8646/v1`.
-4. Select the `ficelle/auto-tools` model in chat.
+## Why there is no tunnel recipe
 
-## The caveat
+The only way around this would be exposing the router on a public address that
+Cursor's servers can reach (a tunnel or a public bind). That trades away Ficelle's
+local-only posture, sends your prompts through Cursor's backend to your exposed router,
+and puts the admin surfaces, designed for loopback, within reach of the internet.
+Ficelle does not document or support that setup.
 
-Parts of Cursor run from Cursor's servers, not your machine — including, in some
-versions, the "verify" step on a custom base URL and some agent features. A URL
-on `127.0.0.1` is unreachable from there: verification can fail or server-side
-features can silently not use your endpoint even though local chat does. That is
-a Cursor architecture property, not a Ficelle failure. If verification refuses
-the loopback URL on your version, the only workaround is exposing the router on
-an address Cursor's servers can reach (a tunnel) — which trades away the
-local-only posture and is **not** recommended by default; Ficelle's admin
-surfaces are designed for loopback.
+## What works instead
 
-The one-request check in [the clients index](README.md) tells you definitively
-whether the router side works.
+- Editor and agent clients that call the endpoint from your machine, such as
+  [Continue](continue.md) or [Claude Code](claude-code.md).
+- [Open WebUI](open-webui.md) or [your own scripts](openai-sdk.md) for chat.
+
+The one-request check in [the clients index](README.md#verify-any-client-in-one-request)
+tells you whether the router itself answers.

@@ -1,17 +1,8 @@
 # Ficelle
 
-<!--
-  Site links point at the Netlify deployment while the ficelle.ai domain is being
-  registered. Once it resolves, swap the three occurrences of
-  https://ficelle-website.netlify.app back to https://ficelle.ai (badge, benchmark
-  link, pricing link) and restore the "ficelle.ai" badge label. The release_url in
-  the update-manifest example further down is an illustration, not a live link, and
-  already uses the final domain.
--->
-
 [![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-f26a1b)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
-[![Website](https://img.shields.io/badge/website-live-1c1410)](https://ficelle-website.netlify.app)
+[![Website](https://img.shields.io/badge/website-ficelle.ai-1c1410)](https://ficelle.ai)
 
 **A local, OpenAI-compatible router that keeps your AI agents running, and never lets
 them overspend.** Point any OpenAI-compatible client at `http://127.0.0.1:8646/v1`
@@ -59,14 +50,19 @@ routing was *quality-safe* (tied or better) on:
 | Polished long-form writing | 50% | keep your paid model |
 
 Route the first three through Ficelle and keep the budget for the writing. Method and
-raw numbers: [the benchmark write-up](https://ficelle-website.netlify.app/blog/free-vs-paid-llm-benchmark/).
+raw numbers: [the benchmark write-up](https://ficelle.ai/blog/free-vs-paid-llm-benchmark/).
 
 ## Quick start
 
-Install the versioned open Core from its GitHub Release:
+The following bootstrap is pinned to the public mirror commit for release v0.3.13. It predates
+the `Requires-Dist` protections in the development bootstrap and in-place updater, and the
+mandatory matching SHA-256 for a local or loopback Pro wheel. Those protections arrive with
+the next release; refresh this pinned SHA after that release ships them.
+
+Install open Core using the existing v0.3.13 pin:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.13/scripts/bootstrap-ficelle.py | python3
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/350b724e17d1b7d0d0d95bf41d8938e7a2f171c9/scripts/bootstrap-ficelle.py | python3
 ~/.local/bin/ficelle doctor --text
 ```
 
@@ -77,7 +73,7 @@ key in shell history, enter it silently before running the same safe command:
 (
   read -s FICELLE_LICENSE_KEY
   export FICELLE_LICENSE_KEY
-  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.13/scripts/bootstrap-ficelle.py | python3
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/350b724e17d1b7d0d0d95bf41d8938e7a2f171c9/scripts/bootstrap-ficelle.py | python3
 )
 ```
 
@@ -216,13 +212,13 @@ Update checks are non-blocking and can be disabled for a managed environment wit
 ## Point your client at it
 
 One page per client, each ending at the same local endpoint:
-[Codex CLI](docs/clients/codex.md) ·
 [Continue](docs/clients/continue.md) ·
-[Cursor](docs/clients/cursor.md) ·
 [Open WebUI](docs/clients/open-webui.md) ·
 [OpenAI SDK / scripts](docs/clients/openai-sdk.md) ·
-[Claude Code (protocol status)](docs/clients/claude-code.md) —
+[Claude Code](docs/clients/claude-code.md) —
 shared basics and the model-id table in [the index](docs/clients/README.md).
+[Codex CLI](docs/clients/codex.md) and [Cursor](docs/clients/cursor.md) are not supported today;
+their pages explain why.
 
 ## How it works
 
@@ -258,16 +254,25 @@ the strict-zero safety model, the provider-adapter framework, and reference prov
 
 The paywall never sits on the core loop: routing, strict-zero, and free-provider access
 stay free and open. The Pro pack is not part of this repository; the core runs fully
-without it. [Pricing and purchase](https://ficelle-website.netlify.app/#pricing) live on
+without it. [Pricing and purchase](https://ficelle.ai/#pricing) live on
 the website.
 
 ## Optional client connectors
 
 Hermes is not required to install, update, or use Ficelle. If you want the connector and Hermes is
-not installed yet, use its official installer, which launches the setup wizard:
+not installed yet, use the official third-party installer from Nous Research. Ficelle does not
+control this script; it launches the Hermes setup wizard:
 
 ```bash
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+```
+
+To download and inspect the third-party script before running it instead:
+
+```bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o hermes-install.sh
+less hermes-install.sh
+bash hermes-install.sh
 ```
 
 Run the connector phase from the already installed Ficelle runtime:

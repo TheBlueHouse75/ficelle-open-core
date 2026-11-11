@@ -1,49 +1,42 @@
-# Codex CLI on Ficelle
+# Codex CLI and Ficelle
 
-Route Codex CLI's completions through Ficelle: same agent, strict-zero free
-models, full request observability on the local dashboard.
+**Not supported today.** No Codex CLI configuration can route through Ficelle at the
+moment. This page explains why, so you do not spend time on a config that cannot work.
 
-Config format from the Codex CLI documentation as of 2026-08; not yet validated
-against a live install — please report deltas.
+Checked on 11/11/2026 against the Codex documentation and repository.
 
-## Configure
+## Why it does not work
 
-Add a provider and a profile to `~/.codex/config.toml`:
+- **Codex only speaks the OpenAI Responses API.** Codex announced the deprecation of
+  Chat Completions support in
+  [discussion #7782](https://github.com/openai/codex/discussions/7782), and the
+  `wire_api = "chat"` code path was removed by
+  [PR #10157](https://github.com/openai/codex/pull/10157), merged on 03/02/2026. The
+  [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+  now lists `responses` as the only supported `wire_api` value.
+- **Ficelle does not serve `/v1/responses`.** It serves the OpenAI Chat Completions API
+  (`/v1/chat/completions`) and the Anthropic Messages API (`/v1/messages`). A custom
+  Codex provider pointed at `http://127.0.0.1:8646/v1` therefore sends requests to a
+  route Ficelle does not implement.
+- **The old profile recipe is also obsolete.** Since Codex 0.134.0, `--profile` no
+  longer reads `[profiles.<name>]` tables from `config.toml`, and the top-level
+  `profile = "<name>"` selector is gone; profiles now live in
+  `~/.codex/<name>.config.toml`
+  ([advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced)).
+  Earlier versions of this page used both, together with `wire_api = "chat"`.
 
-```toml
-[model_providers.ficelle]
-name = "Ficelle"
-base_url = "http://127.0.0.1:8646/v1"
-env_key = "FICELLE_API_KEY"
-# Ficelle serves the OpenAI chat-completions API, not the Responses API.
-wire_api = "chat"
+If you followed that earlier recipe, remove the `[model_providers.ficelle]` and
+`[profiles.ficelle]` tables and any `profile = "ficelle"` line from
+`~/.codex/config.toml`.
 
-[profiles.ficelle]
-model_provider = "ficelle"
-model = "ficelle/auto-tools"
-```
+## What works instead
 
-Codex requires the configured environment variable to be non-empty. For the
-default loopback listener, use a non-secret local value:
+- Agent clients that speak Chat Completions, such as [Continue](continue.md),
+  [Open WebUI](open-webui.md) or [your own scripts](openai-sdk.md).
+- [Claude Code](claude-code.md), through Ficelle's Anthropic Messages edge.
 
-```bash
-export FICELLE_API_KEY=ficelle-local
-codex --profile ficelle
-```
+Serving the Responses API is not part of Ficelle's current scope (see the
+[Claude Code page](claude-code.md#scope)). This page will change if that does.
 
-For a non-loopback bind, use `ficelle access-token api` as the value.
-
-Hermes uses the same variable name from `$HERMES_HOME/.env`. Ficelle setup seeds it so Hermes can
-select Ficelle as its main provider, explicitly or through `provider: auto`; that behavior is
-intentional. See [Hermes integration](../../README.md#optional-hermes-integration).
-
-To make it the default, set `profile = "ficelle"` at the top of the same file.
-
-## Notes
-
-- `ficelle/auto-tools` is the right default profile for Codex's tool-heavy loop;
-  switch a session to `ficelle/auto-orchestrator` for heavier multi-step work.
-- Expect free-tier pacing: Ficelle absorbs upstream rate limits by failing over
-  between free models, but long agent bursts can still see slower turns than a
-  paid endpoint. The Requests page on `http://127.0.0.1:8646/admin` shows every
-  fallback as it happens.
+The one-request check in [the clients index](README.md#verify-any-client-in-one-request)
+still tells you whether the router itself answers.
