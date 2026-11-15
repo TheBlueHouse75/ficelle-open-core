@@ -43,6 +43,8 @@ def test_canary_and_bootstrap_pin_the_same_core_hash() -> None:
 
     assert match is not None
     assert match.group(1) == canary.CORE_SHA256
+    assert re.fullmatch(r"[0-9a-f]{40}", canary.BOOTSTRAP_COMMIT)
+    assert canary.BOOTSTRAP_PATH in bootstrap
 
 
 def test_private_phase_requires_anonymous_repo_and_release_404() -> None:
@@ -79,8 +81,7 @@ def test_public_phase_checks_release_hash_files_bootstrap_and_site(
         f"https://api.github.com/repos/{repository}":
             canary.Snapshot(200, b'{"private": false}'),
         release_url: canary.Snapshot(200, wheel),
-        f"https://raw.githubusercontent.com/{repository}/v{canary.VERSION}/"
-        "scripts/bootstrap-ficelle.py":
+        f"https://raw.githubusercontent.com{canary.BOOTSTRAP_PATH}":
             canary.Snapshot(
                 200,
                 (
@@ -90,8 +91,7 @@ def test_public_phase_checks_release_hash_files_bootstrap_and_site(
             ),
         "https://site.example/": canary.Snapshot(
             200,
-            f"/TheBlueHouse75/ficelle-open-core/v{canary.VERSION}"
-            "/scripts/bootstrap-ficelle.py".encode(),
+            canary.BOOTSTRAP_PATH.encode(),
         ),
         "https://license.example/healthz": _health(),
     }

@@ -137,7 +137,7 @@ from ficelle.selection import (
     sort_available_for_virtual_model as sort_available_for_virtual_model_policy,
     typed_catalog_rows,
 )
-from ficelle.runtime_paths import RuntimePaths
+from ficelle.runtime_paths import RuntimePaths, validated_runtime_home
 from ficelle.routing_policy import (
     catalog_denies_input_modality,
     catalog_denies_structured_output,
@@ -566,6 +566,10 @@ try:
         from ficelle_pro.provider_pack import RETIRED_PROVIDER_IDS
     except ImportError:  # pragma: no cover - compatibility with an older installed Pro pack
         RETIRED_PROVIDER_IDS: tuple[str, ...] = ()
+    try:
+        from ficelle_pro.provider_pack import PROVIDER_PACK_LOGOS
+    except ImportError:  # pragma: no cover - compatibility with an older installed Pro pack
+        PROVIDER_PACK_LOGOS: dict[str, str] = {}
 except ImportError:  # pragma: no cover - core-only install without the closed pack
     # The curated provider pack (incl. the grey-market relays and their key URLs) ships
     # only in the closed Pro package. Absent → DEFAULT_CONFIG["providers"] is
@@ -577,6 +581,7 @@ except ImportError:  # pragma: no cover - core-only install without the closed p
     PROVIDER_PACK_KEY_URLS: dict[str, str] = {}
     PROVIDER_PACK_KEY_VALIDATORS: dict[str, Any] = {}
     PROVIDER_PACK_LABELS: dict[str, str] = {}
+    PROVIDER_PACK_LOGOS: dict[str, str] = {}
     RETIRED_PROVIDER_IDS: tuple[str, ...] = ()
 PROVIDER_KEY_VALIDATORS.update(PROVIDER_PACK_KEY_VALIDATORS)
 
@@ -5599,15 +5604,15 @@ def admin_license_notice() -> dict[str, Any] | None:
 def admin_notices_payload(state: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return lightweight automatic guard notices for dashboard polling.
 
-    The full ``/admin/state`` endpoint rebuilds catalog/admin projections and is intentionally not
+    The full ``/admin/state`` endpoint rebuilds the admin projections and is intentionally not
     polled. Paid-model notices need only the quarantine map, and expose no provider error detail:
     model ids, provider source, and the guard timestamp are sufficient for the UI.
 
     It also carries a ``catalog`` freshness marker, which is what lets the dashboard notice that a
     tab left open has gone stale without polling the heavy endpoint to find out. The marker is read
     with ``load_catalog_document`` — the published file, through its mtime-keyed cache — so this
-    stays a plain read: no refresh, no provider fan-out, and none of the quota probes that
-    ``/admin/state`` runs on the request thread.
+    stays a plain read: no refresh, no provider fan-out, and none of the per-model projections
+    ``/admin/state`` builds on the request thread.
     """
     runtime_state = load_runtime_state() if state is None else state
     raw_quarantine = runtime_state.get("quarantine") if isinstance(runtime_state, dict) else {}
@@ -5763,10 +5768,87 @@ def fusion_admin_payload(config: dict[str, Any], state: dict[str, Any]) -> dict[
     return build_fusion_admin_status_builder().fusion_payload(config, state)
 
 
+_ADMIN_CATALOG_REFRESH_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def _start_admin_catalog_refresh_worker(run: Callable[[], None]) -> None:
+    """Single dispatch point for the admin view's background refresh, so a test can hold or
+    run the worker instead of racing it."""
+    threading.Thread(target=run, name="ficelle-admin-catalog-refresh", daemon=True).start()
+
+
+def schedule_admin_catalog_refresh(config: dict[str, Any]) -> None:
+    """Bring a stale catalog up to date off the request thread, at most one run at a time.
+
+    It runs the same `load_or_refresh_catalog` the request used to run inline, so it publishes
+    exactly what that call would have. The open dashboard notices the publish through the
+    `/admin/notices` catalog marker and reloads `/admin/state` on its own.
+    """
+    in_flight = _ADMIN_CATALOG_REFRESH_IN_FLIGHT_LOCK
+    if not in_flight.acquire(blocking=False):
+        return
+
+    def run() -> None:
+        try:
+            load_or_refresh_catalog(refresh_config)
+        except Exception as exc:  # a background refresh must never take the process down
+            print(f"ficelle: background catalog refresh failed: {safe_detail(exc)}", file=sys.stderr)
+        finally:
+            in_flight.release()
+
+    try:
+        # The loader also reads canonical fingerprints outside its effective-config copy;
+        # those reads must see the same snapshot even if an admin write lands mid-refresh.
+        with LIVE_CONFIG_LOCK:
+            refresh_config = copy.deepcopy(config)
+        _start_admin_catalog_refresh_worker(run)
+    except Exception:
+        in_flight.release()
+        raise
+
+
+def admin_state_catalog(config: dict[str, Any]) -> dict[str, Any]:
+    """The catalog `/admin/state` shows: the cached one, never refreshed on the request thread.
+
+    `/admin/state` used to call `load_or_refresh_catalog`, so past the TTL, or after any change
+    to the catalog fingerprint (toggling a provider, saving the minimum context), the request
+    the dashboard blocks its first render on walked every configured provider synchronously,
+    each bounded only by `catalog_timeout_seconds`. The same trap `/health` fell into
+    (docs/components/service-backends.md).
+
+    A stale catalog is shown as last known, filtered with the *current* config so a provider
+    just disabled is already off the list, and flagged `stale`/`stale_reason`. Unlike
+    `/admin/status.json` it is never emptied on a structural mismatch: this is the operator's
+    working view, and an empty Providers list would hide the very card that was just toggled.
+    """
+    effective_config = effective_runtime_config(config)
+    catalog = load_cached_catalog_for_admin_status(effective_config)
+    stale_reason = cached_catalog_stale_reason(catalog, effective_config)
+    # Setup must remain reachable before the first catalog publish (or for a newly added
+    # provider). Diagnostics are local, safe metadata; never expose the raw provider config.
+    cached_providers = catalog.get("providers")
+    providers = dict(cached_providers) if isinstance(cached_providers, dict) else {}
+    for source, provider in (effective_config.get("providers") or {}).items():
+        if not isinstance(provider, dict):
+            continue
+        providers[source] = {
+            **providers.get(source, {}),
+            **provider_catalog_adapter(str(source)).safe_diagnostics(provider),
+            "enabled": bool(provider.get("enabled", True)),
+            "key_url": PROVIDER_KEY_URLS.get(source),
+        }
+    catalog = {**catalog, "providers": providers}
+    filtered = filter_cached_catalog_to_enabled_providers(catalog, effective_config)
+    if stale_reason is None:
+        return filtered
+    schedule_admin_catalog_refresh(config)
+    return {**filtered, "stale": True, "stale_reason": stale_reason}
+
+
 def build_admin_state_builder() -> AdminStateBuilder:
     return AdminStateBuilder(
         AdminStateBuildPorts(
-            load_or_refresh_catalog=load_or_refresh_catalog,
+            load_catalog=admin_state_catalog,
             load_runtime_state=load_runtime_state,
             normalized_virtual_profiles=normalized_virtual_profiles,
             build_admin_status=build_admin_status,
@@ -5788,6 +5870,7 @@ def admin_state(config: dict[str, Any]) -> dict[str, Any]:
 
     payload = build_admin_state_builder().build(config)
     payload["provider_labels"] = dict(PROVIDER_LABELS)
+    payload["provider_logos"] = dict(PROVIDER_PACK_LOGOS)
     # The admin UI reads this to hide the Fusion/Compression action buttons on a
     # core-only install (the views themselves gate structurally — pro-views.js ships
     # and renders them only when the pack is present). False on a core-only install.
@@ -12823,7 +12906,14 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_html(200, admin_page_html())
                 return
             if path == "/admin/state":
-                self._send_json(200, admin_state(self.config))
+                # Intermittent 10-40 s loads were seen without a catalog refresh to blame;
+                # splitting build from send tells a slow projection from a slow client next time.
+                started = time.monotonic()
+                payload = admin_state(self.config)
+                built = time.monotonic()
+                self._send_json(200, payload)
+                if time.monotonic() - started > 2.0:
+                    print(f"ficelle: slow /admin/state build={built - started:.2f}s send={time.monotonic() - built:.2f}s", file=sys.stderr)
                 return
             if path == "/admin/status.json":
                 # A GET must not spend free quota. Explicit probes use the same-origin-protected
@@ -13230,15 +13320,20 @@ class RouterHandler(BaseHTTPRequestHandler):
                 return
 
             try:
+                home = validated_runtime_home(FICELLE_HOME)
                 pro_install.queue_install()
                 try:
+                    home = validated_runtime_home(FICELLE_HOME)
                     subprocess.Popen(
                         pro_install.detached_install_command(),
                         env={
                             **os.environ,
                             "FICELLE_LICENSE_KEY": license_key,
                             "FICELLE_INSTALL_QUEUED": "1",
+                            "FICELLE_HOME": str(home),
+                            "PYTHONSAFEPATH": "1",
                         },
+                        cwd=str(home),
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         start_new_session=True,
@@ -14714,7 +14809,15 @@ def serve(config: dict[str, Any]) -> None:
     # Startup is where an operator reads the service's output, and a setting that is silently
     # doing nothing has to be named somewhere.
     report_config_warnings(config)
-    refresh_hermes_integration_on_startup()
+    try:
+        refresh_hermes_integration_on_startup()
+    except Exception as exc:
+        # The connector is optional; its exception text may contain credentials.
+        print(
+            f"ficelle: Hermes connector refresh failed ({type(exc).__name__}); continuing startup",
+            file=sys.stderr,
+            flush=True,
+        )
     # Strict-zero fail-fast: refuse to start if paid fallback was somehow enabled.
     # The catalog warm runs in a background thread below (where this guard would be
     # swallowed), so assert it synchronously here before binding — cheap, no network.

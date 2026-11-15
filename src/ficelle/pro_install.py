@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -34,8 +33,9 @@ from ficelle import artifact_integrity
 from ficelle.install import CommandResult, pip_is_unavailable
 from ficelle.json_store import atomic_write_json, load_json
 from ficelle.probe_lock import file_lock
-from ficelle.runtime_paths import RuntimePaths
+from ficelle.runtime_paths import RuntimePaths, absolute_python
 from ficelle.url_security import uses_secure_http_transport
+from ficelle.update import _run_isolated_command
 
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 MAX_PRO_WHEEL_BYTES = 256 * 1024 * 1024
@@ -324,7 +324,7 @@ def detached_install_command() -> list[str]:
     scope; ``systemd-run --scope`` inherits the supplied environment without placing the
     license key on argv.
     """
-    command = [sys.executable, "-m", "ficelle", "install-pro"]
+    command = [absolute_python(sys.executable), "-P", "-m", "ficelle", "install-pro"]
     if not os.getenv("INVOCATION_ID"):
         return command
     systemd_run = _resolve_executable("systemd-run", ["/usr/bin/systemd-run"])
@@ -348,10 +348,12 @@ def install_pro_wheel(
     runner: Callable[[list[str]], CommandResult | int] | None = None,
 ) -> None:
     """Install ``wheel`` into the existing Core environment without consulting PyPI."""
+    wheel = wheel.absolute()
+    python = str(Path(sys.executable).absolute())
     verify_pro_core_compatibility(wheel)
     run = runner or _pip_run
     dependency_command = [
-        sys.executable,
+        python,
         "-m",
         "pip",
         "install",
@@ -368,11 +370,12 @@ def install_pro_wheel(
         if not uv:
             raise ProInstallError("pip is unavailable and uv could not be found")
         uv_dependency_command = [
-            uv,
+            str(Path(uv).absolute()),
             "pip",
             "install",
+            "--no-config",
             "--python",
-            sys.executable,
+            python,
             *PRO_RUNTIME_REQUIREMENTS,
         ]
         if _command_result(
@@ -382,7 +385,7 @@ def install_pro_wheel(
             raise ProInstallError("uv install of the Pro runtime failed")
 
     pip_command = [
-        sys.executable,
+        python,
         "-m",
         "pip",
         "install",
@@ -399,11 +402,12 @@ def install_pro_wheel(
     if not uv:
         raise ProInstallError("pip is unavailable and uv could not be found")
     uv_command = [
-        uv,
+        str(Path(uv).absolute()),
         "pip",
         "install",
+        "--no-config",
         "--python",
-        sys.executable,
+        python,
         "--reinstall",
         "--no-deps",
         str(wheel),
@@ -441,7 +445,8 @@ def verify_pro_core_compatibility(wheel: Path) -> None:
 
 
 def _pip_run(command: list[str]) -> CommandResult:
-    completed = subprocess.run(command, capture_output=True, text=True)
+    # Share the updater's private cwd; uv must also ignore configuration in its parents.
+    completed = _run_isolated_command(command, env={**os.environ, "UV_NO_CONFIG": "1"})
     return CommandResult(command, completed.returncode, completed.stdout, completed.stderr)
 
 

@@ -150,7 +150,7 @@ class AdminStatusBuildPorts:
 
 @dataclass(frozen=True)
 class AdminStateBuildPorts:
-    load_or_refresh_catalog: LoadCatalog
+    load_catalog: LoadCatalog
     load_runtime_state: LoadRuntimeState
     normalized_virtual_profiles: NormalizeVirtualProfiles
     build_admin_status: BuildAdminStatus
@@ -189,7 +189,7 @@ class AdminStateBuilder:
     default_canary_profiles: list[str]
 
     def build(self, config: dict[str, Any]) -> dict[str, Any]:
-        catalog = self.ports.load_or_refresh_catalog(config)
+        catalog = self.ports.load_catalog(config)
         state = self.ports.load_runtime_state()
         if not isinstance(state, dict):
             state = {}
@@ -255,8 +255,50 @@ def catalog_with_auto_scores(
             profile_id: details["score_total"]
             for profile_id, details in details_by_profile.items()
         }
-        model["auto_score_details"] = details_by_profile
+        model["auto_score_details"] = {
+            profile_id: admin_score_detail(details)
+            for profile_id, details in details_by_profile.items()
+        }
     return enriched
+
+
+# The per-model, per-profile score breakdown `/admin/state` ships. A full
+# `model_score_explanation` row is ~30 fields and, multiplied by every catalog model and every
+# virtual profile, was over half of a ~4 MB payload the dashboard downloads before its first
+# render. These are the fields a reader actually has: the score tooltip in the admin dashboard
+# (`scoreTitle` in assets/admin/app.js) and the quality-feedback evidence that
+# docs/components/config-and-state.md promises in score details. The complete row stays
+# available for each profile's winner (`profiles[...].selected_score_details`) and, per
+# candidate, in `top_candidates` — both also in `/admin/status.json`.
+ADMIN_SCORE_DETAIL_FIELDS: tuple[str, ...] = (
+    "score_base",
+    "evidence_status",
+    "evidence_reason",
+    "last_evidence_at",
+    "verified_bonus",
+    "benchmark_bonus",
+    "failure_penalty",
+    "score_decay_factor",
+    "quality_status",
+    "quality_sample_count",
+    "quality_adjustment",
+    "quality_last_reason",
+    "quality_last_severity",
+    "quality_last_recorded_at",
+)
+
+
+def admin_score_detail(details: dict[str, Any]) -> dict[str, Any]:
+    """Project one score explanation onto `ADMIN_SCORE_DETAIL_FIELDS`, dropping nulls.
+
+    An absent key and a null read the same to every consumer (the dashboard falls back on both),
+    and most evidence timestamps and reasons are null on most models.
+    """
+    return {
+        field: details[field]
+        for field in ADMIN_SCORE_DETAIL_FIELDS
+        if details.get(field) is not None
+    }
 
 
 def build_admin_job_row(

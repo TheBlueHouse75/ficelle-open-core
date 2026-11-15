@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,14 +37,13 @@ from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlparse
 
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
-from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
 from ficelle import __version__ as CORE_VERSION
 from ficelle.json_store import atomic_write_json, load_json
 from ficelle.probe_lock import file_lock
 from ficelle.redaction import sanitize_error_detail
-from ficelle.runtime_paths import RuntimePaths
+from ficelle.runtime_paths import RuntimePaths, absolute_python, validated_runtime_home
 from ficelle.url_security import uses_secure_http_transport
 
 
@@ -762,29 +762,33 @@ def _detached_helper_command(command: list[str], unit_prefix: str) -> list[str]:
 
 def detached_update_command() -> list[str]:
     return _detached_helper_command(
-        [sys.executable, "-m", "ficelle", "update", "--apply"],
+        [absolute_python(sys.executable), "-P", "-m", "ficelle", "update", "--apply"],
         "ficelle-update",
     )
 
 
 def detached_recovery_command() -> list[str]:
     return _detached_helper_command(
-        [sys.executable, "-m", "ficelle", "update", "--recover"],
+        [absolute_python(sys.executable), "-P", "-m", "ficelle", "update", "--recover"],
         "ficelle-update-recovery",
     )
 
 
 def spawn_update() -> dict[str, Any]:
     """Queue and detach the update helper so the daemon can safely restart itself."""
-    status = queue_update()
     try:
+        home = validated_runtime_home(_RUNTIME_PATHS.ficelle_home)
+        status = queue_update()
         subprocess.Popen(
             detached_update_command(),
-            env={**os.environ, "FICELLE_UPDATE_QUEUED": "1"},
+            env={**os.environ, "FICELLE_HOME": str(home), "FICELLE_UPDATE_QUEUED": "1", "PYTHONSAFEPATH": "1"},
+            cwd=str(home),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+    except (UpdateInProgress, UpdateUnavailable):
+        raise
     except Exception as exc:
         try:
             _write_status({"status": "failed", "message": "The Ficelle updater could not start."})
@@ -798,30 +802,42 @@ def spawn_recovery() -> bool:
     """Start recovery outside the router so the service can restart safely."""
     if not update_recovery_marker_path().exists():
         return False
-    subprocess.Popen(
-        detached_recovery_command(),
-        env={**os.environ, "FICELLE_UPDATE_RECOVERY": "1"},
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    try:
+        home = validated_runtime_home(_RUNTIME_PATHS.ficelle_home)
+        subprocess.Popen(
+            detached_recovery_command(),
+            env={**os.environ, "FICELLE_HOME": str(home), "FICELLE_UPDATE_RECOVERY": "1", "PYTHONSAFEPATH": "1"},
+            cwd=str(home),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        try:
+            _write_status({"status": "failed", "message": "The Ficelle update recovery helper could not start."})
+        except UpdateError:
+            pass
+        raise UpdateError("the Ficelle update recovery helper could not start") from exc
     return True
 
 
 def _uv_executable() -> str | None:
     configured = os.getenv("FICELLE_UV_BIN", "").strip()
     if configured and Path(configured).is_file() and os.access(configured, os.X_OK):
-        return configured
-    return shutil.which("uv")
+        return str(Path(configured).absolute())
+    executable = shutil.which("uv")
+    return str(Path(executable).absolute()) if executable else None
 
 
 def _run_command(
     command: list[str],
     *,
     timeout: float = UPDATE_COMMAND_TIMEOUT_SECONDS,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             command,
@@ -833,7 +849,23 @@ def _run_command(
         return subprocess.CompletedProcess(command, 1, stdout="", stderr=f"{type(exc).__name__}: {exc}")
 
 
+def _run_isolated_command(command: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    # Isolate installs and import checks from local project/archive/module names.
+    env = {**(os.environ if env is None else env), "PYTHONSAFEPATH": "1"}
+    with tempfile.TemporaryDirectory(prefix="ficelle-pip-") as cwd:
+        Path(cwd).chmod(0o700)
+        return _run_command(command, cwd=cwd, env=env)
+
+
+def _run_uv_command(executable: str, group: list[str], arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    # uv searches parent directories too; a private empty cwd alone is insufficient.
+    env = os.environ.copy()
+    env["UV_NO_CONFIG"] = "1"
+    return _run_isolated_command([executable, *group, "--no-config", *arguments], env=env)
+
+
 def _install_wheel(wheel: Path) -> None:
+    wheel = wheel.absolute()
     command = [
         sys.executable,
         "-m",
@@ -843,19 +875,62 @@ def _install_wheel(wheel: Path) -> None:
         "--no-deps",
     ]
     command.append(str(wheel))
-    result = _run_command(command)
+    result = _run_isolated_command(command)
     if result.returncode == 0:
         return
     combined = f"{result.stdout}\n{result.stderr}"
     uv = _uv_executable()
     if "No module named pip" not in combined or not uv:
         raise UpdateError("package installation failed")
-    uv_command = [uv, "pip", "install", "--python", sys.executable, "--reinstall"]
-    uv_command.append("--no-deps")
-    uv_command.append(str(wheel))
-    result = _run_command(uv_command)
+    result = _run_uv_command(uv, ["pip", "install"], ["--python", sys.executable, "--reinstall", "--no-deps", str(wheel)])
     if result.returncode != 0:
         raise UpdateError("package installation failed")
+
+
+# Keep this stdlib grammar equivalent to scripts/bootstrap-ficelle.py. The bootstrap
+# runs before Core is installed; cross-tests exercise both copies with the same inputs.
+_REQUIREMENT_NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+_REQUIREMENT_EXTRAS = rf"{_REQUIREMENT_NAME}(?:[ ]*,[ ]*{_REQUIREMENT_NAME})*"
+_REQUIREMENT_SPECIFIER = r"(?:===|==|!=|<=|>=|~=|<|>)[ ]*[A-Za-z0-9*+!_.-]+"
+_REQUIREMENT_SPECIFIERS = rf"{_REQUIREMENT_SPECIFIER}(?:[ ]*,[ ]*{_REQUIREMENT_SPECIFIER})*"
+_REQUIREMENT_MARKER = r"[A-Za-z0-9_.\"'<>=! (),]+"
+# Pip's ARCHIVE_EXTENSIONS (pip/_internal/utils/filetypes.py) plus defence-in-depth
+# extras (.tbz2, .tar.zst, .egg): pip interprets these as local archive filenames.
+_RUNTIME_ARCHIVE_SUFFIXES = (
+    ".whl", ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".tbz2",
+    ".tar.xz", ".txz", ".tar.lz", ".tlz", ".tar.lzma", ".tar.zst", ".egg",
+)
+_RUNTIME_REQUIREMENT = re.compile(
+    rf"(?P<name>{_REQUIREMENT_NAME})"
+    rf"(?:[ ]*\[[ ]*(?:{_REQUIREMENT_EXTRAS})[ ]*\])?"
+    rf"(?:[ ]*(?:{_REQUIREMENT_SPECIFIERS}|\([ ]*{_REQUIREMENT_SPECIFIERS}[ ]*\)))?"
+    rf"(?:[ ]*;[ ]*{_REQUIREMENT_MARKER})?"
+)
+
+
+def _validate_runtime_requirement(raw: object) -> str:
+    """Keep the named-index-only policy in sync with the stdlib bootstrap validator."""
+    if not isinstance(raw, str):
+        raise UpdateError("refusing a runtime requirement that is not a package specifier")
+    # Validate before trimming so forbidden leading/trailing characters cannot disappear.
+    if any(not (" " <= character <= "~") for character in raw):
+        raise UpdateError(
+            "refusing a runtime requirement that contains non-ASCII or control characters "
+            "(including newline or null)"
+        )
+    requirement = raw.strip(" ")
+    if not requirement:
+        raise UpdateError("refusing an empty runtime requirement")
+    if requirement.startswith("-"):
+        raise UpdateError("refusing a runtime requirement that starts with '-'; pip options are not accepted")
+    if "://" in requirement or "@" in requirement.split(";", 1)[0]:
+        raise UpdateError("refusing a direct-URL runtime requirement; only named packages from the configured index are accepted")
+    match = _RUNTIME_REQUIREMENT.fullmatch(requirement)
+    if match is None:
+        raise UpdateError("refusing a runtime requirement that is not a package specifier")
+    if match.group("name").lower().endswith(_RUNTIME_ARCHIVE_SUFFIXES):
+        raise UpdateError("refusing a runtime requirement with an archive filename as its package name")
+    return requirement
 
 
 def _wheel_runtime_requirements(wheel: Path) -> tuple[str, ...]:
@@ -869,39 +944,39 @@ def _wheel_runtime_requirements(wheel: Path) -> tuple[str, ...]:
         raise UpdateError("wheel metadata could not be read") from exc
     requirements: list[str] = []
     for raw_requirement in metadata.get_all("Requires-Dist", []):
-        try:
-            requirement = Requirement(raw_requirement)
-        except InvalidRequirement as exc:
-            raise UpdateError("wheel contains an invalid runtime requirement") from exc
-        if requirement.name.lower().replace("_", "-") in {"ficelle-router", "ficelle-pro"}:
+        safe_requirement = _validate_runtime_requirement(raw_requirement)
+        match = _RUNTIME_REQUIREMENT.fullmatch(safe_requirement)
+        assert match is not None  # validated above with the same grammar
+        if match.group("name").lower().replace("_", "-") in {"ficelle-router", "ficelle-pro"}:
             continue
-        requirements.append(raw_requirement)
+        requirements.append(safe_requirement)
     return tuple(requirements)
 
 
 def _install_requirements(requirements: tuple[str, ...]) -> None:
     if not requirements:
         return
-    command = [sys.executable, "-m", "pip", "install", *requirements]
-    result = _run_command(command)
+    safe_requirements = tuple(_validate_runtime_requirement(requirement) for requirement in requirements)
+    command = [sys.executable, "-m", "pip", "install", *safe_requirements]
+    result = _run_isolated_command(command)
     if result.returncode == 0:
         return
     combined = f"{result.stdout}\n{result.stderr}"
     uv = _uv_executable()
     if "No module named pip" not in combined or not uv:
         raise UpdateError("runtime dependency installation failed")
-    result = _run_command([uv, "pip", "install", "--python", sys.executable, *requirements])
+    result = _run_uv_command(uv, ["pip", "install"], ["--python", sys.executable, *safe_requirements])
     if result.returncode != 0:
         raise UpdateError("runtime dependency installation failed")
 
 
 def _pip_check() -> None:
-    result = _run_command([sys.executable, "-m", "pip", "check"])
+    result = _run_isolated_command([sys.executable, "-m", "pip", "check"])
     if result.returncode != 0:
         combined = f"{result.stdout}\n{result.stderr}"
         uv = _uv_executable()
         if "No module named pip" in combined and uv:
-            result = _run_command([uv, "pip", "check", "--python", sys.executable])
+            result = _run_uv_command(uv, ["pip", "check"], ["--python", sys.executable])
     if result.returncode != 0:
         raise UpdateError("Ficelle runtime dependency check failed")
 
@@ -1002,30 +1077,43 @@ def _package_root() -> Path:
     return purelib
 
 
-def _installed_package_paths() -> list[Path]:
-    purelib = _package_root()
-    paths = [purelib / "ficelle"]
-    paths.extend(sorted(purelib.glob("ficelle_router-*.dist-info")))
-    paths.extend(sorted(purelib.glob("ficelle_router-*.egg-info")))
-    if (purelib / "ficelle_pro").exists():
-        paths.append(purelib / "ficelle_pro")
-    paths.extend(sorted(purelib.glob("ficelle_pro-*.dist-info")))
-    paths.extend(sorted(purelib.glob("ficelle_pro-*.egg-info")))
-    return [path for path in paths if path.exists()]
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or not path.exists():
+        path.unlink(missing_ok=True)
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    path.unlink(missing_ok=True)
+
+
+def _copy_preserved(source: Path, destination: Path) -> None:
+    """Copy a site-package entry without following a top-level symbolic link."""
+    if source.is_symlink():
+        destination.symlink_to(os.readlink(source))
+        return
+    if source.is_dir():
+        shutil.copytree(source, destination, symlinks=True)
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination, follow_symlinks=False)
 
 
 def _backup_installed_packages(destination: Path) -> list[_BackupEntry]:
+    """Snapshot the whole environment so a failed update can restore dependencies too."""
+    purelib = _package_root()
     destination.mkdir(parents=True, exist_ok=True)
-    entries: list[_BackupEntry] = []
-    for index, original in enumerate(_installed_package_paths()):
-        backup = destination / f"{index}-{original.name}"
-        if original.is_dir():
-            shutil.copytree(original, backup)
-        else:
-            shutil.copy2(original, backup)
-        entries.append(_BackupEntry(original, backup))
-    if not entries:
+    children = sorted(
+        (child for child in purelib.iterdir() if child.name != "__pycache__"),
+        key=lambda path: path.name,
+    )
+    if not any(child.name == "ficelle" or child.name.startswith("ficelle_router") for child in children):
         raise UpdateError("installed Ficelle package files could not be located")
+    entries: list[_BackupEntry] = []
+    for index, original in enumerate(children):
+        backup = destination / f"{index}-{original.name}"
+        _copy_preserved(original, backup)
+        entries.append(_BackupEntry(original, backup))
     return entries
 
 
@@ -1043,14 +1131,33 @@ def _remove_installed_package_paths() -> None:
             path.unlink()
 
 
-def _restore_installed_packages(entries: list[_BackupEntry]) -> None:
-    _remove_installed_package_paths()
+def _restore_installed_packages(
+    entries: list[_BackupEntry],
+    *,
+    remove_unlisted: bool = False,
+) -> None:
+    """Put the snapshotted environment back.
+
+    ``remove_unlisted`` drops distributions installed after the snapshot. Legacy
+    recovery markers only listed Ficelle's own files, so they must not delete the
+    rest of site-packages.
+    """
+    if not entries:
+        raise UpdateError("installed Ficelle package files could not be located")
+    if remove_unlisted:
+        purelib = Path(sysconfig.get_paths()["purelib"]).resolve()
+        kept = {entry.original.name for entry in entries}
+        for child in list(purelib.iterdir()):
+            if child.name == "__pycache__" or child.name in kept:
+                continue
+            _remove_path(child)
+    else:
+        _remove_installed_package_paths()
     for entry in entries:
-        if entry.backup.is_dir():
-            shutil.copytree(entry.backup, entry.original)
-        else:
-            entry.original.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(entry.backup, entry.original)
+        if entry.original.exists() or entry.original.is_symlink():
+            _remove_path(entry.original)
+        entry.original.parent.mkdir(parents=True, exist_ok=True)
+        _copy_preserved(entry.backup, entry.original)
 
 
 def _recovery_entry_payload(entries: list[_BackupEntry]) -> list[dict[str, str]]:
@@ -1084,6 +1191,9 @@ def _write_recovery_marker(
     marker.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": 1,
+        # "environment" snapshots every site-package, so recovery can drop dependencies
+        # installed after the marker. Older markers omit this and only restore Ficelle.
+        "scope": "environment",
         "phase": phase,
         "target_version": target_version,
         "entries": _recovery_entry_payload(entries),
@@ -1093,7 +1203,7 @@ def _write_recovery_marker(
     marker.chmod(0o600)
 
 
-def _read_recovery_marker() -> tuple[str, str, list[_BackupEntry]]:
+def _read_recovery_marker() -> tuple[str, str, list[_BackupEntry], str]:
     marker = update_recovery_marker_path()
     invalid = object()
     payload = load_json(marker, invalid)
@@ -1131,7 +1241,12 @@ def _read_recovery_marker() -> tuple[str, str, list[_BackupEntry]]:
         if not backup.exists():
             raise UpdateError("the interrupted update recovery backup is missing")
         entries.append(_BackupEntry(original, backup))
-    return phase, target_version, entries
+    scope = payload.get("scope")
+    if scope is None:
+        scope = "packages"
+    if scope not in {"packages", "environment"}:
+        raise UpdateError("the interrupted update recovery backup is invalid")
+    return phase, target_version, entries, str(scope)
 
 
 def _write_recovery_phase(phase: str) -> None:
@@ -1153,7 +1268,7 @@ def _recover_interrupted_update_locked() -> bool:
     marker = update_recovery_marker_path()
     if not marker.exists():
         return False
-    phase, target_version, entries = _read_recovery_marker()
+    phase, target_version, entries, scope = _read_recovery_marker()
     if phase == "committed":
         try:
             _write_status({
@@ -1169,7 +1284,7 @@ def _recover_interrupted_update_locked() -> bool:
 
     # The marker is written before stopping the service and before the first pip mutation. If the
     # helper disappears at any point after that, restoring the durable copy is safe and idempotent.
-    _restore_installed_packages(entries)
+    _restore_installed_packages(entries, remove_unlisted=scope == "environment")
     backend, managed = _managed_service()
     if managed and backend.restart() != 0:
         raise UpdateError("the previous Ficelle update was rolled back but the service did not restart")
@@ -1199,7 +1314,7 @@ def recover_interrupted_update() -> bool:
 
 
 def _installed_version() -> str:
-    result = _run_command([sys.executable, "-c", "import ficelle; print(ficelle.__version__)"])
+    result = _run_isolated_command([absolute_python(sys.executable), "-P", "-c", "import ficelle; print(ficelle.__version__)"])
     if result.returncode != 0:
         raise UpdateError("updated package could not be imported")
     try:
@@ -1212,7 +1327,7 @@ def _verify_updated_runtime(*, expect_pro: bool) -> None:
     imports = "import ficelle"
     if expect_pro:
         imports += "; import ficelle_pro"
-    result = _run_command([sys.executable, "-c", imports])
+    result = _run_isolated_command([absolute_python(sys.executable), "-P", "-c", imports])
     if result.returncode != 0:
         raise UpdateError("updated package runtime dependencies could not be imported")
 
@@ -1315,13 +1430,11 @@ def _apply_update_locked(
         requirements = list(_wheel_runtime_requirements(core_wheel))
         if pro_wheel is not None:
             requirements.extend(_wheel_runtime_requirements(pro_wheel))
-        _install_requirements(tuple(dict.fromkeys(requirements)))
-        # Dependency preparation is allowed while the old service is still running because
-        # its imports are already resident. A broken environment must fail before service stop.
-        _pip_check()
         try:
             # A previous committed marker is normally cleaned during startup recovery. Clean
             # marker-less leftovers as a second guard before creating the next durable backup.
+            # The snapshot is the whole environment and is taken before the first pip mutation,
+            # so a later failure restores dependencies as well as Ficelle itself.
             _clear_update_recovery()
             backup = _backup_installed_packages(update_recovery_backup_dir())
             _write_recovery_marker(backup, target_version=target_version)
@@ -1330,6 +1443,11 @@ def _apply_update_locked(
             raise
         rollback_complete = False
         try:
+            _install_requirements(tuple(dict.fromkeys(requirements)))
+            # Dependency preparation still runs while the old service is up, because its
+            # imports are already resident. A broken environment fails before service stop
+            # and the snapshot above is restored.
+            _pip_check()
             if backend.stop() != 0:
                 raise UpdateError("the Ficelle service could not be stopped safely")
             _install_wheel(core_wheel)
@@ -1346,7 +1464,7 @@ def _apply_update_locked(
         except Exception:
             try:
                 backend.stop()
-                _restore_installed_packages(backup)
+                _restore_installed_packages(backup, remove_unlisted=True)
                 if backend.restart() != 0:
                     raise UpdateError("the previous Ficelle package was restored but the service did not restart")
                 rollback_complete = True

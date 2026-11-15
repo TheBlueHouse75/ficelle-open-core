@@ -45,6 +45,9 @@ DIST_STEM = "ficelle_router"
 # release notes are ignored; anything installable has to be recognised.
 DIST_SUFFIXES = (".whl", ".tar.gz", ".zip", ".egg")
 
+# Written by `scripts/write-bootstrap-pin.py` from the documented bootstrap pin; it must never ride in the wheel.
+CATALOG_PIN_FILENAME = "bootstrap-pin.json"
+
 # A wheel holds the import package and its metadata directory. Nothing else has ever been in
 # one here, so an unexpected top-level entry means the build tree was not the mirror.
 WHEEL_TOP_LEVEL = {"ficelle"}
@@ -139,6 +142,11 @@ def audit_wheel(path: Path, version: str, expected_sha256: str, failures: list[s
         )
         if unexpected:
             failures.append(f"{path.name}: unexpected top-level entries {unexpected}")
+        pins = [name for name in names if name.rsplit("/", 1)[-1] == CATALOG_PIN_FILENAME]
+        if pins:
+            # The pin records the SHA-256 of the bootstrap that pins this wheel's digest; inside
+            # the wheel it would be circular (see MANIFEST.in).
+            failures.append(f"{path.name}: contains the catalog bootstrap pin {pins}")
         try:
             metadata = archive.read(f"{dist_info}/METADATA").decode("utf-8")
         except KeyError:

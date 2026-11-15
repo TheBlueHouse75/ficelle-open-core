@@ -8,6 +8,8 @@
   <title>Ficelle · Control Center</title>
   <link rel="icon" type="image/svg+xml" href="/admin/static/ficelle-badge.svg">
   <link rel="stylesheet" href="/admin/static/admin.css">
+  <!-- Synchronous on purpose (no inline script under the CSP): sets data-theme before first paint. -->
+  <script src="/admin/static/theme-init.js"></script>
 </head>
 <body>
   <a class="skip-link" href="#mainContent">Skip to main content</a>
@@ -105,7 +107,7 @@
                     <button class="btn ghost sm danger-text" type="button" id="deleteCustomProfileBtn">Delete</button>
                   </div>
                 </div>
-                <div class="lane-stack">
+                <div class="lane-stack" tabindex="0" role="region" aria-label="Virtual model order and exclusions">
                   <div id="orderBlock" class="order-block">
                     <h3 class="section-title compact-title">Your order</h3>
                     <p class="section-sub">Drag models from the right to rank them. The top working model wins each request.</p>
@@ -238,7 +240,7 @@
       <!-- ============ Health view ============ -->
       <section class="view" data-view="health" id="view-health">
         <div class="health-grid view-kpi-spacing-lg" id="healthGrid"></div>
-        <h3 class="section-title">Active guardrails</h3>
+        <h2 class="section-title">Active guardrails</h2>
         <p class="section-sub">Models or providers Ficelle is currently holding back, and why.</p>
         <div class="guard-list" id="guardList"></div>
       </section>
@@ -258,7 +260,7 @@
         <div class="card">
           <div class="card-head">
             <div><h2>Generic client configuration</h2><div class="ch-sub">Use this with any OpenAI-compatible client. No secrets included.</div></div>
-            <button class="btn sm" type="button" id="copyExportBtn">Copy JSON</button>
+            <button class="btn sm" type="button" id="copyExportBtn" disabled>Copy JSON</button>
           </div>
           <div class="card-body">
             <div class="ep-inline" id="exportEndpoint" hidden>
@@ -266,7 +268,7 @@
               <div><span class="ep-key">Full chat URL</span><span class="ep-val" id="exportEndpointChatUrl">&nbsp;</span></div>
               <div><span class="ep-key">API key</span><span class="ep-val" id="exportEndpointKey">&nbsp;</span></div>
             </div>
-            <textarea class="codeblock" id="configExport" readonly placeholder="Press &quot;Build snippet&quot; to generate the export."></textarea>
+            <textarea class="codeblock" id="configExport" readonly placeholder="Generating…"></textarea>
           </div>
         </div>
       </section>
@@ -394,7 +396,7 @@
     </form>
   </dialog>
 
-  <div class="toast" id="toast" role="status" aria-live="polite"><span class="t-dot"></span><span class="t-body"><span id="toastMsg"></span><button type="button" class="btn sm t-action" id="toastAction" hidden></button></span></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"><span class="t-dot"></span><span class="t-body"><span id="toastMsg"></span><button type="button" class="btn sm t-action" id="toastAction" hidden></button></span><button type="button" class="iconbtn t-close" id="toastClose" aria-label="Dismiss">&times;</button></div>
 
   <script type="module" src="/admin/static/app.js"></script>
 </body>

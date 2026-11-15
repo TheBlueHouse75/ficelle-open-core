@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 import sys
+
+import pytest
 from dataclasses import replace
 from pathlib import Path
 
@@ -67,7 +69,7 @@ def test_select_service_backend_uses_launchagent_on_darwin(tmp_path):
     backend = select_service_backend(
         platform_name="darwin",
         paths=paths,
-        run_command=lambda cmd: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         uid_provider=lambda: "501",
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
@@ -90,7 +92,7 @@ def test_select_service_backend_uses_systemd_user_on_linux(tmp_path):
     backend = select_service_backend(
         platform_name="linux",
         paths=paths,
-        run_command=lambda cmd: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         uid_provider=lambda: "1000",
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
@@ -116,7 +118,7 @@ def test_launchagent_ignores_client_home_environment(tmp_path):
     backend = select_service_backend(
         platform_name="darwin",
         paths=paths,
-        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         uid_provider=lambda: "501",
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
@@ -138,7 +140,7 @@ def _launchagent_backend(
 ):
     """A LaunchAgent backend whose `launchctl`/`lsof` answers are scripted."""
 
-    def run(cmd):
+    def run(cmd, **kwargs):
         calls.append(cmd)
         if cmd[0] == "lsof":
             if port_holder_pid is None:
@@ -238,7 +240,7 @@ def test_systemd_ignores_client_home_environment(tmp_path):
     paths = make_paths(tmp_path, hermes_home=hermes_home)
     backend = SystemdUserServiceBackend(
         paths=paths,
-        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
         report_stale_servers=lambda _pids: None,
@@ -257,7 +259,7 @@ def test_systemd_persists_the_context_of_a_service_it_leaves_running(tmp_path, c
     paths = make_paths(tmp_path, persist_home=True)
     backend = SystemdUserServiceBackend(
         paths=paths,
-        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         wait_for_ready=lambda: False,
         terminate_stale_servers=lambda: [],
         report_stale_servers=lambda _pids: None,
@@ -281,7 +283,7 @@ def test_systemd_quotes_complete_environment_assignments(tmp_path):
     )
     backend = SystemdUserServiceBackend(
         paths=paths,
-        run_command=lambda cmd: subprocess.CompletedProcess(
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(
             cmd, 0, stdout="", stderr=""
         ),
         wait_for_ready=lambda: True,
@@ -308,7 +310,7 @@ def test_service_keeps_all_artifacts_under_ficelle_home(tmp_path):
     backend = select_service_backend(
         platform_name="darwin",
         paths=paths,
-        run_command=lambda cmd: subprocess.CompletedProcess(
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(
             cmd, 0, stdout="", stderr=""
         ),
         uid_provider=lambda: "501",
@@ -354,7 +356,7 @@ def test_systemd_user_restart_reuses_existing_unit(tmp_path):
     paths.systemd_unit.write_text("existing", encoding="utf-8")
     backend = SystemdUserServiceBackend(
         paths=paths,
-        run_command=lambda cmd: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
         report_stale_servers=lambda _pids: None,
@@ -382,7 +384,7 @@ def test_systemd_user_restart_reuses_the_interpreter_recorded_in_the_unit(tmp_pa
 
     installed = SystemdUserServiceBackend(
         paths=replace(paths, install_python=installed_python),
-        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
         report_stale_servers=lambda _pids: None,
@@ -391,7 +393,7 @@ def test_systemd_user_restart_reuses_the_interpreter_recorded_in_the_unit(tmp_pa
 
     restarted = SystemdUserServiceBackend(
         paths=replace(paths, install_python=current_python),
-        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
         report_stale_servers=lambda _pids: None,
@@ -416,8 +418,8 @@ def test_systemd_user_restart_repoints_when_recorded_interpreter_is_unusable(tmp
         f"ExecStart={broken_python} -m ficelle.router --serve\n", encoding="utf-8"
     )
 
-    def run_command(command):
-        if command[:2] == [str(broken_python), "-c"]:
+    def run_command(command, **kwargs):
+        if command[:3] == [str(broken_python), "-P", "-c"]:
             return subprocess.CompletedProcess(command, 1, stdout="", stderr="broken")
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
@@ -441,7 +443,7 @@ def test_systemd_user_uninstall_removes_unit_and_reloads(tmp_path):
     paths.systemd_unit.write_text("unit", encoding="utf-8")
     backend = SystemdUserServiceBackend(
         paths=paths,
-        run_command=lambda cmd: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
         report_stale_servers=lambda _pids: None,
@@ -458,7 +460,7 @@ def test_systemd_user_uninstall_removes_unit_and_reloads(tmp_path):
 def _windows_backend(paths, calls=None, *, account="EXAMPLE\\cyril", ready=True):
     recorded = calls if calls is not None else []
 
-    def run(cmd):
+    def run(cmd, **kwargs):
         recorded.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -476,7 +478,7 @@ def test_select_service_backend_uses_scheduled_task_on_windows(tmp_path):
     backend = select_service_backend(
         platform_name="win32",
         paths=make_paths(tmp_path),
-        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         uid_provider=lambda: "1000",
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
@@ -569,7 +571,7 @@ def test_scheduled_task_restart_repoints_when_recorded_interpreter_is_unusable(t
     paths.ficelle_home.joinpath(f"{paths.label}.task.xml").write_text(
         WindowsScheduledTaskBackend(
             paths=replace(paths, install_python=broken_python),
-            run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+            run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
             wait_for_ready=lambda: True,
             terminate_stale_servers=lambda: [],
             report_stale_servers=lambda _pids: None,
@@ -578,8 +580,8 @@ def test_scheduled_task_restart_repoints_when_recorded_interpreter_is_unusable(t
         encoding="utf-16",
     )
 
-    def run_command(command):
-        if command[:2] == [str(broken_python), "-c"]:
+    def run_command(command, **kwargs):
+        if command[:3] == [str(broken_python), "-P", "-c"]:
             return subprocess.CompletedProcess(command, 1, stdout="", stderr="broken")
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
@@ -655,7 +657,7 @@ def test_select_service_backend_rejects_unknown_platform(tmp_path, capsys):
     backend = select_service_backend(
         platform_name="sunos5",
         paths=make_paths(tmp_path),
-        run_command=lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
         uid_provider=lambda: "1000",
         wait_for_ready=lambda: True,
         terminate_stale_servers=lambda: [],
@@ -694,7 +696,7 @@ def test_restart_reuses_the_interpreter_the_plist_already_records(tmp_path, caps
     with paths.plist.open("wb") as handle:
         plistlib.dump({"ProgramArguments": [str(installed_python), "-m", "ficelle.router", "--serve"]}, handle)
 
-    backend = _launchagent(paths, lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
+    backend = _launchagent(paths, lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
     assert backend.paths.install_python != installed_python, "precondition: a different interpreter is running"
 
     assert backend.restart() == 0
@@ -717,9 +719,9 @@ def test_restart_repoints_when_the_recorded_interpreter_cannot_import_ficelle(tm
     with paths.plist.open("wb") as handle:
         plistlib.dump({"ProgramArguments": [str(broken_python), "-m", "ficelle.router", "--serve"]}, handle)
 
-    def run_command(cmd):
+    def run_command(cmd, **kwargs):
         # The import probe fails for the recorded interpreter; launchctl calls succeed.
-        if cmd[:2] == [str(broken_python), "-c"]:
+        if cmd[:3] == [str(broken_python), "-P", "-c"]:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="ModuleNotFoundError")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -731,3 +733,28 @@ def test_restart_repoints_when_the_recorded_interpreter_cannot_import_ficelle(tm
         rewritten = plistlib.load(handle)
     assert rewritten["ProgramArguments"][0] == str(paths.install_python), "a dead interpreter must be replaced"
     assert "unusable" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("shadow", ["ficelle.py", "ficelle/__init__.py"])
+def test_recorded_interpreter_probe_cannot_import_caller_package(tmp_path, monkeypatch, shadow):
+    from ficelle.service import _usable_recorded_interpreter
+
+    caller = tmp_path / "caller"
+    planted = caller / shadow
+    planted.parent.mkdir(parents=True)
+    planted.write_text("raise RuntimeError('caller shadow')\n")
+    interpreter = tmp_path / "venv" / "python"
+    interpreter.parent.mkdir()
+    interpreter.touch()
+    monkeypatch.chdir(caller)
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    calls = []
+    def run(command, **kwargs):
+        assert Path(kwargs["cwd"]).stat().st_mode & 0o777 == 0o700
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
+    assert _usable_recorded_interpreter(interpreter, run) == interpreter
+    (command, kwargs), = calls
+    assert command == [str(interpreter), "-P", "-c", "import ficelle"]
+    assert kwargs["env"]["PYTHONSAFEPATH"] == "1"
+    assert Path(kwargs["cwd"]).is_absolute() and kwargs["cwd"] != str(caller)

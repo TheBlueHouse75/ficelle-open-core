@@ -539,7 +539,7 @@ def test_update_installs_wheels_without_dependency_resolution(
     monkeypatch.setattr(
         update,
         "_run_command",
-        lambda command: commands.append(command)
+        lambda command, **kwargs: commands.append(command)
         or subprocess.CompletedProcess(command, 0, "", ""),
     )
 
@@ -561,7 +561,7 @@ def test_update_dependency_check_falls_back_to_uv_without_pip(
 ) -> None:
     commands: list[list[str]] = []
 
-    def fake_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+    def fake_run(command: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
         commands.append(command)
         if command[:3] == [update.sys.executable, "-m", "pip"]:
             return subprocess.CompletedProcess(
@@ -583,6 +583,7 @@ def test_update_dependency_check_falls_back_to_uv_without_pip(
             "/usr/local/bin/uv",
             "pip",
             "check",
+            "--no-config",
             "--python",
             update.sys.executable,
         ],
@@ -600,7 +601,7 @@ def test_update_extracts_only_external_runtime_requirements(tmp_path: Path) -> N
                     "Name: ficelle-pro",
                     "Version: 0.3.7",
                     "Requires-Dist: ficelle-router==0.3.7",
-                    "Requires-Dist: packaging>=24",
+                    "Requires-Dist: packaging (>=24)",
                     "Requires-Dist: cryptography>=42; python_version >= '3.11'",
                     "",
                 )
@@ -608,9 +609,60 @@ def test_update_extracts_only_external_runtime_requirements(tmp_path: Path) -> N
         )
 
     assert update._wheel_runtime_requirements(wheel) == (
-        "packaging>=24",
+        "packaging (>=24)",
         "cryptography>=42; python_version >= '3.11'",
     )
+
+
+@pytest.mark.parametrize("requirement", [
+    "foo @ https://user:private-value@example.test/foo.whl",
+    "ficelle-router @ file:///private-value.whl",
+    "", "   ", "--index-url=https://private-value@example.test/simple",
+])
+def test_update_rejects_unsafe_wheel_requirements(tmp_path, requirement):
+    wheel = tmp_path / "ficelle_router.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "ficelle_router.dist-info/METADATA",
+            f"Metadata-Version: 2.4\nRequires-Dist: {requirement}\n",
+        )
+    with pytest.raises(update.UpdateError, match="runtime requirement") as error:
+        update._wheel_runtime_requirements(wheel)
+    assert "private-value" not in str(error.value)
+
+
+@pytest.mark.parametrize("requirement", [
+    "foo @ https://user:private-value@example.test/foo.whl",
+    "", "   ", "--index-url=https://private-value@example.test/simple",
+    "pkg>=1\n--extra-index-url https://private-value@example.test/simple",
+    "\xa0private-value", "private-value\x00",
+])
+def test_update_validates_all_requirements_before_running_pip(monkeypatch, requirement):
+    calls = []
+    monkeypatch.setattr(update, "_run_command", calls.append)
+    with pytest.raises(update.UpdateError, match="runtime requirement") as error:
+        update._install_requirements(("packaging>=24", requirement))
+    assert calls == []
+    assert "private-value" not in str(error.value)
+
+
+@pytest.mark.parametrize("missing_pip", [False, True])
+def test_update_installs_valid_requirements_with_pip_or_uv(monkeypatch, missing_pip):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if missing_pip and len(calls) == 1:
+            return subprocess.CompletedProcess(command, 1, "", "No module named pip")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(update, "_run_command", run)
+    monkeypatch.setattr(update, "_uv_executable", lambda: "uv")
+    requirements = ("packaging>=24", 'requests[security]>=2.31; python_version >= "3.11"')
+    update._install_requirements(requirements)
+    assert calls[0] == [update.sys.executable, "-m", "pip", "install", *requirements]
+    if missing_pip:
+        assert calls[1] == ["uv", "pip", "install", "--no-config", "--python", update.sys.executable, *requirements]
 
 
 def test_update_check_loop_retries_a_failed_check(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -732,10 +784,307 @@ def test_interrupted_update_recovery_marker_is_durable_and_restores(
             restarted.append(True)
             return 0
 
-    monkeypatch.setattr(update, "_restore_installed_packages", lambda value: restored.append(value))
+    monkeypatch.setattr(
+        update,
+        "_restore_installed_packages",
+        lambda value, **_kwargs: restored.append(value),
+    )
     monkeypatch.setattr(update, "_managed_service", lambda: (_Backend(), True))
 
     assert update.recover_interrupted_update() is True
     assert restored == [entries]
     assert restarted == [True]
     assert not (tmp_path / "recovery").exists()
+
+
+def test_failed_update_restores_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    purelib = tmp_path / "purelib"
+    (purelib / "ficelle").mkdir(parents=True)
+    (purelib / "ficelle" / "__init__.py").write_text("old-ficelle\n", encoding="utf-8")
+    (purelib / "requests").mkdir()
+    (purelib / "requests" / "__init__.py").write_text("old-requests\n", encoding="utf-8")
+    monkeypatch.setattr(update.sysconfig, "get_paths", lambda: {"purelib": str(purelib)})
+    monkeypatch.setattr(update, "_package_root", lambda: purelib.resolve())
+    monkeypatch.setattr(update, "update_recovery_dir", lambda: tmp_path / "recovery")
+    manifest = update.parse_release_manifest(
+        compact_manifest(),
+        source_url="https://install.ficelle.ai/api/releases/latest/core",
+    )
+    status = {**manifest.internal_dict(), "status": "available", "update_available": True}
+
+    def download(artifact: update.ReleaseArtifact, destination: Path, **_kwargs: object) -> Path:
+        destination.mkdir(parents=True, exist_ok=True)
+        path = destination / artifact.filename
+        path.write_bytes(b"wheel")
+        return path
+
+    def install_requirements(_requirements: tuple[str, ...]) -> None:
+        assert update.update_recovery_marker_path().is_file()
+        saved = next(update.update_recovery_backup_dir().glob("*-requests"))
+        assert (saved / "__init__.py").read_text(encoding="utf-8") == "old-requests\n"
+        (purelib / "requests" / "__init__.py").write_text("new-requests\n", encoding="utf-8")
+        new_package = purelib / "brand-new"
+        new_package.mkdir()
+        (new_package / "__init__.py").write_text("new\n", encoding="utf-8")
+
+    class _Backend:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def stop(self) -> int:
+            self.events.append("stop")
+            return 0
+
+        def restart(self) -> int:
+            self.events.append("restart")
+            return 0
+
+    backend = _Backend()
+    monkeypatch.setattr(update, "_download_artifact", download)
+    monkeypatch.setattr(update, "_wheel_runtime_requirements", lambda _wheel: ("requests>=2.32",))
+    monkeypatch.setattr(update, "_is_pro_installed", lambda: False)
+    monkeypatch.setattr(update, "_managed_service", lambda: (backend, True))
+    def fail_dependency_check() -> None:
+        raise update.UpdateError("Ficelle runtime dependency check failed")
+
+    monkeypatch.setattr(update, "_install_requirements", install_requirements)
+    monkeypatch.setattr(update, "_pip_check", fail_dependency_check)
+    monkeypatch.setattr(
+        update,
+        "_install_wheel",
+        lambda _wheel: pytest.fail("wheel install must not run after the dependency check fails"),
+    )
+
+    with pytest.raises(update.UpdateError, match="dependency check failed"):
+        update._apply_update_locked(status)
+
+    assert (purelib / "requests" / "__init__.py").read_text(encoding="utf-8") == "old-requests\n"
+    assert (purelib / "ficelle" / "__init__.py").read_text(encoding="utf-8") == "old-ficelle\n"
+    assert not (purelib / "brand-new").exists()
+    assert backend.events == ["stop", "restart"]
+
+
+def test_legacy_recovery_marker_does_not_delete_other_distributions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    purelib = tmp_path / "purelib"
+    ficelle_dir = purelib / "ficelle"
+    ficelle_dir.mkdir(parents=True)
+    (ficelle_dir / "__init__.py").write_text("new\n", encoding="utf-8")
+    requests_dir = purelib / "requests"
+    requests_dir.mkdir()
+    (requests_dir / "__init__.py").write_text("keep-me\n", encoding="utf-8")
+    (purelib / "brand-new").mkdir()
+    backup = tmp_path / "recovery" / "backup" / "0-ficelle"
+    backup.mkdir(parents=True)
+    (backup / "__init__.py").write_text("old\n", encoding="utf-8")
+    monkeypatch.setattr(update.sysconfig, "get_paths", lambda: {"purelib": str(purelib)})
+    monkeypatch.setattr(update, "_package_root", lambda: purelib.resolve())
+    monkeypatch.setattr(update, "update_recovery_dir", lambda: tmp_path / "recovery")
+    update._write_recovery_marker([update._BackupEntry(ficelle_dir, backup)], target_version=NEXT_VERSION)
+    marker = update.update_recovery_marker_path()
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload.pop("scope", None)
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    _phase, _version, entries, scope = update._read_recovery_marker()
+
+    assert scope == "packages"
+    update._restore_installed_packages(entries, remove_unlisted=False)
+    assert (ficelle_dir / "__init__.py").read_text(encoding="utf-8") == "old\n"
+    assert (requests_dir / "__init__.py").read_text(encoding="utf-8") == "keep-me\n"
+    assert (purelib / "brand-new").is_dir()
+
+
+@pytest.mark.parametrize("operation", ["apply", "recover"])
+@pytest.mark.parametrize("systemd", [False, True])
+def test_detached_helpers_use_safe_python_and_runtime_cwd(tmp_path, monkeypatch, operation, systemd):
+    caller = tmp_path / "untrusted"
+    caller.mkdir()
+    (caller / "ficelle.py").write_text("raise RuntimeError('caller shadow')\n")
+    home = tmp_path / "new-runtime"
+    monkeypatch.chdir(caller)
+    monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    monkeypatch.setattr(update, "queue_update", lambda: {"status": "queued"})
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/tools/systemd-run" if name == "systemd-run" else None)
+    if systemd:
+        monkeypatch.setenv("INVOCATION_ID", "test-service")
+    else:
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+    if operation == "recover":
+        update.update_recovery_marker_path().parent.mkdir(parents=True)
+        update.update_recovery_marker_path().touch()
+    calls = []
+    monkeypatch.setattr(update.subprocess, "Popen", lambda command, **kwargs: calls.append((command, kwargs)))
+
+    result = update.spawn_update() if operation == "apply" else update.spawn_recovery()
+
+    assert result
+    (command, kwargs), = calls
+    python_index = command.index(update.sys.executable)
+    assert command[python_index:] == [update.sys.executable, "-P", "-m", "ficelle", "update", f"--{operation}"]
+    assert (command[0] == "/tools/systemd-run") is systemd
+    assert kwargs["env"]["PYTHONSAFEPATH"] == "1"
+    assert kwargs["env"]["FICELLE_HOME"] == str(home.absolute())
+    assert kwargs["cwd"] == str(home.absolute())
+    assert home.is_dir()
+    assert kwargs["start_new_session"] is True
+
+
+@pytest.mark.parametrize("operation", ["apply", "recover"])
+def test_detached_helpers_refuse_an_unusable_home(tmp_path, monkeypatch, operation):
+    home = tmp_path / "not-a-directory"
+    home.touch()
+    monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
+    monkeypatch.setattr(update, "queue_update", lambda: {"status": "queued"})
+    monkeypatch.setattr(update, "update_recovery_marker_path", lambda: home)
+    monkeypatch.setattr(update.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not inherit the caller cwd"))
+    with pytest.raises(update.UpdateError):
+        (update.spawn_update if operation == "apply" else update.spawn_recovery)()
+
+
+@pytest.mark.parametrize("parent_config", ["uv.toml", "tool.uv", "tool.uv.pip"])
+@pytest.mark.parametrize("operation", ["wheel", "requirements", "check"])
+def test_update_uv_fallbacks_ignore_parent_configuration(tmp_path, monkeypatch, parent_config, operation):
+    parent = tmp_path / "shared-temp"
+    parent.mkdir()
+    filename = "uv.toml" if parent_config == "uv.toml" else "pyproject.toml"
+    table = "" if parent_config == "uv.toml" else f"[{parent_config}]\n"
+    (parent / filename).write_text(table + 'index-url = "https://attacker.invalid/simple"\n')
+    monkeypatch.setattr(update.tempfile, "tempdir", str(parent))
+    monkeypatch.setenv("UV_NO_CONFIG", "0")
+    trusted_uv = {
+        "UV_CONFIG_FILE": str(tmp_path / "user-selected-uv.toml"),
+        "UV_INDEX_URL": "https://user-index.invalid/simple",
+        "UV_CACHE_DIR": str(tmp_path / "user-cache"),
+    }
+    for name, value in trusted_uv.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(update, "_uv_executable", lambda: "/tools/uv")
+    monkeypatch.chdir(tmp_path)
+    directories = []
+    commands = []
+
+    def run(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        assert cwd.is_absolute() and cwd.parent == parent
+        assert cwd.stat().st_mode & 0o777 == 0o700
+        assert list(cwd.iterdir()) == []
+        assert cwd not in directories
+        directories.append(cwd)
+        commands.append(command)
+        if command[0] != "/tools/uv":
+            return subprocess.CompletedProcess(command, 1, "", "No module named pip")
+        assert command[:4] == ["/tools/uv", "pip", "check" if operation == "check" else "install", "--no-config"]
+        assert kwargs["env"]["UV_NO_CONFIG"] == "1"
+        assert {name: kwargs["env"][name] for name in trusted_uv} == trusted_uv
+        assert command[command.index("--python") + 1] == update.sys.executable
+        if operation == "wheel":
+            assert command[-1] == str(tmp_path / "ficelle.whl")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(update.subprocess, "run", run)
+    if operation == "wheel":
+        update._install_wheel(Path("ficelle.whl"))
+    elif operation == "requirements":
+        update._install_requirements(("packaging",))
+    else:
+        update._pip_check()
+
+    assert len(commands) == 2
+    assert commands[0][:3] == [update.sys.executable, "-m", "pip"]
+    assert all(not directory.exists() for directory in directories)
+
+
+@pytest.mark.parametrize("operation", ["apply", "recover"])
+@pytest.mark.parametrize("mode,accepted", [(0o700, True), (0o755, True), (0o775, False), (0o757, False)])
+def test_detached_helpers_revalidate_existing_home(tmp_path, monkeypatch, operation, mode, accepted):
+    home = tmp_path / "home"
+    home.mkdir(mode=mode)
+    home.chmod(mode)
+    marker = tmp_path / "marker"
+    marker.touch()
+    monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
+    monkeypatch.setattr(update, "queue_update", lambda: {"status": "queued"})
+    monkeypatch.setattr(update, "update_recovery_marker_path", lambda: marker)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    calls = []
+    monkeypatch.setattr(update.subprocess, "Popen", lambda *a, **kw: calls.append(kw))
+    spawn = update.spawn_update if operation == "apply" else update.spawn_recovery
+    if accepted:
+        assert spawn()
+        assert calls[0]["cwd"] == str(home)
+    else:
+        with pytest.raises(update.UpdateError):
+            spawn()
+        assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["mkdir", "validation", "spawn"])
+@pytest.mark.parametrize("status_writable", [True, False])
+def test_recovery_start_failure_reports_failed_without_losing_marker(tmp_path, monkeypatch, failure, status_writable):
+    marker = tmp_path / "marker"
+    marker.touch()
+    home = tmp_path / "home"
+    monkeypatch.setattr(update, "update_recovery_marker_path", lambda: marker)
+    monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
+    if failure == "mkdir":
+        home.parent.joinpath("blocked").touch()
+        home = home.parent / "blocked" / "home"
+        monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
+    elif failure == "validation":
+        home.mkdir(mode=0o775)
+        home.chmod(0o775)
+    calls = []
+    def spawn(*args, **kwargs):
+        calls.append(args)
+        raise OSError("sensitive diagnostic")
+    monkeypatch.setattr(update.subprocess, "Popen", spawn)
+    statuses = []
+    def write_status(payload):
+        statuses.append(payload)
+        if not status_writable:
+            raise update.UpdateError("status unavailable")
+    monkeypatch.setattr(update, "_write_status", write_status)
+    with pytest.raises(update.UpdateError, match="recovery helper could not start") as caught:
+        update.spawn_recovery()
+    assert "sensitive" not in str(caught.value)
+    assert statuses == [{"status": "failed", "message": "The Ficelle update recovery helper could not start."}]
+    assert bool(calls) is (failure == "spawn")
+    assert marker.exists()
+
+
+def test_recovery_without_marker_does_not_create_home_or_spawn(tmp_path, monkeypatch):
+    home = tmp_path / "missing-home"
+    monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
+    monkeypatch.setattr(update.subprocess, "Popen", lambda *a, **kw: pytest.fail("no recovery needed"))
+    assert update.spawn_recovery() is False
+    assert not home.exists()
+
+
+@pytest.mark.parametrize("operation", ["version", "core", "pro"])
+@pytest.mark.parametrize("shadow", ["ficelle.py", "ficelle/__init__.py"])
+def test_updated_runtime_probes_ignore_caller_imports(tmp_path, monkeypatch, operation, shadow):
+    caller = tmp_path / "caller"
+    planted = caller / shadow
+    planted.parent.mkdir(parents=True)
+    planted.write_text("raise RuntimeError('caller shadow')\n")
+    monkeypatch.chdir(caller)
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    calls = []
+    def run(command, **kwargs):
+        assert Path(kwargs["cwd"]).stat().st_mode & 0o777 == 0o700
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, ficelle.__version__, "")
+    monkeypatch.setattr(update.subprocess, "run", run)
+    if operation == "version":
+        assert update._installed_version() == ficelle.__version__
+    else:
+        update._verify_updated_runtime(expect_pro=operation == "pro")
+    (command, kwargs), = calls
+    assert command[:3] == [update.sys.executable, "-P", "-c"]
+    assert "import ficelle" in command[3]
+    assert kwargs["env"]["PYTHONSAFEPATH"] == "1"
+    assert Path(kwargs["cwd"]).is_absolute() and kwargs["cwd"] != str(caller)

@@ -1,4 +1,9 @@
 name: ficelle
 kind: model-provider
-version: 0.3.13
+version: 0.3.14
 description: Ficelle FREE local strict-zero OpenAI-compatible model router.
+requires_hermes: ">=0.22.6"
+requires_env:
+  - name: FICELLE_API_KEY
+    description: Non-secret local listener value. Leave empty; selecting Ficelle in `hermes model` sets it.
+    secret: false

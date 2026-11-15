@@ -102,7 +102,7 @@ def test_admin_state_builder_assembles_operator_payload_without_running_quota_pr
 
     builder = AdminStateBuilder(
         AdminStateBuildPorts(
-            load_or_refresh_catalog=lambda _config: catalog,
+            load_catalog=lambda _config: catalog,
             load_runtime_state=lambda: state,
             normalized_virtual_profiles=lambda _config: {"ficelle/auto-fast": {"mode": "auto"}},
             build_admin_status=lambda _catalog, _config, _state: {
@@ -186,7 +186,11 @@ def test_catalog_with_auto_scores_enriches_copy_without_mutating_source():
         normalized_free_access=lambda model: {"eligible": model["id"] == "m1", "mode": "test"},
         model_score_explanation=lambda profile_id, model, _state: {
             "score_total": 90.0 if profile_id == "ficelle/auto-fast" else 70.0,
+            "score_base": 88.0,
+            "evidence_status": "missing",
+            "evidence_reason": None,
             "model_id": model["id"],
+            "latency_score": 0.7,
         },
     )
 
@@ -199,7 +203,12 @@ def test_catalog_with_auto_scores_enriches_copy_without_mutating_source():
         "ficelle/auto-fast": 90.0,
         "ficelle/auto-json": 70.0,
     }
-    assert enriched["models"][0]["auto_score_details"]["ficelle/auto-fast"]["model_id"] == "m1"
+    # Every model ships one detail row per profile, so this projection is most of the payload:
+    # fields no consumer reads and null values stay out (see ADMIN_SCORE_DETAIL_FIELDS).
+    assert enriched["models"][0]["auto_score_details"]["ficelle/auto-fast"] == {
+        "score_base": 88.0,
+        "evidence_status": "missing",
+    }
 
 
 def test_catalog_score_details_keep_quality_feedback_projection_redacted():

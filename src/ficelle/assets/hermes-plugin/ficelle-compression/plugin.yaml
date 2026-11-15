@@ -1,6 +1,7 @@
 name: ficelle-compression
 kind: standalone
-version: 0.3.13
+version: 0.3.14
 description: Ficelle local compression retrieval tool for Hermes.
+requires_hermes: ">=0.22.6"
 provides_tools:
   - ficelle_retrieve_compressed

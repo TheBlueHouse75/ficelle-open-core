@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import re
 import tomllib
 from pathlib import Path
@@ -108,3 +109,30 @@ def test_the_two_pinned_core_digests_agree() -> None:
         f"bootstrap pins {bootstrap} but the launch canary pins {canary}"
     )
     assert bootstrap[0] == ficelle.__version__
+
+
+def test_the_wheel_ships_the_plugin_runtime_but_never_the_bootstrap_pin() -> None:
+    """The pin holds the digest of a file that pins the wheel, so it can only live outside it.
+
+    setuptools applies `exclude-package-data` over `package-data` globs; this mirrors that rule
+    because building a wheel needs network access to fetch the build backend.
+    """
+    settings = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["tool"]["setuptools"]
+    included = settings["package-data"]["ficelle"]
+    excluded = settings["exclude-package-data"]["ficelle"]
+    assets = REPO_ROOT / "src/ficelle"
+
+    def shipped(relative: str) -> bool:
+        return any(fnmatch.fnmatchcase(relative, pattern) for pattern in included) and not any(
+            fnmatch.fnmatchcase(relative, pattern) for pattern in excluded
+        )
+
+    assert not shipped("assets/hermes-plugin/ficelle/bootstrap-pin.json")
+    runtime = [
+        path.relative_to(assets).as_posix()
+        for plugin in (assets / "assets/hermes-plugin").iterdir()
+        for path in plugin.iterdir()
+        if path.is_file() and path.name != "bootstrap-pin.json" and path.suffix != ".pyc"
+    ]
+    assert "assets/hermes-plugin/ficelle/setup_flow.py" in runtime
+    assert [relative for relative in runtime if not shipped(relative)] == []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -720,7 +721,13 @@ def test_weekly_schedule_is_disabled_until_installed_and_uses_same_cli(tmp_path:
 
     assert status["enabled"] is True
     assert status["schedule"] == {"Weekday": 2, "Hour": 3, "Minute": 15}
-    assert ["synthetic-health", "run", "--depth", "deep", "--json"] == status["program_arguments"][3:]
+    assert ["synthetic-health", "run", "--depth", "deep", "--json"] == status["program_arguments"][4:]
+    import plistlib
+
+    payload = plistlib.loads(plist.read_bytes())
+    assert payload["ProgramArguments"][:4] == [sys.executable, "-P", "-m", "ficelle.cli"]
+    assert payload["EnvironmentVariables"]["PYTHONSAFEPATH"] == "1"
+    assert payload["WorkingDirectory"] == str(tmp_path / "home")
     assert calls[-1][:2] == ["launchctl", "bootstrap"]
 
 

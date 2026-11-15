@@ -87,6 +87,24 @@ class FicelleProfile(ProviderProfile):
         return virtual_ids or list(self.fallback_models)
 
 
+def _setup_flow_options() -> dict[str, object]:
+    """The `hermes model` setup hook, only where this Hermes release has the field.
+
+    A release whose `ProviderProfile` lacks `model_setup_flow` must still load the provider, so
+    the keyword is never passed unconditionally. The flow module is imported when the user picks
+    Ficelle, never while the plugin loads.
+    """
+    if "model_setup_flow" not in getattr(ProviderProfile, "__dataclass_fields__", {}):
+        return {}
+
+    def model_setup_flow(config: object, current_model: str, args: object) -> bool:
+        from . import setup_flow
+
+        return setup_flow.model_setup_flow(config, current_model, args, router_url=FICELLE_ROUTER_URL)
+
+    return {"model_setup_flow": model_setup_flow}
+
+
 ficelle = FicelleProfile(
     name="ficelle",
     aliases=("Ficelle", "Ficelle FREE"),
@@ -95,11 +113,13 @@ ficelle = FicelleProfile(
     # See docs/components/hermes-integration.md.
     env_vars=("FICELLE_API_KEY",),
     display_name="Ficelle FREE",
-    description="Local strict-zero/free OpenAI-compatible model router",
+    # Hermes shows this line alone in the `hermes model` picker, so it must carry the name.
+    description="Ficelle — local strict-zero/free OpenAI-compatible model router",
     signup_url=FICELLE_ROUTER_URL + "/admin",
     base_url=FICELLE_ROUTER_URL + "/v1",
     models_url=FICELLE_ROUTER_URL + "/v1/models",
     fallback_models=VIRTUAL_MODELS,
+    **_setup_flow_options(),
 )
 
 register_provider(ficelle)

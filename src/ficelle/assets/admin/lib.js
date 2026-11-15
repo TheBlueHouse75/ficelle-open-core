@@ -222,12 +222,41 @@ export function showToast(msg, level = "", action = null) {
   // `onclick` holds one handler by construction, so the previous toast's action cannot
   // still be attached here.
   button.onclick = action
-    ? () => { toast.classList.remove("show"); clearTimeout(showToast.t); action.onClick(); }
+    ? () => { hideToast(); action.onClick(); }
     : null;
+  bindToastPause(toast);
   toast.classList.add("show");
-  clearTimeout(showToast.t);
-  const ms = action ? 14000 : (level === "warn" || level === "error" ? 6000 : 2800);
-  showToast.t = setTimeout(() => toast.classList.remove("show"), ms);
+  toastMs = action ? 14000 : (level === "warn" || level === "error" ? 6000 : 2800);
+  armToastTimer();
+}
+
+let toastTimer = 0;
+let toastMs = 0;
+let toastBound = false;
+
+function hideToast() {
+  clearTimeout(toastTimer);
+  $("toast").classList.remove("show");
+}
+
+function armToastTimer() {
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, toastMs);
+}
+
+// A toast that sits over controls for 14s must be dismissable, and must not vanish while
+// the user is reading it or about to press its action: hover/focus pauses the countdown.
+// Bound on first use rather than at import, because tests evaluate this module without a DOM.
+function bindToastPause(toast) {
+  if (toastBound) return;
+  toastBound = true;
+  const pause = () => clearTimeout(toastTimer);
+  const resume = () => { if (toast.classList.contains("show")) armToastTimer(); };
+  toast.addEventListener("mouseenter", pause);
+  toast.addEventListener("mouseleave", () => { if (!toast.matches(":focus-within")) resume(); });
+  toast.addEventListener("focusin", pause);
+  toast.addEventListener("focusout", (e) => { if (!toast.contains(e.relatedTarget) && !toast.matches(":hover")) resume(); });
+  $("toastClose").addEventListener("click", hideToast);
 }
 
 // The `auth.key_source` families a removal cannot reach, mapped to the next move — same shape

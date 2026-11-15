@@ -51,6 +51,11 @@
       --shadow-pop: 0 28px 70px -24px rgba(1, 3, 8, 0.9);
       --glow: 0 0 34px -10px color-mix(in srgb, var(--brand) 58%, transparent);
       --scrim: rgba(5, 7, 11, 0.76);
+      /* Dark text on chips keeps the fill hue; the light theme darkens it for AA. */
+      --brand-text: var(--brand);
+      --danger-text: var(--danger);
+      /* --surface-2 composed over --bg-1: popovers and toasts must not let content bleed through. */
+      --surface-pop: #121823;
     }
 
     html[data-theme="light"] {
@@ -64,7 +69,7 @@
       --border-strong: rgba(66, 52, 39, 0.24);
       --text: #191510;
       --text-soft: #51463c;
-      --text-muted: #74685d;
+      --text-muted: #6b6055;
       --brand: #b5430a;
       --brand-soft: #8a3408;
       --brand-ink: #ffffff;
@@ -83,6 +88,11 @@
       --shadow-pop: 0 24px 60px -24px rgba(44, 56, 73, 0.28);
       --glow: 0 0 0 1px color-mix(in srgb, var(--brand) 32%, transparent);
       --scrim: rgba(242, 240, 235, 0.76);
+      /* Brand/danger as *text* on their own tinted chips: the fill tokens above stay,
+         these darker stops carry the label to 4.5:1. */
+      --brand-text: #8f3306;
+      --danger-text: #a52414;
+      --surface-pop: #f7f3ed;
     }
 
     /* Legacy alias: app.js still emits `var(--accent)` in inline styles, the shared
@@ -252,6 +262,16 @@
     }
     .nav-item.active svg { opacity: 1; color: var(--brand); }
     .nav-spacer { flex: 1; }
+    /* The theme switch lives at the rail's foot; on common 900px-high screens the rail
+       overflowed and hid it, so the rail tightens until it fits. */
+    @media (min-width: 1081px) and (max-height: 1000px) {
+      .rail { padding-block: 14px 12px; gap: 6px; }
+      .brand { padding-bottom: 8px; }
+      .endpoint-alt .ep-hint { display: none; }
+      .nav-item { padding-block: 6px; }
+      .nav-label { padding-top: 6px; }
+      .rail-foot { gap: 8px; }
+    }
     .nav-shell { min-width: 0; }
 
     .rail-foot { display: flex; flex-direction: column; gap: 12px; padding-top: 8px; border-top: 1px solid var(--border); }
@@ -371,7 +391,11 @@
     .btn svg { width: 15px; height: 15px; opacity: 0.85; }
     .btn:hover { background: var(--surface-2); border-color: var(--brand-line); transform: translateY(-2px); box-shadow: 0 12px 30px -22px var(--brand); }
     .btn:active { transform: translateY(0) scale(0.98); }
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    /* Inert, not "dimmed": a half-transparent primary read as a salmon active button. */
+    .btn:disabled, .btn.primary:disabled {
+      background: var(--surface-2); color: var(--text-muted); border-color: var(--border);
+      box-shadow: none; filter: none; cursor: not-allowed; transform: none;
+    }
     .btn.is-loading svg, .iconbtn.is-loading svg { display: none; }
     .btn.is-loading::before, .iconbtn.is-loading::before {
       content: "";
@@ -392,7 +416,6 @@
     }
     .btn.primary:hover { filter: brightness(1.06); box-shadow: 0 0 0 1px color-mix(in srgb, var(--brand) 66%, white), 0 18px 38px -18px var(--brand); }
     .btn.primary:active { transform: translateY(1px) scale(0.98); box-shadow: 0 0 0 1px color-mix(in srgb, var(--brand) 56%, white), 0 8px 24px -18px var(--brand); }
-    .btn.primary:disabled { box-shadow: 0 0 0 1px color-mix(in srgb, var(--brand) 45%, white); }
     .btn.ghost { background: transparent; }
     .btn.sm { padding: 6px 12px; font-size: 12px; }
     /* Unsaved-virtual-model count on Save. `:empty` matters: .btn is a flex container with
@@ -430,9 +453,9 @@
     .badge.mono { font-family: var(--font-mono); font-weight: 550; font-size: 11px; }
     .badge.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
     .badge.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); border-color: color-mix(in srgb, var(--warn) 32%, transparent); }
-    .badge.danger { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); border-color: color-mix(in srgb, var(--danger) 32%, transparent); }
+    .badge.danger { color: var(--danger-text); background: color-mix(in srgb, var(--danger) 14%, transparent); border-color: color-mix(in srgb, var(--danger) 32%, transparent); }
     .badge.info { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); border-color: color-mix(in srgb, var(--info) 30%, transparent); }
-    .badge.accent { color: var(--brand); background: color-mix(in srgb, var(--brand) 14%, transparent); border-color: color-mix(in srgb, var(--brand) 30%, transparent); }
+    .badge.accent { color: var(--brand-text); background: color-mix(in srgb, var(--brand) 14%, transparent); border-color: color-mix(in srgb, var(--brand) 30%, transparent); }
     .badge.violet { color: var(--violet); background: color-mix(in srgb, var(--violet) 15%, transparent); border-color: color-mix(in srgb, var(--violet) 30%, transparent); }
 
     /* Status dot (next to the model name) */
@@ -455,7 +478,7 @@
     /* Keep the three column headers' separators aligned even when the narrow column's
        subtitle wraps to two lines (border-box: 1px border + 32px padding + 21px h2
        + 3px sub margin + two 18px sub lines). */
-    .workspace .card-head { min-height: 96px; align-items: start; }
+    .workspace .card-head { min-height: 96px; align-items: start; flex-shrink: 0; }
     .ws-col.lanes .card-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "title action" "sub sub"; align-content: start; }
     .ws-col.lanes .card-head > div { display: contents; }
     .ws-col.lanes .card-head h2 { grid-area: title; }
@@ -468,6 +491,7 @@
     /* Central column: order, auto-note, and excluded share one scroll region so nothing is clipped. */
     .lane-stack { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; padding-right: 4px; margin-right: -4px; }
     .lane-stack .order-block { flex: 0 0 auto; }
+    .lane-stack:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
     .lane-stack #selectedList { flex: 0 0 auto; overflow: visible; }
     #selectedList { min-height: 120px; }
     .ws-col .scroll { flex: 1 1 auto; min-height: 0; max-height: none; }
@@ -488,7 +512,7 @@
     .profile-tab:active { transform: translateX(1px) scale(0.992); }
     .profile-tab.active { border-color: var(--brand-line); background: var(--brand-wash); }
     .profile-tab .pt-name { font-weight: 620; font-size: 13.5px; }
-    .profile-tab .pt-id { grid-column: 1 / -1; font-family: var(--font-mono); font-size: 10.5px; color: var(--brand); }
+    .profile-tab .pt-id { grid-column: 1 / -1; font-family: var(--font-mono); font-size: 10.5px; color: var(--brand-text); }
     .profile-tab .pt-meta { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-muted); }
     .profile-tab .pt-counts { display: flex; gap: 5px; align-items: center; }
     .profile-tab .pt-counts .badge { padding-inline: 6px; font-size: 10.5px; }
@@ -496,7 +520,7 @@
     .profile-group-label { margin: 11px 2px 2px; color: var(--text-muted); font-size: 10.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
     .custom-profile-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-left: auto; }
     .custom-profile-actions[hidden] { display: none; }
-    .danger-text { color: var(--danger); }
+    .danger-text { color: var(--danger-text); }
 
     .profile-dialog { width: min(520px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--border-strong); border-radius: var(--radius-md); background: var(--surface-1); color: var(--text); box-shadow: var(--shadow-pop); }
     .profile-dialog::backdrop { background: rgb(12 18 26 / 0.62); backdrop-filter: blur(3px); }
@@ -527,7 +551,9 @@
     .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
     .switch .track {
       width: 38px; height: 22px; border-radius: 999px; position: relative; flex: none;
-      border: 1px solid color-mix(in srgb, var(--border-strong) 88%, transparent);
+      /* OFF vs ON must read without relying on hue: the knob is a solid --text-muted disc
+         (>=3:1 on the track) when off and a --brand-ink disc on a solid --brand track when on. */
+      border: 1px solid color-mix(in srgb, var(--text-muted) 70%, transparent);
       background: var(--surface-2);
       transition: background 0.18s var(--ease), border-color 0.18s var(--ease), transform 0.18s var(--ease);
     }
@@ -535,23 +561,23 @@
       content: "";
       position: absolute; top: 2px; left: 2px;
       width: 16px; height: 16px; border-radius: 999px;
-      background: var(--surface-1);
+      background: var(--text-muted);
       transition: transform 0.18s var(--ease), background 0.18s var(--ease);
     }
     .switch input:checked + .track {
-      background: color-mix(in srgb, var(--brand) 26%, var(--surface-2));
-      border-color: color-mix(in srgb, var(--brand) 60%, transparent);
+      background: var(--brand);
+      border-color: var(--brand);
     }
     .switch input:checked + .track::after {
       transform: translateX(16px);
-      background: color-mix(in srgb, var(--brand) 30%, var(--surface-1));
+      background: var(--brand-ink);
     }
     .switch input:focus-visible + .track {
       outline: 2px solid color-mix(in srgb, var(--brand) 70%, transparent);
       outline-offset: 2px;
     }
-    .switch:hover input:checked + .track { border-color: color-mix(in srgb, var(--brand) 66%, transparent); }
-    .switch:hover input:not(:checked) + .track { border-color: var(--border-strong); }
+    .switch:hover input:checked + .track { filter: brightness(1.08); }
+    .switch:hover input:not(:checked) + .track { border-color: var(--text-muted); }
     .dimple-toggle {
       display: inline-flex; align-items: center; gap: 10px;
       min-width: 0;
@@ -569,14 +595,14 @@
       position: relative;
       width: 40px; height: 24px; flex: none;
       border-radius: 999px;
-      border: 1px solid color-mix(in srgb, var(--border-strong) 86%, transparent);
+      border: 1px solid color-mix(in srgb, var(--text-muted) 70%, transparent);
       background: var(--surface-2);
       overflow: hidden;
     }
     .dimple-knob {
       position: absolute; top: 2px; left: 2px;
       width: 18px; height: 18px; border-radius: 999px;
-      background: var(--surface-1);
+      background: var(--text-muted);
       transition: transform 0.18s var(--ease), background 0.18s var(--ease);
     }
     .dimple-label { min-width: 0; }
@@ -586,11 +612,8 @@
       color: var(--text);
       background: color-mix(in srgb, var(--brand) 10%, var(--surface-1));
     }
-    .dimple-toggle.is-on .dimple-track {
-      border-color: color-mix(in srgb, var(--brand) 58%, transparent);
-      background: color-mix(in srgb, var(--brand) 24%, var(--surface-2));
-    }
-    .dimple-toggle.is-on .dimple-knob { transform: translateX(16px); background: color-mix(in srgb, var(--brand) 32%, var(--surface-1)); }
+    .dimple-toggle.is-on .dimple-track { border-color: var(--brand); background: var(--brand); }
+    .dimple-toggle.is-on .dimple-knob { transform: translateX(16px); background: var(--brand-ink); }
     .dimple-toggle.is-connecting,
     .dimple-toggle.is-polling {
       border-color: color-mix(in srgb, var(--brand) 34%, var(--border));
@@ -652,7 +675,7 @@
     .flt-pop {
       position: absolute; top: calc(100% + 6px); left: 0; z-index: 20;
       min-width: 200px; padding: 6px; border-radius: var(--radius-sm);
-      background: var(--surface-2); border: 1px solid var(--border-strong); box-shadow: var(--shadow-pop);
+      background: var(--surface-pop); border: 1px solid var(--border-strong); box-shadow: var(--shadow-pop);
       display: none; max-height: 320px; overflow: auto;
     }
     .flt-pop.align-right { left: auto; right: 0; }
@@ -691,6 +714,7 @@
 
     /* ============ Model card (expandable) ============ */
     .mcard {
+      container-type: inline-size;
       border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-1);
       transition: border-color 0.16s var(--ease), background 0.16s var(--ease), box-shadow 0.16s var(--ease), transform 0.12s var(--ease);
     }
@@ -730,6 +754,17 @@
     .iconbtn.add { color: var(--brand); border-color: color-mix(in srgb, var(--brand) 34%, transparent); }
     .iconbtn.add:hover { background: color-mix(in srgb, var(--brand) 14%, transparent); }
     .iconbtn.danger:hover { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 34%, transparent); }
+    /* Narrow columns (Available models ~400px) cannot fit name + 4-6 round buttons on one
+       row: the buttons drop under the name so dot, name and chevron stay on one line. */
+    @container (max-width: 520px) {
+      .mcard-top { grid-template-columns: auto minmax(0, 1fr); row-gap: 8px; }
+      .mcard.no-grip .mcard-top { grid-template-columns: minmax(0, 1fr); }
+      .mcard-right, .mcard-right:has(.mcard-status) {
+        grid-column: 1 / -1; flex-direction: row-reverse; justify-content: space-between;
+        align-items: center; align-self: auto; flex-wrap: wrap;
+      }
+      .mcard-actions { flex-wrap: wrap; }
+    }
     .mcard-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 0 12px 11px 45px; }
     .mcard.no-grip .mcard-chips { padding-left: 12px; }
 
@@ -860,6 +895,13 @@
       .prov-list-item { flex: 0 0 auto; min-width: 200px; }
       .prov-pro-cta { flex: 0 0 260px; margin-top: 0; }
     }
+    /* A strip of 20 full-width cards is one visible provider and no scroll cue: on phones
+       the list goes back to a bounded vertical scroller. */
+    @media (max-width: 760px) {
+      .prov-list { flex-direction: column; overflow-x: hidden; overflow-y: auto; max-height: 320px; padding-bottom: 0; padding-right: 2px; }
+      .prov-list-item { min-width: 0; flex: 0 0 auto; }
+      .prov-pro-cta { flex: 0 0 auto; margin-top: 4px; }
+    }
 
     /* ============ Ficelle Pro gates + core upgrade hub ============ */
     .pro-gate-card { overflow: hidden; }
@@ -988,7 +1030,7 @@
       flex: none; align-self: flex-start;
       padding: 3px 8px; border: 1px solid color-mix(in srgb, var(--brand) 32%, transparent);
       border-radius: 999px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
-      color: var(--brand); background: color-mix(in srgb, var(--brand) 12%, transparent);
+      color: var(--brand-text); background: color-mix(in srgb, var(--brand) 12%, transparent);
     }
     .settings-section-body { padding: 14px 16px 16px; }
     .settings-section:not([open]) .settings-section-body { display: none; }
@@ -1026,6 +1068,8 @@
     .stage-list { display: flex; flex-direction: column; gap: 8px; margin-top: 13px; }
     .stage-row { display: grid; grid-template-columns: minmax(132px, 0.32fr) minmax(0, 1fr) 76px; gap: 10px; align-items: center; padding: 9px 10px; border: 1px solid var(--border); border-radius: var(--radius-xs); background: var(--surface-1); font-size: 12px; }
     .stage-row > span:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+    /* Label/value rows (License) reuse the stage-row look without the third timing column. */
+    .stage-row.kv-row { grid-template-columns: minmax(132px, 0.32fr) minmax(0, 1fr); }
     .stage-bar { height: 7px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
     .stage-bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--brand), var(--cyan)); border-radius: 999px; }
 
@@ -1050,15 +1094,18 @@
     .toast {
       position: fixed; right: 22px; bottom: 22px; z-index: 50;
       max-width: 380px; padding: 13px 16px; border-radius: var(--radius-sm);
-      background: var(--surface-2); border: 1px solid var(--border-strong); color: var(--text);
+      background: var(--surface-pop);
+      border: 1px solid var(--border-strong); color: var(--text);
       box-shadow: var(--shadow-pop); font-size: 13px;
       display: flex; align-items: center; gap: 10px;
       transform: translateY(14px); opacity: 0; pointer-events: none;
-      transition: transform 0.22s var(--ease), opacity 0.22s var(--ease);
+      /* visibility keeps the hidden toast's buttons out of the tab order once faded out. */
+      visibility: hidden;
+      transition: transform 0.22s var(--ease), opacity 0.22s var(--ease), visibility 0s linear 0.22s;
     }
     /* pointer-events must come back on while shown, otherwise the action button below
        is unclickable. */
-    .toast.show { transform: translateY(0); opacity: 1; pointer-events: auto; }
+    .toast.show { transform: translateY(0); opacity: 1; pointer-events: auto; visibility: visible; transition-delay: 0s; }
     .toast .t-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--brand); box-shadow: var(--glow); flex: none; }
     /* A partial success and an outright failure used to look identical here, which is how a
        remove that cleared nothing read as "it worked". The dot carries the level. */
@@ -1069,6 +1116,8 @@
     /* Styling comes from .btn.sm; this only keeps the button from stretching in the
        column flex above. */
     .toast .t-action { align-self: flex-start; }
+    .toast .t-close { width: 24px; height: 24px; margin: -4px -6px -4px 2px; align-self: flex-start; font-size: 16px; line-height: 1; color: var(--text-muted); border-color: transparent; background: transparent; }
+    .toast .t-close:hover { color: var(--text); }
 
     /* ============ Views ============ */
     .view { display: none; animation: viewin 0.3s var(--ease); }
@@ -1330,4 +1379,8 @@
     @media (max-width: 420px) {
       .brand-name { display: none; }
       .settings-index-button { min-width: 142px; }
+    }
+    /* Touch targets: the 30px round buttons are below the comfortable minimum. */
+    @media (pointer: coarse) {
+      .iconbtn { min-width: 36px; min-height: 36px; }
     }

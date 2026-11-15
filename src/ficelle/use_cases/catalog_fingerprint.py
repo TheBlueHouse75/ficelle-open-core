@@ -81,6 +81,7 @@ def provider_config_fingerprint(
         "official_free_id_suffixes": provider_cfg.get("official_free_id_suffixes"),
         "model_id_allowlist": provider_cfg.get("model_id_allowlist"),
         "require_model_id_allowlist": provider_cfg.get("require_model_id_allowlist"),
+        "catalog_unlisted_model_ids": provider_cfg.get("catalog_unlisted_model_ids"),
     }
     if include_credentials and str(provider_cfg.get("activation_policy") or "") == "configured_credentials":
         fingerprint["credential_activation"] = ports.credential_activation_fingerprint(source, provider_cfg)

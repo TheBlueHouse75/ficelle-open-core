@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+import shutil
+import stat
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Iterator, Mapping
 
 
 FICELLE_CREDENTIAL_FILENAMES = frozenset({".env", "ficelle-secrets.keychain-db"})
@@ -64,3 +68,52 @@ class RuntimePaths:
             capability_oracle_cache_path=router_dir / "capability_oracle.json",
             admin_assets_dir=admin_assets_dir,
         )
+
+
+def validated_runtime_home(home: Path, *, create: bool = True) -> Path:
+    """Return an absolute home safe to use as a Python child working directory."""
+    home = Path(os.path.abspath(home.expanduser()))
+    try:
+        info = os.lstat(home)
+    except FileNotFoundError:
+        if not create:
+            raise
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        info = os.lstat(home)
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError("Ficelle home must be a directory, not a symbolic link or file.")
+    if hasattr(os, "getuid"):
+        if info.st_uid != os.getuid():
+            raise OSError("Ficelle home must be owned by the current user.")
+        if info.st_mode & 0o022:
+            raise OSError("Ficelle home must not be group- or other-writable.")
+    return home
+
+
+def absolute_python(python: str | Path) -> str:
+    # Preserve a venv's interpreter symlink: resolving it selects the base runtime.
+    value = str(Path(python).expanduser())
+    return os.path.abspath(shutil.which(value) or value)
+
+
+@contextmanager
+def python_child_context(
+    home: Path | None = None, *, environ: Mapping[str, str] | None = None,
+) -> Iterator[tuple[str, dict[str, str]]]:
+    """Keep Python imports out of the caller's directory, even before setup."""
+    env = dict(os.environ if environ is None else environ)
+    env["PYTHONSAFEPATH"] = "1"
+    if home is not None:
+        home = Path(os.path.abspath(home.expanduser()))
+        env["FICELLE_HOME"] = str(home)
+        try:
+            cwd = validated_runtime_home(home, create=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if os.access(cwd, os.R_OK | os.X_OK):
+                yield str(cwd), env
+                return
+    with tempfile.TemporaryDirectory(prefix="ficelle-python-") as cwd:
+        Path(cwd).chmod(0o700)
+        yield str(Path(cwd).absolute()), env

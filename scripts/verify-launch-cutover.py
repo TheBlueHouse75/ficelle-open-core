@@ -11,10 +11,11 @@ from dataclasses import dataclass
 from typing import Callable
 
 REPOSITORY = "TheBlueHouse75/ficelle-open-core"
-VERSION = "0.3.13"
+VERSION = "0.3.14"
 CORE_WHEEL = f"ficelle_router-{VERSION}-py3-none-any.whl"
-CORE_SHA256 = "ac64e53ed968a81dc84b43c935dfadf2a7ed3e089ff2d2f0a5fe350f4ecf1bb7"
-BOOTSTRAP_PATH = f"/{REPOSITORY}/v{VERSION}/scripts/bootstrap-ficelle.py"
+CORE_SHA256 = "be8838e4cfe327577889d7128b4031df32067e5e4b1cc8f5f80da194df39bba3"
+BOOTSTRAP_COMMIT = "350b724e17d1b7d0d0d95bf41d8938e7a2f171c9"
+BOOTSTRAP_PATH = f"/{REPOSITORY}/{BOOTSTRAP_COMMIT}/scripts/bootstrap-ficelle.py"
 
 
 @dataclass(frozen=True)
@@ -66,10 +67,7 @@ def verify(
     release_url = (
         f"https://github.com/{REPOSITORY}/releases/download/v{VERSION}/{CORE_WHEEL}"
     )
-    bootstrap_url = (
-        f"https://raw.githubusercontent.com/{REPOSITORY}/v{VERSION}/"
-        "scripts/bootstrap-ficelle.py"
-    )
+    bootstrap_url = f"https://raw.githubusercontent.com{BOOTSTRAP_PATH}"
 
     repository = fetcher(api_url)
     release = fetcher(release_url)
@@ -110,11 +108,11 @@ def verify(
 
     bootstrap = fetcher(bootstrap_url)
     if bootstrap.status != 200:
-        failures.append(f"versioned bootstrap returned HTTP {bootstrap.status}")
+        failures.append(f"commit-pinned bootstrap returned HTTP {bootstrap.status}")
     else:
         text = bootstrap.body.decode("utf-8", errors="replace")
         if CORE_SHA256 not in text or f'CORE_VERSION = "{VERSION}"' not in text:
-            failures.append("versioned bootstrap does not pin the release wheel and version")
+            failures.append("commit-pinned bootstrap does not pin the release wheel and version")
 
     for filename in ("README.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md"):
         raw_url = (
@@ -126,7 +124,7 @@ def verify(
 
     website_text = website.body.decode("utf-8", errors="replace")
     if BOOTSTRAP_PATH not in website_text:
-        failures.append("website does not advertise the versioned public bootstrap")
+        failures.append("website does not advertise the commit-pinned public bootstrap")
     return failures
 
 

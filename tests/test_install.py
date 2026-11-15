@@ -11,14 +11,19 @@ import pytest
 
 from ficelle.install import (
     MANAGED_CONFIG_BEGIN,
+    MANAGED_CONFIG_END,
     CommandResult,
+    ClientHomeError,
     HermesPluginConflictError,
     InstallOptions,
+    _normalized_plugin_payload,
     backup_existing_path,
     build_parser,
     cli_reachability_notice,
     collect_preflight_checks,
     configure_hermes,
+    config_outside_managed_block,
+    config_has_user_additions,
     copy_plugin_tree,
     doctor_auth_report,
     dedicated_keychain_path,
@@ -27,6 +32,7 @@ from ficelle.install import (
     ensure_hermes_toolset_enabled,
     ensure_hermes_plugin_enabled,
     expose_cli_scripts,
+    file_sha256,
     hermes_plugin_install_specs,
     hermes_connector_metadata,
     install_plugins,
@@ -38,13 +44,16 @@ from ficelle.install import (
     package_is_local_reference,
     package_install_command,
     probe_target_python,
+    refresh_installed_hermes_integration,
     remove_hermes_connector,
+    replace_managed_block,
     rollback_last_hermes_install,
     run_install,
     seed_provider_plugin_env_key,
     uv_package_install_command,
+    validated_client_home,
 )
-from ficelle.connector_registry import load_connectors, register_connector
+from ficelle.connector_registry import load_connectors, register_connector, save_connectors
 
 
 def make_options(tmp_path, **overrides):
@@ -109,6 +118,20 @@ def test_remove_hermes_connector_is_reversible_for_unchanged_artifacts(tmp_path)
     assert not (options.hermes_home / "config.yaml").exists()
     assert not (options.hermes_home / ".env").exists()
     assert not (options.hermes_home / "plugins" / "model-providers" / "ficelle").exists()
+
+
+def test_remove_hermes_connector_ignores_bytecode_written_by_hermes(tmp_path):
+    # Hermes compiles the provider on first import; that must not read as a user modification.
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    plugin_path = options.hermes_home / "plugins" / "model-providers" / "ficelle"
+    (plugin_path / "__pycache__").mkdir(exist_ok=True)
+    (plugin_path / "__pycache__" / "__init__.cpython-314.pyc").write_bytes(b"\0compiled")
+
+    removed, _messages = remove_hermes_connector(options.ficelle_home)
+
+    assert removed is True
+    assert not plugin_path.exists()
 
 
 def test_remove_hermes_connector_refuses_modified_artifacts(tmp_path):
@@ -277,9 +300,9 @@ def test_run_install_dry_run_orders_package_plugin_service_and_smoke(monkeypatch
     ]
     assert "FICELLE_HOME=" in output
     assert "HERMES_HOME=" not in output
-    assert " /usr/bin/python3 -m pip install" in output
-    assert " /usr/bin/python3 -m ficelle.cli install" in output
-    assert " /usr/bin/python3 -m ficelle.cli doctor --json" in output
+    assert " /usr/bin/python3 -P -m pip install" in output
+    assert " /usr/bin/python3 -P -m ficelle.cli install" in output
+    assert " /usr/bin/python3 -P -m ficelle.cli doctor --json" in output
     assert "Ficelle setup complete." in output
 
 
@@ -390,7 +413,7 @@ def test_run_install_stops_on_failed_command(monkeypatch, tmp_path):
     else:
         raise AssertionError("run_install should stop when a command fails")
 
-    assert calls == [["/usr/bin/python3", "-m", "pip", "install", "."]]
+    assert calls == [["/usr/bin/python3", "-m", "pip", "install", str(Path.cwd())]]
 
 
 def test_run_install_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_path):
@@ -423,8 +446,8 @@ def test_run_install_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_path)
 
     assert run_install(options) == 0
     assert calls == [
-        ["/usr/bin/python3", "-m", "pip", "install", "."],
-        ["uv", "pip", "install", "--python", "/usr/bin/python3", "."],
+        ["/usr/bin/python3", "-m", "pip", "install", str(Path.cwd())],
+        ["uv", "pip", "install", "--python", "/usr/bin/python3", str(Path.cwd())],
     ]
 
 
@@ -1039,6 +1062,127 @@ def test_configure_hermes_leaves_unmanaged_config_untouched(tmp_path, capsys):
     assert "Existing unmanaged Hermes config left untouched" in capsys.readouterr().out
 
 
+@pytest.fixture(params=[
+    pytest.param(f"{MANAGED_CONFIG_END}\nuser: keep\n{MANAGED_CONFIG_BEGIN}\n", id="end-before-begin"),
+    pytest.param(f"{MANAGED_CONFIG_BEGIN}\nuser: keep\n", id="missing-end"),
+    pytest.param(f"{MANAGED_CONFIG_END}\nuser: keep\n", id="missing-begin"),
+    pytest.param(f"{MANAGED_CONFIG_END}\n{MANAGED_CONFIG_BEGIN}\n{MANAGED_CONFIG_END}\n", id="extra-end"),
+    pytest.param(f"{MANAGED_CONFIG_BEGIN}\n{MANAGED_CONFIG_BEGIN}\n{MANAGED_CONFIG_END}\n", id="extra-begin"),
+    pytest.param(f"note: '{MANAGED_CONFIG_BEGIN}'\nuser: keep\n{MANAGED_CONFIG_END}\n", id="inline-marker"),
+])
+def malformed_hermes_config(request):
+    return f"prefix: keep\n{request.param}\nsuffix: keep\n"
+
+
+def test_configure_hermes_preserves_malformed_managed_config(tmp_path, capsys, malformed_hermes_config):
+    options = make_options(tmp_path, dry_run=False)
+    options.hermes_home.mkdir()
+    config = options.hermes_home / "config.yaml"
+    config.write_text(malformed_hermes_config)
+    before = config.read_bytes()
+
+    configure_hermes(options)
+
+    assert config.read_bytes() == before
+    assert not list(options.hermes_home.glob("config.yaml.backup-*"))
+    assert "malformed" in capsys.readouterr().out.lower()
+
+
+def test_malformed_managed_config_is_never_treated_as_owned(malformed_hermes_config):
+    assert config_outside_managed_block(malformed_hermes_config) == malformed_hermes_config
+    assert config_has_user_additions(malformed_hermes_config)
+    with pytest.raises(ValueError, match="[Mm]alformed"):
+        replace_managed_block(malformed_hermes_config, "replacement")
+
+
+@pytest.mark.parametrize("failure", ["nul", "unknown-user", "resolve-loop", "home-unavailable"])
+@pytest.mark.parametrize("caller", ["validate", "refresh", "remove"])
+def test_invalid_client_home_errors_are_contained(tmp_path, monkeypatch, capsys, failure, caller):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config = options.hermes_home / "config.yaml"
+    before = config.read_bytes()
+    value = {
+        "nul": str(options.hermes_home) + "\0invalid",
+        "unknown-user": "~nonexistent-user-xyz/hermes",
+    }.get(failure, str(options.hermes_home))
+    connectors = load_connectors(options.ficelle_home)
+    connectors["hermes"]["client_home"] = value
+    save_connectors(options.ficelle_home, connectors)
+    original_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        if path == options.hermes_home:
+            raise RuntimeError("private symlink loop details")
+        return original_resolve(path, *args, **kwargs)
+
+    def home():
+        raise RuntimeError("private home lookup details")
+
+    with monkeypatch.context() as patch:
+        if failure == "resolve-loop":
+            patch.setattr(Path, "resolve", resolve)
+        elif failure == "home-unavailable":
+            patch.setattr(Path, "home", staticmethod(home))
+        if caller == "validate":
+            with pytest.raises(ClientHomeError, match="could not be validated") as caught:
+                validated_client_home(value)
+            assert caught.value.__suppress_context__
+        elif caller == "refresh":
+            refresh_installed_hermes_integration(Path(value), tmp_path, options.ficelle_home)
+            assert "could not be validated" in capsys.readouterr().err
+        else:
+            removed, messages = remove_hermes_connector(options.ficelle_home)
+            assert not removed
+            assert len(messages) == 1 and "could not be validated" in messages[0]
+    assert config.read_bytes() == before
+    assert load_connectors(options.ficelle_home) == connectors
+
+
+@pytest.mark.parametrize("config_created", [False, True])
+def test_remove_hermes_refuses_malformed_config_before_any_deletion(
+    tmp_path, malformed_hermes_config, config_created,
+):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config = options.hermes_home / "config.yaml"
+    config.write_text(malformed_hermes_config)
+    connectors = load_connectors(options.ficelle_home)
+    # A matching digest must not authorize deletion of a malformed block.
+    connectors["hermes"]["metadata"]["config_sha256"] = file_sha256(config)
+    connectors["hermes"]["metadata"]["config_created"] = config_created
+    save_connectors(options.ficelle_home, connectors)
+    before = {path: path.read_bytes() for path in options.hermes_home.rglob("*") if path.is_file()}
+
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+
+    assert not removed
+    assert messages == ["Malformed Ficelle managed config block; config left untouched and nothing was removed."]
+    assert {path: path.read_bytes() for path in options.hermes_home.rglob("*") if path.is_file()} == before
+    assert load_connectors(options.ficelle_home) == connectors
+
+
+def test_remove_hermes_preserves_exact_text_outside_valid_block(tmp_path):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config = options.hermes_home / "config.yaml"
+    original = "user: keep\n" + config.read_text() + "\n  # keep indentation\n\n"
+    config.write_text(original)
+    connectors = load_connectors(options.ficelle_home)
+    connectors["hermes"]["metadata"]["config_sha256"] = file_sha256(config)
+    save_connectors(options.ficelle_home, connectors)
+    start = original.index(MANAGED_CONFIG_BEGIN)
+    end = original.index(MANAGED_CONFIG_END) + len(MANAGED_CONFIG_END)
+    expected = original[:start] + original[end:]
+
+    removed, _messages = remove_hermes_connector(options.ficelle_home)
+
+    assert removed
+    assert config.read_text() == expected
+    replacement = f"{MANAGED_CONFIG_BEGIN}\nnew: true\n{MANAGED_CONFIG_END}"
+    assert replace_managed_block(original, replacement) == original[:start] + replacement + original[end:]
+
+
 def test_configure_hermes_updates_managed_block_with_backup(tmp_path):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
@@ -1482,6 +1626,30 @@ def test_install_plugins_rejects_incompatible_external_payload_before_mutation(
     assert not (options.hermes_home / ".env").exists()
 
 
+def test_external_payload_comparison_ignores_exactly_the_pin_and_the_readme(tmp_path, monkeypatch):
+    provider_source, _ = _test_plugin_sources(tmp_path, monkeypatch)
+    (provider_source / "setup_flow.py").write_text("flow", encoding="utf-8")
+    options = make_options(tmp_path, target="hermes", dry_run=False)
+    external = options.hermes_home / "plugins" / "ficelle"
+    shutil.copytree(provider_source, external)
+
+    # A catalog copy carries the release pin and its own README; neither is runtime payload.
+    (external / "bootstrap-pin.json").write_text("{}", encoding="utf-8")
+    (external / "README.md").write_text("catalog readme", encoding="utf-8")
+    install_plugins(options)
+
+    # Anything else differing, at any depth, is still a conflict.
+    for relative in ("setup_flow.py", "notes.md", "sub/README.md", "sub/bootstrap-pin.json"):
+        stale = options.hermes_home / "plugins" / "ficelle-stale"
+        shutil.rmtree(stale, ignore_errors=True)
+        shutil.copytree(external, stale)
+        target = stale / relative
+        target.parent.mkdir(exist_ok=True)
+        target.write_text("changed", encoding="utf-8")
+        assert _normalized_plugin_payload(stale) != _normalized_plugin_payload(provider_source), relative
+    assert _normalized_plugin_payload(external) == _normalized_plugin_payload(provider_source)
+
+
 def test_install_plugins_seeds_the_provider_plugin_env_key(tmp_path, monkeypatch):
     """Installing the plugin without its env var leaves Hermes unable to use it.
 
@@ -1596,6 +1764,7 @@ def test_refresh_installed_hermes_integration_updates_managed_main_route(tmp_pat
     assert 'key_env: "FICELLE_API_KEY"' in config.read_text(encoding="utf-8")
     assert parse_env_file(hermes_home / ".env")[PROVIDER_PLUGIN_ENV_KEY] == "canonical-token"
     assert list(hermes_home.glob("config.yaml.backup-*"))
+    assert load_connectors(ficelle_home)["hermes"]["metadata"]["config_managed"] is True
 
 
 def test_refresh_installed_hermes_integration_does_not_block_core_on_catalog_conflict(
@@ -1621,6 +1790,257 @@ def test_refresh_installed_hermes_integration_does_not_block_core_on_catalog_con
     assert (flat_provider / "__init__.py").read_text(encoding="utf-8") == "stale runtime"
     assert not (hermes_home / "plugins" / "model-providers" / "ficelle").exists()
     assert not (hermes_home / ".env").exists()
+
+
+def test_refresh_keeps_a_user_modified_config_out_of_connector_removal(tmp_path):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config_path = options.hermes_home / "config.yaml"
+    original_hash = load_connectors(options.ficelle_home)["hermes"]["metadata"]["config_sha256"]
+    config_path.write_text(config_path.read_text(encoding="utf-8") + "user_setting: true\n", encoding="utf-8")
+
+    refresh_installed_hermes_integration(
+        options.hermes_home,
+        options.ficelle_home,
+        options.ficelle_home,
+    )
+
+    metadata = load_connectors(options.ficelle_home)["hermes"]["metadata"]
+    assert metadata["config_sha256"] == original_hash
+    assert metadata["config_managed"] is True
+    assert metadata["config_created"] is True
+    assert "user_setting: true" in config_path.read_text(encoding="utf-8")
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+    assert removed is False
+    assert str(config_path) in messages
+    assert "user_setting: true" in config_path.read_text(encoding="utf-8")
+    assert MANAGED_CONFIG_BEGIN in config_path.read_text(encoding="utf-8")
+
+
+def test_refresh_preserves_malformed_config_and_recorded_ownership(tmp_path, malformed_hermes_config):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config = options.hermes_home / "config.yaml"
+    config.write_text(malformed_hermes_config, encoding="utf-8")
+    connectors = load_connectors(options.ficelle_home)
+    # Legacy metadata may already contain the malformed file's digest. It still cannot
+    # authorize a rewrite, and refresh must retain ownership for safe removal checks.
+    connectors["hermes"]["metadata"]["config_sha256"] = file_sha256(config)
+    save_connectors(options.ficelle_home, connectors)
+    previous = connectors["hermes"]["metadata"]
+    snippet = options.hermes_home / "ficelle" / "hermes-config.snippet.yaml"
+    snippet.write_text("user snippet: keep\n", encoding="utf-8")
+    before = config.read_bytes()
+
+    refresh_installed_hermes_integration(options.hermes_home, options.ficelle_home, options.ficelle_home)
+
+    assert config.read_bytes() == before
+    assert not list(options.hermes_home.glob("config.yaml.backup-*"))
+    assert snippet.read_text(encoding="utf-8") == "user snippet: keep\n"
+    metadata = load_connectors(options.ficelle_home)["hermes"]["metadata"]
+    for key in ("config_managed", "config_created", "config_sha256"):
+        assert metadata[key] == previous[key]
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+    assert not removed
+    assert any("malformed" in message.lower() for message in messages)
+    assert config.read_bytes() == before
+
+
+@pytest.mark.parametrize("config_created", [False, True])
+def test_refresh_keeps_ownership_when_user_replaces_managed_config(tmp_path, config_created):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    connectors = load_connectors(options.ficelle_home)
+    connectors["hermes"]["metadata"]["config_created"] = config_created
+    save_connectors(options.ficelle_home, connectors)
+    previous = connectors["hermes"]["metadata"]
+    config = options.hermes_home / "config.yaml"
+    config.write_text("model: user-owned\n", encoding="utf-8")
+    before = config.read_bytes()
+
+    refresh_installed_hermes_integration(options.hermes_home, options.ficelle_home, options.ficelle_home)
+
+    assert config.read_bytes() == before
+    metadata = load_connectors(options.ficelle_home)["hermes"]["metadata"]
+    for key in ("config_managed", "config_created", "config_sha256"):
+        assert metadata[key] == previous[key]
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+    assert removed
+    assert messages[-1] == "config.yaml left untouched because the Ficelle managed config block was absent."
+    assert all(not destination.exists() for _, destination in hermes_plugin_install_specs(options.hermes_home))
+    assert config.read_bytes() == before
+
+
+def test_refresh_of_an_unmodified_config_still_allows_removal(tmp_path):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+
+    refresh_installed_hermes_integration(
+        options.hermes_home,
+        options.ficelle_home,
+        options.ficelle_home,
+    )
+
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+
+    assert removed is True
+    assert messages == ["Hermes connector artifacts removed."]
+    assert not (options.hermes_home / "config.yaml").exists()
+
+
+def test_remove_keeps_user_config_when_the_recorded_hash_includes_it(tmp_path):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config_path = options.hermes_home / "config.yaml"
+    config_path.write_text(config_path.read_text(encoding="utf-8") + "user_setting: true\n", encoding="utf-8")
+    connectors = load_connectors(options.ficelle_home)
+    connectors["hermes"]["metadata"]["config_sha256"] = file_sha256(config_path)
+    save_connectors(options.ficelle_home, connectors)
+
+    removed, _messages = remove_hermes_connector(options.ficelle_home)
+
+    text = config_path.read_text(encoding="utf-8")
+    assert removed is True
+    assert "user_setting: true" in text
+    assert MANAGED_CONFIG_BEGIN not in text
+
+
+def test_remove_refuses_empty_root_home_and_unscoped_client_homes(tmp_path, monkeypatch):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config_path = options.hermes_home / "config.yaml"
+    original = config_path.read_text(encoding="utf-8")
+
+    cases = {
+        "   ": "no client home",
+        "relative/hermes": "absolute path",
+        "/": "filesystem root",
+        "/usr": "expected scope",
+        "/etc/ssh": "expected scope",
+        "/private/etc/ssh": "expected scope",
+        # macOS links /tmp to /private/tmp: test the real directory for the scope check
+        # (it is /tmp itself on Linux) and the link for the symlink refusal.
+        os.path.realpath("/tmp"): "expected scope",
+    }
+    if Path("/tmp").is_symlink():
+        cases["/tmp"] = "symbolic link"
+    for client_home, expected in cases.items():
+        connectors = load_connectors(options.ficelle_home)
+        connectors["hermes"]["client_home"] = client_home
+        save_connectors(options.ficelle_home, connectors)
+        removed, messages = remove_hermes_connector(options.ficelle_home)
+        assert removed is False, messages
+        assert any(expected in message for message in messages), messages
+        assert config_path.read_text(encoding="utf-8") == original
+
+    home = tmp_path / "home"
+    home.mkdir()
+    sentinel = home / "config.yaml"
+    sentinel.write_text("keep-home\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    connectors = load_connectors(options.ficelle_home)
+    connectors["hermes"]["client_home"] = str(home)
+    save_connectors(options.ficelle_home, connectors)
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+    assert removed is False
+    assert any("user home directory" in message for message in messages)
+    assert sentinel.read_text(encoding="utf-8") == "keep-home\n"
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("path", [
+    "/etc", "/private/etc", "/etc/ssh", "/private/etc/ssh",
+    "/usr/local/share", "/usr/bin/ficelle", "/bin/x", "/sbin/x",
+    "/System/Library/ficelle", "/System/Volumes/Data/etc/ssh",
+    "/Library/ficelle", "/Applications/Ficelle.app",
+    "/root/hermes", "/var/root/hermes", "/private/var/root/hermes",
+    "/var/log/ficelle", "/private/var/log/ficelle",
+    *[f"{tree}{suffix}" for tree in (
+        "/etc", "/private/etc", "/usr", "/Library", "/System", "/Applications",
+        "/opt/homebrew", "/boot", "/dev", "/proc", "/sys", "/run",
+        "/var/lib", "/var/db", "/private/var/lib", "/private/var/db",
+        "/var/run", "/private/var/run", "/var/spool", "/private/var/spool",
+        "/var/cache", "/private/var/cache", "/snap", "/nix",
+        "/var/mail", "/private/var/mail", "/var/opt", "/private/var/opt",
+        "/var/empty", "/private/var/empty",
+        "/var/backups", "/private/var/backups", "/var/www", "/private/var/www",
+        "/var/local", "/private/var/local", "/var/crash", "/private/var/crash",
+        "/var/vm", "/private/var/vm",
+    ) for tree in (tree, tree.upper()) for suffix in ("", "/x", "/x/y")],
+    "/PRIVATE/ETC/ssh", "/LIBRARY/x", "/USR/LOCAL/bin", "/PRIVATE/VAR",
+    "/tmp", "/private/tmp", "/var", "/private/var", "/Users", "/home", "/opt",
+])
+def test_validated_client_home_refuses_system_subtrees_and_unscoped_roots(path):
+    # Inaccessible system paths must still be refused on non-root Linux runners.
+    with pytest.raises(ClientHomeError):
+        validated_client_home(path)
+
+
+@pytest.mark.parametrize("path", [
+    "/Users/test-user/hermes", "/home/test-user/hermes",
+    "/private/var/folders/zz/test-user/T/hermes", "/var/folders/zz/test-user/T/hermes",
+    "/tmp/ficelle-test/hermes", "/private/tmp/ficelle-test/hermes",
+    "/opt/ficelle-test/hermes", "/opt/hermes", "/usr-local/hermes",
+    "/opt/homebrew-other/hermes", "/var/library/hermes",
+    "/srv/hermes", "/mnt/data/hermes", "/media/disk/hermes",
+])
+def test_validated_client_home_allows_scoped_user_temp_and_application_homes(path):
+    assert validated_client_home(path) == Path(path).resolve()
+
+
+def test_validated_client_home_resolves_parent_links_before_system_scope_check(tmp_path):
+    # The leaf is not a symlink: only resolving its parent reveals the protected tree.
+    alias = tmp_path / "etc-alias"
+    alias.symlink_to(Path("/private/etc") if Path("/private/etc").is_dir() else Path("/etc"))
+    with pytest.raises(ClientHomeError, match="expected scope"):
+        validated_client_home(alias / "ssh")
+
+
+def test_validated_client_home_allows_real_temporary_home(tmp_path):
+    assert validated_client_home(tmp_path / "hermes") == (tmp_path / "hermes").resolve()
+
+
+def test_remove_refuses_a_symlinked_client_home_and_plugin_path(tmp_path):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    real = tmp_path / "real-hermes"
+    real.mkdir()
+    (real / "config.yaml").write_text("keep-real\n", encoding="utf-8")
+    link = tmp_path / "link-hermes"
+    link.symlink_to(real)
+    connectors = load_connectors(options.ficelle_home)
+    connectors["hermes"]["client_home"] = str(link)
+    save_connectors(options.ficelle_home, connectors)
+
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+
+    assert removed is False
+    assert any("symbolic link" in message for message in messages)
+    assert (real / "config.yaml").read_text(encoding="utf-8") == "keep-real\n"
+
+    connectors["hermes"]["client_home"] = str(options.hermes_home)
+    save_connectors(options.ficelle_home, connectors)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("keep-outside\n", encoding="utf-8")
+    plugin = options.hermes_home / "plugins" / "model-providers" / "ficelle"
+    shutil.rmtree(plugin)
+    plugin.symlink_to(outside)
+
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+
+    assert removed is False
+    assert any("symbolic link" in message for message in messages)
+    assert sentinel.read_text(encoding="utf-8") == "keep-outside\n"
+    assert outside.is_dir()
+
+
+def test_refresh_skips_an_unsafe_client_home(tmp_path, capsys):
+    refresh_installed_hermes_integration(Path("/"), tmp_path, tmp_path)
+
+    assert "filesystem root" in capsys.readouterr().err
+    assert not (tmp_path / "plugins").exists()
 
 
 def test_install_plugins_dry_run_writes_no_provider_plugin_env_key(tmp_path, monkeypatch):
@@ -1772,3 +2192,246 @@ def test_rollback_refuses_to_remove_modified_fresh_asset(monkeypatch, tmp_path):
 
     assert installed.exists()
     assert (installed / "__init__.py").read_text() == "user modification"
+
+
+@pytest.mark.parametrize("operation", ["is_symlink", "resolve", "expanduser", "home"])
+@pytest.mark.parametrize("caller", ["validate", "refresh", "remove"])
+def test_client_home_permission_errors_are_reported_without_traceback(
+    tmp_path, monkeypatch, capsys, operation, caller,
+):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config = options.hermes_home / "config.yaml"
+    before = config.read_bytes()
+    original = getattr(Path, operation)
+
+    def denied(path=None, *args, **kwargs):
+        if operation == "home" or path == options.hermes_home:
+            raise PermissionError("private filesystem details")
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, operation, staticmethod(denied) if operation == "home" else denied)
+        if caller == "validate":
+            with pytest.raises(ClientHomeError, match="filesystem access failed") as caught:
+                validated_client_home(options.hermes_home)
+            assert caught.value.__suppress_context__
+        elif caller == "refresh":
+            refresh_installed_hermes_integration(options.hermes_home, tmp_path, options.ficelle_home)
+            assert "filesystem access failed" in capsys.readouterr().err
+        else:
+            removed, messages = remove_hermes_connector(options.ficelle_home)
+            assert not removed
+            assert messages == ["Hermes client home could not be validated; filesystem access failed."]
+    assert config.read_bytes() == before
+    assert "hermes" in load_connectors(options.ficelle_home)
+
+
+@pytest.mark.parametrize("config_created", [False, True])
+@pytest.mark.parametrize("text", ["", "model:\n  provider: user-choice\n# keep exactly\n"])
+def test_remove_hermes_preserves_config_when_managed_block_is_absent(
+    tmp_path, monkeypatch, config_created, text,
+):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config = options.hermes_home / "config.yaml"
+    config.write_text(text)
+    before = config.stat()
+    connectors = load_connectors(options.ficelle_home)
+    connectors["hermes"]["metadata"]["config_created"] = config_created
+    save_connectors(options.ficelle_home, connectors)
+    original_sha256 = file_sha256
+
+    def guarded_sha256(path):
+        assert path != config, "Absent-block config must not be hash checked"
+        return original_sha256(path)
+
+    monkeypatch.setattr("ficelle.install.file_sha256", guarded_sha256)
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+
+    assert removed
+    assert messages == [
+        "Hermes connector artifacts removed.",
+        "config.yaml left untouched because the Ficelle managed config block was absent.",
+    ]
+    assert config.read_bytes() == text.encode()
+    assert (config.stat().st_ino, config.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+    assert not (options.hermes_home / "ficelle/hermes-config.snippet.yaml").exists()
+    assert not (options.hermes_home / ".env").exists()
+    assert all(not destination.exists() for _, destination in hermes_plugin_install_specs(options.hermes_home))
+    assert load_connectors(options.ficelle_home) == {}
+
+
+def test_remove_hermes_absent_block_still_refuses_modified_owned_artifacts(tmp_path):
+    options = make_options(tmp_path, dry_run=False)
+    _register_test_hermes_connector(options)
+    config = options.hermes_home / "config.yaml"
+    config.write_text("user: keep\n")
+    snippet = options.hermes_home / "ficelle/hermes-config.snippet.yaml"
+    snippet.write_text("user: edited\n")
+    before = {path: path.read_bytes() for path in options.hermes_home.rglob("*") if path.is_file()}
+
+    removed, messages = remove_hermes_connector(options.ficelle_home)
+
+    assert not removed
+    assert messages == ["Connector artifacts were modified; nothing was removed:", str(snippet)]
+    assert {path: path.read_bytes() for path in options.hermes_home.rglob("*") if path.is_file()} == before
+    assert "hermes" in load_connectors(options.ficelle_home)
+
+
+@pytest.mark.parametrize("shadow", ["ficelle.py", "ficelle/__init__.py"])
+@pytest.mark.parametrize("command_args", [
+    ["set-key", "openrouter", "--stdin"], ["demo"], ["install"],
+    ["doctor", "--json"], ["health"], ["models"],
+])
+@pytest.mark.parametrize("existing_home", [True, False])
+def test_install_children_ignore_caller_modules_and_preserve_stdin(
+    tmp_path, monkeypatch, shadow, command_args, existing_home,
+):
+    from ficelle import install
+
+    caller = tmp_path / "caller"
+    planted = caller / shadow
+    planted.parent.mkdir(parents=True)
+    planted.write_text("raise RuntimeError('caller shadow')\n")
+    home = tmp_path / "state"
+    if existing_home:
+        home.mkdir(mode=0o755)
+    interpreter = tmp_path / "venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    monkeypatch.chdir(caller)
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    captured = []
+    def run(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        assert cwd.is_absolute() and cwd != caller and cwd.is_dir()
+        if not existing_home:
+            assert cwd.stat().st_mode & 0o777 == 0o700
+        captured.append((command, kwargs))
+        return install.subprocess.CompletedProcess(command, 0, "", "")
+    monkeypatch.setattr(install.subprocess, "run", run)
+    secret_input = "test-provider-key\n" if "--stdin" in command_args else None
+    result = install.run_command(
+        ["../venv/bin/python", "-m", "ficelle.cli", *command_args],
+        dry_run=False, env={"FICELLE_HOME": "../state"}, input_text=secret_input,
+    )
+    assert result.returncode == 0
+    (command, kwargs), = captured
+    assert command == [str(interpreter), "-P", "-m", "ficelle.cli", *command_args]
+    assert kwargs["env"]["PYTHONSAFEPATH"] == "1"
+    assert kwargs["env"]["FICELLE_HOME"] == str(home)
+    assert kwargs["input"] == secret_input
+    assert not any("test-provider-key" in arg for arg in command)
+    if existing_home:
+        assert kwargs["cwd"] == str(home)
+    else:
+        assert not Path(kwargs["cwd"]).exists()
+        assert not home.exists()
+
+
+def test_install_rejects_symlink_home_before_normalizing_or_spawning(tmp_path, monkeypatch):
+    from ficelle import install
+
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    home = tmp_path / "link"
+    home.symlink_to(real_home, target_is_directory=True)
+    args = install.build_parser().parse_args(["--ficelle-home", str(home), "--skip-package"])
+    monkeypatch.setattr(install, "run_preflight", lambda *a: pytest.fail("unsafe home"))
+    with pytest.raises(OSError, match="symbolic link"):
+        install.run_install(install.options_from_args(args))
+
+
+def test_package_commands_make_local_paths_absolute_before_changing_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    wheel = tmp_path / "ficelle.whl"
+    wheel.touch()
+    options = make_options(tmp_path, package="ficelle.whl", python="venv/bin/python", editable=False)
+    for command in (package_install_command(options), uv_package_install_command(options)):
+        assert command[-1] == str(wheel)
+        assert str(tmp_path / "venv/bin/python") in command
+
+
+@pytest.mark.parametrize("shadow", ["ficelle.py", "ficelle/__init__.py"])
+def test_target_python_probe_uses_safe_path_and_empty_private_cwd(tmp_path, monkeypatch, shadow):
+    from ficelle import install
+
+    planted = tmp_path / shadow
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_text("raise RuntimeError('caller shadow')\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    calls = []
+    def run(command, **kwargs):
+        assert Path(kwargs["cwd"]).stat().st_mode & 0o777 == 0o700
+        calls.append((command, kwargs))
+        return install.subprocess.CompletedProcess(command, 0, "3.11\n", "")
+    monkeypatch.setattr(install.subprocess, "run", run)
+    assert probe_target_python("venv/bin/python").returncode == 0
+    (command, kwargs), = calls
+    assert command[:3] == [str(tmp_path / "venv/bin/python"), "-P", "-c"]
+    assert kwargs["env"]["PYTHONSAFEPATH"] == "1"
+    assert kwargs["cwd"] != str(tmp_path)
+
+
+@pytest.mark.parametrize("shadow", ["ficelle.py", "ficelle/__init__.py"])
+def test_real_python_import_probe_ignores_caller_ficelle(tmp_path, monkeypatch, shadow):
+    from ficelle import install
+
+    planted = tmp_path / shadow
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_text("raise RuntimeError('caller shadow executed')\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    result = install.run_python_probe(sys.executable, "import ficelle; print(ficelle.__file__)")
+    assert result.returncode == 0, result.stderr
+    assert str(tmp_path) not in result.stdout
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file", "group-writable", "other-writable"])
+def test_install_child_refuses_unsafe_home_without_spawning(tmp_path, monkeypatch, kind):
+    from ficelle import install
+
+    home = tmp_path / "home"
+    home.mkdir()
+    if kind == "symlink":
+        link = tmp_path / "link"
+        link.symlink_to(home, target_is_directory=True)
+        home = link
+    elif kind == "file":
+        home = tmp_path / "file"
+        home.touch()
+    else:
+        home.chmod(0o775 if kind == "group-writable" else 0o757)
+    monkeypatch.setattr(install.subprocess, "run", lambda *a, **kw: pytest.fail("unsafe home"))
+    with pytest.raises(OSError, match="Ficelle home must"):
+        install.run_command(
+            [sys.executable, "-m", "ficelle.cli", "set-key", "openrouter", "--stdin"],
+            dry_run=False, env={"FICELLE_HOME": str(home)}, input_text="test-key\n",
+        )
+
+
+
+def test_install_child_uses_private_cwd_when_valid_home_is_not_searchable(tmp_path, monkeypatch):
+    from ficelle import install
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    real_access = os.access
+    monkeypatch.setattr(os, "access", lambda path, mode, **kw: (
+        False if Path(path) == home else real_access(path, mode, **kw)
+    ))
+    calls = []
+    def run(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        assert cwd.is_dir() and cwd != home and cwd.stat().st_mode & 0o777 == 0o700
+        calls.append(kwargs)
+        return install.subprocess.CompletedProcess(command, 0, "", "")
+    monkeypatch.setattr(install.subprocess, "run", run)
+    install.run_command(
+        [sys.executable, "-m", "ficelle.cli", "health"],
+        dry_run=False, env={"FICELLE_HOME": str(home)},
+    )
+    assert calls[0]["env"]["FICELLE_HOME"] == str(home)
+    assert not Path(calls[0]["cwd"]).exists()

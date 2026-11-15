@@ -16,6 +16,11 @@
 # pattern reaching a file under `src/ficelle/` *would* change the wheel and invalidate the pin.
 # Re-check the digest after any edit that touches the package directory.
 #
+# One file is deliberately kept out of the wheel even though the patterns below list it:
+# `assets/hermes-plugin/ficelle/bootstrap-pin.json` (excluded in pyproject.toml). It records the
+# SHA-256 of `scripts/bootstrap-ficelle.py`, which pins this wheel's digest, so a copy inside the
+# wheel would be circular. `scripts/audit-release-artifacts.py` fails a wheel that carries it.
+#
 # `scripts/audit-release-artifacts.py` enforces the resulting shape before anything is
 # uploaded, so a re-added pattern fails the publish rather than shipping.
 include CHANGELOG.md

@@ -29,6 +29,7 @@ from ficelle.failures import (
     provider_error_codes,
     status_for_error_codes,
 )
+from ficelle.runtime_paths import absolute_python, validated_runtime_home
 from ficelle.json_store import atomic_write_json as write_atomic_json
 from ficelle.json_store import ensure_private_dir, ensure_private_fd, open_private_append
 from ficelle.probe_lock import (
@@ -4320,7 +4321,9 @@ def install_weekly_schedule(
     if max_duration_seconds is not None and max_duration_seconds <= 0:
         raise SyntheticHealthError("max_duration_seconds must be positive")
     path = plist_path or schedule_plist_path()
-    arguments = [sys.executable, "-m", "ficelle.cli", "synthetic-health", "run", "--depth", "deep", "--json"]
+    ficelle_home = validated_runtime_home(ficelle_home)
+    path = path.expanduser().absolute()
+    arguments = [absolute_python(sys.executable), "-P", "-m", "ficelle.cli", "synthetic-health", "run", "--depth", "deep", "--json"]
     if max_duration_seconds is not None:
         arguments.extend(["--max-duration-seconds", str(max_duration_seconds)])
     log_dir = ficelle_home / "logs"
@@ -4328,7 +4331,8 @@ def install_weekly_schedule(
     payload = {
         "Label": SCHEDULE_LABEL,
         "ProgramArguments": arguments,
-        "EnvironmentVariables": {"FICELLE_HOME": str(ficelle_home)},
+        "EnvironmentVariables": {"FICELLE_HOME": str(ficelle_home), "PYTHONSAFEPATH": "1"},
+        "WorkingDirectory": str(ficelle_home),
         "StartCalendarInterval": {"Weekday": weekday, "Hour": hour, "Minute": minute},
         "RunAtLoad": False,
         "ProcessType": "Background",
