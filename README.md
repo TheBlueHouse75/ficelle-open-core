@@ -54,15 +54,11 @@ raw numbers: [the benchmark write-up](https://ficelle.ai/blog/free-vs-paid-llm-b
 
 ## Quick start
 
-The following bootstrap is pinned to the public mirror commit for release v0.3.13. It predates
-the `Requires-Dist` protections in the development bootstrap and in-place updater, and the
-mandatory matching SHA-256 for a local or loopback Pro wheel. Those protections arrive with
-the next release; refresh this pinned SHA after that release ships them.
-
-Install open Core using the existing v0.3.13 pin:
+The following bootstrap is pinned to the public mirror commit for release v0.3.14. It installs
+open Core:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/350b724e17d1b7d0d0d95bf41d8938e7a2f171c9/scripts/bootstrap-ficelle.py | python3
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/77932ecbd1b34b4650a8f69ba59bc2d38a418f2d/scripts/bootstrap-ficelle.py | python3
 ~/.local/bin/ficelle doctor --text
 ```
 
@@ -73,7 +69,7 @@ key in shell history, enter it silently before running the same safe command:
 (
   read -s FICELLE_LICENSE_KEY
   export FICELLE_LICENSE_KEY
-  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/350b724e17d1b7d0d0d95bf41d8938e7a2f171c9/scripts/bootstrap-ficelle.py | python3
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/77932ecbd1b34b4650a8f69ba59bc2d38a418f2d/scripts/bootstrap-ficelle.py | python3
 )
 ```
 

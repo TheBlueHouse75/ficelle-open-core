@@ -1,0 +1,9 @@
+{
+  "bootstrap_sha256": "37f7e67f784f03f13628705b660b3ead31027d5f0a38061bd387762a866d7d51",
+  "bootstrap_url": "https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/77932ecbd1b34b4650a8f69ba59bc2d38a418f2d/scripts/bootstrap-ficelle.py",
+  "core_version_range": {
+    "max_exclusive": "0.4.0",
+    "min": "0.3.0"
+  },
+  "release_tag": "v0.3.14"
+}
