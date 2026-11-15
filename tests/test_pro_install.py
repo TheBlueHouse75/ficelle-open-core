@@ -224,6 +224,7 @@ def test_install_pro_wheel_falls_back_to_uv_when_pip_is_unavailable(tmp_path: Pa
         "/opt/homebrew/bin/uv",
         "pip",
         "install",
+        "--no-config",
         "--python",
         sys.executable,
         "cryptography>=42",
@@ -233,6 +234,7 @@ def test_install_pro_wheel_falls_back_to_uv_when_pip_is_unavailable(tmp_path: Pa
         "/opt/homebrew/bin/uv",
         "pip",
         "install",
+        "--no-config",
         "--python",
         sys.executable,
         "--reinstall",
@@ -287,7 +289,7 @@ def test_detached_install_command_uses_systemd_scope(tmp_path: Path, monkeypatch
         "--collect",
     ]
     assert command[5].startswith("--unit=ficelle-pro-install-")
-    assert command[6:] == [sys.executable, "-m", "ficelle", "install-pro"]
+    assert command[6:] == [sys.executable, "-P", "-m", "ficelle", "install-pro"]
 
 
 def test_install_status_roundtrip_is_private(tmp_path: Path) -> None:
@@ -808,3 +810,63 @@ def test_install_lock_waits_for_the_current_holder_to_release(tmp_path: Path, lo
     finally:
         release_holder.set()
         holder.join(timeout=10)
+
+
+@pytest.mark.parametrize("parent_config", ["uv.toml", "pyproject.toml"])
+@pytest.mark.parametrize("missing_pip", [False, True])
+def test_pro_install_ignores_parent_configuration_and_caller_files(
+    tmp_path, monkeypatch, parent_config, missing_pip,
+):
+    import subprocess
+
+    parent = tmp_path / "shared-temp"
+    parent.mkdir()
+    table = "[tool.uv]\n" if parent_config == "pyproject.toml" else ""
+    (parent / parent_config).write_text(table + 'index-url = "https://attacker.invalid/simple"\n')
+    monkeypatch.setattr(pro_install.tempfile, "tempdir", str(parent))
+    monkeypatch.setenv("UV_NO_CONFIG", "0")
+    trusted_uv = {
+        "UV_CONFIG_FILE": str(tmp_path / "user-selected-uv.toml"),
+        "UV_INDEX_URL": "https://user-index.invalid/simple",
+        "UV_CACHE_DIR": str(tmp_path / "user-cache"),
+    }
+    for name, value in trusted_uv.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.chdir(tmp_path)
+    wheel = Path("ficelle_pro-1-py3-none-any.whl")
+    write_pro_wheel(wheel)
+    (tmp_path / "pip.py").write_text("raise RuntimeError('caller shadow')\n")
+    uv = Path("tools/uv")
+    uv.parent.mkdir()
+    uv.touch(mode=0o700)
+    monkeypatch.setenv("FICELLE_UV_BIN", str(uv))
+    calls = []
+    directories = []
+
+    def run(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        assert cwd.is_absolute() and cwd.parent == parent
+        assert cwd.stat().st_mode & 0o777 == 0o700
+        assert list(cwd.iterdir()) == []
+        assert cwd not in directories
+        directories.append(cwd)
+        assert Path(command[0]).is_absolute()
+        if command[1:3] == ["-m", "pip"]:
+            assert command[0] == sys.executable
+            code = 1 if missing_pip else 0
+        else:
+            assert command[:4] == [str(tmp_path / uv), "pip", "install", "--no-config"]
+            assert kwargs["env"]["UV_NO_CONFIG"] == "1"
+            assert {name: kwargs["env"][name] for name in trusted_uv} == trusted_uv
+            assert command[command.index("--python") + 1] == sys.executable
+            code = 0
+        if "--no-deps" in command:
+            assert command[-1] == str(tmp_path / wheel)
+        calls.append(command)
+        return subprocess.CompletedProcess(command, code, "", "No module named pip" if code else "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    pro_install.install_pro_wheel(wheel)
+
+    assert len(calls) == (4 if missing_pip else 2)
+    assert all(not directory.exists() for directory in directories)

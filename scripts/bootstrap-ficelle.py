@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Install Ficelle Core, and optionally Ficelle Pro, without cloning the repository.
 
-This script is intentionally stdlib-only so it can be served as:
+This script is intentionally stdlib-only. Bootstrap pinned to public mirror release v0.3.13:
 
-    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/v0.3.13/scripts/bootstrap-ficelle.py | python3
+    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/350b724e17d1b7d0d0d95bf41d8938e7a2f171c9/scripts/bootstrap-ficelle.py | python3
 
 Without a license key it installs the versioned open Core from the public GitHub
 release. With ``FICELLE_LICENSE_KEY`` (or the legacy ``FICELLE_INSTALL_TOKEN``)
@@ -25,18 +25,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from email.parser import Parser
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
-CORE_VERSION = "0.3.13"
+CORE_VERSION = "0.3.14"
 DEFAULT_CORE_WHEEL_URL = (
     "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
     f"v{CORE_VERSION}/ficelle_router-{CORE_VERSION}-py3-none-any.whl"
 )
 DEFAULT_CORE_SHA256 = (
-    "ac64e53ed968a81dc84b43c935dfadf2a7ed3e089ff2d2f0a5fe350f4ecf1bb7"
+    "be8838e4cfe327577889d7128b4031df32067e5e4b1cc8f5f80da194df39bba3"
 )
 DEFAULT_WHEEL_URL = f"https://install.ficelle.ai/api/releases/{CORE_VERSION}/wheel"
 PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
@@ -97,14 +98,14 @@ def command_env(options: BootstrapOptions) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("FICELLE_RUNTIME_DIR", None)
     if options.ficelle_home_explicit:
-        env["FICELLE_HOME"] = str(options.ficelle_home)
+        env["FICELLE_HOME"] = str(options.ficelle_home.absolute())
     else:
         env.pop("FICELLE_HOME", None)
     env.pop("HERMES_HOME", None)
     return env
 
 
-def run_command(command: Sequence[str], *, dry_run: bool, env: Mapping[str, str] | None = None) -> CommandResult:
+def run_command(command: Sequence[str], *, dry_run: bool, env: Mapping[str, str] | None = None, cwd: str | None = None) -> CommandResult:
     env_hint = ""
     if env:
         hints = [
@@ -119,12 +120,38 @@ def run_command(command: Sequence[str], *, dry_run: bool, env: Mapping[str, str]
         print(f"DRY RUN:{env_hint} {printable}")
         return CommandResult(list(command), 0)
     print(f"RUN:{env_hint} {printable}")
-    completed = subprocess.run(list(command), text=True, capture_output=True, env=dict(env) if env else None)
+    completed = subprocess.run(list(command), text=True, capture_output=True, env=dict(env) if env else None, cwd=cwd)
     if completed.stdout:
         print(completed.stdout, end="")
     if completed.stderr:
         print(completed.stderr, end="", file=sys.stderr)
     return CommandResult(list(command), completed.returncode, completed.stdout or "", completed.stderr or "")
+
+
+@contextmanager
+def isolated_command_cwd() -> Iterator[str]:
+    # Package names and imports must not bind to files in the caller's directory.
+    with tempfile.TemporaryDirectory(prefix="ficelle-pip-") as cwd:
+        Path(cwd).chmod(0o700)
+        yield cwd
+
+
+def run_isolated_command(command: Sequence[str], *, dry_run: bool, env: Mapping[str, str] | None = None) -> CommandResult:
+    with isolated_command_cwd() as cwd:
+        return run_command(command, dry_run=dry_run, env=env, cwd=cwd)
+
+
+def run_uv_command(
+    executable: str, group: Sequence[str], arguments: Sequence[str], *,
+    dry_run: bool, env: Mapping[str, str],
+) -> CommandResult:
+    # uv also discovers config in parents of the empty cwd (including shared /tmp).
+    uv_env = dict(env)
+    uv_env["UV_NO_CONFIG"] = "1"
+    return run_isolated_command(
+        [str(Path(executable).absolute()), *group, "--no-config", *arguments],
+        dry_run=dry_run, env=uv_env,
+    )
 
 
 def ensure_success(result: CommandResult, *, action: str) -> None:
@@ -138,9 +165,10 @@ def pip_is_unavailable(result: CommandResult) -> bool:
 
 
 def run_python_probe(python: Path, code: str) -> CommandResult:
-    command = [str(python), "-c", code]
+    command = [str(python.absolute()), "-c", code]
     try:
-        completed = subprocess.run(command, text=True, capture_output=True)
+        with isolated_command_cwd() as cwd:
+            completed = subprocess.run(command, text=True, capture_output=True, cwd=cwd)
     except OSError as exc:
         return CommandResult(command, 1, stderr=f"{type(exc).__name__}: {exc}")
     return CommandResult(
@@ -177,24 +205,29 @@ def prepare_ficelle_python(
     selected_python: Path,
 ) -> Path:
     """Create or reuse the Ficelle-owned runtime from the selected base Python."""
-    python = venv_python(options.venv)
+    python = venv_python(options.venv.absolute())
     if python.exists():
         return validate_python(python)
-    result = run_command(
-        [str(selected_python), "-m", "venv", str(options.venv)],
+    venv_existed = options.venv.exists()
+    result = run_isolated_command(
+        [str(selected_python.absolute()), "-m", "venv", str(options.venv.absolute())],
         dry_run=options.dry_run,
     )
-    if result.returncode != 0 and shutil.which("uv"):
-        result = run_command(
-            [
-                "uv",
-                "venv",
+    uv = shutil.which("uv")
+    if result.returncode != 0 and uv:
+        result = run_uv_command(
+            uv, ["venv"], [
                 "--python",
-                str(selected_python),
-                str(options.venv),
+                str(selected_python.absolute()),
+                str(options.venv.absolute()),
             ],
             dry_run=options.dry_run,
+            env=command_env(options),
         )
+    if result.returncode != 0 and not options.dry_run and not venv_existed:
+        # A failed `python -m venv` (Debian/Ubuntu without python3-venv) leaves an interpreter
+        # with no pip behind; the next run would reuse it as a finished runtime and fail later.
+        shutil.rmtree(options.venv, ignore_errors=True)
     ensure_success(result, action="isolated Python environment creation")
     if options.dry_run:
         return python
@@ -202,8 +235,15 @@ def prepare_ficelle_python(
 
 
 def resolve_base_python(options: BootstrapOptions) -> Path:
-    selected = Path(options.python).expanduser() if options.python else Path(sys.executable)
-    return validate_python(selected)
+    value = options.python or sys.executable
+    selected = Path(value).expanduser()
+    # A bare executable name uses PATH; an explicit relative path uses the caller's cwd.
+    if not selected.is_absolute() and not os.path.dirname(value):
+        executable = shutil.which(value)
+        if executable is None:
+            raise SystemExit(f"target Python executable was not found on PATH: {value}")
+        selected = Path(executable)
+    return validate_python(selected.absolute())
 
 
 def safe_wheel_filename(value: str | None) -> str | None:
@@ -458,22 +498,30 @@ def verify_pro_wheel_integrity(
     wheel: Path,
     download_dir: Path,
 ) -> None:
-    """Verify a remote Pro wheel against an independent release root before pip executes it."""
+    """Verify a Pro wheel before pip executes it.
+
+    A remote wheel needs an explicit SHA-256 or the signed release attestation rooted
+    in Core. A local file or loopback wheel has no attestation sidecar, so a matching
+    SHA-256 is mandatory. A missing or mismatched digest stops the bootstrap.
+    """
     if options.sha256:
         verify_sha256(wheel, options.sha256)
         return
     if not pro_wheel_needs_signed_attestation(options.wheel_url):
-        print("Local development wheel: signed release attestation not required.")
-        return
+        raise SystemExit(
+            "Pro wheel SHA-256 is required for a local or loopback wheel. "
+            "Pass --sha256 or set FICELLE_WHEEL_SHA256. "
+            "Refusing to install an unverified Pro wheel."
+        )
     attestation = download_pro_attestation(options, download_dir)
-    result = run_command(
+    result = run_isolated_command(
         [
-            str(python),
+            str(python.absolute()),
             "-m",
             "ficelle.artifact_integrity",
             "verify",
-            str(wheel),
-            str(attestation),
+            str(wheel.absolute()),
+            str(attestation.absolute()),
         ],
         dry_run=False,
         env=command_env(options),
@@ -495,6 +543,8 @@ def install_wheel(
     python: Path,
     wheel: Path,
 ) -> None:
+    python = python.absolute()
+    wheel = wheel.absolute()
     env = command_env(options)
     pip_command = [
         str(python),
@@ -505,27 +555,25 @@ def install_wheel(
     ]
     pip_command.append("--no-deps")
     pip_command.append(str(wheel))
-    result = run_command(
+    result = run_isolated_command(
         pip_command,
         dry_run=options.dry_run,
         env=env,
     )
     if result.returncode == 0:
         return
-    if pip_is_unavailable(result) and shutil.which("uv"):
+    uv = shutil.which("uv")
+    if pip_is_unavailable(result) and uv:
         print("python -m pip is unavailable; retrying wheel install with uv pip.")
-        uv_command = [
-            "uv",
-            "pip",
-            "install",
+        uv_arguments = [
             "--python",
             str(python),
             "--reinstall",
         ]
-        uv_command.append("--no-deps")
-        uv_command.append(str(wheel))
-        result = run_command(
-            uv_command,
+        uv_arguments.append("--no-deps")
+        uv_arguments.append(str(wheel))
+        result = run_uv_command(
+            uv, ["pip", "install"], uv_arguments,
             dry_run=options.dry_run,
             env=env,
         )
@@ -539,29 +587,91 @@ def install_requirements(
 ) -> None:
     if not requirements:
         return
+    # Validate again at the pip boundary so a caller cannot pass flags or URLs through.
+    safe_requirements = [validate_runtime_requirement(requirement) for requirement in requirements]
+    python = python.absolute()
     env = command_env(options)
-    pip_command = [str(python), "-m", "pip", "install", *requirements]
-    result = run_command(
+    pip_command = [str(python), "-m", "pip", "install", *safe_requirements]
+    result = run_isolated_command(
         pip_command,
         dry_run=options.dry_run,
         env=env,
     )
     if result.returncode == 0:
         return
-    if pip_is_unavailable(result) and shutil.which("uv"):
-        result = run_command(
+    uv = shutil.which("uv")
+    if pip_is_unavailable(result) and uv:
+        result = run_uv_command(
+            uv, ["pip", "install"],
             [
-                "uv",
-                "pip",
-                "install",
                 "--python",
                 str(python),
-                *requirements,
+                *safe_requirements,
             ],
             dry_run=options.dry_run,
             env=env,
         )
     ensure_success(result, action="runtime dependency install")
+
+
+# Conservative named-index grammar, duplicated in update.py because bootstrap runs
+# before Core or packaging is installed. Cross-tests keep both policies equivalent.
+_REQUIREMENT_NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+_REQUIREMENT_EXTRAS = rf"{_REQUIREMENT_NAME}(?:[ ]*,[ ]*{_REQUIREMENT_NAME})*"
+_REQUIREMENT_SPECIFIER = r"(?:===|==|!=|<=|>=|~=|<|>)[ ]*[A-Za-z0-9*+!_.-]+"
+_REQUIREMENT_SPECIFIERS = rf"{_REQUIREMENT_SPECIFIER}(?:[ ]*,[ ]*{_REQUIREMENT_SPECIFIER})*"
+_REQUIREMENT_MARKER = r"[A-Za-z0-9_.\"'<>=! (),]+"
+# Pip's ARCHIVE_EXTENSIONS (pip/_internal/utils/filetypes.py) plus defence-in-depth
+# extras (.tbz2, .tar.zst, .egg): pip interprets these as local archive filenames.
+_RUNTIME_ARCHIVE_SUFFIXES = (
+    ".whl", ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".tbz2",
+    ".tar.xz", ".txz", ".tar.lz", ".tlz", ".tar.lzma", ".tar.zst", ".egg",
+)
+_RUNTIME_REQUIREMENT = re.compile(
+    rf"(?P<name>{_REQUIREMENT_NAME})"
+    rf"(?:[ ]*\[[ ]*(?:{_REQUIREMENT_EXTRAS})[ ]*\])?"
+    rf"(?:[ ]*(?:{_REQUIREMENT_SPECIFIERS}|\([ ]*{_REQUIREMENT_SPECIFIERS}[ ]*\)))?"
+    rf"(?:[ ]*;[ ]*{_REQUIREMENT_MARKER})?"
+)
+_FICELLE_REQUIREMENT_NAMES = ("ficelle-router", "ficelle-pro")
+
+
+def validate_runtime_requirement(raw: object) -> str:
+    """Return a pip-installable name requirement, or stop with a readable error.
+
+    Refuses pip options (entries starting with ``-``), direct URLs, VCS paths, and
+    any string that is not a package name with optional extras, specifiers, and marker.
+    """
+    if not isinstance(raw, str):
+        raise SystemExit("refusing a runtime requirement that is not a package specifier")
+    # Check the original input before trimming: strip() would hide Unicode/control bytes.
+    if any(not (" " <= character <= "~") for character in raw):
+        raise SystemExit(
+            "refusing a runtime requirement that contains non-ASCII or control characters "
+            "(including newline or null)"
+        )
+    requirement = raw.strip(" ")
+    if not requirement:
+        raise SystemExit("refusing an empty runtime requirement")
+    if requirement.startswith("-"):
+        raise SystemExit(
+            "refusing a runtime requirement that starts with '-'. "
+            "Pip options are not accepted from wheel metadata."
+        )
+    name_part = requirement.split(";", 1)[0]
+    if "://" in requirement or "@" in name_part:
+        raise SystemExit(
+            "refusing a direct-URL runtime requirement. "
+            "Only named packages from the configured index are accepted."
+        )
+    match = _RUNTIME_REQUIREMENT.fullmatch(requirement)
+    if match is None:
+        raise SystemExit(
+            "refusing a runtime requirement that is not a package specifier"
+        )
+    if match.group("name").lower().endswith(_RUNTIME_ARCHIVE_SUFFIXES):
+        raise SystemExit("refusing a runtime requirement with an archive filename as its package name")
+    return requirement
 
 
 def wheel_runtime_requirements(
@@ -570,7 +680,7 @@ def wheel_runtime_requirements(
     fallback: Sequence[str] = (),
 ) -> tuple[str, ...]:
     if not wheel.is_file():
-        return tuple(fallback)
+        return tuple(validate_runtime_requirement(requirement) for requirement in fallback)
     try:
         with zipfile.ZipFile(wheel) as archive:
             metadata_name = next(
@@ -579,24 +689,26 @@ def wheel_runtime_requirements(
             metadata = Parser().parsestr(archive.read(metadata_name).decode("utf-8"))
     except (OSError, UnicodeError, zipfile.BadZipFile, StopIteration) as exc:
         raise SystemExit(f"wheel metadata could not be read: {wheel}") from exc
-    return tuple(
-        requirement
-        for requirement in metadata.get_all("Requires-Dist", [])
-        if not requirement.lower().replace("_", "-").startswith(
-            ("ficelle-router", "ficelle-pro")
-        )
-    )
+    accepted: list[str] = []
+    for raw_requirement in metadata.get_all("Requires-Dist", []):
+        requirement = validate_runtime_requirement(raw_requirement)
+        normalized = requirement.lower().replace("_", "-")
+        if normalized.startswith(_FICELLE_REQUIREMENT_NAMES):
+            continue
+        accepted.append(requirement)
+    return tuple(accepted)
 
 
 def check_runtime(options: BootstrapOptions, python: Path) -> None:
-    result = run_command(
-        [str(python), "-m", "pip", "check"],
+    result = run_isolated_command(
+        [str(python.absolute()), "-m", "pip", "check"],
         dry_run=options.dry_run,
         env=command_env(options),
     )
-    if result.returncode != 0 and pip_is_unavailable(result) and shutil.which("uv"):
-        result = run_command(
-            ["uv", "pip", "check", "--python", str(python)],
+    uv = shutil.which("uv")
+    if result.returncode != 0 and pip_is_unavailable(result) and uv:
+        result = run_uv_command(
+            uv, ["pip", "check"], ["--python", str(python.absolute())],
             dry_run=options.dry_run,
             env=command_env(options),
         )
@@ -611,20 +723,20 @@ def setup_command(
     expose_cli: bool = True,
 ) -> list[str]:
     command = [
-        str(python),
+        str(python.absolute()),
         "-m",
         "ficelle.install",
         "--skip-package",
         "--package",
-        str(wheel),
+        str(wheel.absolute()),
         "--no-editable",
     ]
     if options.ficelle_home_explicit:
-        command.extend(("--ficelle-home", str(options.ficelle_home)))
+        command.extend(("--ficelle-home", str(options.ficelle_home.absolute())))
     for connector in options.connectors:
         command.extend(("--connector", connector))
     if "hermes" in options.connectors:
-        command.extend(("--hermes-home", str(options.hermes_home)))
+        command.extend(("--hermes-home", str(options.hermes_home.absolute())))
     if not options.backup_existing:
         command.append("--no-backup")
     if options.skip_service:
@@ -645,7 +757,7 @@ def run_packaged_setup(
     *,
     expose_cli: bool = True,
 ) -> None:
-    result = run_command(
+    result = run_isolated_command(
         setup_command(options, python, wheel, expose_cli=expose_cli),
         dry_run=options.dry_run,
         env=command_env(options),
@@ -668,8 +780,8 @@ def verify_install(
         if expect_pro
         else "import ficelle; print('ficelle core')"
     )
-    result = run_command(
-        [str(python), "-c", code],
+    result = run_isolated_command(
+        [str(python.absolute()), "-c", code],
         dry_run=options.dry_run,
         env=command_env(options),
     )
@@ -694,7 +806,7 @@ def run_license_activation(
         return
     env = command_env(options)
     env["FICELLE_LICENSE_KEY"] = options.license_key
-    result = run_command([str(python), "-m", "ficelle", "license", "activate"], dry_run=options.dry_run, env=env)
+    result = run_isolated_command([str(python.absolute()), "-m", "ficelle", "license", "activate"], dry_run=options.dry_run, env=env)
     if result.returncode == 0:
         print("Pro license activated on this machine.")
     else:
@@ -805,7 +917,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sha256",
         default=os.getenv("FICELLE_WHEEL_SHA256"),
-        help="Optional out-of-band Pro wheel SHA256; remote releases otherwise require the bundled signing root.",
+        help=(
+            "Pro wheel SHA256. Required for a local or loopback wheel; "
+            "remote releases may instead use the bundled signing root."
+        ),
     )
     parser.add_argument(
         "--python",

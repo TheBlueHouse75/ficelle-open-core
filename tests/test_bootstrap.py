@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from conftest import unreleasable_version
+from ficelle import update
 
 
 BOOTSTRAP_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bootstrap-ficelle.py"
@@ -140,7 +141,7 @@ def test_implicit_home_is_omitted_from_setup_command_and_environment(
     options = make_options(tmp_path, ficelle_home_explicit=False)
     captured = {}
 
-    def fake_run(command, *, dry_run, env=None):
+    def fake_run(command, *, dry_run, env=None, cwd=None):
         captured["command"] = list(command)
         captured["env"] = dict(env or {})
         return bootstrap.CommandResult(list(command), 0)
@@ -166,7 +167,7 @@ def test_explicit_home_is_passed_to_setup_command_and_environment(
     options = make_options(tmp_path, ficelle_home_explicit=True)
     captured = {}
 
-    def fake_run(command, *, dry_run, env=None):
+    def fake_run(command, *, dry_run, env=None, cwd=None):
         captured["command"] = list(command)
         captured["env"] = dict(env or {})
         return bootstrap.CommandResult(list(command), 0)
@@ -234,7 +235,7 @@ def test_install_wheel_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_pat
     wheel.write_text("placeholder")
     options = make_options(tmp_path)
 
-    def fake_run(command, *, dry_run, env=None):
+    def fake_run(command, *, dry_run, env=None, cwd=None):
         calls.append(
             (
                 command,
@@ -253,7 +254,7 @@ def test_install_wheel_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_pat
 
     assert calls == [
         (["/tmp/hermes-python", "-m", "pip", "install", "--force-reinstall", "--no-deps", str(wheel)], None, str(tmp_path / ".ficelle")),
-        (["uv", "pip", "install", "--python", "/tmp/hermes-python", "--reinstall", "--no-deps", str(wheel)], None, str(tmp_path / ".ficelle")),
+        (["/opt/homebrew/bin/uv", "pip", "install", "--no-config", "--python", "/tmp/hermes-python", "--reinstall", "--no-deps", str(wheel)], None, str(tmp_path / ".ficelle")),
     ]
 
 
@@ -264,7 +265,7 @@ def test_pro_requirements_fall_back_to_uv_when_pip_is_missing(
     calls = []
     options = make_options(tmp_path)
 
-    def fake_run(command, *, dry_run, env=None):
+    def fake_run(command, *, dry_run, env=None, cwd=None):
         calls.append(command)
         if command[:3] == ["/tmp/ficelle-python", "-m", "pip"]:
             return bootstrap.CommandResult(
@@ -296,9 +297,10 @@ def test_pro_requirements_fall_back_to_uv_when_pip_is_missing(
             "cryptography>=42",
         ],
         [
-            "uv",
+            "/opt/homebrew/bin/uv",
             "pip",
             "install",
+            "--no-config",
             "--python",
             "/tmp/ficelle-python",
             "cryptography>=42",
@@ -310,7 +312,7 @@ def test_runtime_check_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_pat
     calls = []
     options = make_options(tmp_path)
 
-    def fake_run(command, *, dry_run, env=None):
+    def fake_run(command, *, dry_run, env=None, cwd=None):
         calls.append(command)
         if command[:3] == ["/tmp/ficelle-python", "-m", "pip"]:
             return bootstrap.CommandResult(
@@ -331,7 +333,7 @@ def test_runtime_check_falls_back_to_uv_when_pip_is_missing(monkeypatch, tmp_pat
 
     assert calls == [
         ["/tmp/ficelle-python", "-m", "pip", "check"],
-        ["uv", "pip", "check", "--python", "/tmp/ficelle-python"],
+        ["/opt/homebrew/bin/uv", "pip", "check", "--no-config", "--python", "/tmp/ficelle-python"],
     ]
 
 
@@ -380,11 +382,27 @@ def test_default_core_wheel_is_versioned_and_pinned():
         f"/ficelle_router-{bootstrap.CORE_VERSION}-py3-none-any.whl"
     )
     assert len(bootstrap.DEFAULT_CORE_SHA256) == 64
-    # The docstring's curl line is what users copy; a bump that forgets it would serve an
-    # older installer than the wheel it pins.
-    assert f"/v{bootstrap.CORE_VERSION}/scripts/bootstrap-ficelle.py" in (
-        bootstrap.__doc__ or ""
+
+
+def test_documented_bootstrap_urls_use_one_immutable_public_commit():
+    root = BOOTSTRAP_PATH.parents[1]
+    paths = [root / "README.md", BOOTSTRAP_PATH]
+    # The public mirror relocates public-readme.md to README.md and omits install.md.
+    paths.extend(
+        path for path in (root / "docs/install.md", root / "docs/public-readme.md")
+        if path.exists()
     )
+    refs = []
+    for path in paths:
+        matches = re.findall(
+            r"https://raw\.githubusercontent\.com/TheBlueHouse75/ficelle-open-core/"
+            r"([^/\s]+)/scripts/bootstrap-ficelle\.py",
+            path.read_text(encoding="utf-8"),
+        )
+        assert matches, path
+        assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in matches), path
+        refs.extend(matches)
+    assert len(set(refs)) == 1
 
 
 def test_wheel_filename_rejects_non_version_placeholder():
@@ -571,7 +589,7 @@ def test_remote_pro_wheel_is_verified_with_the_installed_core_root(
         lambda _options, _directory: attestation,
     )
 
-    def run(command, *, dry_run, env=None):
+    def run(command, *, dry_run, env=None, cwd=None):
         commands.append(command)
         return bootstrap.CommandResult(list(command), 0)
 
@@ -706,6 +724,31 @@ def test_python_probe_converts_execution_error_to_unusable(monkeypatch, tmp_path
     assert "PermissionError" in result.stderr
 
 
+@pytest.mark.parametrize("selection", ["python3", "./python3"])
+def test_base_python_preserves_path_lookup_and_explicit_relative_paths(monkeypatch, tmp_path, selection):
+    monkeypatch.chdir(tmp_path)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "python3").symlink_to(sys.executable)
+    (tmp_path / "python3").symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", str(tools))
+    options = make_options(tmp_path, python=selection)
+    expected = tools / "python3" if selection == "python3" else tmp_path / "python3"
+
+    assert bootstrap.resolve_base_python(options) == expected
+
+
+def test_base_python_missing_on_path_does_not_execute_a_local_namesake(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    tools = tmp_path / "empty-path"
+    tools.mkdir()
+    (tmp_path / "python3").symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", str(tools))
+
+    with pytest.raises(SystemExit, match="not found on PATH"):
+        bootstrap.resolve_base_python(make_options(tmp_path, python="python3"))
+
+
 def test_generic_install_creates_an_isolated_runtime(
     monkeypatch,
     tmp_path,
@@ -715,7 +758,7 @@ def test_generic_install_creates_an_isolated_runtime(
     created = []
     runtime = bootstrap.venv_python(options.venv)
 
-    def fake_run(command, *, dry_run, env=None):
+    def fake_run(command, *, dry_run, env=None, cwd=None):
         created.append(command)
         runtime.parent.mkdir(parents=True)
         runtime.touch()
@@ -738,7 +781,7 @@ def test_generic_install_falls_back_to_uv_venv(monkeypatch, tmp_path):
     runtime = bootstrap.venv_python(options.venv)
     calls = []
 
-    def fake_run(command, *, dry_run, env=None):
+    def fake_run(command, *, dry_run, env=None, cwd=None):
         calls.append(command)
         if command[:3] == [str(selected), "-m", "venv"]:
             return bootstrap.CommandResult(command, 1)
@@ -758,13 +801,34 @@ def test_generic_install_falls_back_to_uv_venv(monkeypatch, tmp_path):
     assert calls == [
         [str(selected), "-m", "venv", str(options.venv)],
         [
-            "uv",
+            "/usr/local/bin/uv",
             "venv",
+            "--no-config",
             "--python",
             str(selected),
             str(options.venv),
         ],
     ]
+
+
+def test_failed_venv_creation_leaves_no_partial_runtime(monkeypatch, tmp_path):
+    # Ubuntu without python3-venv: `python -m venv` writes bin/python, then fails on ensurepip.
+    # Reusing that interpreter on the next run fails later with "No module named pip".
+    options = make_options(tmp_path, target="generic")
+    runtime = bootstrap.venv_python(options.venv)
+
+    def fake_run(command, *, dry_run, env=None, cwd=None):
+        runtime.parent.mkdir(parents=True)
+        runtime.touch()
+        return bootstrap.CommandResult(list(command), 1)
+
+    monkeypatch.setattr(bootstrap, "run_command", fake_run)
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: None)
+
+    with pytest.raises(SystemExit, match="isolated Python environment creation failed"):
+        bootstrap.prepare_ficelle_python(options, Path("/usr/bin/python3"))
+
+    assert not options.venv.exists()
 
 
 def test_explicit_python_still_creates_an_isolated_runtime(monkeypatch, tmp_path):
@@ -788,7 +852,7 @@ def test_run_license_activation_passes_key_via_env_not_argv(monkeypatch, tmp_pat
     captured = {}
     monkeypatch.setenv("FICELLE_RUNTIME_DIR", "/stale/inherited/runtime")
 
-    def fake_run(command, *, dry_run, env=None):
+    def fake_run(command, *, dry_run, env=None, cwd=None):
         captured["command"] = list(command)
         captured["env"] = env
         return bootstrap.CommandResult(list(command), 0)
@@ -926,6 +990,7 @@ def test_pro_bootstrap_installs_core_then_pro_without_dependencies(
         core_wheel_url=str(core),
         wheel_url=str(pro),
         license_key="FICL-SECRET",
+        sha256=bootstrap.sha256_file(pro),
     )
     installed = []
     requirements = []
@@ -965,3 +1030,367 @@ def test_pro_bootstrap_installs_core_then_pro_without_dependencies(
         (pro.name, {}),
     ]
     assert requirements == ["requests>=2.31", "cryptography>=42"]
+
+
+def _wheel_with_requirements(path: Path, requires: list[str]) -> None:
+    lines = [
+        "Metadata-Version: 2.4",
+        "Name: ficelle-pro",
+        "Version: 0.1.3",
+        *[f"Requires-Dist: {requirement}" for requirement in requires],
+        "",
+    ]
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("ficelle_pro-0.1.3.dist-info/METADATA", "\n".join(lines))
+
+
+def test_wheel_runtime_requirements_accept_named_specifiers_only(tmp_path):
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    wheel = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    accepted = [
+        f"ficelle-router=={bootstrap.CORE_VERSION}",
+        "cryptography>=42",
+        'packaging>=24; python_version >= "3.11"',
+    ]
+    _wheel_with_requirements(wheel, accepted)
+
+    assert bootstrap.wheel_runtime_requirements(wheel) == (
+        "cryptography>=42",
+        'packaging>=24; python_version >= "3.11"',
+    )
+    for requirement in accepted:
+        parsed = Requirement(requirement)
+        assert parsed.url is None
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        "",
+        "   ",
+        "-r /tmp/evil.txt",
+        "--index-url https://evil.example/simple",
+        "evil @ https://evil.example/p.whl",
+        "https://evil.example/p.whl",
+        "evil @ file:///tmp/p.whl",
+    ],
+)
+def test_wheel_runtime_requirements_reject_options_and_direct_urls(tmp_path, requirement):
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    wheel = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    _wheel_with_requirements(
+        wheel,
+        [f"ficelle-router=={bootstrap.CORE_VERSION}", requirement],
+    )
+
+    with pytest.raises(SystemExit, match="refusing"):
+        bootstrap.wheel_runtime_requirements(wheel)
+    try:
+        parsed = Requirement(requirement)
+    except InvalidRequirement:
+        parsed = None
+    if parsed is not None:
+        assert parsed.url
+
+
+def test_runtime_requirement_rejects_embedded_pip_options():
+    with pytest.raises(SystemExit, match="newline"):
+        bootstrap.validate_runtime_requirement("pkg>=1\n--extra-index-url https://evil.example/simple")
+
+
+# One table exercises both implementations: the downloaded bootstrap cannot import Core.
+@pytest.mark.parametrize("validator,error_type", [
+    (bootstrap.validate_runtime_requirement, SystemExit),
+    (update._validate_runtime_requirement, update.UpdateError),
+], ids=["bootstrap", "updater"])
+@pytest.mark.parametrize("requirement,accepted", [
+    ("foo", True),
+    ("zipp", True), ("tarfile-ng", True), ("wheel", True), ("py.test", True),
+    ("pkg.zip-tools>=1", True),
+    ("packaging>=24", True),
+    ('requests[security]>=2.31; python_version >= "3.11"', True),
+    (" foo!=1.0,>=0.9 ", True),
+    ("  foo >= 1.0  ", True),
+    ("foo[bar,baz]>=1.0, <2", True),
+    ("foo (>=1.0)", True),
+    ("foo[bar] (>=1.0,<2)", True),
+    ('foo (>=1.0) ; python_version >= "3.11"', True),
+    ("foo[bar] ( >=1.0 , <2 ) ; python_version >= '3.11'", True),
+    ("foo; python_version >= '3.11' and (os_name == 'posix' or os_name == 'nt')", True),
+    ("foo===1.0", True),
+    ("foo!=1.0.*,~=2.0", True),
+    ("", False), ("   ", False), (None, False), (b"foo", False),
+    ("foo @ https://private-value@example.test/foo.whl", False),
+    ("foo @ file:///private-value.whl", False),
+    ("git+https://private-value@example.test/foo.git", False),
+    ("--index-url=https://private-value@example.test/simple", False),
+    (" -e private-value", False),
+    ("foo>=1 --extra-index-url=private-value", False),
+    ("private-value ???", False),
+    ("foo ()", False), ("foo (>=1", False), ("foo >=1)", False),
+    ("foo ((>=1))", False), ("foo (>=1),<2", False),
+    ("foo (>=1,)", False),
+] + [
+    (f"evil{extension}{suffix}", False)
+    for extension in (
+        ".whl", ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".tbz2",
+        ".tar.xz", ".txz", ".tar.lz", ".tlz", ".tar.lzma", ".tar.zst", ".egg",
+    )
+    for extension in (extension, extension.upper())
+    for suffix in ("", ">=1", "[extra] (>=1)", "; python_version >= '3.11'")
+] + [
+    ("foo-1.0-py3-none-any.whl", False),
+    ("pkg.zip>=1", False),
+] + [
+    (f"{prefix}{character}{suffix}", False)
+    for character in (
+        *(chr(code) for code in range(32)), "\x7f",
+        "\x85", "\xa0", "\u1680", *(chr(code) for code in range(0x2000, 0x200c)),
+        "\u2028", "\u2029", "\u202f", "\u205f", "\u3000", "\ufeff", "é",
+    )
+    for prefix, suffix in (("", "foo"), ("foo", ""), ("foo>=", "1"),
+                           ("foo; os_name == '", "'"))
+])
+def test_bootstrap_and_update_runtime_requirement_policy_agrees(validator, error_type, requirement, accepted):
+    if accepted:
+        assert validator(requirement) == requirement.strip(" ")
+    else:
+        with pytest.raises(error_type, match="runtime requirement") as error:
+            validator(requirement)
+        assert "private-value" not in str(error.value)
+        if isinstance(requirement, str) and requirement.strip(" "):
+            assert requirement.strip(" ") not in str(error.value)
+
+
+@pytest.mark.parametrize("requirement", [
+    "foo @ https://user:private-value@example.test/foo.whl", "", "   ", "--index-url=private-value",
+    "\xa0private-value", "private-value\x00",
+])
+def test_bootstrap_validates_all_requirements_before_running_pip(monkeypatch, tmp_path, requirement):
+    calls = []
+    monkeypatch.setattr(bootstrap, "run_command", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(SystemExit, match="runtime requirement") as error:
+        bootstrap.install_requirements(make_options(tmp_path), Path("python"), ["packaging>=24", requirement])
+    assert calls == []
+    assert "private-value" not in str(error.value)
+
+
+def test_install_requirements_does_not_pass_rejected_specifiers_to_pip(monkeypatch, tmp_path):
+    options = make_options(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        bootstrap,
+        "run_command",
+        lambda command, **kwargs: calls.append(command) or bootstrap.CommandResult(command, 0),
+    )
+
+    with pytest.raises(SystemExit, match="starts with '-'"):
+        bootstrap.install_requirements(options, Path("/tmp/ficelle-python"), ["--index-url", "https://evil.example/simple"])
+
+    assert calls == []
+
+
+def test_local_pro_wheel_requires_a_matching_sha256(tmp_path):
+    wheel = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    wheel.write_bytes(b"pro-wheel")
+    missing = make_options(tmp_path, wheel_url=str(wheel), sha256=None)
+
+    with pytest.raises(SystemExit, match="SHA-256 is required"):
+        bootstrap.verify_pro_wheel_integrity(missing, Path("/tmp/ficelle-python"), wheel, tmp_path)
+
+    mismatched = make_options(tmp_path, wheel_url=str(wheel), sha256="0" * 64)
+    with pytest.raises(SystemExit, match="SHA256 mismatch"):
+        bootstrap.verify_pro_wheel_integrity(mismatched, Path("/tmp/ficelle-python"), wheel, tmp_path)
+
+    matched = make_options(tmp_path, wheel_url=str(wheel), sha256=bootstrap.sha256_file(wheel))
+    bootstrap.verify_pro_wheel_integrity(matched, Path("/tmp/ficelle-python"), wheel, tmp_path)
+
+
+def test_loopback_pro_wheel_requires_sha256_when_no_digest_is_configured(tmp_path):
+    wheel = tmp_path / "ficelle_pro-0.1.3-py3-none-any.whl"
+    wheel.write_bytes(b"pro-wheel")
+    options = make_options(tmp_path, wheel_url="http://127.0.0.1:8799/wheel", sha256=None)
+
+    with pytest.raises(SystemExit, match="SHA-256 is required"):
+        bootstrap.verify_pro_wheel_integrity(options, Path("/tmp/ficelle-python"), wheel, tmp_path)
+
+
+
+def test_runtime_archive_suffix_lists_agree():
+    assert bootstrap._RUNTIME_ARCHIVE_SUFFIXES == update._RUNTIME_ARCHIVE_SUFFIXES
+
+
+@pytest.mark.parametrize("parent_config", ["uv.toml", "tool.uv", "tool.uv.pip"])
+@pytest.mark.parametrize("operation", [
+    "bootstrap-wheel", "bootstrap-requirements", "bootstrap-check", "bootstrap-venv",
+])
+def test_uv_fallbacks_ignore_configuration_in_temporary_parent(
+    tmp_path, monkeypatch, parent_config, operation,
+):
+    import stat
+    import subprocess
+
+    parent = tmp_path / "shared-temp"
+    parent.mkdir()
+    filename = "uv.toml" if parent_config == "uv.toml" else "pyproject.toml"
+    table = "" if parent_config == "uv.toml" else f"[{parent_config}]\n"
+    (parent / filename).write_text(table + 'index-url = "https://attacker.invalid/simple"\n')
+    monkeypatch.setattr(bootstrap.tempfile, "tempdir", str(parent))
+    monkeypatch.setenv("TMPDIR", str(parent))
+    monkeypatch.setenv("UV_NO_CONFIG", "0")
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: "/tools/uv" if name == "uv" else None)
+    monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
+    calls = []
+
+    def run(command, **kwargs):
+        if command[0] != "/tools/uv":
+            return subprocess.CompletedProcess(command, 1, "", "No module named pip")
+        calls.append(command)
+        group_end = 3 if command[1] == "pip" else 2
+        assert command[group_end] == "--no-config"
+        assert kwargs["env"]["UV_NO_CONFIG"] == "1"
+        cwd = Path(kwargs["cwd"])
+        assert cwd.parent == parent
+        assert list(cwd.iterdir()) == []
+        assert stat.S_IMODE(cwd.stat().st_mode) == 0o700
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", run)
+    options = make_options(tmp_path)
+    python = tmp_path / "python"
+    wheel = tmp_path / "ficelle.whl"
+    if operation == "bootstrap-wheel":
+        bootstrap.install_wheel(options, python, wheel)
+    elif operation == "bootstrap-requirements":
+        bootstrap.install_requirements(options, python, ["packaging"])
+    elif operation == "bootstrap-check":
+        bootstrap.check_runtime(options, python)
+    else:
+        bootstrap.prepare_ficelle_python(options, python)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("operation", [
+    "bootstrap-check", "bootstrap-venv", "attestation", "setup", "import-core",
+    "import-pro", "activation", "update-check", "version", "update-import-core",
+    "update-import-pro", "bootstrap-probe",
+])
+def test_runtime_checks_and_setup_use_fresh_empty_cwd(tmp_path, monkeypatch, operation):
+    import stat
+    import subprocess
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "ficelle.py").write_text("raise RuntimeError('caller shadow')")
+    (tmp_path / "pip.py").write_text("raise RuntimeError('caller shadow')")
+    monkeypatch.setenv("FICELLE_LICENSE_KEY", "test-only-key")
+    options = bootstrap.options_from_args(bootstrap.build_parser().parse_args([
+        "--ficelle-home", "state", "--hermes-home", "client", "--venv", "runtime",
+        "--connector", "hermes",
+    ]))
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: "/tools/uv" if name == "uv" else None)
+    monkeypatch.setattr(update, "_uv_executable", lambda: "/tools/uv")
+    monkeypatch.setattr(bootstrap, "validate_python", lambda python: python)
+    monkeypatch.setattr(bootstrap, "download_pro_attestation", lambda *args: Path("signature.json"))
+    directories = []
+
+    def run(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        assert cwd.is_absolute() and cwd != tmp_path
+        assert cwd.is_dir() and not list(cwd.iterdir())
+        assert stat.S_IMODE(cwd.stat().st_mode) == 0o700
+        assert Path(command[0]).is_absolute()
+        for flag in ("--python", "--package", "--ficelle-home", "--hermes-home"):
+            if flag in command:
+                assert Path(command[command.index(flag) + 1]).is_absolute()
+        if operation == "attestation":
+            assert command[-2:] == [str(tmp_path / "wheel.whl"), str(tmp_path / "signature.json")]
+        if operation == "bootstrap-venv":
+            assert command[-1] == str(options.venv)
+        directories.append(cwd)
+        (cwd / "leftover").touch()
+        if command[1:3] == ["-m", "pip"] or command[1:3] == ["-m", "venv"]:
+            return subprocess.CompletedProcess(command, 1, "", "No module named pip")
+        return subprocess.CompletedProcess(command, 0, update.CORE_VERSION, "")
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", run)
+    python = Path("bin/python")
+    if operation == "bootstrap-check":
+        bootstrap.check_runtime(options, python)
+    elif operation == "bootstrap-venv":
+        bootstrap.prepare_ficelle_python(options, python)
+    elif operation == "attestation":
+        options = make_options(tmp_path, wheel_url="https://example.invalid/wheel")
+        bootstrap.verify_pro_wheel_integrity(options, python, Path("wheel.whl"), tmp_path)
+    elif operation == "setup":
+        bootstrap.run_packaged_setup(options, python, Path("wheel.whl"))
+    elif operation.startswith("import-"):
+        bootstrap.verify_install(options, python, expect_pro=operation == "import-pro")
+    elif operation == "activation":
+        bootstrap.run_license_activation(options, python)
+    elif operation == "update-check":
+        update._pip_check()
+    elif operation == "version":
+        assert update._installed_version() == update.CORE_VERSION
+    elif operation == "bootstrap-probe":
+        bootstrap.run_python_probe(python, "import sys")
+    else:
+        update._verify_updated_runtime(expect_pro=operation == "update-import-pro")
+    assert len(directories) == (2 if operation in {"bootstrap-check", "bootstrap-venv", "update-check"} else 1)
+    assert len(set(directories)) == len(directories)
+    assert all(not directory.exists() for directory in directories)
+
+
+@pytest.mark.parametrize("installer", ["bootstrap", "update"])
+@pytest.mark.parametrize("kind", ["wheel", "requirements"])
+@pytest.mark.parametrize("missing_pip", [False, True])
+def test_runtime_installs_use_fresh_empty_cwd(
+    tmp_path, monkeypatch, installer, kind, missing_pip,
+):
+    import subprocess
+
+    monkeypatch.chdir(tmp_path)
+    # An innocent-looking requirement must not resolve to this local project.
+    (tmp_path / "packaging").mkdir()
+    wheel = Path("ficelle_router.whl")
+    wheel.write_bytes(b"wheel")
+    directories = []
+    uv = Path("tools/uv")
+    uv.parent.mkdir()
+    uv.touch(mode=0o755)
+    monkeypatch.setenv("FICELLE_UV_BIN", str(uv))
+
+    def run(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        assert cwd.is_absolute() and cwd != tmp_path
+        assert cwd.is_dir() and list(cwd.iterdir()) == []
+        if kind == "wheel":
+            assert command[-1] == str(tmp_path / wheel)
+        if installer == "bootstrap":
+            python = command[command.index("--python") + 1] if "--python" in command else command[0]
+            assert python == str(tmp_path / "venv/bin/python")
+        if "--python" in command:
+            assert command[0] == str(tmp_path / uv)
+        directories.append(cwd)
+        # Even an unsuccessful installer can leave files behind.
+        (cwd / "leftover").touch()
+        if missing_pip and len(directories) == 1:
+            return subprocess.CompletedProcess(command, 1, "", "No module named pip")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", run)
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: str(uv) if name == "uv" else None)
+    if installer == "bootstrap":
+        options = make_options(tmp_path, dry_run=False)
+        python = Path("venv/bin/python")
+        if kind == "wheel":
+            bootstrap.install_wheel(options, python, wheel)
+        else:
+            bootstrap.install_requirements(options, python, ["packaging"])
+    elif kind == "wheel":
+        update._install_wheel(wheel)
+    else:
+        update._install_requirements(("packaging",))
+    assert len(directories) == (2 if missing_pip else 1)
+    assert all(not directory.exists() for directory in directories)

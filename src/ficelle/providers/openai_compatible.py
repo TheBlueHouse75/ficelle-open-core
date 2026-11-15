@@ -268,6 +268,20 @@ class OpenAICompatibleCatalogAdapter:
             return DEFAULT_FAILURE_MARKERS.with_extra(
                 quota_exhausted=("api rate limit exceeded",),
             )
+        if self.source == "zai":
+            # Z.ai answers 429 for every limit, so the generic reading is a provider-wide burst.
+            # 1305 is one model's serving pool overloaded (live 06/10/2026: glm-4.7-flash 1305 while
+            # glm-4.5-flash answered), so it must not cool the provider. Its error object has a
+            # code and no type. 1308 names a usage window with a reset time, and 1113 says the free
+            # model has no allocation left for this account: both are model quota to cool and
+            # re-probe.
+            return DEFAULT_FAILURE_MARKERS.with_extra(
+                upstream_rate_limit_error_codes=(("1305", ""),),
+                quota_exhausted=(
+                    "usage limit reached for",
+                    "insufficient balance or no resource package",
+                ),
+            )
         if self.source == "ollama":
             # Ollama's cloud catalog can list a model that later requires a subscription. Its live
             # 403 uses account-like status semantics, so these provider-specific words must win
@@ -1099,7 +1113,21 @@ class OpenAICompatibleCatalogAdapter:
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list):
             return [], "invalid catalog shape"
-        return data, None
+        return self._with_unlisted_models(data, provider_cfg), None
+
+    def _with_unlisted_models(self, data: list[Any], provider_cfg: dict[str, Any]) -> list[Any]:
+        """Add ids the provider serves but leaves out of its catalog.
+
+        Only reached after a successful catalog fetch, and the added rows carry nothing but the
+        id: allowlists, defaults and capability gates still decide whether they can route.
+        """
+        listed = {str(row.get("id") or "").lower() for row in data if isinstance(row, dict)}
+        unlisted = [
+            {"id": model_id, "object": "model"}
+            for model_id in self._safe_string_list(provider_cfg.get("catalog_unlisted_model_ids"))
+            if model_id.lower() not in listed
+        ]
+        return [*data, *unlisted]
 
     def _fetch_cloudflare_catalog(
         self,

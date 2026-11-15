@@ -25,12 +25,28 @@ They are rendered **monochrome and theme-adaptive** in the dashboard (CSS mask +
 | `ollama.svg` | Ollama Cloud (`ollama`) | Simple Icons (`ollama`), CC0 |
 | `cohere.svg` | Cohere (`cohere`) | Official brand mark (via svgl.app); flattened to a single-colour silhouette of the three mark shapes. |
 | `kilo.svg` | Kilo Code (`kilo`) | Official Kilo Code mark (via svgl.app); the framed pixel mark flattened to a single colour (frame hole preserved). |
+| `zai.svg` | Z.ai (`zai`) | LobeHub `@lobehub/icons-static-svg` 1.95.1 (`zai`), MIT |
+| `sambanova.svg` | SambaNova Cloud (`sambanova`) | LobeHub `@lobehub/icons-static-svg` 1.95.1 (`sambanova`), MIT |
+| `cloudflare.svg` | Cloudflare Workers AI (`cloudflare`) | Simple Icons (`cloudflare`), CC0 |
+| `hetzner.svg` | Hetzner Inference (`hetzner`) | Simple Icons (`hetzner`), CC0 |
+| `ovhcloud.svg` | OVHcloud AI Endpoints (`ovhcloud`) | Simple Icons (`ovh`), CC0 |
+| `requesty.svg` | Requesty (`requesty`) | Official `requesty.ai` app icon, traced to a single-colour silhouette with potrace (the `>_` prompt kept as a cut-out). |
+| `orcarouter.svg` | OrcaRouter (`orcarouter`) | Official `orcarouter.ai` orca logo, traced to a single-colour silhouette with potrace (white markings kept as cut-outs). |
+| `routeway.svg` | Routeway (`routeway`) | Official `routeway.ai` favicon: the white arrow mark traced with potrace, without its gradient disc. |
 
 Marks for the closed pack's relay providers ship with the Pro pack, under
-`ficelle_pro/assets/logos/`, not here.
+`ficelle_pro/assets/logos/`, not here. The pack maps their sources in
+`PROVIDER_PACK_LOGOS` (`ficelle_pro/provider_pack.py`); `/admin/state` exposes that map as
+`provider_logos` and the dashboard overlays it on `PROVIDER_LOGO_FILES`, so this open-core
+tree never names those providers.
+
+Marks taken from LobeHub's MIT-licensed icon set (`siliconflow.svg`, `zai.svg`, `sambanova.svg`)
+ship with its copyright and permission notice in `LICENSE-lobehub.txt`, as the MIT licence requires.
 
 The logos are the respective companies' trademarks, used nominatively here only to
 identify each upstream provider in the local control plane. To add a provider logo,
 drop an `.svg` in this directory and map its source slug to that file name in the
 `PROVIDER_LOGO_FILES` table in `app.js`. Several sources may map to one file.
-Unknown providers fall back to a letter avatar.
+Unknown providers fall back to a letter avatar, but every registered provider must have a mark:
+`test_every_registered_provider_has_a_servable_dashboard_logo` in `tests/test_router.py` fails
+when one is missing, so adding a provider includes adding its logo here or in the pack.

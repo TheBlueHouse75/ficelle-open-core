@@ -102,6 +102,41 @@ def test_serve_binds_before_catalog_warm(monkeypatch):
             srv.server_close()
 
 
+@pytest.mark.parametrize("failure", [None, "paid_fallback", "tokens"])
+def test_connector_failure_preserves_startup_and_security_guards(monkeypatch, capsys, failure):
+    def refresh_connector():
+        raise OSError("private-value")
+
+    calls = []
+
+    def tokens():
+        calls.append("tokens")
+        if failure == "tokens":
+            raise RuntimeError("token setup failed")
+
+    monkeypatch.setattr(router, "refresh_hermes_integration_on_startup", refresh_connector)
+    monkeypatch.setattr(router, "ensure_access_tokens", tokens)
+
+    class ReachedBind(Exception):
+        pass
+
+    def bind(*args):
+        calls.append("bound")
+        raise ReachedBind()
+
+    monkeypatch.setattr(router, "ThreadingHTTPServer", bind)
+    config = {"allow_paid_fallback": failure == "paid_fallback"}
+    message = "allow_paid_fallback must stay false" if failure == "paid_fallback" else "token setup failed"
+    with pytest.raises(RuntimeError if failure else ReachedBind, match=message if failure else None):
+        router.serve(config)
+    assert calls == {
+        None: ["tokens", "bound"], "paid_fallback": [], "tokens": ["tokens"],
+    }[failure]
+    output = capsys.readouterr()
+    assert "Hermes" in output.err and "OSError" in output.err
+    assert "private-value" not in output.out + output.err
+
+
 def test_catalog_refresh_loop_keeps_catalog_fresh(monkeypatch):
     """The catalog refresh daemon warms once, then refreshes well within the TTL, so an idle
     instance never lets the catalog go stale — which admin_status would otherwise report as a

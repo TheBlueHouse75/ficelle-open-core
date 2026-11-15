@@ -11,7 +11,7 @@ import secrets
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 
 from ficelle.json_store import write_private_text
 from ficelle.connector_registry import load_connectors, register_connector, unregister_connector
-from ficelle.runtime_paths import RuntimePaths
+from ficelle.runtime_paths import RuntimePaths, absolute_python, python_child_context, validated_runtime_home
 from ficelle.service import active_home_pointer_path, persist_active_service_context
 from ficelle.url_security import connectable_host, connectable_http_url
 from ficelle.use_cases.provider_auth import (
@@ -43,6 +43,9 @@ CONNECTORS = ("hermes", "openclaw")
 PLUGIN_OWNER_FICELLE = "ficelle"
 PLUGIN_OWNER_HERMES = "hermes"
 HERMES_CATALOG_SIDECAR = ".hermes-catalog.json"
+# Top-level plugin files that are distribution metadata or documentation, not runtime payload: the
+# release-written bootstrap pin exists only in catalog copies, and the README only discloses.
+HERMES_PLUGIN_NON_RUNTIME_FILES = frozenset({"bootstrap-pin.json", "README.md"})
 
 
 @dataclass(frozen=True)
@@ -97,9 +100,10 @@ def default_ficelle_home() -> Path:
 
 
 def run_python_probe(python: str | Path, code: str) -> CommandResult:
-    command = [str(python), "-c", code]
+    command = [absolute_python(python), "-P", "-c", code]
     try:
-        completed = subprocess.run(command, text=True, capture_output=True)
+        with python_child_context() as (cwd, env):
+            completed = subprocess.run(command, text=True, capture_output=True, cwd=cwd, env=env)
     except OSError as exc:
         return CommandResult(command, 1, stderr=f"{type(exc).__name__}: {exc}")
     return CommandResult(
@@ -111,20 +115,20 @@ def run_python_probe(python: str | Path, code: str) -> CommandResult:
 
 
 def package_install_command(options: InstallOptions) -> list[str]:
-    command = [options.python, "-m", "pip", "install"]
+    command = [absolute_python(options.python), "-m", "pip", "install"]
     package_path = Path(options.package)
     if options.editable and package_path.exists() and package_path.is_dir():
         command.append("-e")
-    command.append(options.package)
+    command.append(absolute_package_reference(options.package))
     return command
 
 
 def uv_package_install_command(options: InstallOptions) -> list[str]:
-    command = ["uv", "pip", "install", "--python", options.python]
+    command = ["uv", "pip", "install", "--python", absolute_python(options.python)]
     package_path = Path(options.package)
     if options.editable and package_path.exists() and package_path.is_dir():
         command.append("-e")
-    command.append(options.package)
+    command.append(absolute_package_reference(options.package))
     return command
 
 
@@ -135,7 +139,7 @@ def pip_is_unavailable(result: CommandResult) -> bool:
 
 def command_env(options: InstallOptions) -> dict[str, str]:
     env = os.environ.copy()
-    env["FICELLE_HOME"] = str(options.ficelle_home)
+    env["FICELLE_HOME"] = os.path.abspath(options.ficelle_home.expanduser())
     env.pop("FICELLE_RUNTIME_DIR", None)
     env.pop("HERMES_HOME", None)
     return env
@@ -148,6 +152,11 @@ def run_command(
     env: Mapping[str, str] | None = None,
     input_text: str | None = None,
 ) -> CommandResult:
+    command = list(command)
+    python_command = len(command) > 1 and command[1] in {"-m", "-c"}
+    if python_command:
+        command[0] = absolute_python(command[0])
+        command.insert(1, "-P")
     printable = " ".join(command)
     env_hint = ""
     if env:
@@ -162,13 +171,18 @@ def run_command(
         print(f"DRY RUN:{env_hint} {printable}")
         return CommandResult(list(command), 0)
     print(f"RUN:{env_hint} {printable}")
-    completed = subprocess.run(
-        list(command),
-        text=True,
-        capture_output=True,
-        env=dict(env) if env else None,
-        input=input_text,
-    )
+    if python_command:
+        child_env = dict(os.environ)
+        child_env.update(env or {})
+        home = Path(child_env["FICELLE_HOME"]) if child_env.get("FICELLE_HOME") else None
+        with python_child_context(home, environ=child_env) as (cwd, child_env):
+            completed = subprocess.run(
+                command, text=True, capture_output=True, env=child_env, cwd=cwd, input=input_text,
+            )
+    else:
+        completed = subprocess.run(
+            command, text=True, capture_output=True, env=dict(env) if env else None, input=input_text,
+        )
     if completed.stdout:
         print(completed.stdout, end="")
     if completed.stderr:
@@ -243,7 +257,7 @@ def trees_equal(source: Path, destination: Path) -> bool:
 
 
 def _normalized_plugin_payload(root: Path) -> dict[str, bytes] | None:
-    """Return runtime-relevant plugin files, ignoring provenance and generated files.
+    """Return runtime-relevant plugin files, ignoring provenance, generated files and non-runtime metadata.
 
     Catalog pins may legitimately carry an older manifest version when a Ficelle release did not
     change connector behavior. Everything else must match so Hermes cannot load stale code from
@@ -260,6 +274,7 @@ def _normalized_plugin_payload(root: Path) -> dict[str, bytes] | None:
                 or ".git" in relative.parts
                 or "__pycache__" in relative.parts
                 or child.suffix == ".pyc"
+                or relative.as_posix() in HERMES_PLUGIN_NON_RUNTIME_FILES
                 or not child.is_file()
             ):
                 continue
@@ -335,6 +350,11 @@ def copy_plugin_tree(
 ) -> bool:
     if not source.exists():
         raise FileNotFoundError(f"Ficelle Hermes plugin template not found: {source}")
+    if destination.is_symlink():
+        raise HermesPluginConflictError(
+            f"refusing to replace a symlinked Hermes plugin path: {destination}. "
+            "No Hermes files were changed."
+        )
     if trees_equal(source, destination):
         print(f"Hermes plugin already up to date: {destination}")
         return False
@@ -462,6 +482,24 @@ def refresh_installed_hermes_integration(
     service context identifies a Hermes home. Existing managed files are backed up before
     replacement so a failed migration remains recoverable.
     """
+    try:
+        hermes_home = validated_client_home(hermes_home)
+    except ClientHomeError as exc:
+        print(f"Hermes connector refresh skipped: {exc}", file=sys.stderr)
+        return
+    refresh_paths = [
+        hermes_home / "config.yaml",
+        hermes_home / ".env",
+        hermes_home / "ficelle" / "hermes-config.snippet.yaml",
+    ]
+    refresh_paths.extend(
+        destination for _source, destination in hermes_plugin_install_specs(hermes_home)
+    )
+    for path in refresh_paths:
+        problem = unsafe_client_path(hermes_home, path)
+        if problem:
+            print(f"Hermes connector refresh skipped: {problem}", file=sys.stderr)
+            return
     options = InstallOptions(
         package="",
         editable=False,
@@ -480,7 +518,17 @@ def refresh_installed_hermes_integration(
     previous = load_connectors(ficelle_home).get("hermes") or {}
     previous_metadata = previous.get("metadata")
     previous_metadata = previous_metadata if isinstance(previous_metadata, dict) else {}
-    config_existed = (hermes_home / "config.yaml").exists()
+    config_path = hermes_home / "config.yaml"
+    previous_config_hash = previous_metadata.get("config_sha256")
+    before_config_hash = file_sha256(config_path)
+    # A digest recorded at install time must stay the reference. Recomputing it here
+    # would treat a user edit as Ficelle-owned and let connector removal delete the file.
+    user_modified_config = (
+        isinstance(previous_config_hash, str)
+        and isinstance(before_config_hash, str)
+        and before_config_hash != previous_config_hash
+    )
+    config_existed = config_path.exists()
     env_path = hermes_home / ".env"
     env_file_existed = env_path.exists()
     from ficelle.router import parse_env_file
@@ -493,12 +541,13 @@ def refresh_installed_hermes_integration(
         # starting after an update. The explicit connector command reports the conflict instead.
         print(f"Hermes connector refresh skipped: {exc}", file=sys.stderr)
         return
-    config_path = hermes_home / "config.yaml"
     try:
         config_text = config_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         config_text = ""
-    if MANAGED_CONFIG_BEGIN in config_text and MANAGED_CONFIG_END in config_text:
+    if user_modified_config:
+        print(f"User-modified Hermes config left untouched: {config_path}", file=sys.stderr)
+    elif managed_config_span(config_text) is not None:
         configure_hermes(options, runtime_dir=runtime_dir)
     metadata = hermes_connector_metadata(
         options,
@@ -507,10 +556,14 @@ def refresh_installed_hermes_integration(
         env_key_existed=env_key_existed,
         plugin_ownership=plugin_ownership,
     )
-    for ownership_key in ("config_created", "env_file_created", "env_key_created"):
+    # Refresh retains recorded ownership even when edits invalidate the managed span.
+    for ownership_key in ("config_managed", "config_created", "env_file_created", "env_key_created"):
         metadata[ownership_key] = bool(
             metadata[ownership_key] or previous_metadata.get(ownership_key)
         )
+    if user_modified_config and isinstance(previous_config_hash, str):
+        metadata["config_sha256"] = previous_config_hash
+        metadata["config_created"] = bool(previous_metadata.get("config_created"))
     register_connector(
         ficelle_home,
         "hermes",
@@ -657,6 +710,11 @@ def package_is_local_reference(package: str) -> bool:
     )
 
 
+def absolute_package_reference(package: str) -> str:
+    path = Path(package).expanduser()
+    return os.path.abspath(path) if package_is_local_reference(package) else package
+
+
 def probe_target_python(python: str) -> CommandResult:
     code = (
         "import sys; "
@@ -756,8 +814,10 @@ def collect_preflight_checks(
             checks.append(PreflightCheck("hermes-config", "ok", "config.yaml is absent; setup can create a Ficelle-only config with backup-safe semantics"))
         else:
             text = config_path.read_text(encoding="utf-8", errors="replace")
-            if MANAGED_CONFIG_BEGIN in text and MANAGED_CONFIG_END in text:
+            if managed_config_span(text) is not None:
                 checks.append(PreflightCheck("hermes-config", "ok", "existing Ficelle managed config block can be updated with backup"))
+            elif MANAGED_CONFIG_BEGIN in text or MANAGED_CONFIG_END in text:
+                checks.append(PreflightCheck("hermes-config", "warn", "malformed Ficelle managed config block; config.yaml will be left untouched", "Repair the managed markers before retrying connector setup."))
             else:
                 checks.append(PreflightCheck("hermes-config", "warn", "existing config.yaml is unmanaged; setup will not rewrite it", "A ready snippet will be written under ~/.hermes/ficelle/."))
     return checks
@@ -993,20 +1053,53 @@ def ensure_hermes_compression_plugin_enabled(text: str) -> str:
     return ensure_hermes_toolset_enabled(with_compression)
 
 
-def replace_managed_block(text: str, replacement: str) -> str:
+def managed_config_span(text: str) -> tuple[int, int] | None:
+    """Grant ownership only to one ordered pair of standalone managed markers."""
+    lines = text.splitlines()
+    if any(text.count(marker) != 1 or marker not in lines for marker in (MANAGED_CONFIG_BEGIN, MANAGED_CONFIG_END)):
+        return None
     start = text.index(MANAGED_CONFIG_BEGIN)
-    end = text.index(MANAGED_CONFIG_END, start) + len(MANAGED_CONFIG_END)
-    return f"{text[:start]}{replacement.rstrip()}\n{text[end:].lstrip()}"
+    end = text.index(MANAGED_CONFIG_END)
+    if end < start:
+        return None
+    return start, end + len(MANAGED_CONFIG_END)
+
+
+def replace_managed_block(text: str, replacement: str) -> str:
+    span = managed_config_span(text)
+    if span is None:
+        raise ValueError("Malformed Ficelle managed config block; config left untouched")
+    start, end = span
+    return f"{text[:start]}{replacement.rstrip()}{text[end:]}"
+
+
+def config_outside_managed_block(text: str) -> str:
+    """Return the YAML outside Ficelle's managed markers."""
+    span = managed_config_span(text)
+    if span is None:
+        return text
+    start, end = span
+    return f"{text[:start]}{text[end:]}"
+
+
+def config_has_user_additions(text: str) -> bool:
+    """Return whether YAML outside the managed block is more than Ficelle's preamble.
+
+    Setup writes the plugin and toolset lists before the markers. That preamble is
+    Ficelle-owned. Anything else outside the markers belongs to the user.
+    """
+    outside = config_outside_managed_block(text).strip()
+    if not outside:
+        return False
+    if MANAGED_CONFIG_BEGIN not in text or MANAGED_CONFIG_END not in text:
+        return True
+    preamble = ensure_hermes_compression_plugin_enabled("").strip()
+    return outside != preamble
 
 
 def has_top_level_model_outside_managed_block(text: str) -> bool:
     """Return whether user-owned YAML outside Ficelle's block already owns ``model``."""
-    if MANAGED_CONFIG_BEGIN not in text or MANAGED_CONFIG_END not in text:
-        return any(line.startswith("model:") for line in text.splitlines())
-    start = text.index(MANAGED_CONFIG_BEGIN)
-    end = text.index(MANAGED_CONFIG_END, start) + len(MANAGED_CONFIG_END)
-    user_owned = f"{text[:start]}{text[end:]}"
-    return any(line.startswith("model:") for line in user_owned.splitlines())
+    return any(line.startswith("model:") for line in config_outside_managed_block(text).splitlines())
 
 
 def write_text_file(path: Path, content: str, *, dry_run: bool) -> None:
@@ -1029,11 +1122,20 @@ def file_sha256(path: Path) -> str | None:
 
 
 def tree_sha256(path: Path) -> str | None:
+    """Digest of an installed plugin tree, without the bytecode its host writes beside it.
+
+    Hermes compiles a plugin into `__pycache__` on first import, so counting those files would
+    make every used connector look modified and refuse its own removal.
+    """
     if not path.is_dir():
         return None
     digest = hashlib.sha256()
     try:
-        for child in sorted(item for item in path.rglob("*") if item.is_file()):
+        for child in sorted(
+            item
+            for item in path.rglob("*")
+            if item.is_file() and "__pycache__" not in item.relative_to(path).parts
+        ):
             digest.update(str(child.relative_to(path)).encode("utf-8"))
             digest.update(b"\0")
             digest.update(child.read_bytes())
@@ -1071,7 +1173,7 @@ def hermes_connector_metadata(
     )
     return {
         "config_created": not config_existed and config_path.is_file(),
-        "config_managed": MANAGED_CONFIG_BEGIN in config_text and MANAGED_CONFIG_END in config_text,
+        "config_managed": managed_config_span(config_text) is not None,
         "config_sha256": file_sha256(config_path),
         "snippet_sha256": file_sha256(snippet_path),
         "env_file_created": not env_file_existed and env_path.is_file(),
@@ -1091,21 +1193,181 @@ def hermes_connector_metadata(
     }
 
 
+class ClientHomeError(ValueError):
+    """The registered client home is not a safe directory to delete files from."""
+
+
+# Unscoped roots are unsafe, but dedicated user/application homes and temporary
+# homes below /Users, /home, /opt, /tmp and /var/folders must remain usable.
+_UNSCOPED_CLIENT_HOMES = frozenset(
+    {
+        Path("/usr"),
+        Path("/usr/local"),
+        Path("/usr/bin"),
+        Path("/usr/lib"),
+        Path("/etc"),
+        Path("/private/etc"),
+        Path("/var"),
+        Path("/var/log"),
+        Path("/private/var/log"),
+        Path("/bin"),
+        Path("/sbin"),
+        Path("/opt"),
+        Path("/tmp"),
+        Path("/private"),
+        Path("/private/tmp"),
+        Path("/private/var"),
+        Path("/System"),
+        Path("/Library"),
+        Path("/Applications"),
+        Path("/Users"),
+        Path("/home"),
+        Path("/root"),
+    }
+)
+
+
+# Configuration, binaries, OS/app libraries, logs and root's home are protected
+# recursively. Do not block all of /var: macOS per-user temp homes live there.
+# Keep scoped homes under /srv, /mnt and /media accepted as legitimate data mounts.
+# Resolve both sides below so macOS /etc and /var aliases cannot bypass the policy.
+_SYSTEM_CLIENT_HOME_TREES = frozenset(
+    Path(path) for path in (
+        "/etc", "/private/etc", "/usr", "/bin", "/sbin", "/System", "/Library",
+        "/Applications", "/root", "/var/root", "/private/var/root",
+        "/var/log", "/private/var/log",
+        "/opt/homebrew", "/boot", "/dev", "/proc", "/sys", "/run",
+        "/var/lib", "/var/db", "/private/var/lib", "/private/var/db",
+        "/var/run", "/private/var/run", "/var/spool", "/private/var/spool",
+        "/var/cache", "/private/var/cache", "/snap", "/nix",
+        "/var/mail", "/private/var/mail", "/var/opt", "/private/var/opt",
+        "/var/empty", "/private/var/empty",
+        "/var/backups", "/private/var/backups", "/var/www", "/private/var/www",
+        "/var/local", "/private/var/local", "/var/crash", "/private/var/crash",
+        "/var/vm", "/private/var/vm",
+    )
+)
+
+
+def validated_client_home(value: object) -> Path:
+    """Resolve a Hermes client home, or refuse a path that must not be deleted from."""
+    if isinstance(value, Path):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        raise ClientHomeError("Hermes client home is empty.")
+    if not text.strip():
+        raise ClientHomeError("Hermes client home is empty.")
+    try:
+        raw = Path(text).expanduser()
+        if not raw.is_absolute():
+            raise ClientHomeError("Hermes client home must be an absolute path.")
+        if raw.is_symlink():
+            raise ClientHomeError("Hermes client home must not be a symbolic link.")
+        resolved = raw.resolve()
+        if resolved == Path(resolved.anchor):
+            raise ClientHomeError("Hermes client home must not be the filesystem root.")
+        home = Path.home().resolve()
+        # Compare components without case distinctions even on case-sensitive hosts.
+        # Keep the actual resolved path for filesystem operations.
+        resolved_parts = tuple(part.casefold() for part in resolved.parts)
+        home_parts = tuple(part.casefold() for part in home.parts)
+        if resolved_parts == home_parts:
+            raise ClientHomeError("Hermes client home must not be the user home directory.")
+        if home_parts[:len(resolved_parts)] == resolved_parts:
+            raise ClientHomeError("Hermes client home must not contain the user home directory.")
+        protected_trees = _SYSTEM_CLIENT_HOME_TREES
+        # macOS maps /home into its writable Data volume under /System. Preserve that
+        # specific home namespace without opening the rest of /System to connector writes.
+        macos_home = Path("/System/Volumes/Data/home")
+        macos_home_parts = tuple(part.casefold() for part in macos_home.parts)
+        if (
+            Path("/home").resolve() == macos_home
+            and resolved_parts[:len(macos_home_parts)] == macos_home_parts
+        ):
+            protected_trees = protected_trees - {Path("/System")}
+        unscoped_parts = {
+            tuple(part.casefold() for part in path.parts)
+            for directory in _UNSCOPED_CLIENT_HOMES
+            for path in (directory, directory.resolve())
+        }
+        protected_parts = {
+            tuple(part.casefold() for part in path.parts)
+            for directory in protected_trees
+            for path in (directory, directory.resolve())
+        }
+        if (
+            len(resolved.parts) < 3
+            or resolved_parts in unscoped_parts
+            or any(resolved_parts[:len(parts)] == parts for parts in protected_parts)
+        ):
+            raise ClientHomeError("Hermes client home is outside the expected scope.")
+        return resolved
+    except ClientHomeError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise ClientHomeError(
+            "Hermes client home could not be validated; filesystem access failed."
+        ) from None
+
+
+def unsafe_client_path(client_home: Path, path: Path) -> str | None:
+    """Return why ``path`` must not be removed, or None when it stays inside the home."""
+    if path.is_symlink():
+        return f"{path} is a symbolic link"
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(client_home)
+    except ValueError:
+        return f"{path} is outside the Hermes client home"
+    if resolved == client_home:
+        return f"{path} is the Hermes client home"
+    return None
+
+
 def remove_hermes_connector(ficelle_home: Path) -> tuple[bool, list[str]]:
     """Remove only unchanged Hermes artifacts previously registered by Ficelle."""
     record = load_connectors(ficelle_home).get("hermes")
     if not record:
         return False, ["Hermes connector is not registered."]
     client_home_value = record.get("client_home")
-    if not isinstance(client_home_value, str) or not client_home_value:
+    if not isinstance(client_home_value, str) or not client_home_value.strip():
         return False, ["Hermes connector registry has no client home."]
-    hermes_home = Path(client_home_value)
+    try:
+        hermes_home = validated_client_home(client_home_value)
+    except ClientHomeError as exc:
+        return False, [str(exc)]
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     config_path = hermes_home / "config.yaml"
     snippet_path = hermes_home / "ficelle" / "hermes-config.snippet.yaml"
     env_path = hermes_home / ".env"
+    removal_paths = [config_path, snippet_path, env_path]
+    removal_paths.extend(
+        destination for _source, destination in hermes_plugin_install_specs(hermes_home)
+    )
+    unsafe = [
+        message
+        for path in removal_paths
+        if (message := unsafe_client_path(hermes_home, path))
+    ]
+    if unsafe:
+        return False, [
+            "Hermes client home is not safe to modify; nothing was removed:",
+            *unsafe,
+        ]
+    current_config = config_path.read_text(encoding="utf-8", errors="replace") if config_path.exists() else ""
+    config_span = managed_config_span(current_config)
+    if config_path.exists() and config_span is None and (
+        MANAGED_CONFIG_BEGIN in current_config
+        or MANAGED_CONFIG_END in current_config
+    ):
+        return False, ["Malformed Ficelle managed config block; config left untouched and nothing was removed."]
+    config_block_absent = (
+        config_path.exists() and metadata.get("config_managed") and config_span is None
+    )
     guarded_files = [(snippet_path, metadata.get("snippet_sha256"))]
-    if metadata.get("config_managed"):
+    if metadata.get("config_managed") and config_span is not None:
         guarded_files.append((config_path, metadata.get("config_sha256")))
     changed = [
         str(path)
@@ -1172,16 +1434,27 @@ def remove_hermes_connector(ficelle_home: Path) -> tuple[bool, list[str]]:
             and not env_path.read_text(encoding="utf-8").strip()
         ):
             env_path.unlink()
-    if config_path.exists() and metadata.get("config_managed"):
-        if metadata.get("config_created"):
+    if config_path.exists() and metadata.get("config_managed") and config_span is not None:
+        current = current_config
+        # config_created means Ficelle created the file. Delete it only when the user
+        # added nothing outside the managed block. A matching digest is not enough:
+        # startup must not be able to bless a later edit and erase it.
+        if metadata.get("config_created") and not config_has_user_additions(current):
             config_path.unlink()
         else:
-            current = config_path.read_text(encoding="utf-8", errors="replace")
-            start = current.index(MANAGED_CONFIG_BEGIN)
-            end = current.index(MANAGED_CONFIG_END, start) + len(MANAGED_CONFIG_END)
-            write_text_file(config_path, f"{current[:start]}{current[end:].lstrip()}", dry_run=False)
+            start, end = config_span
+            write_text_file(
+                config_path,
+                f"{current[:start]}{current[end:]}",
+                dry_run=False,
+            )
     unregister_connector(ficelle_home, "hermes")
-    return True, ["Hermes connector artifacts removed."]
+    messages = ["Hermes connector artifacts removed."]
+    if config_block_absent:
+        messages.append(
+            "config.yaml left untouched because the Ficelle managed config block was absent."
+        )
+    return True, messages
 
 
 def configure_hermes(options: InstallOptions, *, runtime_dir: Path | None = None) -> None:
@@ -1202,8 +1475,11 @@ def configure_hermes(options: InstallOptions, *, runtime_dir: Path | None = None
         return
 
     current = config_path.read_text(encoding="utf-8", errors="replace")
-    if MANAGED_CONFIG_BEGIN not in current or MANAGED_CONFIG_END not in current:
-        print(f"Existing unmanaged Hermes config left untouched: {config_path}")
+    if managed_config_span(current) is None:
+        if MANAGED_CONFIG_BEGIN in current or MANAGED_CONFIG_END in current:
+            print(f"Malformed Ficelle managed config block; Hermes config left untouched: {config_path}")
+        else:
+            print(f"Existing unmanaged Hermes config left untouched: {config_path}")
         print(f"Next: review and merge the ready snippet: {snippet_path}")
         return
 
@@ -1492,6 +1768,16 @@ def offer_first_key_capture(
 
 
 def run_install(options: InstallOptions) -> int:
+    options = replace(
+        options, python=absolute_python(options.python),
+        package=absolute_package_reference(options.package),
+        ficelle_home=Path(os.path.abspath(options.ficelle_home.expanduser())),
+        hermes_home=Path(os.path.abspath(options.hermes_home.expanduser())),
+    )
+    try:
+        validated_runtime_home(options.ficelle_home, create=False)
+    except FileNotFoundError:
+        pass
     run_preflight(options)
     if options.preflight_only:
         print("Preflight complete. No install actions were run.")
@@ -1672,8 +1958,8 @@ def options_from_args(args: argparse.Namespace) -> InstallOptions:
         editable=not args.no_editable,
         python=args.python,
         connectors=tuple(dict.fromkeys(args.connector)),
-        ficelle_home=Path(configured_ficelle_home or default_ficelle_home()).expanduser().resolve(),
-        hermes_home=Path(args.hermes_home).expanduser().resolve(),
+        ficelle_home=Path(os.path.abspath(Path(configured_ficelle_home or default_ficelle_home()).expanduser())),
+        hermes_home=Path(os.path.abspath(Path(args.hermes_home).expanduser())),
         dry_run=args.dry_run,
         skip_package=args.skip_package,
         skip_plugin=args.skip_plugin,

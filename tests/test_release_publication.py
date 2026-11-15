@@ -43,10 +43,17 @@ def _metadata(description: str = DESCRIPTION, version: str = VERSION) -> str:
     )
 
 
-def _wheel(directory: Path, description: str = DESCRIPTION, version: str = VERSION) -> Path:
+def _wheel(
+    directory: Path,
+    description: str = DESCRIPTION,
+    version: str = VERSION,
+    extra_member: str | None = None,
+) -> Path:
     path = directory / f"ficelle_router-{version}-py3-none-any.whl"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("ficelle/__init__.py", f'__version__ = "{version}"\n')
+        if extra_member:
+            archive.writestr(extra_member, "{}\n")
         archive.writestr(
             f"ficelle_router-{version}.dist-info/METADATA", _metadata(description, version)
         )
@@ -117,6 +124,14 @@ def test_a_wheel_that_is_not_the_pinned_one_is_refused(dist: Path, tmp_path: Pat
     wheel.write_bytes(wheel.read_bytes() + b"\0")
 
     assert _run(dist, bootstrap) == 1
+
+
+def test_a_wheel_carrying_the_catalog_bootstrap_pin_is_refused(dist: Path, tmp_path: Path) -> None:
+    # The pin hashes the bootstrap that pins this wheel's digest, so it can only be circular here.
+    wheel = _wheel(dist, extra_member="ficelle/assets/hermes-plugin/ficelle/bootstrap-pin.json")
+    _sdist(dist)
+
+    assert _run(dist, _bootstrap(tmp_path, wheel)) == 1
 
 
 def test_an_sdist_from_another_tree_is_refused(dist: Path, tmp_path: Path) -> None:

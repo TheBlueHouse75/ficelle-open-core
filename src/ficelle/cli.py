@@ -21,7 +21,7 @@ from ficelle.connector_registry import (
     SUPPORTED_CONNECTORS,
     unregister_connector,
 )
-from ficelle.runtime_paths import RuntimePaths
+from ficelle.runtime_paths import RuntimePaths, absolute_python, python_child_context
 from ficelle.url_security import connectable_http_url
 from ficelle.service import (
     SERVER_COMMAND_SIGNATURES,
@@ -81,8 +81,8 @@ with active_runtime_environment():
     from ficelle import coding_certification, license_ops, router, update as update_service  # noqa: E402
 
 
-def _run(cmd: list[str], *, check: bool = False, timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=check)
+def _run(cmd: list[str], *, check: bool = False, timeout: int = 60, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=check, **kwargs)
 
 
 def _uid() -> str:
@@ -590,19 +590,21 @@ def cmd_connectors(args: argparse.Namespace) -> int:
         return 0
     if action == "install":
         command = [
-            sys.executable,
+            absolute_python(sys.executable),
+            "-P",
             "-m",
             "ficelle.install",
             "--skip-package",
             "--skip-service",
             "--ficelle-home",
-            str(FICELLE_HOME),
+            os.path.abspath(FICELLE_HOME.expanduser()),
             "--connector",
             args.connector,
         ]
         if args.connector == "hermes" and args.client_home:
-            command.extend(("--hermes-home", args.client_home))
-        return subprocess.run(command, check=False).returncode
+            command.extend(("--hermes-home", os.path.abspath(Path(args.client_home).expanduser())))
+        with python_child_context(FICELLE_HOME) as (cwd, env):
+            return subprocess.run(command, check=False, cwd=cwd, env=env).returncode
     if action == "remove":
         if args.connector == "hermes":
             from ficelle.install import remove_hermes_connector

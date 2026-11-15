@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Callable, Protocol
 from xml.sax.saxutils import escape as xml_escape
 
+from ficelle.runtime_paths import absolute_python, python_child_context
+
 
 LOG_FILE_NAME = "ficelle.log"
 ERROR_LOG_FILE_NAME = "ficelle.error.log"
@@ -30,7 +32,7 @@ def service_log_dir(ficelle_home: Path) -> Path:
     return ficelle_home / "logs"
 
 
-RunCommand = Callable[[list[str]], subprocess.CompletedProcess[str]]
+RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 ReadyCheck = Callable[[], bool]
 StaleServerTerminator = Callable[[], list[int]]
 StaleServerReporter = Callable[[list[int]], None]
@@ -184,10 +186,11 @@ def _usable_recorded_interpreter(
     if not candidate.exists():
         return None
     try:
-        probe = run_command([str(candidate), "-c", "import ficelle"])
+        with python_child_context() as (cwd, env):
+            probe = run_command([absolute_python(candidate), "-P", "-c", "import ficelle"], cwd=cwd, env=env)
     except OSError:
         return None
-    return candidate if probe.returncode == 0 else None
+    return Path(absolute_python(candidate)) if probe.returncode == 0 else None
 
 
 class LaunchAgentServiceBackend:
@@ -327,12 +330,7 @@ class LaunchAgentServiceBackend:
         if not isinstance(arguments, list) or not arguments:
             return None
         candidate = Path(str(arguments[0]))
-        if not candidate.exists():
-            return None
-        probe = self.run_command([str(candidate), "-c", "import ficelle"])
-        if probe.returncode != 0:
-            return None
-        return candidate
+        return _usable_recorded_interpreter(candidate, self.run_command)
 
     def restart(self) -> int:
         recorded = self.recorded_interpreter()

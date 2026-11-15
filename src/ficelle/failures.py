@@ -295,25 +295,42 @@ def provider_error_codes(text: str) -> tuple[str, ...]:
     Returns `()` for a body that is not JSON, is shaped differently, or is too large to be an error
     payload — all of which fall back to matching the prose.
     """
+    error = _provider_error_object(text)
+    return error_object_codes(error) if error is not None else ()
+
+
+def provider_error_code_pair(text: str) -> tuple[str, str] | None:
+    """The body's ``(code, type)`` in position, ``""`` for a field that is absent or not text.
+
+    `error_object_codes` drops missing fields, so its tuple cannot tell a lone ``code`` from a lone
+    ``type``; a structured pair match needs that distinction.
+    """
+    error = _provider_error_object(text)
+    if error is None:
+        return None
+    code, type_ = (error.get(key) for key in ("code", "type"))
+    return (code if isinstance(code, str) else "", type_ if isinstance(type_, str) else "")
+
+
+def _provider_error_object(text: str) -> dict[str, Any] | None:
     if len(text) > ERROR_BODY_PARSE_LIMIT:
-        return ()
+        return None
     try:
         payload = json.loads(text)
     except (ValueError, RecursionError):
         # RecursionError is not a ValueError: `json.loads` raises it on a deeply nested body, which
         # fits well under the size limit. Letting it out turns a failover into a 500, since the chat
         # path calls `classify_failure` outside the try/except that wraps `invoke_model`.
-        return ()
+        return None
     if not isinstance(payload, dict):
-        return ()
+        return None
     nested_error = payload.get("error")
     # OpenAI-compatible providers use both shapes in practice: the canonical
     # ``{"error": {...}}`` envelope and a bare serialized error object. Mistral's
     # SDK exposes the latter for HTTP failures, including its stable capacity
     # code/type pair. Read the same two structural fields from either shape;
     # arbitrary nested metadata remains deliberately out of scope.
-    error = nested_error if isinstance(nested_error, dict) else payload
-    return error_object_codes(error)
+    return nested_error if isinstance(nested_error, dict) else payload
 
 
 def status_for_error_codes(*values: Any) -> int | None:
@@ -1001,17 +1018,18 @@ def _body_names_our_model(lower_without_urls: str, upstream_model_id: str | None
 
 
 def _matches_structured_error_code(
-    error_codes: tuple[str, ...], configured_pairs: tuple[tuple[str, str], ...]
+    text: str, configured_pairs: tuple[tuple[str, str], ...]
 ) -> bool:
     """Match an adapter's exact ``error.code``/``error.type`` verdict.
 
-    ``error_object_codes`` keeps the two fields in a stable ``(code, type)`` order. Requiring both
-    values, in their respective positions, prevents an unrelated 429/account or quota payload from
+    ``provider_error_code_pair`` reads the body's two fields in their ``(code, type)`` positions.
+    Requiring both values, in their respective positions, prevents an unrelated 429/account or quota payload from
     inheriting a provider-specific model-pool classification merely because one word overlaps.
+    A provider whose error object carries a ``code`` but no ``type`` is matched by a pair with an
+    empty type, which therefore never matches a payload that does name a type.
     """
-    if len(error_codes) < 2:
-        return False
-    return error_codes[:2] in configured_pairs
+    pair = provider_error_code_pair(text) if configured_pairs else None
+    return pair is not None and pair in configured_pairs
 
 
 def classify_failure(
@@ -1102,7 +1120,7 @@ def classify_failure(
             marker in lower_without_urls for marker in ACCOUNT_RATE_LIMIT_TEXT_MARKERS
         )
         if not names_account_scope and _matches_structured_error_code(
-            resolved_error_codes,
+            text,
             marker_set.upstream_rate_limit_error_codes,
         ):
             return "rate_limited_upstream"
