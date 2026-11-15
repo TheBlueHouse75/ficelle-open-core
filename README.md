@@ -255,6 +255,9 @@ the website.
 
 ## Optional client connectors
 
+Hermes Agent users can also set Ficelle up from Hermes itself, through the Ficelle provider
+plugin: see [Ficelle for Hermes](https://ficelle.ai/integrations/hermes/).
+
 Hermes is not required to install, update, or use Ficelle. If you want the connector and Hermes is
 not installed yet, use the official third-party installer from Nous Research. Ficelle does not
 control this script; it launches the Hermes setup wizard:
