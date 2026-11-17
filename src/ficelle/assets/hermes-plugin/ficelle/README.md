@@ -68,11 +68,8 @@ Only through Hermes' own helpers, and only these two things:
   `http://127.0.0.1:8646/v1` and the chat-completions protocol.
 
 The plugin never opens `.env`, `config.yaml`, `auth.json` or any Ficelle credential file, never
-writes into its own directory, and never runs `ficelle connectors install hermes`. That command
-remains available: it adds Ficelle's compression plugin, replaces the listener value with
-Ficelle's own listener token, and writes the recommended Hermes configuration (auxiliary models,
-fallback), or a snippet to merge when you already have a `config.yaml`. The setup step stores no
-progress file; each run checks the machine again.
+writes into its own directory, and never runs Ficelle's own Hermes connector. The setup step
+stores no progress file; each run checks the machine again.
 
 ## Credentials
 

@@ -501,8 +501,6 @@ def run_setup(seams: Seams) -> SetupResult:
     return SetupResult(
         True, "hermes-activation", "Ready",
         f"A real request succeeded and Hermes now defaults to {DEFAULT_MODEL}.",
-        "Optional: `ficelle connectors install hermes` adds the compression plugin and prepares the "
-        "recommended Hermes configuration.",
     )
 
 
