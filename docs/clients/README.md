@@ -69,10 +69,10 @@ merely tool-capable model.
 ```bash
 curl -s http://127.0.0.1:8646/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $FICELLE_API_KEY" \
   -d '{"model":"ficelle/auto-fast","messages":[{"role":"user","content":"Reply exactly: ficelle-ok"}],"temperature":0}'
 ```
 
+On a non-loopback bind, add `-H "Authorization: Bearer $(ficelle access-token api)"`.
 If this answers and your client does not, the problem is the client config, not
 the router. If this fails with `credentials unavailable`, store a provider key
 (`ficelle set-key openrouter`). The admin dashboard at

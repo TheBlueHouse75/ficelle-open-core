@@ -39,6 +39,16 @@ class FakeRouter:
     def normalized_free_access(self, model: dict[str, Any]) -> dict[str, Any]:
         return model.get("free_access") or {"eligible": True, "mode": "catalog_free"}
 
+    def quota_cooldown_scope(self, model: dict[str, Any]) -> str:
+        from ficelle import router
+
+        return router.quota_cooldown_scope(model)
+
+    def quota_cooldown_key(self, model: dict[str, Any]) -> str:
+        from ficelle import router
+
+        return router.quota_cooldown_key(model)
+
     def benchmark_body(self, profile_id: str, config: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
         return ({"model": profile_id, "messages": [{"role": "user", "content": "probe"}]}, "exact_text", "ok")
 
@@ -66,6 +76,23 @@ class FakeRouter:
 
     def success_error_payload_failure(self, _payload: dict[str, Any], _model: dict[str, Any] | None) -> None:
         return None
+
+
+@pytest.mark.parametrize(
+    "prose",
+    ["no risk-of-precipitation expected", "task-oriented-benchmarking", "disk-usage-exceeded-retry"],
+)
+def test_secret_detector_ignores_sk_inside_ordinary_hyphenated_words(prose: str) -> None:
+    # A false breach aborts the rest of a ~100-minute run, so the detector must not read "ri-sk-of-…".
+    assert synthetic_health.SECRET_PATTERN.search(prose) is None
+
+
+@pytest.mark.parametrize(
+    "leak",
+    ["key sk-proj-abcdefghijklmnopqrstuvwx", '"token": "sk-or-v1-0123456789abcdef"', "Bearer abcdefghijklmnop1234"],
+)
+def test_secret_detector_still_flags_real_key_shapes(leak: str) -> None:
+    assert synthetic_health.SECRET_PATTERN.search(leak) is not None
 
 
 def test_service_base_url_uses_the_configured_ipv6_listener() -> None:
@@ -875,6 +902,67 @@ def test_summary_surfaces_enabled_provider_access_failure(tmp_path: Path) -> Non
     assert summary["coverage"]["providers"]["skipped"][0]["reason"] == "credential_missing"
 
 
+def test_capacity_groups_only_sources_drawing_on_one_shared_account_pool(tmp_path: Path) -> None:
+    router = FakeRouter()
+    config = {"providers": {name: {"enabled": True} for name in ("alpha", "beta", "gamma", "delta")}}
+
+    def model(source: str, scope: str) -> dict[str, Any]:
+        return {
+            "id": f"ficelle/{source}/m",
+            "upstream_id": "m",
+            "source": source,
+            "provider_account_id": "acct-shared",
+            "free_access": {"eligible": True, "mode": "catalog_free", "scope": scope},
+        }
+
+    # Only `shared_account` pools quota across sources (`shared_account:{id}`); gamma's
+    # `account` and delta's `provider` scopes key their cooldowns per source, so the same
+    # account id must not fold them into alpha and beta's pool.
+    catalog = {
+        "models": [
+            model("alpha", "shared_account"),
+            model("beta", "shared_account"),
+            model("gamma", "account"),
+            model("delta", "provider"),
+        ],
+    }
+
+    inventory = synthetic_health.build_inventory(router, config, catalog)
+    summary = synthetic_health.build_summary(
+        synthetic_health.RunPaths.for_run(tmp_path, "run-accounts"),
+        {"run_id": "run-accounts", "corpus_version": "1", "corpus_hash": "hash", "config_structural_fingerprint": "config"},
+        inventory,
+        [],
+        [],
+    )
+
+    assert summary["capacity"]["shared_account_groups"] == [{"sources": ["alpha", "beta"], "source_count": 2}]
+
+
+def test_long_shared_account_ids_differing_late_stay_separate_pools() -> None:
+    """The router keys a pool on the full sanitized account id; a shorter cut here would merge two pools."""
+    router = FakeRouter()
+    prefix = "a" * 240
+    catalog = {
+        "models": [
+            {
+                "id": f"ficelle/{source}/m",
+                "upstream_id": "m",
+                "source": source,
+                "provider_account_id": prefix + suffix,
+                "free_access": {"eligible": True, "mode": "catalog_free", "scope": "shared_account"},
+            }
+            for source, suffix in (("alpha", "-one"), ("beta", "-two"))
+        ],
+    }
+
+    inventory = synthetic_health.build_inventory(router, {"providers": {"alpha": {}, "beta": {}}}, catalog)
+
+    keys = {row["source"]: row["shared_quota_keys"] for row in inventory["providers"]}
+    assert keys["alpha"] != keys["beta"]
+    assert keys["alpha"] == [router.quota_cooldown_key(catalog["models"][0])]
+
+
 def test_summary_surfaces_invokable_provider_catalog_failure(tmp_path: Path) -> None:
     paths = synthetic_health.RunPaths.for_run(tmp_path, "run-catalog-gap")
     inventory = {
@@ -1579,6 +1667,42 @@ def test_dual_denominators_exclude_candidate_free_from_competence_only():
     assert metrics["conditional_competence"]["rate"] == 1.0
     assert metrics["conditional_competence"]["excluded_candidate_free"] == 1
     assert metrics["conditional_competence"]["excluded_candidate_free_case_ids"] == [unreachable.id]
+
+
+def test_dialect_failures_stay_out_of_basic_tool_counts_and_denominators():
+    base = _tool_case("p3.tools.alpha-m.choice")
+    dialect = _tool_case(
+        "p3.dialect.alpha-m.enums",
+        validator="tool-dialect",
+        expected={"feature": "enums", "tool_name": "t", "arguments": {}},
+        tags=("tools", "t8", "dialect", "dialect:enums"),
+    )
+    staged_pass = {"selection_reachable": True, "upstream_reached": True, "protocol_valid": True, "tool_semantic_valid": True, "end_user_success": True}
+    base_row = {
+        "case_id": base.id,
+        "status": "pass",
+        "axes": {"semantic": {"status": "pass", "tool_assertions": {"selection": True, "arguments": True}}},
+        "staged_verdict": staged_pass,
+    }
+    dialect_row = {
+        "case_id": dialect.id,
+        "status": "fail",
+        "axes": {"semantic": {"status": "fail", "tool_assertions": {"selection": False, "arguments": None}}},
+        "staged_verdict": {**staged_pass, "tool_semantic_valid": False, "end_user_success": False},
+    }
+
+    metrics = synthetic_health._tool_metrics([base, dialect], [base_row, dialect_row])
+
+    assert (metrics["planned"], metrics["passed"], metrics["failed"]) == (1, 1, 0)
+    assert metrics["t1"]["selection"] == {"passed": 1, "failed": 0}
+    assert metrics["t2"]["arguments"] == {"passed": 1, "failed": 0}
+    assert metrics["service_availability"] == {"planned": 1, "succeeded": 1, "rate": 1.0}
+    assert metrics["conditional_competence"]["reached_and_protocol_valid"] == 1
+    assert metrics["conditional_competence"]["rate"] == 1.0
+    assert metrics["models"]["covered"] == 1
+    # The dialect failure is still reported, in its own block and matrix.
+    assert (metrics["t8"]["planned"], metrics["t8"]["failed"]) == (1, 1)
+    assert metrics["schema_dialects"]["ficelle/alpha/m"]["enums"]["verdict"] != "supported"
 
 
 def test_late_correlated_case_is_audited_through_its_recovered_route_row():

@@ -386,6 +386,33 @@ def test_stale_rows_block_past_grace_and_route_within_it():
     assert result.excluded_reasons["ficelle/openrouter/expired"] == "stale_catalog"
 
 
+def test_a_cooled_model_that_cannot_serve_the_profile_is_not_blamed_on_the_cooldown():
+    import dataclasses
+
+    # Counting it as a cooldown exclusion made a refusal advertise a Retry-After that no wait
+    # could make true: the model would never have served this profile.
+    policy = dataclasses.replace(
+        simple_policy(), model_on_cooldown=lambda model, _state: (model.get("id") == "ficelle/openrouter/text-only", None)
+    )
+    catalog = {
+        "models": [
+            model_row("ficelle/openrouter/text-only", supports_tools=False),
+            model_row("ficelle/openrouter/tooling", supports_tools=True, invokable=False),
+        ]
+    }
+    config = {"virtual_profiles": {"ficelle/auto-tools": {"requirements": {"tools": True}}}}
+
+    result = select_models_result_from_typed_rows(
+        "ficelle/auto-tools", typed_catalog_rows(catalog), config, {}, policy
+    )
+
+    assert result.candidates == []
+    assert result.excluded_reasons == {
+        "ficelle/openrouter/text-only": "profile_requirements",
+        "ficelle/openrouter/tooling": "not_invokable",
+    }
+
+
 def test_cooldown_exclusions_carry_their_scope():
     import dataclasses
 

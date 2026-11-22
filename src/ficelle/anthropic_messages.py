@@ -357,6 +357,10 @@ def translate_anthropic_request(
     metadata = source.get("metadata")
     if metadata is not None and not isinstance(metadata, Mapping):
         raise AnthropicRequestError("metadata must be an object")
+    if metadata is not None:
+        # Never forwarded: Claude Code puts its account and session ids in `user_id`, and every
+        # upstream provider (and every Fusion panelist) would receive them.
+        ignored.add("metadata")
     if "thinking" in source:
         ignored.add("thinking")
     if "cache_control" in source:
@@ -414,8 +418,6 @@ def translate_anthropic_request(
         # `stream_options` is not portable across OpenAI-compatible providers. Translate usage
         # whenever an upstream reports it, but never make an otherwise valid stream depend on this
         # optional extension.
-    if metadata is not None:
-        openai_body["metadata"] = dict(metadata)
     tool_choice = source.get("tool_choice")
     if tool_choice is not None:
         if not isinstance(tool_choice, Mapping):
@@ -657,12 +659,18 @@ def encode_anthropic_sse_event(event: str, data: Any) -> bytes:
     return f"event: {event}\ndata: {encoded}\n\n".encode("utf-8")
 
 
-def anthropic_sse_error_event(code: str, detail: str | None = None, *, error_type: str = "api_error") -> bytes:
+def anthropic_sse_error_event(
+    code: str,
+    detail: str | None = None,
+    *,
+    error_type: str = "api_error",
+    request_id: str | None = None,
+) -> bytes:
     """Encode a stream failure with a valid Anthropic error type and Ficelle diagnostic code."""
-    return encode_anthropic_sse_event(
-        "error",
-        {"type": "error", "error": {"type": error_type, "message": detail or code, "ficelle_code": code}},
-    )
+    error = {"type": error_type, "message": detail or code, "ficelle_code": code}
+    if request_id:
+        error["ficelle_request_id"] = request_id
+    return encode_anthropic_sse_event("error", {"type": "error", "error": error})
 
 
 def encode_anthropic_message_stream(message: Mapping[str, Any]) -> list[bytes]:

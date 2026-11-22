@@ -89,6 +89,18 @@ def test_catalog_config_fingerprint_tracks_structural_provider_fields() -> None:
     )
 
 
+def test_fingerprint_tracks_the_provider_fields_stamped_onto_catalog_rows() -> None:
+    """Overrides decide tools and context acceptance and `burn_weight` is copied onto every row, so
+    an edit (or a shipped default change) must not keep serving rows built from the old value."""
+    calls: list[tuple[str, dict[str, Any]]] = []
+    base = {"providers": {"groq": {"enabled": True, "catalog_model_overrides": {"m": {"context_length": 1}}}}}
+    base_fingerprint = catalog_config_fingerprint(base, ports=ports(calls))
+
+    for field, value in (("catalog_model_overrides", {"m": {"context_length": 2}}), ("burn_weight", 7)):
+        changed = {"providers": {"groq": {**base["providers"]["groq"], field: value}}}
+        assert catalog_config_fingerprint(changed, ports=ports(calls)) != base_fingerprint, field
+
+
 def test_structural_fingerprint_excludes_credential_activation_state() -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
     config = {

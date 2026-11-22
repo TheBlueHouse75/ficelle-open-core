@@ -174,7 +174,7 @@ def test_success_rate_uses_smoothed_runtime_stats() -> None:
     model = {"source": "openrouter", "upstream_id": "free"}
     state = {"stats": {"openrouter::free": {"successes": "3", "failures": "1"}}}
 
-    assert success_rate_for_model(model, state, ports=_ports()) == 0.625
+    assert success_rate_for_model(model, state, ports=_ports()) == (3 + 2.88) / 8
 
 
 def test_success_rate_keeps_decaying_while_a_model_is_idle() -> None:
@@ -202,12 +202,32 @@ def test_success_rate_keeps_decaying_while_a_model_is_idle() -> None:
 
     # Same state, three read instants: the rate slides back toward the prior as the evidence ages.
     assert rate_after(0) > rate_after(7) > rate_after(21)
-    # Past ~5 half-lives fewer than one effective observation is left, so the model reads as
-    # unknown rather than drifting below a model nobody has ever called.
-    assert rate_after(35) == 0.72
+    # Past ~5 half-lives the evidence is gone and the rate has converged on the unknown-model value.
+    assert abs(rate_after(350) - 0.72) < 1e-6
     # A state written before decay existed keeps scoring on its lifetime totals.
     legacy = {"stats": {"openrouter::free": {"successes": 3, "failures": 1}}}
-    assert success_rate_for_model(model, legacy, ports=_ports()) == 0.625
+    assert success_rate_for_model(model, legacy, ports=_ports()) == (3 + 2.88) / 8
+
+
+def test_success_rate_never_ranks_a_clean_record_below_an_unknown_model() -> None:
+    model = {"source": "openrouter", "upstream_id": "free"}
+    unknown = success_rate_for_model(model, {}, ports=_ports())
+
+    def after(successes: float, failures: float) -> float:
+        state = {"stats": {"openrouter::free": {"scored_successes": successes, "scored_failures": failures,
+                                                  "scored_at": 0.0}}}
+        ports = ModelScoringPorts(
+            cooldown_key=lambda candidate: f"{candidate.get('source')}::{candidate.get('upstream_id')}",
+            safe_int=lambda value, default: int(value) if value is not None else default,
+            now_epoch=lambda: 0.0,
+        )
+        return success_rate_for_model(model, state, ports=ports)
+
+    # 2 and 3 wins used to read 0.667 / 0.714, under the 0.72 of a model nobody has ever called.
+    assert unknown == 0.72
+    assert unknown < after(1, 0) < after(2, 0) < after(3, 0)
+    # The threshold the old curve flipped on is no longer a cliff for a failure either.
+    assert abs(after(0, 0.99) - after(0, 1.0)) < 0.01
 
 
 def test_latency_score_prefers_ewma_and_never_saturates() -> None:
@@ -236,6 +256,17 @@ def test_latency_score_separates_every_speed_in_a_slow_pool() -> None:
 def test_latency_score_falls_back_to_legacy_success_latency() -> None:
     model = {"source": "openrouter", "upstream_id": "free"}
     state = {"successes": {"openrouter::free": {"latency_seconds": 15}}}
+
+    assert latency_score_for_model(model, state, ports=_ports()) == 0.5
+
+
+def test_latency_score_ignores_legacy_latency_written_by_probes() -> None:
+    model = {"source": "openrouter", "upstream_id": "free"}
+    # Every success, probe or not, writes the legacy record; the stats row says this one was only probed.
+    state = {
+        "stats": {"openrouter::free": {"probe_latency_ewma": 0.8}},
+        "successes": {"openrouter::free": {"latency_seconds": 0.8}},
+    }
 
     assert latency_score_for_model(model, state, ports=_ports()) == 0.5
 
@@ -509,12 +540,12 @@ def test_model_score_explanation_combines_profile_weights_evidence_and_failure_p
 
     score = model_score_explanation("ficelle/auto-multimodal", model, state, ports=_score_explanation_ports())
 
-    assert score["score_base"] == 81.9
+    assert score["score_base"] == 85.7
     assert score["score_adjustment"] == 23.0
     assert score["failure_penalty"] == 12.0
-    assert score["score_total"] == 92.9
-    assert score["score_total_raw"] == 92.875
-    assert score["success_rate"] == 0.625
+    assert score["score_total"] == 96.7
+    assert score["score_total_raw"] == 96.725
+    assert score["success_rate"] == 0.735
     assert score["latency_score"] == 0.5
     # No first_delta_ewma and no throughput recorded: both stay neutral, so speed_score collapses
     # to the latency term. auto-multimodal's own weights do not use speed_score at all, so

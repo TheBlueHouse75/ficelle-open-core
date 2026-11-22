@@ -80,23 +80,30 @@ class FakeResponse:
 class FakeSession:
     """A scripted session that also reports connection provenance the way a real pool does."""
 
-    def __init__(self, router, outcomes, *, reused: bool = True) -> None:
+    def __init__(self, router, outcomes, *, reused: bool = True, on_failure=None) -> None:
         self.posts: list[str] = []
+        self.timeouts: list[object] = []
+        self._on_failure = on_failure
         self._router = router
         self._outcomes = list(outcomes)
         self._reused = reused
 
-    def post(self, url, **_kwargs):
+    def post(self, url, **kwargs):
         self.posts.append(url)
+        self.timeouts.append(kwargs.get("timeout"))
         self._router._UPSTREAM_CONNECTION_STATE.reused = self._reused
         outcome = self._outcomes.pop(0) if self._outcomes else FakeResponse()
         if isinstance(outcome, BaseException):
+            if self._on_failure is not None:
+                self._on_failure()
             raise outcome
         return outcome
 
 
-def install_fake_session(monkeypatch, router, outcomes, *, reused: bool = True) -> FakeSession:
-    session = FakeSession(router, outcomes, reused=reused)
+def install_fake_session(
+    monkeypatch, router, outcomes, *, reused: bool = True, on_failure=None
+) -> FakeSession:
+    session = FakeSession(router, outcomes, reused=reused, on_failure=on_failure)
     monkeypatch.setattr(router, "_UPSTREAM_SESSION", session)
     return session
 
@@ -218,6 +225,25 @@ def test_errno_less_timeout_is_stale_only_when_it_fired_early(router, elapsed, e
     assert router.stale_upstream_connection(failure, elapsed_seconds=elapsed) is expected
 
 
+@pytest.mark.parametrize(
+    ("elapsed", "read_timeout", "expected"),
+    [
+        pytest.param(18.0, 180.0, True, id="production-shape-under-a-long-budget"),
+        pytest.param(4.0, 20.0, True, id="early-under-a-short-budget"),
+        pytest.param(18.0, 20.0, False, id="short-budget-nearly-spent"),
+        pytest.param(19.9, 20.0, False, id="short-budget-spent"),
+    ],
+)
+def test_errno_less_timeout_cap_follows_the_send_read_timeout(router, elapsed, read_timeout, expected):
+    failure = requests.exceptions.ReadTimeout(f"Read timed out. (read timeout={read_timeout})")
+    assert (
+        router.stale_upstream_connection(
+            failure, elapsed_seconds=elapsed, read_timeout_seconds=read_timeout
+        )
+        is expected
+    )
+
+
 def test_errno_stays_conclusive_however_late_it_arrives(router):
     assert router.stale_upstream_connection(stale_failure(), elapsed_seconds=599.0)
 
@@ -230,6 +256,20 @@ def test_slow_provider_on_a_reused_socket_is_not_replayed(monkeypatch, router):
 
     with pytest.raises(requests.exceptions.ReadTimeout):
         router.upstream_post("https://provider.example/v1/chat/completions", timeout=(5.0, 600.0))
+
+    assert len(session.posts) == 1
+
+
+def test_silent_provider_with_a_short_read_timeout_is_not_replayed(monkeypatch, router):
+    # Under the old fixed 30s cap, a 20s budget that ran out on a reused socket was read as a
+    # dead socket and the provider got the request twice.
+    silent = requests.exceptions.ReadTimeout("Read timed out. (read timeout=20.0)")
+    session = install_fake_session(monkeypatch, router, [silent, FakeResponse()])
+    clock = iter([0.0, 19.9])
+    monkeypatch.setattr(router.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        router.upstream_post("https://provider.example/v1/chat/completions", timeout=(5.0, 20.0))
 
     assert len(session.posts) == 1
 
@@ -291,7 +331,7 @@ def test_upstream_post_skips_the_replay_the_caller_cannot_afford(monkeypatch, ro
 
     with pytest.raises(requests.exceptions.ReadTimeout):
         router.upstream_post(
-            "https://provider.example/v1/chat/completions", replay_allowed=lambda: False
+            "https://provider.example/v1/chat/completions", replay_timeout=lambda: None
         )
 
     assert len(session.posts) == 1
@@ -346,6 +386,39 @@ def test_invoke_model_does_not_replay_past_the_request_deadline(monkeypatch, rou
         )
 
     assert len(session.posts) == 1
+
+
+def test_invoke_model_replay_read_budget_is_cut_to_the_remaining_deadline(monkeypatch, router):
+    # The discarded send spent 5s of a 10s request budget; replaying with the 8s read timeout
+    # computed at dispatch would let the replay run 3s past the deadline.
+    clock = [100.0]
+    monkeypatch.setattr(router.time, "monotonic", lambda: clock[0])
+
+    def spend_five_seconds():
+        clock[0] += 5.0
+
+    session = install_fake_session(
+        monkeypatch, router, [stale_failure(), FakeResponse()], on_failure=spend_five_seconds
+    )
+    allow_provider(monkeypatch, router)
+
+    response = router.invoke_model(
+        invokable_model(),
+        chat_body(),
+        router.load_config(),
+        remaining_budget_seconds=10.0,
+        deadline_monotonic=110.0,
+    )
+
+    assert len(session.posts) == 2
+    first_connect, first_read = session.timeouts[0]
+    replay_connect, replay_read = session.timeouts[1]
+    assert first_read == 8.0
+    assert replay_read == pytest.approx(110.0 - 105.0 - router.REQUEST_BUDGET_MARGIN_SECONDS)
+    assert replay_connect <= replay_read
+    # A timeout under that cut budget is the deadline's doing, exactly as at dispatch.
+    assert response._ficelle_read_timeout_source == "request_deadline"
+    assert response._ficelle_read_timeout_seconds == replay_read
 
 
 def test_invoke_model_does_not_replay_once_upstream_bytes_arrived(monkeypatch, router):
@@ -453,3 +526,63 @@ def test_request_log_keeps_the_new_attempt_fields():
         "transport_retry",
         "stale_latency_seconds",
     } <= set(request_log._ATTEMPT_KEYS)
+
+
+# --------------------------------------------------------------------------- #
+# The shutdown drain's cut
+# --------------------------------------------------------------------------- #
+def test_a_send_the_drain_cut_is_not_replayed(monkeypatch, router):
+    # The cut shuts the socket a send waits on; its ECONNRESET looks stale. Replaying would send
+    # the request again on a connection the drain never sees, and the exit would sever it anyway.
+    import threading
+
+    current = threading.current_thread()
+    session = install_fake_session(
+        monkeypatch, router, [stale_failure(), FakeResponse()],
+        on_failure=lambda: router.shut_upstream_connection(current),
+    )
+    try:
+        with pytest.raises(requests.exceptions.ReadTimeout):
+            router.upstream_post("https://provider.example/v1/chat/completions")
+    finally:
+        router.forget_upstream_connection(current)
+
+    assert len(session.posts) == 1
+
+
+def test_a_failed_send_leaves_no_connection_registered_for_its_thread(monkeypatch, router):
+    # urllib3 hands a failed send's connection back as `None`, so the pool hook cannot unregister
+    # it: probe and benchmark threads, which no handler cleanup reaches, kept their entries.
+    import threading
+
+    current = threading.current_thread()
+    router._UPSTREAM_CONNECTION_BY_THREAD[current] = (FakeConnection(), None)
+    install_fake_session(monkeypatch, router, [stale_failure()], reused=False)
+
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        router.upstream_post("https://provider.example/v1/chat/completions")
+
+    assert current not in router._UPSTREAM_CONNECTION_BY_THREAD
+
+
+def test_a_stream_that_ended_on_its_own_is_not_cut_when_the_flag_rises(router):
+    # A provider that sends no `[DONE]` finished just as the drain flag went up: only an EOF the
+    # cut produced (its thread's socket was shut) is `service_stopping`.
+    import threading
+
+    expiring = threading.Event()
+
+    def chunks():
+        yield b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'
+        expiring.set()
+
+    assert list(router.drain_guarded_chunks(chunks(), expiring))
+
+    current = threading.current_thread()
+    expiring.clear()
+    router.shut_upstream_connection(current)
+    try:
+        with pytest.raises(router.ServiceStopping):
+            list(router.drain_guarded_chunks(chunks(), expiring))
+    finally:
+        router.forget_upstream_connection(current)

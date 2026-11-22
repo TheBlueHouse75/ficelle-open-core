@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from ficelle.failures import REQUEST_REJECTION_STATUSES as FAILURE_REQUEST_REJECTION_STATUSES
+from ficelle.failures import UpstreamResponseBudgetExceeded
 from ficelle.provider_admission import ProviderAdmissionRefused
 from ficelle.retry_hints import retry_hint
 
@@ -70,6 +71,47 @@ def probeable_capability_profiles(
     return out
 
 
+# How long a probe that its own token budget cut short keeps that (model, capability) out of the
+# queue. Discovery cycles run hours apart; a day retries a model that may have changed without
+# letting one that always thinks past the probe budget take a cycle slot every time.
+DISCOVERY_INCONCLUSIVE_RETRY_SECONDS = 86_400.0
+
+
+@dataclass
+class InconclusiveProbeMemory:
+    """(model, capability) pairs whose last probe was inconclusive, so discovery moves on.
+
+    Such a probe writes no verdict — it proved nothing about the model — so without this the pair
+    stays due and is re-probed at the front of every cycle. Process-local on purpose: it is a
+    scheduling hint, never capability evidence, and a restart only costs one extra probe.
+    """
+
+    monotonic: Callable[[], float] = time.monotonic
+    retry_after_seconds: float = DISCOVERY_INCONCLUSIVE_RETRY_SECONDS
+    _until: dict[tuple[str, str], float] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def record(self, profile_id: str, model: dict[str, Any]) -> None:
+        now = self.monotonic()
+        with self._lock:
+            # `holds` only drops the pairs it is asked about; models that left the catalog would
+            # otherwise stay here for the life of the process.
+            for key in [key for key, until in self._until.items() if until <= now]:
+                del self._until[key]
+            self._until[(str(model.get("id") or ""), str(profile_id))] = now + self.retry_after_seconds
+
+    def holds(self, profile_id: str, model: dict[str, Any]) -> bool:
+        key = (str(model.get("id") or ""), str(profile_id))
+        with self._lock:
+            until = self._until.get(key)
+            if until is None:
+                return False
+            if until <= self.monotonic():
+                del self._until[key]
+                return False
+            return True
+
+
 def model_due_capabilities(
     model: dict[str, Any],
     profile_ids: list[str],
@@ -77,6 +119,7 @@ def model_due_capabilities(
     *,
     verified_capability_row: Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]],
     catalog_denies_capability: Callable[[str, dict[str, Any]], bool],
+    recently_inconclusive: Callable[[str, dict[str, Any]], bool] = lambda _profile_id, _model: False,
 ) -> list[str]:
     """Return probeable capabilities without a fresh verified/failed verdict.
 
@@ -84,13 +127,14 @@ def model_due_capabilities(
     404 the catalog predicted. Dropping it here rather than at the probe means the model converges
     and leaves the discovery queue, instead of coming back every cycle for an answer it has — which
     is why the port is required: a caller that forgot it would still queue the model with nothing
-    left to ask it.
+    left to ask it. A capability whose last probe was inconclusive waits out its retry window.
     """
     return [
         profile_id
         for profile_id in profile_ids
         if not catalog_denies_capability(profile_id, model)
         and not verified_capability_row(profile_id, model, state)
+        and not recently_inconclusive(profile_id, model)
     ]
 
 
@@ -202,6 +246,7 @@ def models_needing_discovery(
     verified_capability_row: Callable[[str, dict[str, Any], dict[str, Any]], dict[str, Any]],
     catalog_denies_capability: Callable[[str, dict[str, Any]], bool],
     priority_ports: DiscoveryPriorityPorts | None = None,
+    recently_inconclusive: Callable[[str, dict[str, Any]], bool] = lambda _profile_id, _model: False,
 ) -> list[dict[str, Any]]:
     """Return eligible models with at least one due discovery capability, most useful first."""
     due_models = [
@@ -218,6 +263,7 @@ def models_needing_discovery(
             state,
             verified_capability_row=verified_capability_row,
             catalog_denies_capability=catalog_denies_capability,
+            recently_inconclusive=recently_inconclusive,
         )
     ]
     if priority_ports is None:
@@ -239,10 +285,25 @@ REQUEST_REJECTION_STATUSES = FAILURE_REQUEST_REJECTION_STATUSES
 # strips URLs before matching the false-free markers.
 ROUTE_REJECTION_STATUSES = frozenset({404, 410})
 
-# `skip` sent nothing and cooled nothing; `verified`/`failed` are real capability verdicts and let
-# the cycle continue to the next profile. `blocked` is the only sent/cooldown path and stops the
-# remaining probes for that model.
+# `skip` records and cools nothing (nothing was sent, or the answer proved nothing); `verified`/
+# `failed` are real capability verdicts and let the cycle continue to the next profile. `blocked` is
+# the only cooldown path and stops the remaining probes for that model.
 ProbeVerdict = Literal["verified", "failed", "blocked", "skip"]
+
+
+@dataclass(frozen=True)
+class ProbeSuccessProblem:
+    """Why an HTTP 2xx probe answer says nothing about the capability being probed.
+
+    `inconclusive` is a probe whose own token budget ended it (`truncated_before_content`): no
+    cooldown, no verdict. Otherwise the body carried an upstream failure and `reason` is the chat
+    path's classification of it.
+    """
+
+    reason: str
+    detail: str
+    status_code: int | None = None
+    inconclusive: bool = False
 
 # Spacing between two probes of the SAME provider when it declares no `rate_limit_rpm` — a safety
 # floor, not a preference: an operator raising `auto_benchmark_models_per_cycle` would otherwise
@@ -371,6 +432,11 @@ class CapabilityDiscoveryJob:
     route_blocking_reasons: frozenset[str]
     pacer: ProviderProbePacer
     registry: ProbeResponseValidator
+    # Both default to the permissive answer so a job built without them behaves as it always did;
+    # the router wires the chat path's own classifiers so the two paths cannot disagree.
+    success_problem: Callable[[Any, dict[str, Any]], ProbeSuccessProblem | None] = lambda _payload, _model: None
+    classify_exception: Callable[[Exception, dict[str, Any]], str] = lambda _exc, _model: "unavailable"
+    inconclusive_probes: InconclusiveProbeMemory | None = None
 
     def _cool_and_stop(
         self,
@@ -410,11 +476,13 @@ class CapabilityDiscoveryJob:
         try:
             response = self.invoke_model(model, body, config)
         except Exception as exc:
-            if isinstance(exc, ProviderAdmissionRefused):
+            # Neither says anything about the model: live traffic holds the provider's allowance,
+            # or Ficelle's own response retention budget is full.
+            if isinstance(exc, (ProviderAdmissionRefused, UpstreamResponseBudgetExceeded)):
                 return "skip"
             return self._cool_and_stop(
                 model,
-                "unavailable",
+                self.classify_exception(exc, model),
                 config,
                 detail=f"discovery {type(exc).__name__}",
                 profile_id=profile_id,
@@ -431,8 +499,10 @@ class CapabilityDiscoveryJob:
             return self._record_http_capability_result(model, profile_id, config, response, result)
         try:
             payload = response.json()
-            text = self.extract_message_text(payload)
-            passed, message = self.registry.validate_response(test_type, expected, text, payload)
+            problem = self.success_problem(payload, model)
+            if problem is None:
+                text = self.extract_message_text(payload)
+                passed, message = self.registry.validate_response(test_type, expected, text, payload)
         except Exception as exc:
             return self._cool_and_stop(
                 model,
@@ -440,6 +510,24 @@ class CapabilityDiscoveryJob:
                 config,
                 detail=f"discovery parse {type(exc).__name__}",
                 profile_id=profile_id,
+            )
+        if problem is not None:
+            # A 200 that carries an upstream failure is that failure, not a wrong answer: the chat
+            # path classifies it the same way, and a capability verdict written from it would bench
+            # a healthy model on this profile until a later probe happened to replace it.
+            if problem.inconclusive:
+                if self.inconclusive_probes is not None:
+                    self.inconclusive_probes.record(profile_id, model)
+                return "skip"
+            return self._record_failed_probe(
+                model,
+                profile_id,
+                config,
+                result,
+                reason=problem.reason,
+                status_code=problem.status_code or response.status_code,
+                response_text=problem.detail,
+                headers=getattr(response, "headers", None),
             )
         result.update({
             "status": "pass" if passed else "fail",
@@ -462,15 +550,37 @@ class CapabilityDiscoveryJob:
         result: dict[str, Any],
     ) -> ProbeVerdict:
         response_text = str(response.text)
-        reason = self.classify_failure(response.status_code, response_text, model)
+        return self._record_failed_probe(
+            model,
+            profile_id,
+            config,
+            result,
+            reason=self.classify_failure(response.status_code, response_text, model),
+            status_code=response.status_code,
+            response_text=response_text,
+            headers=getattr(response, "headers", None),
+        )
+
+    def _record_failed_probe(
+        self,
+        model: dict[str, Any],
+        profile_id: str,
+        config: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        reason: str,
+        status_code: int,
+        response_text: str,
+        headers: Any,
+    ) -> ProbeVerdict:
         blocking = reason in self.route_blocking_reasons
         # A rejected probe is a verdict on the capability, not on the model, so it must NOT bench the
         # model globally. Route rejections still defer to a provider-wide block: strict-zero means a
         # genuine payment demand has to quarantine even when it arrives on a probe.
-        rejected_request = response.status_code in REQUEST_REJECTION_STATUSES
-        rejected_route = response.status_code in ROUTE_REJECTION_STATUSES and not blocking
+        rejected_request = status_code in REQUEST_REJECTION_STATUSES
+        rejected_route = status_code in ROUTE_REJECTION_STATUSES and not blocking
         if rejected_request or rejected_route:
-            result.update({"status": "fail", "message": f"HTTP {response.status_code}: {reason}"})
+            result.update({"status": "fail", "message": f"HTTP {status_code}: {reason}"})
             if rejected_route:
                 # The probe never reached the model, so this verdict ages fast (see the constant).
                 # Only the first one does: the writer counts repeats, the reader stops shortening
@@ -479,12 +589,12 @@ class CapabilityDiscoveryJob:
             self.record_benchmark_result(profile_id, model, result)
             self.record_verified_capability(profile_id, model, result)
             return "failed"
-        hint = retry_hint(getattr(response, "headers", None), response_text) if response.status_code in {429, 503} else None
+        hint = retry_hint(headers, response_text) if status_code in {429, 503} else None
         return self._cool_and_stop(
             model,
             reason,
             config,
-            detail=f"discovery HTTP {response.status_code}: {reason}",
+            detail=f"discovery HTTP {status_code}: {reason}",
             profile_id=profile_id,
             retry_after_seconds=hint.seconds if hint else None,
             retry_after_source=hint.source if hint else None,

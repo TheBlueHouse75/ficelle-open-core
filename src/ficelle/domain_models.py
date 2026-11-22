@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -44,12 +45,18 @@ def _safe_string_list(value: Any) -> list[str]:
     return cleaned
 
 
-def _safe_dict(value: Any) -> dict[str, Any]:
-    return copy.deepcopy(value) if isinstance(value, dict) else {}
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _is_sensitive_key(key: Any) -> bool:
-    normalized = str(key).lower().replace("-", "_")
+    return _is_sensitive_key_name(str(key))
+
+
+# Catalog rows repeat the same few dozen field names on every row of every request.
+@functools.lru_cache(maxsize=4096)
+def _is_sensitive_key_name(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
     compact = normalized.replace("_", "")
     return (
         normalized in _SENSITIVE_JSON_KEYS
@@ -73,7 +80,9 @@ def _redact_extra_value(value: Any) -> Any:
         return safe
     if isinstance(value, list):
         return [_redact_extra_value(item) for item in value]
-    return copy.deepcopy(value)
+    # Containers are rebuilt above so `extra_fields` never aliases `raw`; leaves come from the
+    # model's private copy of the row (`CatalogModel.from_raw`), so they need no copy of their own.
+    return value
 
 
 def _redact_unknown_fields(raw: dict[str, Any], known_fields: set[str]) -> dict[str, Any]:
@@ -113,6 +122,10 @@ class CatalogModel:
     def from_raw(cls, row: Any) -> "CatalogModel | None":
         if not isinstance(row, dict):
             return None
+        # One deep copy at the boundary: rows usually come from the shared catalog document cache
+        # (`router.load_catalog_document`), so the model must never alias them. Every derived
+        # field is then read from this private copy rather than deep-copied again on its own.
+        row = copy.deepcopy(row)
         known = set(cls.__dataclass_fields__) - {"extra_fields", "raw"}
         model_id = _safe_string(row.get("id"))
         source = _safe_string(row.get("source"))
@@ -128,16 +141,16 @@ class CatalogModel:
             supports_tools=bool(row.get("supports_tools")),
             supports_structured_outputs=bool(row.get("supports_structured_outputs")),
             invokable=bool(row.get("invokable")),
-            pricing=_safe_dict(row.get("pricing")),
-            pricing_safety=_safe_dict(row.get("pricing_safety")),
-            free_access=_safe_dict(row.get("free_access")),
+            pricing=_dict_or_empty(row.get("pricing")),
+            pricing_safety=_dict_or_empty(row.get("pricing_safety")),
+            free_access=_dict_or_empty(row.get("free_access")),
             supported_parameters=_safe_string_list(row.get("supported_parameters")),
             input_modalities=_safe_string_list(row.get("input_modalities")),
             output_modalities=_safe_string_list(row.get("output_modalities")),
             provider_account_id=_safe_string(row.get("provider_account_id")) or None,
             name=_safe_string(row.get("name")) or None,
             extra_fields=_redact_unknown_fields(row, known),
-            raw=copy.deepcopy(row),
+            raw=row,
         )
 
     def as_legacy_dict(self) -> dict[str, Any]:

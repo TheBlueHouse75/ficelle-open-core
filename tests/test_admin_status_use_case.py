@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import re
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -12,6 +14,7 @@ from ficelle.use_cases.admin_status import (
     AdminStatusBuildPorts,
     FusionAdminStatusBuilder,
     active_admin_jobs,
+    with_provider_admission,
     candidate_rank_rows,
     active_model_cooldown_rows,
     active_provider_cooldown_rows,
@@ -128,6 +131,10 @@ def test_admin_state_builder_assembles_operator_payload_without_running_quota_pr
             safe_string_list=lambda value: [str(item) for item in value]
             if isinstance(value, list)
             else [],
+            provider_admission_rows=lambda _config: {},
+            apply_scoring_config=lambda _config: None,
+            scoring_state=lambda source, _config: source,
+            score_explanation_memo=contextlib.nullcontext,
         ),
         default_min_context=128000,
         default_canary_profiles=["ficelle/auto-fast"],
@@ -164,7 +171,25 @@ def test_admin_state_builder_assembles_operator_payload_without_running_quota_pr
         "canary_profiles": ["ficelle/auto-fast"],
         "base_url": "http://127.0.0.2:9999/v1",
         "hermes_base_url": "http://127.0.0.2:9999/v1",
+        "bind_is_loopback": False,
     }
+
+
+def test_provider_admission_attaches_to_known_sources_and_never_invents_a_failing_record():
+    runtime_state = {"provider_stats": {"groq": {"requests": 9, "successes": 9, "failures": 0}}}
+    rows = {
+        "groq": {"state": "observed"},
+        "cohere": {"state": "declared_only"},
+        "silent": {"state": "unknown"},
+    }
+
+    merged = with_provider_admission(runtime_state, rows)
+
+    stats = merged["provider_stats"]
+    assert stats["groq"]["requests"] == 9 and stats["groq"]["admission"] == {"state": "observed"}
+    assert stats["cohere"]["admission"] == {"state": "declared_only"}
+    # A source nobody has called and no one has reported on stays absent rather than zeroed.
+    assert "silent" not in stats
 
 
 def test_catalog_with_auto_scores_enriches_copy_without_mutating_source():
@@ -1676,6 +1701,56 @@ def test_admin_status_document_assembles_core_sections_from_ports():
         {"model_id": "ficelle/openrouter/model-a", "rank": 1}
     ]
     assert payload["fusion"] == {"config": {"enabled": False}}
+
+
+def test_admin_status_document_ranks_each_profile_pool_once_for_both_row_builders():
+    # The profile rows and the performance history rank the same pool with the same arguments;
+    # ranking sorts and scores every eligible model, so doing it twice is pure repeated work.
+    ranked: list[str] = []
+    ports = make_admin_status_ports()
+    ports = replace(
+        ports,
+        normalized_virtual_profiles=lambda config: {
+            "ficelle/auto-fast": {"mode": "auto", "requirements": {}},
+            "ficelle/auto-tools": {"mode": "auto", "requirements": {}},
+        },
+        candidates_for_profile=lambda profile_id, available, state, profile: ranked.append(profile_id) or list(available),
+    )
+
+    payload = build_admin_status_document(
+        catalog={"models": [admin_status_model()], "generated_at": "catalog-time", "min_context_length": 128000},
+        config={},
+        state={},
+        critical_profile_ids=("ficelle/auto-fast",),
+        ports=ports,
+    )
+
+    assert ranked == ["ficelle/auto-fast", "ficelle/auto-tools"]
+    assert payload["performance_history"]["ficelle/auto-tools"]["models"] == [
+        {"model_id": "ficelle/openrouter/model-a", "rank": 1}
+    ]
+    assert payload["profiles"]["ficelle/auto-tools"]["selected_model"] == "ficelle/openrouter/model-a"
+
+
+def test_admin_status_document_hands_runtime_diagnostics_the_raw_state():
+    # The redacted state exists for display; the evidence counts need the rows it may omit.
+    seen: list[Any] = []
+    state = {"benchmark_results": {"m": {"p": {"status": "pass", "ran_at": "2026-06-19T01:00:00+00:00"}}}}
+    ports = replace(
+        make_admin_status_ports(),
+        redact_runtime_state=lambda _state: {},
+        runtime_state_diagnostics=lambda runtime_state: seen.append(runtime_state) or {"status": "ok"},
+    )
+
+    build_admin_status_document(
+        catalog={"models": [admin_status_model()], "generated_at": "catalog-time", "min_context_length": 128000},
+        config={},
+        state=state,
+        critical_profile_ids=("ficelle/auto-fast",),
+        ports=ports,
+    )
+
+    assert seen == [state]
 
 
 def test_admin_status_builder_applies_config_rules_before_document_build():

@@ -142,7 +142,7 @@ def profile_capability_metadata(requirements: dict[str, Any]) -> dict[str, Any]:
     """What a virtual model guarantees about whichever candidate ends up answering.
 
     Read off the profile's requirements, not off today's candidates, because the
-    requirements are a hard contract: `select_models_result_from_typed_rows` applies
+    requirements are a hard contract: `select_models_result_from_rows` applies
     `model_matches_profile_requirements` BEFORE the manual_order/auto branch, both the
     manual list and the auto tail are built from that filtered set, and the competence
     gate's anti-empty fallback re-serves an already-filtered list. A model failing these

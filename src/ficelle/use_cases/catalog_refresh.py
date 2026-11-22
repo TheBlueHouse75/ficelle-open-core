@@ -775,6 +775,12 @@ def publish_catalog(
         # the pair it holds lines up before concluding anything from it.
         state["previous_catalog_provider_raw_counts"] = replaced
         state["catalog_provider_raw_counts"] = catalog_listing_sizes(catalog)
+        # A rejected refresh leaves the old file in place and records its age here. Any publish
+        # replaces that file, so the epoch no longer describes it — and only the periodic loop
+        # clears it otherwise, leaving the Refresh button and the routing-path reload blocked.
+        refresh = state.get("catalog_refresh")
+        if isinstance(refresh, dict):
+            refresh.pop("catalog_stale_since", None)
 
     update_state(mutate, "refresh_catalog")
 

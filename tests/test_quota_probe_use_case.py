@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from ficelle.use_cases.quota_probe import (
@@ -115,7 +116,7 @@ def test_quota_probe_body_uses_safe_default_and_removes_stream():
     assert body == {"messages": [], "max_tokens": 3}
 
 
-def test_find_quota_probe_model_filters_to_invokable_quota_free_matching_model():
+def test_find_quota_probe_model_filters_to_invokable_eligible_matching_model():
     catalog = {
         "models": [
             {
@@ -135,12 +136,12 @@ def test_find_quota_probe_model_filters_to_invokable_quota_free_matching_model()
                 "free_access": {"eligible": True, "mode": "quota_free"},
             },
             {
-                "id": "strict-zero",
+                "id": "ineligible",
                 "source": "nvidia",
-                "upstream_id": "strict",
+                "upstream_id": "ineligible",
                 "invokable": True,
                 "quota_key": "provider:nvidia",
-                "free_access": {"eligible": True, "mode": "strict_zero"},
+                "free_access": {"eligible": False, "mode": "quota_free"},
             },
             {
                 "id": "match",
@@ -158,6 +159,30 @@ def test_find_quota_probe_model_filters_to_invokable_quota_free_matching_model()
 
     assert match is not None
     assert match["id"] == "match"
+
+
+def test_find_quota_probe_model_accepts_catalog_free_model_scoped_quota_row():
+    # OrcaRouter ships as catalog_free with model-scoped quota keys; its 403
+    # free_quota_exhausted row must be probeable or it would never be lifted.
+    catalog = {
+        "models": [
+            {
+                "id": "orca-free",
+                "source": "orcarouter",
+                "upstream_id": "deepseek/deepseek-v4-flash-free",
+                "invokable": True,
+                "quota_key": "model:orcarouter::deepseek/deepseek-v4-flash-free",
+                "free_access": {"eligible": True, "mode": "catalog_free"},
+            }
+        ]
+    }
+
+    match = find_quota_probe_model(
+        catalog, "model:orcarouter::deepseek/deepseek-v4-flash-free", {}, ports=make_model_ports()
+    )
+
+    assert match is not None
+    assert match["id"] == "orca-free"
 
 
 def test_find_quota_probe_model_skips_quarantined_and_provider_cooldown_candidates():
@@ -322,3 +347,23 @@ def test_run_due_quota_probes_filters_source_keys_and_reservation():
     assert result["results"] == [{"status": "pass", "key": "provider:nvidia", "model_id": "nvidia-model"}]
     assert reserved == ["provider:nvidia", "provider:busy"]
     assert probed == ["provider:nvidia"]
+
+
+def test_due_quota_probe_keys_skips_the_catalog_scan_when_no_cooldown_is_due():
+    # Every request asks this; in the steady state nothing is due, so the profile filter over the
+    # whole catalog is pure overhead.
+    state = {"quota_cooldowns": {"provider:later": {"until": 200, "next_probe_at": 150}}}
+    models = [{"id": "m", "quota_key": "provider:later"}]
+    runner, _, _ = make_runner(state)
+    scanned: list[str] = []
+    runner = QuotaProbeRunner(
+        replace(
+            runner.ports,
+            model_matches_profile_requirements=lambda model, _profile: scanned.append(model["id"]) or True,
+        )
+    )
+    config = {"virtual_profiles": {"ficelle/auto-tools": {"mode": "auto"}}}
+
+    assert runner.due_quota_probe_keys_for_request("ficelle/auto-tools", models, config, state) == []
+    assert runner.due_quota_probe_keys_for_request("ficelle/auto-tools", models, config, {}) == []
+    assert scanned == []

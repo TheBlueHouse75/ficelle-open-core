@@ -81,7 +81,9 @@ def find_quota_probe_model(
         if isinstance(model_cooldown, dict) and ports.safe_float(model_cooldown.get("until"), 0.0) > now_ts:
             continue
         access = ports.normalized_free_access(model)
-        if access.get("eligible") is not True or access.get("mode") != "quota_free":
+        # Not limited to quota_free: catalog_free providers (OrcaRouter) also write
+        # quota rows from a 403 free_quota_exhausted, and only this probe lifts them.
+        if access.get("eligible") is not True:
             continue
         if ports.quota_cooldown_matches_model(key, model):
             return model
@@ -198,12 +200,8 @@ class QuotaProbeRunner:
         config: dict[str, Any],
         state: dict[str, Any],
     ) -> list[str]:
-        relevant_models = self._relevant_models_for_request(requested_model, models, config)
-        if not relevant_models:
-            return []
-
         now_ts = self.ports.now_seconds()
-        due_keys: list[str] = []
+        due_candidates: list[str] = []
         cooldowns = state.get("quota_cooldowns") if isinstance(state.get("quota_cooldowns"), dict) else {}
         for key, row in cooldowns.items():
             if not isinstance(row, dict):
@@ -212,9 +210,17 @@ class QuotaProbeRunner:
             next_probe_at = self.ports.safe_float(row.get("next_probe_at"), until)
             if until <= 0 or next_probe_at > now_ts:
                 continue
-            if any(self.ports.quota_cooldown_matches_model(str(key), model) for model in relevant_models):
-                due_keys.append(str(key))
-        return due_keys
+            due_candidates.append(str(key))
+        if not due_candidates:
+            # The steady state: skip the profile filter over the whole catalog.
+            return []
+
+        relevant_models = self._relevant_models_for_request(requested_model, models, config)
+        return [
+            key
+            for key in due_candidates
+            if any(self.ports.quota_cooldown_matches_model(key, model) for model in relevant_models)
+        ]
 
     def _relevant_models_for_request(
         self,

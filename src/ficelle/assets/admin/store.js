@@ -6,6 +6,8 @@
  */
 
 export let state = null;
+// When `state` was last replaced; Health says so, since its cooldown timers freeze at that moment.
+export let stateLoadedAt = 0;
 export let auditEntries = [];
 export let draftProfiles = {};
 export let draftFusion = {};
@@ -31,7 +33,7 @@ export let requestsLive = false;
 export const expandedRequests = new Set();
 export const requestFilters = { profile: "", source: "", reason: "", status: "", q: "", window: "24h" };
 
-export function setState(v) { state = v; }
+export function setState(v) { state = v; stateLoadedAt = Date.now(); }
 export function setAuditEntries(v) { auditEntries = v; }
 export function setDraftProfiles(v) { draftProfiles = v; }
 export function setDraftFusion(v) { draftFusion = v; }

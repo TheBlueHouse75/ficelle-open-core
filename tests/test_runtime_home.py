@@ -56,3 +56,12 @@ def test_runtime_home_without_getuid_skips_owner_and_mode_checks(tmp_path, monke
     ))
     with pytest.raises(OSError, match="symbolic link"):
         runtime_paths.validated_runtime_home(tmp_path)
+
+
+def test_relative_ficelle_home_resolves_to_an_absolute_path(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    paths = runtime_paths.RuntimePaths.from_env(environ={"FICELLE_HOME": "relhome"})
+
+    assert paths.ficelle_home == tmp_path / "relhome"
+    assert paths.config_path == tmp_path / "relhome" / "config.json"

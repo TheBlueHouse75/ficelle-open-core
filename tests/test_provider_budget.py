@@ -9,6 +9,8 @@ from ficelle.use_cases.provider_budget import (
     budget_pool_scope,
     budget_window,
     drop_provider_budget_in_state,
+    legacy_spend_meters_expired,
+    merge_legacy_spend_meters,
     probing_is_within_budget,
     provider_budget_rows,
     provider_spend,
@@ -23,8 +25,8 @@ NEXT_DAY = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
 NEXT_MONTH = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 
 
-def spend(state, meter_key="provider:openrouter", source="openrouter", amount=1.0, *, now=NOW, budget=None):
-    record_provider_spend(state, meter_key, source, amount, now=now, budget=budget)
+def spend(meters, meter_key="provider:openrouter", source="openrouter", amount=1.0, *, now=NOW):
+    record_provider_spend(meters, meter_key, source, amount, now=now)
 
 
 def test_counting_is_per_pool_and_per_window():
@@ -41,11 +43,14 @@ def test_counting_is_per_pool_and_per_window():
     assert provider_spend(state, "provider:openrouter", now=NEXT_DAY) == 0
     spend(state, now=NEXT_DAY)
     assert provider_spend(state, "provider:openrouter", now=NEXT_DAY) == 1
-    assert state["provider_budget_spend"]["provider:openrouter"] == {
-        "window": "2026-08-05",
+    stamp = {"openrouter": NEXT_DAY.timestamp()}
+    assert state["provider:openrouter"] == {
         "unit": "requests",
-        "spent": 1.0,
-        "sources": ["openrouter"],
+        # Both schedules are counted, so the writer never needs to know the budget.
+        "windows": {
+            "day": {"window": "2026-08-05", "spent": 1.0, "sources": stamp},
+            "month": {"window": "2026-08", "spent": 4.0, "sources": stamp},
+        },
     }
 
 
@@ -57,10 +62,8 @@ def test_a_shared_pool_is_one_meter_however_many_sources_draw_on_it():
 
     assert provider_spend(state, "shared_account:acct", now=NOW) == 6.0
     # Both contributors are remembered, which is the only way back from the pool key to its members.
-    assert state["provider_budget_spend"]["shared_account:acct"]["sources"] == [
-        "tier_basic",
-        "tier_premium",
-    ]
+    rows = provider_budget_rows({}, state, NOW)
+    assert rows["tier_basic"]["spent"] == rows["tier_premium"]["spent"] == 6.0
 
 
 def test_a_request_spends_its_burn_weight_not_one():
@@ -73,11 +76,11 @@ def test_a_request_spends_its_burn_weight_not_one():
 def test_a_monthly_budget_is_a_different_window_not_a_different_schema():
     state: dict = {}
     monthly = ProviderBudget(1000.0, period="month")
-    spend(state, budget=monthly)
-    spend(state, now=datetime(2026, 8, 30, tzinfo=timezone.utc), budget=monthly)
+    spend(state)
+    spend(state, now=datetime(2026, 8, 30, tzinfo=timezone.utc))
 
     assert provider_spend(state, "provider:openrouter", now=NOW, budget=monthly) == 2
-    assert state["provider_budget_spend"]["provider:openrouter"]["window"] == "2026-08"
+    assert state["provider:openrouter"]["windows"]["month"]["window"] == "2026-08"
     # September starts from zero.
     assert provider_spend(state, "provider:openrouter", now=NEXT_MONTH, budget=monthly) == 0
 
@@ -132,8 +135,10 @@ def test_a_corrupt_meter_cannot_silently_disable_the_budget():
     """Hand-edited or half-written state must not read as "nothing spent yet"."""
     for broken in ("many", None, -5, float("nan"), float("inf"), {"nested": 1}):
         state = {
-            "provider_budget_spend": {
-                "provider:openrouter": {"window": "2026-08-04", "unit": "requests", "spent": broken}
+            "provider:openrouter": {
+                "unit": "requests",
+                "sources": ["openrouter"],
+                "windows": {"day": {"window": "2026-08-04", "spent": broken}},
             }
         }
         assert provider_spend(state, "provider:openrouter", now=NOW) == 0
@@ -141,30 +146,73 @@ def test_a_corrupt_meter_cannot_silently_disable_the_budget():
         spend(state)
         assert provider_spend(state, "provider:openrouter", now=NOW) == 1
 
-    # A meter map of the wrong shape entirely is replaced, not crashed on.
-    state = {"provider_budget_spend": ["not", "a", "map"]}
-    assert provider_spend(state, "provider:openrouter", now=NOW) == 0
-    spend(state)
-    assert provider_spend(state, "provider:openrouter", now=NOW) == 1
+    # A record of the wrong shape entirely is replaced, not crashed on.
+    for broken_record in (["not", "a", "map"], {"unit": "requests", "windows": "nope", "sources": "x"}):
+        state = {"provider:openrouter": broken_record}
+        assert provider_spend(state, "provider:openrouter", now=NOW) == 0
+        spend(state)
+        assert provider_spend(state, "provider:openrouter", now=NOW) == 1
 
 
-def test_pre_release_budget_keys_are_dropped_on_sight():
-    """A dogfood install that ran unreleased builds must not carry the abandoned schema forever.
-
-    No release ever wrote `provider_daily_usage` / `provider_daily_limits`, so they are not read —
-    the cost is at most one window's probe share re-granted on those installs, once.
-    """
+def test_pre_release_budget_keys_are_never_read():
+    """No release ever wrote `provider_daily_usage` / `provider_daily_limits`, so they are not read —
+    the cost is at most one window's probe share re-granted on those installs, once. The budget
+    refresh drops them (see test_router)."""
     state = {
         "provider_daily_usage": {"day": "2026-08-04", "requests": {"openrouter": 19}},
         "provider_daily_limits": {"openrouter": 1000},
     }
     assert stored_provider_budgets(state) == {}
-    assert provider_spend(state, "provider:openrouter", now=NOW) == 0
 
-    spend(state)
-    assert "provider_daily_usage" not in state
-    assert "provider_daily_limits" not in state
-    assert provider_spend(state, "provider:openrouter", now=NOW) == 1
+
+def test_legacy_state_meters_migrate_into_their_window_without_double_counting():
+    """Existing installs kept one-window meters in state.json; none of that spend may be lost.
+
+    The migration copies before it removes the state key, so it can run twice on the same record
+    (a crash in between, or two processes starting at once): it must not add the count again.
+    """
+    legacy = {
+        "provider:openrouter": {"window": "2026-08-04", "unit": "requests", "spent": 7.0, "sources": ["openrouter"]},
+        "provider:cohere": {"window": "2026-08", "unit": "requests", "spent": 40.0, "sources": ["cohere"]},
+        "provider:stale": {"window": "2026-08-04", "unit": "tokens", "spent": 9.0, "sources": ["stale"]},
+    }
+    meters: dict = {}
+    merge_legacy_spend_meters(meters, legacy, now=NOW)
+    spend(meters)  # a request counted after the first copy, before the second
+    merge_legacy_spend_meters(meters, legacy, now=NOW)
+
+    assert provider_spend(meters, "provider:openrouter", now=NOW) == 8
+    monthly = ProviderBudget(1000.0, period="month")
+    assert provider_spend(meters, "provider:cohere", now=NOW, budget=monthly) == 40
+    # A legacy day record also counts toward its month: the month never reads below the day.
+    assert provider_spend(meters, "provider:openrouter", now=NOW, budget=monthly) == 8
+    assert "provider:stale" not in meters
+    rows = provider_budget_rows({}, meters, NOW)
+    assert rows["openrouter"]["spent"] == 8
+
+    # An older legacy window never replaces a newer one already counted in the spend file.
+    spend(meters, now=NEXT_DAY)
+    merge_legacy_spend_meters(meters, legacy, now=NEXT_DAY)
+    assert provider_spend(meters, "provider:openrouter", now=NEXT_DAY) == 1
+
+
+def test_a_legacy_day_from_earlier_this_month_still_counts_toward_the_month():
+    """Updated the day after the last call: the day has passed, its month has not."""
+    legacy = {"provider:openrouter": {"window": "2026-08-04", "unit": "requests", "spent": 7.0, "sources": ["openrouter"]}}
+    monthly = ProviderBudget(1000.0, period="month")
+    meters: dict = {}
+    merge_legacy_spend_meters(meters, legacy, now=NEXT_DAY)
+
+    assert provider_spend(meters, "provider:openrouter", now=NEXT_DAY, budget=monthly) == 7
+    assert provider_spend(meters, "provider:openrouter", now=NEXT_DAY) == 0  # yesterday is not today
+    # A rolled-back version reads a day record only for that day, so nothing keeps the key.
+    assert legacy_spend_meters_expired(legacy, now=NEXT_DAY)
+    assert not legacy_spend_meters_expired(legacy, now=NOW)
+
+    # Once the month has passed too, nothing is copied at all.
+    later: dict = {}
+    merge_legacy_spend_meters(later, legacy, now=NEXT_MONTH)
+    assert later == {}
 
 
 def test_budgets_are_stored_and_reread_with_unit_and_period():
@@ -199,12 +247,13 @@ def test_budget_windows_and_pool_scopes():
 
 def test_admin_rows_surface_spend_limits_and_shared_pools():
     state: dict = {}
+    meters: dict = {}
     store_provider_budgets(state, {"openrouter": ProviderBudget(1000.0), "tier_basic": ProviderBudget(5.0, unit="dollars")})
-    spend(state)
-    spend(state, "shared_account:acct", "tier_basic", 3.0)
-    spend(state, "shared_account:acct", "tier_plus", 2.0)
+    spend(meters)
+    spend(meters, "shared_account:acct", "tier_basic", 3.0)
+    spend(meters, "shared_account:acct", "tier_plus", 2.0)
 
-    rows = provider_budget_rows(state, NOW)
+    rows = provider_budget_rows(state, meters, NOW)
     assert rows["openrouter"] == {"spent": 1, "limit": 1000.0, "unit": "requests", "period": "day", "shared": False}
     # Each tier of a shared pool reads the pool's whole spend — that is what holds it out.
     assert rows["tier_plus"]["spent"] == 5.0
@@ -217,4 +266,53 @@ def test_admin_rows_surface_spend_limits_and_shared_pools():
     assert "groq" not in rows
 
     # Yesterday's meters read as nothing rather than as today's spend.
-    assert provider_budget_rows(state, NEXT_DAY).get("tier_plus") is None
+    assert provider_budget_rows(state, meters, NEXT_DAY).get("tier_plus") is None
+
+
+def test_meters_written_before_per_window_membership_still_attribute_their_spend():
+    """An unreleased build kept contributors on the record, not the window; those files exist."""
+    meters = {
+        "shared_account:acct": {
+            "unit": "requests",
+            "sources": ["tier_basic", "tier_plus"],
+            "windows": {"day": {"window": "2026-08-04", "spent": 5.0}, "month": {"window": "2026-08", "spent": 9.0}},
+        }
+    }
+    rows = provider_budget_rows({}, meters, NOW)
+    assert rows["tier_basic"]["spent"] == 5.0
+    assert rows["tier_plus"]["spent"] == 5.0
+    assert rows["tier_plus"]["shared"] is True
+
+    # One member spending again must not take the attribution away from the others in that window.
+    spend(meters, "shared_account:acct", "tier_basic", 1.0)
+    assert provider_budget_rows({}, meters, NOW)["tier_plus"]["spent"] == 6.0
+    # The record-level list never reaches a window written after it.
+    assert "tier_plus" not in provider_budget_rows({}, meters, NEXT_DAY)
+    spend(meters, "shared_account:acct", "tier_basic", 1.0, now=NEXT_DAY)
+    assert "tier_plus" not in provider_budget_rows({}, meters, NEXT_DAY)
+
+
+def test_a_provider_moved_to_another_shared_account_reads_its_current_pool():
+    """Membership is per window: a provider that left a pool no longer reads that pool's spend."""
+    meters: dict = {}
+    spend(meters, "shared_account:old", "mover", 1.0)
+    spend(meters, "shared_account:old", "stayer", 1.0)
+
+    # Next day the mover's config points at another account; the stayer keeps spending on the old one.
+    spend(meters, "shared_account:old", "stayer", 4.0, now=NEXT_DAY)
+    rows = provider_budget_rows({}, meters, NEXT_DAY)
+    assert rows["stayer"]["spent"] == 4.0
+    assert "mover" not in rows  # it has not spent on any pool this window
+
+    spend(meters, "shared_account:new", "mover", 2.0, now=NEXT_DAY)
+    assert provider_budget_rows({}, meters, NEXT_DAY)["mover"]["spent"] == 2.0
+
+    # Moved within one window: both pools list it, and the one it spent on last is the current one.
+    for key in ("shared_account:new", "shared_account:old"):
+        meters = {}
+        spend(meters, "shared_account:old", "stayer", 4.0)
+        spend(meters, "shared_account:new", "mover", 2.0, now=datetime(2026, 8, 4, 9, tzinfo=timezone.utc))
+        spend(meters, "shared_account:old", "mover", 1.0, now=datetime(2026, 8, 4, 10, tzinfo=timezone.utc))
+        spend(meters, key, "mover", 1.0, now=datetime(2026, 8, 4, 11, tzinfo=timezone.utc))
+        expected = 3.0 if key == "shared_account:new" else 6.0
+        assert provider_budget_rows({}, meters, NOW)["mover"]["spent"] == expected

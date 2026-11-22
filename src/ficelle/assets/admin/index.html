@@ -40,6 +40,9 @@
           <!-- Runtime strict-zero guard: a provider declared one catalog model paid. The model is
                already quarantined; this notice explains the automatic routing change. -->
           <section class="update-banner is-error" id="paidModelBanner" hidden aria-live="assertive"></section>
+          <!-- A provider-wide credential rejection (revoked key, no credit): fallback hides it from
+               clients, so this is the only place the operator learns the pool shrank. -->
+          <section class="update-banner is-error" id="authCooldownBanner" hidden aria-live="assertive"></section>
           <!-- A prune is the only edit Ficelle makes to a virtual model on its own, so it says so
                here once and sends the user to the lane it shortened. Dismissed per audit id, so
                the next prune speaks up again. -->
@@ -220,6 +223,12 @@
           </div>
           <div class="card-body"><div id="requestsTimeline"></div></div>
         </div>
+        <div class="card req-ttft-card">
+          <div class="card-head">
+            <div><h2>Time to first token</h2><div class="ch-sub">Streamed responses only: the wait from the provider request to the first answer or reasoning text sent to the client. Buffered and failed answers are never counted.</div></div>
+          </div>
+          <div class="card-body"><div id="requestsTtft"></div></div>
+        </div>
         <div class="req-filters" id="requestsFilters" role="group" aria-label="Request filters"></div>
         <div class="req-table">
           <div class="req-list-head" aria-hidden="true">
@@ -241,7 +250,7 @@
       <section class="view" data-view="health" id="view-health">
         <div class="health-grid view-kpi-spacing-lg" id="healthGrid"></div>
         <h2 class="section-title">Active guardrails</h2>
-        <p class="section-sub">Models or providers Ficelle is currently holding back, and why.</p>
+        <p class="section-sub">Models or providers Ficelle is currently holding back, and why. <span id="guardAsOf"></span></p>
         <div class="guard-list" id="guardList"></div>
       </section>
 
@@ -287,11 +296,12 @@
            location.origin so it stays right when the router runs on a custom port.
            Both forms are offered because clients disagree on what an "endpoint" field
            means: paste the base into clients that append the route themselves, the full
-           chat URL into clients that send the configured value verbatim. -->
+           chat URL into clients that send the configured value verbatim. The API key hint
+           waits for /admin/state: only the server knows whether its bind is loopback. -->
       <button class="endpoint" id="endpointCopy" type="button" title="Copy the base URL">
         <span class="ep-key">OpenAI-compatible endpoint</span>
         <span class="ep-val" id="endpointUrl">&nbsp;</span>
-        <span class="ep-hint">API key: <code>ficelle access-token api</code></span>
+        <span class="ep-hint" id="endpointKeyHint">&nbsp;</span>
       </button>
       <button class="endpoint endpoint-alt" id="endpointChatCopy" type="button" title="Copy the full chat completions URL">
         <span class="ep-key">Full chat URL</span>

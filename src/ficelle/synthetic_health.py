@@ -83,7 +83,7 @@ CORE_POST_SWEEP_PROFILES = frozenset(
     }
 )
 SECRET_PATTERN = re.compile(
-    r"(?i)(authorization\s*:|bearer\s+[a-z0-9._-]{12,}|api[_-]?key\s*[=:]\s*[^\s,}]+|sk-[a-z0-9_-]{12,})"
+    r"(?i)(authorization\s*:|bearer\s+[a-z0-9._-]{12,}|api[_-]?key\s*[=:]\s*[^\s,}]+|(?<![a-z0-9])sk-[a-z0-9_-]{12,})"
 )
 
 
@@ -991,6 +991,17 @@ def build_inventory(router: Any, config: dict[str, Any], catalog: dict[str, Any]
             if isinstance(model, dict) and model.get("source")
         }
     )
+    # The cross-source quota pools each source draws on: the router's quota cooldown key
+    # for every model whose free-access scope is `shared_account` (`shared_account:{id}`).
+    # `account`/`provider` scopes key per source even when the account id matches, so they
+    # pool nothing. Sources sharing a key are what the summary's `shared_account_groups` reports.
+    # The key is used whole: the router already sanitizes the account id in it, and any cut here
+    # would merge two pools whose ids differ only past it.
+    shared_quota_keys_by_source: dict[str, set[str]] = {}
+    for model in catalog.get("models", []):
+        if isinstance(model, dict) and model.get("source") and router.quota_cooldown_scope(model) == "shared_account":
+            key = router.quota_cooldown_key(model)
+            shared_quota_keys_by_source.setdefault(str(model["source"]), set()).add(key)
     providers: list[dict[str, Any]] = []
     access_by_source: dict[str, Any] = {}
     invokable_by_source: dict[str, bool] = {}
@@ -1022,6 +1033,7 @@ def build_inventory(router: Any, config: dict[str, Any], catalog: dict[str, Any]
                 "catalog_model_count": catalog_model_counts.get(source, 0),
                 "catalog_accepted_count": catalog_provider.get("accepted_count"),
                 "catalog_error": sanitize_error_detail(catalog_provider.get("error"), 500),
+                "shared_quota_keys": sorted(shared_quota_keys_by_source.get(source, ())),
             }
         )
 
@@ -2051,7 +2063,6 @@ def state_change_summary(before: dict[str, Any], after: dict[str, Any]) -> dict[
         "quarantine",
         "provider_errors",
         "model_errors",
-        "provider_budget_spend",
         "provider_budgets",
         "provider_stats",
         "stats",
@@ -2864,7 +2875,10 @@ def _surface_changes(current: dict[str, Any], previous: dict[str, Any]) -> dict[
 
 
 def _tool_metrics(cases: list[SyntheticHealthCase], outcomes: list[dict[str, Any]]) -> dict[str, Any]:
-    planned = [case for case in cases if "tools" in case.tags]
+    # T8 dialect cases probe advanced schema features one at a time: they report in their
+    # own `t8` block and `schema_dialects` matrix, never in the basic tool counts, model
+    # coverage, T1/T2 assertion counts or availability/competence denominators (L3-R3).
+    planned = [case for case in cases if "tools" in case.tags and "t8" not in case.tags]
     outcomes_by_id = {str(row.get("case_id") or ""): row for row in outcomes}
     tagged = [outcomes_by_id[case.id] for case in planned if case.id in outcomes_by_id]
     direct_models = sorted({case.target_id for case in planned if case.target_kind == "direct-model"})
@@ -3228,9 +3242,9 @@ def build_summary(
         if catalog_error and host_match:
             hostname = next(group for group in host_match.groups() if group)
             endpoint_sources.setdefault(hostname, []).append(provider_source)
-        account_id = str(provider.get("provider_account_id") or "")
-        if account_id:
-            account_groups.setdefault(account_id, []).append(provider_source)
+        for pool_key in provider.get("shared_quota_keys") or []:
+            if pool_key:
+                account_groups.setdefault(str(pool_key), []).append(provider_source)
     post_sweep_by_layer = Counter(
         str(row.get("primary_failure_layer") or "unclassified")
         for row in post_virtual

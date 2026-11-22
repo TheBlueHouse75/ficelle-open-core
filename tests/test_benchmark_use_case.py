@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
+from ficelle.failures import UpstreamResponseBudgetExceeded
 from ficelle.provider_admission import ProviderAdmissionRefused
 from ficelle.use_cases.benchmark import (
     ROUTE_REJECTION_VERDICT_TTL_SECONDS,
@@ -30,6 +33,7 @@ from ficelle.use_cases.benchmark import (
     extract_tool_calls,
     has_deliverable_message,
     json_fields_match,
+    run_benchmark_profiles,
     max_benchmark_media_bytes,
     pick_vision_fixture,
     canary_state_payload,
@@ -307,6 +311,30 @@ def test_canary_helpers_build_state_from_result_rows_not_requested_profiles():
     assert state["canary"] == canary_state_payload(result, "fail")
     assert state["canary"]["profiles"] == ["ficelle/auto-fast", "ficelle/auto-tools"]
     assert state["canary"]["failed_profiles"] == ["ficelle/auto-tools", ""]
+
+
+def test_canary_that_could_not_test_every_profile_is_not_a_pass():
+    # The probe lock being held by the discovery cycle reports `skipped` (a second spelling of
+    # `skip`); a canary that tested one profile and found the others locked has verified nothing
+    # about them.
+    ran = lambda profile_id, config, **_kwargs: (  # noqa: E731
+        {"profile_id": profile_id, "status": "pass"}
+        if profile_id == "ficelle/auto-fast"
+        else {"profile_id": profile_id, "status": "skipped", "reason": "benchmark_already_running"}
+    )
+
+    result = run_benchmark_profiles(
+        ["ficelle/auto-fast", "ficelle/auto-tools"],
+        {},
+        benchmark_profile=ran,
+        known_profile_ids={"ficelle/auto-fast", "ficelle/auto-tools"},
+        default_profile_ids=[],
+        safe_int=lambda value, default: int(value) if value is not None else default,
+        now_iso=lambda: "2026-11-17T00:00:00Z",
+    )
+
+    assert result["summary"] == {"total": 2, "passed": 1, "failed": 0, "skipped": 1}
+    assert canary_status_from_benchmark_result(result, safe_int=lambda value, default: int(value or default)) == "skip"
 
 
 def test_canary_with_only_operational_skips_is_not_pass_or_fail():
@@ -706,12 +734,21 @@ def test_benchmark_runner_aggregates_run_summary_and_default_profiles():
     assert result["results"][0]["profile_id"] == "ficelle/auto-fast"
 
 
-def test_local_admission_skip_is_not_persisted_or_counted_as_a_failed_benchmark():
+# Both say "Ficelle has no room right now", never anything about the model: a full response
+# retention budget is the same process-wide condition the chat loop refuses to cool a model for.
+FICELLE_CAPACITY_REFUSALS = [
+    pytest.param(lambda: ProviderAdmissionRefused("test", 12), id="local_admission"),
+    pytest.param(lambda: UpstreamResponseBudgetExceeded("retention budget full"), id="response_budget"),
+]
+
+
+@pytest.mark.parametrize("refusal", FICELLE_CAPACITY_REFUSALS)
+def test_local_admission_skip_is_not_persisted_or_counted_as_a_failed_benchmark(refusal):
     candidates = [{"id": "model-a", "upstream_id": "a", "source": "test"}]
     events: list[str] = []
 
     def refuse_admission(*_args: Any, **_kwargs: Any) -> Any:
-        raise ProviderAdmissionRefused("test", 12)
+        raise refusal()
 
     runner = BenchmarkRunner(
         load_or_refresh_catalog=lambda _config: {"models": candidates},
@@ -789,12 +826,13 @@ def test_capability_discovery_records_shape_rejection_without_cooldown():
     assert not [event for event in events if event[0] == "cooldown"]
 
 
-def test_capability_discovery_local_admission_is_not_model_evidence():
+@pytest.mark.parametrize("refusal", FICELLE_CAPACITY_REFUSALS)
+def test_capability_discovery_local_admission_is_not_model_evidence(refusal):
     events: list[str] = []
     model = {"id": "model-a", "upstream_id": "a", "source": "test"}
 
     def refuse_admission(*_args: Any, **_kwargs: Any) -> Any:
-        raise ProviderAdmissionRefused("test", 12)
+        raise refusal()
 
     job = CapabilityDiscoveryJob(
         benchmark_body=lambda _profile_id, _config: ({}, "tool_call", "ficelle_probe:ok"),

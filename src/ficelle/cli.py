@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from ficelle import __version__
 from ficelle.build_identity import package_build_identity
 from ficelle.connector_registry import (
     SUPPORTED_CONNECTORS,
@@ -31,6 +32,7 @@ from ficelle.service import (
     active_home_pointer_path,
     read_active_service_context,
     select_service_backend,
+    windows_command_names_home,
 )
 from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
@@ -100,8 +102,41 @@ def service_paths() -> ServicePaths:
     )
 
 
+def _process_cwd(pid: int) -> str | None:
+    """Working directory of a live process, or None when it cannot be read."""
+    try:
+        return os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError:
+        pass
+    # macOS has no /proc; `-Fn` prints one `n<path>` field per file descriptor. A host without
+    # lsof, or an lsof that hangs, leaves the cwd unknown, which the caller treats as not ours.
+    try:
+        result = _run(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("n"):
+            return os.path.realpath(line[1:])
+    return None
+
+
+def _owned_by_this_home(pid: int, command: str) -> bool:
+    """Whether a signature-matching server belongs to this FICELLE_HOME.
+
+    Every service backend starts the router with WorkingDirectory=FICELLE_HOME, so an orphan
+    of this service keeps that cwd; a foreground router, a canary or a second home does not.
+    Windows has no cheap cwd probe, but the Task Scheduler entry arguments carry
+    FICELLE_HOME=<path> (WindowsScheduledTaskBackend.entry_arguments).
+    """
+    if sys.platform == "win32":
+        return windows_command_names_home(command, FICELLE_HOME)
+    return _process_cwd(pid) == os.path.realpath(FICELLE_HOME)
+
+
 def ficelle_server_pids() -> list[int]:
-    """Return live Ficelle server PIDs using a narrow command signature."""
+    """Return live Ficelle server PIDs of this FICELLE_HOME using a narrow command signature."""
     if sys.platform == "win32":
         # No `ps` on Windows; WQL pre-filters, the precise match below stays shared.
         result = _run(
@@ -131,7 +166,7 @@ def ficelle_server_pids() -> list[int]:
             continue
         if pid == current_pid:
             continue
-        if any(signature in command for signature in SERVER_COMMAND_SIGNATURES):
+        if any(signature in command for signature in SERVER_COMMAND_SIGNATURES) and _owned_by_this_home(pid, command):
             pids.append(pid)
     return pids
 
@@ -300,8 +335,9 @@ def wait_for_admin_status(
     with `Ficelle listening on …` followed by `signal 15` in the log — has never been
     reproduced: no measured start comes close to needing 20s, let alone 90s. What fits the
     traces is a *second actor* sending the SIGTERM, and this repo has one: every lifecycle
-    command runs `terminate_stale_servers()`, which signals any `-m ficelle.router --serve`
-    on the machine, so a sibling session's `start` kills this session's service. Until that
+    command runs `terminate_stale_servers()`, which used to signal any `-m ficelle.router
+    --serve` on the machine (it now only signals those running in this FICELLE_HOME), and the
+    service label is per user, so a sibling session's `start` can still restart it. Until that
     is understood, the budget stays wide: it costs nothing on a healthy start (the loop
     returns on the first ready answer) and only delays the verdict on a real failure.
     """
@@ -342,7 +378,16 @@ def restart_service() -> int:
 
 
 def stop_service() -> int:
-    return current_service_backend().stop()
+    returncode = current_service_backend().stop()
+    if returncode == 0:
+        print("Stopped the Ficelle service.")
+    else:
+        print(
+            f"The service manager did not confirm the stop (exit {returncode}); the service may already be stopped. "
+            "Run `ficelle status` to check.",
+            file=sys.stderr,
+        )
+    return returncode
 
 
 def uninstall_service() -> int:
@@ -353,7 +398,7 @@ def managed_service_status() -> int:
     return current_service_backend().status()
 
 
-def http_json(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None, timeout: int = 240) -> int:
+def http_json(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None, timeout: int = 10) -> int:
     data = json.dumps(payload or {}).encode("utf-8") if method != "GET" else None
     headers = {
         "Content-Type": "application/json",
@@ -367,6 +412,16 @@ def http_json(path: str, *, method: str = "GET", payload: dict[str, Any] | None 
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         print(body)
+        return 1
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        # HTTPError is a URLError, hence the clause order. Every caller is a cached GET, so a
+        # listener that does not answer within seconds is as unreachable as a refused port.
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        print(
+            f"Cannot reach Ficelle at {router_url(path)} ({reason}). "
+            "Start it with `ficelle start`, then run `ficelle doctor --text`.",
+            file=sys.stderr,
+        )
         return 1
     print(body)
     return 0
@@ -466,6 +521,17 @@ def doctor(*, json_output: bool = True) -> int:
             print(f"build: service runs the CLI build — {describe_build(build.get('cli') or {})}")
         else:
             print(f"build: {build.get('diagnostic') or 'not verified'}")
+        service = status.get("service") or {}
+        if service.get("ready"):
+            print(f"service: reachable at {service.get('url')}")
+        else:
+            reason = service.get("detail") or service.get("error") or (
+                f"HTTP {service['http_status']}" if service.get("http_status") else "no answer"
+            )
+            print(
+                f"service: not reachable at {service.get('url')} ({reason}) — "
+                "run `ficelle start`, then `ficelle status`"
+            )
         for line in doctor_provider_key_lines(status.get("auth") or {}):
             print(line)
     # Exit code follows the reported status so a script or a CI step can gate on `ficelle doctor`
@@ -512,7 +578,14 @@ def set_key(provider: str, *, from_stdin: bool = False, allow_plaintext: bool = 
         )
         return 1
     print(f"Stored {provider} key in {target}.")
-    router.main_args(["--refresh"])
+    if router.main_args(["--refresh"]) != 0:
+        # The key is stored whatever the refresh did, so this stays a success: the router
+        # already printed why it kept the previous catalog, and its background loop retries.
+        print(
+            f"Key stored, but the catalog refresh was rejected; the previous catalog stays active "
+            f"and the background refresh will retry. Run `ficelle auth-status` to check {provider}."
+        )
+        return 0
     print(f"Refreshed. Run `ficelle auth-status` to confirm {provider} is configured.")
     return 0
 
@@ -988,22 +1061,24 @@ def cmd_synthetic_health(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ficelle", description="Ficelle local OpenAI-compatible model router")
+    parser.add_argument("--version", action="version", version=f"ficelle {__version__}")
     sub = parser.add_subparsers(dest="command")
-    for name in ["serve", "refresh", "auth-status"]:
-        sub.add_parser(name)
-    canary_parser = sub.add_parser("canary")
+    sub.add_parser("serve", help="Run the router in the foreground")
+    sub.add_parser("refresh", help="Rebuild the model catalog (contacts the providers)")
+    sub.add_parser("auth-status", help="Show which providers have a usable key (JSON)")
+    canary_parser = sub.add_parser("canary", help="Probe the candidate models with real requests (contacts the providers)")
     canary_parser.add_argument("--profile", action="append", default=[])
-    sub.add_parser("install")
-    sub.add_parser("uninstall")
-    sub.add_parser("start")
-    sub.add_parser("stop")
-    sub.add_parser("restart")
-    sub.add_parser("status")
-    doctor_parser = sub.add_parser("doctor")
+    sub.add_parser("install", help="Write the service definition and start the service")
+    sub.add_parser("uninstall", help="Stop the service and remove its definition")
+    sub.add_parser("start", help="Same as install: rewrites the service definition, then starts the service")
+    sub.add_parser("stop", help="Stop the service")
+    sub.add_parser("restart", help="Restart the service with the interpreter it was installed with")
+    sub.add_parser("status", help="Show the service manager state")
+    doctor_parser = sub.add_parser("doctor", help="Check the service, build, catalog and provider keys")
     doctor_parser.add_argument("--json", action="store_true", dest="json_output", help="Print machine-readable JSON (default)")
     doctor_parser.add_argument("--text", action="store_true", dest="text_output", help="Print a compact human-readable summary")
-    sub.add_parser("models")
-    sub.add_parser("health")
+    sub.add_parser("models", help="List the models served by the running router (JSON)")
+    sub.add_parser("health", help="Query the running router's /health (JSON)")
     sub.add_parser("client-config", help="Export the generic OpenAI-compatible client configuration")
     connectors_parser = sub.add_parser("connectors", help="Manage optional client connectors")
     connectors_sub = connectors_parser.add_subparsers(dest="connector_action", required=True)
@@ -1011,10 +1086,17 @@ def main(argv: list[str] | None = None) -> int:
     connectors_sub.add_parser("detect", help="Detect supported clients without changing them")
     connectors_sub.add_parser("status", help="Show connector capabilities and exports")
     for action in ("install", "export", "remove"):
-        action_parser = connectors_sub.add_parser(action)
+        action_parser = connectors_sub.add_parser(
+            action,
+            help={
+                "install": "Install a connector (a real install, not a preview)",
+                "export": "Print a connector's configuration export",
+                "remove": "Remove a connector",
+            }[action],
+        )
         action_parser.add_argument("connector", choices=SUPPORTED_CONNECTORS)
         if action == "install":
-            action_parser.add_argument("--client-home", help="Explicit client home (Hermes only)")
+            action_parser.add_argument("--client-home", help="Explicit client home (Hermes only; ignored for other connectors)")
     demo_parser = sub.add_parser(
         "demo",
         help="Show the failover: knock out the model that would have answered, on a real request",
@@ -1133,12 +1215,13 @@ def main(argv: list[str] | None = None) -> int:
         for profile_id in args.profile:
             canary_args.extend(["--canary-profile", profile_id])
         return router.main_args(canary_args)
-    if args.command == "install":
-        return install_service()
+    if args.command in {"install", "start"}:
+        returncode = install_service()
+        if returncode == 0:
+            print(f"Ficelle serves {router_url('/v1')}. Next: `ficelle doctor --text`.")
+        return returncode
     if args.command == "uninstall":
         return uninstall_service()
-    if args.command == "start":
-        return install_service()
     if args.command == "stop":
         return stop_service()
     if args.command == "restart":

@@ -45,7 +45,8 @@ def rotate_if_oversized(path: Path, max_bytes: int, keep: int = 3) -> None:
     The append-only JSONL logs had no rotation at all — only the derived SQLite index was
     bounded — so a busy agent host grew them without limit until the disk filled, at which point
     state writes start failing too. The reader tolerates this: the request index detects
-    truncation and identity changes and re-reads from the start.
+    truncation and identity changes and re-reads from the start, after first finishing the
+    rotated segment it had been indexing (`request_log.ROTATED_SEGMENTS` must match `keep`).
     """
     if max_bytes <= 0:
         return
@@ -85,26 +86,31 @@ def open_private_append(path: Path) -> TextIO:
 
 
 def write_private_text(path: Path, text: str) -> None:
-    """Replace a file's contents without ever exposing them at the process umask.
+    """Replace a file's contents atomically, without ever exposing them at the process umask.
 
-    Raises on a failed permission change rather than swallowing it: the callers are writing
-    secrets, and a silent fallback leaves a readable credential file with no warning.
+    The callers are writing secrets, so the file is never rewritten in place: a failed write or a
+    kill part-way would leave `.env` empty or truncated. `mkstemp` creates the temp file at 0600,
+    and the rename carries that mode over, which also tightens a 0644 file left by an older build
+    before any of the new contents are readable under that name. A symlinked `.env` (kept in a
+    dotfiles or secrets checkout) is followed: the rename lands on its target, beside which the
+    temp file is created, and the link stays. Only the link's own directory is made private.
     """
     ensure_private_dir(path.parent)
-    # Do not pass O_TRUNC here: an older 0644 credential file must be tightened *before* its
-    # replacement contents are visible. O_CREAT's mode is ignored for existing files.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, RUNTIME_FILE_MODE)
+    path = Path(os.path.realpath(path))
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(name)
     try:
-        ensure_private_fd(fd)
         handle = os.fdopen(fd, "w", encoding="utf-8")
         fd = -1  # The TextIO wrapper now owns and closes this descriptor.
         with handle:
-            handle.seek(0)
-            handle.truncate()
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
     except BaseException:
         if fd >= 0:
             os.close(fd)
+        tmp.unlink(missing_ok=True)
         raise
 
 
@@ -140,9 +146,14 @@ def load_json(path: Path, default: Any) -> Any:
         return default
 
 
-def atomic_write_json(path: Path, data: Any) -> None:
+def atomic_write_json(path: Path, data: Any, *, compact: bool = False) -> None:
     ensure_private_dir(path.parent)
-    payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    # `indent` makes json fall back to its pure-Python encoder, ~4x slower than the C one. Only
+    # the hot-path state file opts into compact output; files people edit or read stay indented.
+    if compact:
+        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    else:
+        payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     # Write to a *unique* temp file in the same directory, then atomically rename.
     # A fixed `<name>.tmp` path would let concurrent writers of the same file (e.g.
     # the startup catalog warm thread and a request-triggered refresh) clobber each

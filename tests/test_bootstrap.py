@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import re
 import sys
 import zipfile
@@ -222,6 +223,34 @@ def test_options_keep_canonical_default_home_implicit(monkeypatch, tmp_path):
         "home",
         classmethod(lambda _cls: tmp_path),
     )
+
+    options = bootstrap.options_from_args(bootstrap.build_parser().parse_args([]))
+
+    assert options.ficelle_home == tmp_path / ".ficelle"
+    assert options.ficelle_home_explicit is False
+
+
+def test_options_reuse_the_home_a_previous_setup_persisted(monkeypatch, tmp_path):
+    custom_home = tmp_path / "custom-ficelle"
+    custom_home.mkdir()
+    pointer = tmp_path / ".config" / "ficelle" / "active-home"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_text(json.dumps({"ficelle_home": str(custom_home)}), encoding="utf-8")
+    monkeypatch.delenv("FICELLE_HOME", raising=False)
+    monkeypatch.setattr(bootstrap.Path, "home", classmethod(lambda _cls: tmp_path))
+
+    options = bootstrap.options_from_args(bootstrap.build_parser().parse_args([]))
+
+    assert options.ficelle_home == custom_home
+    assert options.ficelle_home_explicit is True
+
+
+def test_a_non_utf8_active_home_pointer_reads_as_unreadable(monkeypatch, tmp_path):
+    pointer = tmp_path / ".config" / "ficelle" / "active-home"
+    pointer.parent.mkdir(parents=True)
+    pointer.write_bytes(b"\xff\xfe/not-utf8")
+    monkeypatch.delenv("FICELLE_HOME", raising=False)
+    monkeypatch.setattr(bootstrap.Path, "home", classmethod(lambda _cls: tmp_path))
 
     options = bootstrap.options_from_args(bootstrap.build_parser().parse_args([]))
 

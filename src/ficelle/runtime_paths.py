@@ -25,6 +25,8 @@ class RuntimePaths:
     admin_audit_log_path: Path
     state_lock_path: Path
     state_backup_dir: Path
+    spend_meter_path: Path
+    spend_meter_lock_path: Path
     capability_discrepancy_log_path: Path
     catalog_refresh_attempts_path: Path
     compression_store_path: Path
@@ -46,7 +48,13 @@ class RuntimePaths:
     ) -> "RuntimePaths":
         source = os.environ if environ is None else environ
         explicit_ficelle_home = source.get("FICELLE_HOME")
-        ficelle_home = Path(explicit_ficelle_home).expanduser() if explicit_ficelle_home else Path.home() / ".ficelle"
+        # Absolute here, at the single resolution point: service definitions and the active-home
+        # pointer record this path, and a relative one is resolved by launchd/systemd, not the shell.
+        ficelle_home = (
+            Path(os.path.abspath(Path(explicit_ficelle_home).expanduser()))
+            if explicit_ficelle_home
+            else Path.home() / ".ficelle"
+        )
         router_dir = ficelle_home
         admin_assets_dir = package_dir / "assets" / "admin" if package_dir is not None else None
         return cls(
@@ -60,6 +68,8 @@ class RuntimePaths:
             admin_audit_log_path=router_dir / "logs" / "admin-actions.jsonl",
             state_lock_path=router_dir / "state.lock",
             state_backup_dir=router_dir / "state-backups",
+            spend_meter_path=router_dir / "provider-spend.json",
+            spend_meter_lock_path=router_dir / "provider-spend.lock",
             capability_discrepancy_log_path=router_dir / "logs" / "capability-discrepancies.jsonl",
             catalog_refresh_attempts_path=router_dir / "catalog-refresh-attempts.json",
             compression_store_path=router_dir / "compression.sqlite",

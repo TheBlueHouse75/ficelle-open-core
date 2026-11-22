@@ -1120,6 +1120,8 @@ def test_no_model_fault_failures_are_the_only_ones_exempt_from_the_streak():
         "bad_upstream_contract",
         "client_disconnected",
         "request_deadline_exceeded",
+        # The shutdown drain cut an attempt in flight: asked, unlike `service_restarting`.
+        "service_stopping",
         "context_length_exceeded",
     }
     # `service_restarting` is not a member and needs no exemption: the loop records it as
@@ -1259,6 +1261,18 @@ def test_upstream_failure_actions_include_default_operator_guidance():
         "Inspect ~/.ficelle/logs/routes.jsonl with the request_id, then clear cooldowns only after the upstream issue is understood."
     ]
     assert any("provider cooldown" in action for action in upstream_failure_actions({"rate_limited": 1}))
+
+
+def test_every_classified_failure_reason_gets_its_own_operator_guidance_even_in_a_mixed_run():
+    from typing import get_args
+
+    from ficelle.failures import FailureReason
+
+    generic = upstream_failure_actions({})
+    for reason in get_args(FailureReason):
+        assert upstream_failure_actions({reason: 1}) != generic, reason
+    mixed = upstream_failure_actions({"quota_exhausted": 1, "server_error": 1})
+    assert any("quota" in action for action in mixed) and any("unstable upstream" in action for action in mixed)
 
 
 def test_upstream_failure_error_preserves_requested_model_detail_limit():
@@ -1449,3 +1463,76 @@ def test_an_unrelated_400_merely_mentioning_tags_is_not_the_nous_gate():
     body = json.dumps({"error": {"message": "invalid schema for function 'tags' — missing property"}})
 
     assert classify_failure(400, body, markers=markers) == "bad_upstream_request"
+
+
+def _context_row(name: str, context_length: int | None, required_tokens: int | None = None) -> dict:
+    row = {
+        "model": f"ficelle/openrouter/{name}",
+        "upstream": name,
+        "source": "openrouter",
+        "reason": "context_length_exceeded",
+        "detail": f"request needs ~340009 tokens, model context is {context_length}",
+    }
+    if context_length is not None:
+        row["context_length"] = context_length
+    if required_tokens is not None:
+        row["required_tokens"] = required_tokens
+    return row
+
+
+def test_context_exhaustion_error_names_the_largest_window_not_the_last_row():
+    """Pool [128k, 262k, 65k] (scored order) and a 340k request: the old answer quoted the LAST
+    row, 65k, as if that were the biggest window on offer. The caller needs the largest free
+    window and the model holding it to know how much to cut."""
+    errors = [
+        _context_row("mid", 131_072, 391_000),
+        _context_row("big", 262_144, 391_000),
+        _context_row("small", 65_536, 391_000),
+    ]
+
+    payload = build_upstream_failure_error("ficelle/auto-long", "req-ctx", 3, [], errors)
+    error = payload["error"]
+
+    assert error["type"] == "invalid_request_error"
+    assert error["required_tokens"] == 391_000
+    assert error["largest_context"] == 262_144
+    assert error["largest_context_model"] == "ficelle/openrouter/big"
+    assert "~391000" in error["message"] and "262144" in error["message"]
+    assert "ficelle/openrouter/big" in error["message"]
+    assert "65536" not in error["message"]
+    assert "paid" not in error["message"].lower()
+    # details[] is unchanged apart from each row's own window.
+    assert [d["model"] for d in error["details"]] == [e["model"] for e in errors]
+    assert [d["context_length"] for d in error["details"]] == [131_072, 262_144, 65_536]
+
+
+def test_context_exhaustion_message_claims_only_the_candidates_it_ruled_out():
+    # `max_attempts_per_request` can stop the walk with a bigger free window still untried: the
+    # message must not present the largest window it saw as the largest one eligible.
+    errors = [_context_row("small", 65_536, 391_000)]
+
+    message = build_upstream_failure_error("ficelle/auto-long", "req-ctx", 3, [], errors)["error"]["message"]
+
+    assert "eligible" not in message and "any available model" not in message
+    assert "65536" in message and "ruled out" in message
+
+
+def test_context_exhaustion_error_without_window_figures_keeps_the_generic_answer():
+    """Rows from before the figures existed (or an upstream that never said) must still answer, with
+    no invented numbers and no structured fields."""
+    errors = [_context_row("a", None), _context_row("b", None)]
+
+    error = build_upstream_failure_error("ficelle/auto-long", "req-ctx", 2, [], errors)["error"]
+
+    assert error["type"] == "invalid_request_error"
+    assert error["message"].startswith("this request does not fit the context window of any candidate Ficelle considered")
+    assert "largest_context" not in error and "required_tokens" not in error
+
+
+def test_context_figures_are_not_attached_when_the_run_failed_for_another_reason():
+    errors = [_context_row("a", 262_144, 391_000), {**_context_row("b", 65_536), "reason": "server_error"}]
+
+    error = build_upstream_failure_error("ficelle/auto-long", "req-mixed", 2, [], errors)["error"]
+
+    assert error["type"] == "upstream_failure"
+    assert "largest_context" not in error

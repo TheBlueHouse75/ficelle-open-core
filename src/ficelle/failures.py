@@ -24,6 +24,15 @@ from ficelle.redaction import sanitize_error_detail
 _URL_PATTERN = re.compile(r"""https?://[^\s"'<>)\]},;]+""")
 
 
+class UpstreamResponseBudgetExceeded(Exception):
+    """Raised when no process-wide non-streaming response retention slot is available.
+
+    A condition of this process, not evidence about any model, so it lives here where the attempt
+    loop can recognize it without importing the router: it must leave the loop untouched (no cooldown,
+    no next candidate that would hit the same limit) and be answered as a retryable 503.
+    """
+
+
 FailureReason = Literal[
     "auth_or_credit",
     "bad_upstream_contract",
@@ -544,6 +553,9 @@ NO_MODEL_FAULT_FAILURE_REASONS = frozenset(
         # loop breaks immediately, so it reaches no state writer at all and needs no exemption. Its
         # consequences live in `TERMINAL_ENDINGS` below.
         "request_deadline_exceeded",
+        # The shutdown drain ran out of budget while the attempt was in flight and ended it. Unlike
+        # `service_restarting` the candidate was asked, so its row does reach the state writers.
+        "service_stopping",
         # The request does not fit this candidate's context window. Every candidate with the same
         # (or smaller) context would reject the identical body, which says nothing about this
         # model's health — so no cooldown and no scoring streak. It stays retryable (see
@@ -573,7 +585,7 @@ class TerminalEnding:
     route_log_status: int | None = None
 
 
-# The three endings the attempt loop can decide by itself, and everything that follows from each.
+# The endings the attempt loop can decide by itself, and everything that follows from each.
 # One table because the same fact used to be re-derived by four separate string comparisons — the
 # HTTP status, the payload `type`, the route-log reason and "is a body written at all" — which is
 # how a run the route log called `client_disconnected` still carried a `final_status` of 502 that
@@ -591,6 +603,10 @@ TERMINAL_ENDINGS: dict[str, TerminalEnding] = {
     # never a verdict on the pool. It does not outrank a run every attempt of which said the
     # request body itself was invalid — that 400 is the truthful answer whatever ended the run.
     "service_restarting": TerminalEnding(http_status=503, error_type="service_restarting"),
+    # The drain's budget ran out while an attempt was still in flight, which the drain then ended.
+    # Before any content the caller still gets its 503; after content the stream ends with the
+    # terminal frame of the same name instead (`stream_chunks_to_writer`), not through this table.
+    "service_stopping": TerminalEnding(http_status=503, error_type="service_stopping"),
     # Ficelle's own request budget expired. Deliberately no status of its own: the attempted
     # failures are the real cause, and answering 504 over a run that died on provider 500s would
     # hide it.
@@ -1269,6 +1285,14 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
             "benchmarked. Clear the quarantine to retry once the provider deploys it, or once an "
             "admin enables the tier."
         )
+    if reason_counts.get("quota_exhausted"):
+        actions.append("The free quota on this provider or account looks spent. Ficelle probes it and resumes on its own once the quota is back; the Retry-After header names the earliest probe. Add your own key for that provider or wait for the quota window to reset.")
+    if reason_counts.get("network_unreachable") or reason_counts.get("tls_error"):
+        actions.append("This machine could not reach the provider or complete the TLS handshake, so the request never got an answer. Check the local network, DNS, proxy and system clock; the provider is paused briefly and there is no cooldown to clear.")
+    if reason_counts.get("request_too_large"):
+        actions.append("The provider rejected the request as too large for its tokens-per-minute budget. Only that model is cooled, briefly; shorten the request or retry after the limit recharges.")
+    if reason_counts.get("unavailable"):
+        actions.append("The provider or model reported itself unavailable. This is usually transient: Ficelle tried the next candidates, so retry after the short cooldown.")
     if reason_counts.get("server_error"):
         actions.append("Retry after the short model cooldown or quarantine the unstable upstream.")
     if reason_counts.get("timeout"):
@@ -1283,6 +1307,8 @@ def upstream_failure_actions(reason_counts: dict[str, int]) -> list[str]:
         actions.append("The client closed the connection while the answer was streaming; the upstream was healthy and was not cooled. Look at the client's timeout or cancel behaviour, not at the model.")
     if reason_counts.get("service_restarting"):
         actions.append("Ficelle was stopping (service restart or update) and did not start further fallback attempts for this request. No model was cooled: nothing upstream failed. Retry once the service is back up.")
+    if reason_counts.get("service_stopping"):
+        actions.append("Ficelle was stopping (service restart or update) and its shutdown drain ran out while this request was still waiting on the provider, so the attempt was ended. No model was cooled: nothing upstream failed. Retry once the service is back up.")
     if reason_counts.get("truncated_before_content"):
         actions.append("The completion token budget ran out before the model emitted any content; reasoning models spend it on reasoning tokens first. Raise max_tokens on the request. No model was cooled: this is a request-side limit, not an upstream failure.")
     if reason_counts.get("empty_assistant_message") or reason_counts.get("invalid_success_json"):
@@ -1408,6 +1434,37 @@ def upstream_retry_after_seconds(errors: list[dict[str, Any]], status: int) -> i
     return min(delays) if delays else None
 
 
+def context_exhaustion_figures(errors: list[dict[str, Any]]) -> dict[str, Any]:
+    """What an all-too-small answer can tell the caller: the estimated tokens the request needs and
+    the LARGEST context among the candidates ruled out for size, with the model holding it.
+
+    Quoting the last row instead would name whichever candidate happened to be scored last, often
+    the smallest, and send the caller to shrink a request that a bigger free window already almost
+    fits. Rows that carry no figure (older rows, an upstream that never said) are skipped; with no
+    figure at all the result is empty and the caller keeps the generic message. Free models only,
+    by construction: the pool never held a paid one, so nothing here suggests one.
+    """
+    sized = [
+        row for row in errors
+        if isinstance(row.get("context_length"), int)
+        and not isinstance(row.get("context_length"), bool)
+        and row["context_length"] > 0
+    ]
+    if not sized:
+        return {}
+    largest = max(sized, key=lambda row: row["context_length"])
+    figures: dict[str, Any] = {}
+    required = [
+        row["required_tokens"] for row in sized
+        if isinstance(row.get("required_tokens"), int) and not isinstance(row.get("required_tokens"), bool)
+    ]
+    if required:
+        figures["required_tokens"] = max(required)
+    figures["largest_context"] = largest["context_length"]
+    figures["largest_context_model"] = sanitize_error_detail(largest.get("model"), 250) or "unknown"
+    return figures
+
+
 def build_upstream_failure_error(
     requested_model: str,
     request_id: str,
@@ -1432,6 +1489,8 @@ def build_upstream_failure_error(
             "upstream": row.get("upstream"),
             "status": row.get("status"),
             "reason": reason,
+            # The window of a candidate ruled out for size, so details[] shows each model's figure.
+            "context_length": row.get("context_length") if reason == "context_length_exceeded" else None,
         }
         detail = sanitize_error_detail(row.get("detail") or row.get("error"), UPSTREAM_DETAIL_LIMIT)
         if detail:
@@ -1440,6 +1499,7 @@ def build_upstream_failure_error(
             safe_row["stream_started"] = bool(row.get("stream_started"))
         safe_details.append({key: value for key, value in safe_row.items() if value is not None})
     reason_summary = ", ".join(f"{reason}={count}" for reason, count in sorted(reason_counts.items())) or "unknown"
+    context_figures: dict[str, Any] = {}
     safe_requested_model = sanitize_error_detail(requested_model, 250) or "[redacted]"
     # Same predicates, same order and the same attempted-only rows as `upstream_failure_status`:
     # the status and this payload's `type` are one verdict written twice, and they must not drift.
@@ -1462,10 +1522,23 @@ def build_upstream_failure_error(
         message = "upstream rejected this request as invalid" + (f": {upstream_detail}" if upstream_detail else "")
         error_type = "invalid_request_error"
     elif request_exceeds_context(attempted_errors):
-        context_detail = attempted_details[-1].get("detail") if attempted_details else ""
-        message = "this request does not fit any available model's context window" + (
-            f": {context_detail}" if context_detail else ""
-        )
+        context_figures = context_exhaustion_figures(attempted_errors)
+        # Worded for the candidates actually ruled out: `max_attempts_per_request` can stop the
+        # walk before a bigger window was tried, so the pool's maximum is not known here.
+        if context_figures:
+            message = "this request does not fit the context window of any candidate Ficelle considered: " + (
+                f"it needs ~{context_figures['required_tokens']} tokens and "
+                if "required_tokens" in context_figures
+                else ""
+            ) + (
+                f"the largest context among the candidates ruled out for size is {context_figures['largest_context']} "
+                f"tokens ({context_figures['largest_context_model']})"
+            )
+        else:
+            context_detail = attempted_details[-1].get("detail") if attempted_details else ""
+            message = "this request does not fit the context window of any candidate Ficelle considered" + (
+                f": {context_detail}" if context_detail else ""
+            )
         error_type = "invalid_request_error"
     elif ending is not None and ending.error_type is not None:
         # The run was cut short by an ending Ficelle owns, so the payload must not read as a
@@ -1478,7 +1551,7 @@ def build_upstream_failure_error(
     else:
         message = f"all Ficelle candidates failed for {safe_requested_model} ({len(attempts)}/{candidate_count} attempted; {reason_summary})"
         error_type = "upstream_failure"
-    return {
+    payload = {
         "error": {
             "message": message,
             "type": error_type,
@@ -1492,3 +1565,6 @@ def build_upstream_failure_error(
             "actions": upstream_failure_actions(reason_counts),
         }
     }
+    if context_figures:
+        payload["error"].update(context_figures)
+    return payload

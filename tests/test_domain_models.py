@@ -102,6 +102,29 @@ def test_catalog_model_keeps_legacy_row_round_trip():
     assert model.as_legacy_dict() == raw
 
 
+def test_catalog_model_never_aliases_the_source_row():
+    # Rows come from the shared catalog document cache: a model sharing nested objects with
+    # its source row would let one request's mutation reach every later reader.
+    raw = free_model("ficelle/openrouter/good", vendor_hint={"tier": "free"})
+    model = CatalogModel.from_raw(raw)
+    assert model is not None
+
+    raw["pricing"]["prompt"] = "1"
+    raw["free_access"]["eligible"] = False
+    raw["vendor_hint"]["tier"] = "paid"
+    raw["supported_parameters"].append("seed")
+    assert model.pricing["prompt"] == "0"
+    assert model.free_access["eligible"] is True
+    assert model.extra_fields["vendor_hint"] == {"tier": "free"}
+    assert model.raw["pricing"]["prompt"] == "0"
+
+    legacy = model.as_legacy_dict()
+    legacy["pricing"]["completion"] = "1"
+    model.extra_fields["vendor_hint"]["tier"] = "changed"
+    assert model.raw["pricing"]["completion"] == "0"
+    assert model.raw["vendor_hint"] == {"tier": "free"}
+
+
 def test_select_models_result_exposes_typed_candidates_and_exclusion_reasons(monkeypatch, tmp_path):
     router = load_router(monkeypatch, tmp_path)
     good = free_model("ficelle/openrouter/good")
@@ -200,7 +223,7 @@ def test_select_models_result_from_state_has_no_runtime_io_or_quota_probes(monke
     def fail_probe(*_args, **_kwargs):
         raise AssertionError("probe")
 
-    monkeypatch.setattr(router, "fresh_runtime_state", fail_state_read)
+    monkeypatch.setattr(router, "shared_runtime_state", fail_state_read)
     monkeypatch.setattr(router, "run_due_quota_probes", fail_probe)
 
     result = router.select_models_result_from_state(

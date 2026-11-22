@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import getpass
 import json
+import ntpath
 import os
 import plistlib
 import shlex
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -51,7 +53,7 @@ def read_active_service_context(
     path = pointer or active_home_pointer_path()
     try:
         raw = path.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     if not raw:
         return None
@@ -120,6 +122,10 @@ class ServiceBackend(Protocol):
         """Print managed service status."""
         ...
 
+    def installed(self) -> bool:
+        """Whether this platform's managed service is installed (what updates require)."""
+        ...
+
 
 @dataclass(frozen=True)
 class PortHolder:
@@ -154,8 +160,20 @@ def service_environment(paths: ServicePaths) -> dict[str, str]:
 
 def _systemd_environment_line(name: str, value: str) -> str:
     """Quote a complete systemd environment assignment."""
-    assignment = json.dumps(f"{name}={value}", ensure_ascii=False)
+    assignment = json.dumps(f"{name}={value}".replace("%", "%%"), ensure_ascii=False)
     return f"Environment={assignment}"
+
+
+def _systemd_exec_word(value: str) -> str:
+    """Quote the ExecStart executable: systemd splits on whitespace and expands `%` there.
+
+    `$` is left single: variable substitution applies to the arguments only, so a `$$` in the
+    executable path would name a file that does not exist.
+    """
+    if not any(char.isspace() or char in "%$\\\"'" for char in value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
 
 
 def write_text_file(path: Path, content: str, *, encoding: str = "utf-8") -> None:
@@ -193,6 +211,23 @@ def _usable_recorded_interpreter(
     return Path(absolute_python(candidate)) if probe.returncode == 0 else None
 
 
+# How long launchd waits between its SIGTERM and SIGKILL. Left unset, launchd killed the router
+# about 5 s after a `launchctl bootout` (measured on macOS 26, 18/11/2026), so the router's 15 s
+# shutdown drain (`router.SHUTDOWN_DRAIN_SECONDS`) never ran and a streamed answer was cut with no
+# terminal frame. The plist states the budget the drain is sized under.
+LAUNCHD_EXIT_TIMEOUT_SECONDS = 20
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class LaunchAgentServiceBackend:
     """macOS LaunchAgent backend."""
 
@@ -214,6 +249,7 @@ class LaunchAgentServiceBackend:
         self.wait_for_ready = wait_for_ready
         self.terminate_stale_servers = terminate_stale_servers
         self.report_stale_servers = report_stale_servers
+        self.pid_alive: Callable[[int], bool] = pid_alive
 
     def plist_payload(self) -> dict[str, object]:
         return {
@@ -221,6 +257,7 @@ class LaunchAgentServiceBackend:
             "ProgramArguments": [str(self.paths.install_python), "-m", "ficelle.router", "--serve"],
             "RunAtLoad": True,
             "KeepAlive": {"SuccessfulExit": False},
+            "ExitTimeOut": LAUNCHD_EXIT_TIMEOUT_SECONDS,
             "StandardOutPath": str(self.paths.log_dir / LOG_FILE_NAME),
             "StandardErrorPath": str(self.paths.log_dir / ERROR_LOG_FILE_NAME),
             "WorkingDirectory": str(self.paths.ficelle_home),
@@ -230,13 +267,29 @@ class LaunchAgentServiceBackend:
     def bootout(self) -> subprocess.CompletedProcess[str]:
         return self.run_command(["launchctl", "bootout", f"gui/{self.uid_provider()}/{self.paths.label}"])
 
+    def bootout_and_wait(self) -> subprocess.CompletedProcess[str]:
+        """Boot the job out and wait for its router to finish draining before anything sweeps.
+
+        `launchctl bootout` returns as soon as it has sent SIGTERM. The stale-server sweep that
+        follows matches our own draining router too, and its 2 s grace then SIGKILLs it: the drain
+        never got to end in-flight requests cleanly. Waiting here, bounded by the plist's
+        `ExitTimeOut`, lets launchd's own budget decide.
+        """
+        pid = self.launchd_job_pid()
+        result = self.bootout()
+        if pid is not None:
+            deadline = time.monotonic() + LAUNCHD_EXIT_TIMEOUT_SECONDS + 2
+            while self.pid_alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.2)
+        return result
+
     def install(self) -> int:
         self.paths.ficelle_home.mkdir(parents=True, exist_ok=True)
         self.paths.log_dir.mkdir(parents=True, exist_ok=True)
         self.paths.plist.parent.mkdir(parents=True, exist_ok=True)
         with self.paths.plist.open("wb") as fh:
             plistlib.dump(self.plist_payload(), fh, sort_keys=False)
-        self.bootout()
+        self.bootout_and_wait()
         self.report_stale_servers(self.terminate_stale_servers())
         load = self.run_command(["launchctl", "bootstrap", f"gui/{self.uid_provider()}", str(self.paths.plist)])
         if load.returncode != 0:
@@ -342,7 +395,7 @@ class LaunchAgentServiceBackend:
         return self.install()
 
     def stop(self) -> int:
-        result = self.bootout()
+        result = self.bootout_and_wait()
         self.report_stale_servers(self.terminate_stale_servers())
         return result.returncode
 
@@ -352,6 +405,9 @@ class LaunchAgentServiceBackend:
             self.paths.plist.unlink()
         print(f"removed {self.paths.plist}")
         return 0
+
+    def installed(self) -> bool:
+        return self.paths.plist.exists()
 
     def status(self) -> int:
         result = self.run_command(["launchctl", "print", f"gui/{self.uid_provider()}/{self.paths.label}"])
@@ -401,9 +457,9 @@ class SystemdUserServiceBackend:
                 "",
                 "[Service]",
                 "Type=simple",
-                f"WorkingDirectory={self.paths.ficelle_home}",
+                f"WorkingDirectory={str(self.paths.ficelle_home).replace('%', '%%')}",
                 *environment,
-                f"ExecStart={self.paths.install_python} -m ficelle.router --serve",
+                f"ExecStart={_systemd_exec_word(str(self.paths.install_python))} -m ficelle.router --serve",
                 "Restart=on-failure",
                 "RestartSec=2",
                 "",
@@ -441,7 +497,8 @@ class SystemdUserServiceBackend:
                 except ValueError:
                     return None
                 if len(parsed) == 1:
-                    command = parsed[0]
+                    # Undo the specifier doubling of _systemd_exec_word.
+                    command = parsed[0].replace("%%", "%")
                 elif not Path(command).exists():
                     return None
             else:
@@ -452,12 +509,22 @@ class SystemdUserServiceBackend:
             return _usable_recorded_interpreter(Path(command), self.run_command) if command else None
         return None
 
+    def stop_unit_then_sweep(self) -> None:
+        """Let systemd stop the unit before sweeping orphans.
+
+        The unit's own router matches the stale-server signature. Signalling it first would
+        SIGKILL it after the sweep's 2 s grace and cut the router's 20 s shutdown drain
+        short; `systemctl stop` waits for it (TimeoutStopSec).
+        """
+        self.run_command(["systemctl", "--user", "stop", self.unit_name])
+        self.report_stale_servers(self.terminate_stale_servers())
+
     def install(self) -> int:
         reload_result = self.write_unit()
         if reload_result.returncode != 0:
             sys.stderr.write(reload_result.stderr or reload_result.stdout)
             return reload_result.returncode
-        self.report_stale_servers(self.terminate_stale_servers())
+        self.stop_unit_then_sweep()
         start = self.run_command(["systemctl", "--user", "enable", "--now", self.unit_name])
         if start.returncode != 0:
             sys.stderr.write(start.stderr or start.stdout)
@@ -491,7 +558,7 @@ class SystemdUserServiceBackend:
         if reload_result.returncode != 0:
             sys.stderr.write(reload_result.stderr or reload_result.stdout)
             return reload_result.returncode
-        self.report_stale_servers(self.terminate_stale_servers())
+        self.stop_unit_then_sweep()
         result = self.run_command(["systemctl", "--user", "restart", self.unit_name])
         if result.returncode != 0:
             sys.stderr.write(result.stderr or result.stdout)
@@ -525,6 +592,9 @@ class SystemdUserServiceBackend:
         print(f"removed {self.paths.systemd_unit}")
         return 0
 
+    def installed(self) -> bool:
+        return self.paths.systemd_unit.exists()
+
     def status(self) -> int:
         result = self.run_command(["systemctl", "--user", "status", "--no-pager", self.unit_name])
         print(result.stdout.strip() or result.stderr.strip() or "not loaded")
@@ -552,6 +622,72 @@ def windows_task_account() -> str:
     domain = os.environ.get("USERDOMAIN")
     user = os.environ.get("USERNAME") or getpass.getuser()
     return f"{domain}\\{user}" if domain else user
+
+
+def windows_command_line_arguments(command: str) -> list[str]:
+    """Split a Windows command line as ``CommandLineToArgvW`` does (the inverse of ``list2cmdline``).
+
+    Unquoted spaces and tabs separate arguments; ``"`` toggles quoting; ``2n`` backslashes before
+    a quote yield ``n`` backslashes and a toggle, ``2n+1`` yield ``n`` and a literal quote; other
+    backslashes are literal. The program name is split with the same rules, which only differ on
+    backslash-quote sequences an executable path never contains.
+    """
+    arguments: list[str] = []
+    current: list[str] = []
+    in_argument = in_quotes = False
+    index, length = 0, len(command)
+    while index < length:
+        char = command[index]
+        if char in " \t" and not in_quotes:
+            if in_argument:
+                arguments.append("".join(current))
+                current, in_argument = [], False
+            index += 1
+            continue
+        in_argument = True
+        if char == "\\":
+            run_end = index
+            while run_end < length and command[run_end] == "\\":
+                run_end += 1
+            backslashes = run_end - index
+            if run_end < length and command[run_end] == '"':
+                current.append("\\" * (backslashes // 2))
+                if backslashes % 2:
+                    current.append('"')
+                    run_end += 1
+            else:
+                current.append("\\" * backslashes)
+            index = run_end
+            continue
+        if char == '"':
+            if in_quotes and command[index + 1 : index + 2] == '"':
+                current.append('"')
+                index += 2
+                continue
+            in_quotes = not in_quotes
+        else:
+            current.append(char)
+        index += 1
+    if in_argument:
+        arguments.append("".join(current))
+    return arguments
+
+
+def windows_command_names_home(command: str, ficelle_home: Path) -> bool:
+    """Whether a Windows command line carries this home's ``FICELLE_HOME=<path>`` entry argument.
+
+    Compares the whole parsed argument with Windows path semantics (case-insensitive, trailing
+    separator ignored), so ``...\\.ficelle`` never matches ``...\\.ficelle-canary`` nor a quoted
+    ``...\\.ficelle canary``. Used for the Task Scheduler entry arguments and, by the CLI, for
+    the full process command line.
+    """
+    prefix = "FICELLE_HOME="
+    expected = ntpath.normcase(ntpath.normpath(str(ficelle_home)))
+    return any(
+        argument.startswith(prefix)
+        and ntpath.normcase(ntpath.normpath(argument[len(prefix) :])) == expected
+        for argument in windows_command_line_arguments(command)
+    )
 
 
 class WindowsScheduledTaskBackend:
@@ -724,6 +860,27 @@ class WindowsScheduledTaskBackend:
         print(result.stdout.strip() or result.stderr.strip() or "not registered")
         return result.returncode
 
+    def installed(self) -> bool:
+        # Task Scheduler is the authority, not the XML under FICELLE_HOME: `install` writes that
+        # file before registering, so it survives a registration that failed. The task name is
+        # per user, so a task another FICELLE_HOME registered (a test router) is not this
+        # service: an update would stop it and re-register the name with this home.
+        try:
+            result = self.run_command(["schtasks", "/Query", "/TN", self.task_name, "/XML"])
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode != 0:
+            return False
+        try:
+            root = ET.fromstring(result.stdout)
+        except ET.ParseError:
+            return False
+        namespace = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+        return any(
+            windows_command_names_home(node.text or "", self.paths.ficelle_home)
+            for node in root.iter(f"{namespace}Arguments")
+        )
+
 
 class UnsupportedServiceBackend:
     """Explicit backend for platforms that do not have a user-proof service installer yet."""
@@ -756,6 +913,9 @@ class UnsupportedServiceBackend:
 
     def status(self) -> int:
         return self._fail()
+
+    def installed(self) -> bool:
+        return False
 
 
 def select_service_backend(

@@ -821,6 +821,96 @@ def test_concurrent_writers_each_keep_their_evidence(tmp_path):
     assert len(store.snapshot()["benchmark_results"]) == 8
 
 
+def _evidence_state() -> dict:
+    return {
+        "benchmark_results": {"m1": {"p": {"status": "pass", "ran_at": "2026-08-01T00:00:00+00:00"}}},
+        "verified_capabilities": {"m1": {"p": {"status": "verified", "verified_at": "2026-08-01T00:00:00+00:00"}}},
+    }
+
+
+def test_update_that_leaves_history_untouched_skips_the_row_merge_but_still_prunes_feedback(tmp_path, monkeypatch):
+    # Every request writes a spend counter and a cooldown through update(); re-merging a ~1 MB
+    # evidence history row by row each time was most of the write cost. Skipping it must not
+    # stop an expired quality-feedback slot from being pruned by whichever write comes next.
+    from ficelle import state_store as state_store_module
+
+    store = StateStore(state_path=tmp_path / "state.json", lock_path=tmp_path / "state.lock", backup_dir=tmp_path / "backups")
+    expired_slot = {"revision": 1, "outcome": "fail", "expires_at": "2000-01-01T00:00:00+00:00"}
+    atomic_write_json(
+        tmp_path / "state.json",
+        {**_evidence_state(), "quality_feedback": {"m1": {"p": {"event_slots": {"old": expired_slot}}}}},
+    )
+    merges: list[object] = []
+    real_merge = state_store_module.merge_runtime_history_rows
+    monkeypatch.setattr(
+        state_store_module,
+        "merge_runtime_history_rows",
+        lambda current, incoming: merges.append(1) or real_merge(current, incoming),
+    )
+
+    store.update(lambda state: state.update({"provider_budget_spend": {"p": 1}}))
+
+    assert merges == []
+    persisted = load_json(tmp_path / "state.json", {})
+    assert persisted["provider_budget_spend"] == {"p": 1}
+    assert persisted["benchmark_results"] == _evidence_state()["benchmark_results"]
+    assert "quality_feedback" not in persisted
+
+
+def test_update_persists_compact_json_that_round_trips(tmp_path):
+    # indent= forces json's pure-Python encoder (about 4x slower on a ~1 MB state).
+    store = StateStore(state_path=tmp_path / "state.json", lock_path=tmp_path / "state.lock", backup_dir=tmp_path / "backups")
+    atomic_write_json(tmp_path / "state.json", _evidence_state())
+
+    store.update(lambda state: state.update({"last_routes": {"ficelle/auto-fast": {"model": "m1"}}}))
+
+    text = (tmp_path / "state.json").read_text(encoding="utf-8")
+    assert "\n  " not in text
+    assert text.endswith("\n")
+    assert store.snapshot()["last_routes"] == {"ficelle/auto-fast": {"model": "m1"}}
+
+
+def test_shared_snapshot_parses_once_per_file_version_and_never_serves_a_stale_state(tmp_path, monkeypatch):
+    from ficelle import state_store as state_store_module
+
+    store = StateStore(state_path=tmp_path / "state.json", lock_path=tmp_path / "state.lock", backup_dir=tmp_path / "backups")
+    atomic_write_json(tmp_path / "state.json", {"unsupported_parameters": {"m1": {"top_p": 1.0}}})
+    parses: list[int] = []
+    real_loads = state_store_module.json.loads
+    monkeypatch.setattr(state_store_module.json, "loads", lambda text, *a, **k: parses.append(1) or real_loads(text, *a, **k))
+
+    first = store.shared_snapshot()
+    first["scratch"] = "a caller replacing a top-level key must not reach the next reader"
+    second = store.shared_snapshot()
+
+    assert parses == [1] and "scratch" not in second
+    assert second["unsupported_parameters"] == {"m1": {"top_p": 1.0}}
+
+    # A same-size rewrite through the store (the spend counter shape) is a new file version.
+    store.update(lambda state: state.update({"unsupported_parameters": {"m1": {"top_p": 2.0}}}))
+    assert store.shared_snapshot()["unsupported_parameters"] == {"m1": {"top_p": 2.0}}
+    # An out-of-band writer (another process) is picked up through the file signature.
+    atomic_write_json(tmp_path / "state.json", {"unsupported_parameters": {"m1": {"top_p": 3.0, "pad": 1}}})
+    assert store.shared_snapshot()["unsupported_parameters"]["m1"]["top_p"] == 3.0
+
+
+def test_shared_snapshot_of_an_unreadable_state_recovers_from_backup_without_caching_it(tmp_path):
+    store = StateStore(
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "state.lock",
+        backup_dir=tmp_path / "backups",
+        backup_min_interval_seconds=0,
+    )
+    atomic_write_json(tmp_path / "state.json", {"marker": "good"})
+    store.update(lambda state: state.update({"marker": "good"}))
+    assert store.backup_files()
+    (tmp_path / "state.json").write_text('{"truncated":', encoding="utf-8")
+
+    assert store.shared_snapshot()["marker"] == "good"
+    atomic_write_json(tmp_path / "state.json", {"marker": "after"})
+    assert store.shared_snapshot()["marker"] == "after"
+
+
 def test_corrupt_config_is_served_as_defaults_but_never_overwritten(tmp_path, capsys):
     # config.json is documented as user-editable, and load_json answers a syntax error with the
     # defaults. Writing those back — any admin save, or the prune during a refresh — replaced the
@@ -982,6 +1072,50 @@ def test_private_text_is_written_where_the_platform_has_no_fchmod(tmp_path, plat
     assert path.read_text(encoding="utf-8") == "OPENROUTER_API_KEY=rotated\n"
 
 
+def test_private_text_replacement_is_atomic_and_always_private(tmp_path):
+    """`.env`, the API token and `connectors.json` go through here: a write that dies half-way must
+    leave the old credentials in place instead of an empty or truncated file."""
+    from ficelle.json_store import write_private_text
+
+    path = tmp_path / "credentials.env"
+    path.write_text("OPENROUTER_API_KEY=old\n", encoding="utf-8")
+    path.chmod(0o644)
+
+    # A lone surrogate cannot be encoded, so the write fails after the destination would have
+    # been truncated by an in-place rewrite.
+    with pytest.raises(UnicodeEncodeError):
+        write_private_text(path, "OPENROUTER_API_KEY=\ud800\n")
+    assert path.read_text(encoding="utf-8") == "OPENROUTER_API_KEY=old\n"
+    assert [entry.name for entry in tmp_path.iterdir()] == ["credentials.env"], "no temp file left behind"
+
+    write_private_text(path, "OPENROUTER_API_KEY=new\n")
+    assert path.read_text(encoding="utf-8") == "OPENROUTER_API_KEY=new\n"
+    assert path.stat().st_mode & 0o777 == 0o600, "a previously world-readable file is tightened"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_private_text_updates_the_target_of_a_symlinked_credentials_file(tmp_path):
+    # `.env` kept in a dotfiles or secrets checkout and symlinked into FICELLE_HOME: replacing the
+    # link with a regular file left the real file holding the old key.
+    from ficelle.json_store import write_private_text
+
+    secrets_dir = tmp_path / "dotfiles"
+    secrets_dir.mkdir()
+    secrets_dir.chmod(0o755)
+    target = secrets_dir / "ficelle.env"
+    target.write_text("OPENROUTER_API_KEY=old\n", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    link = home / ".env"
+    link.symlink_to(target)
+
+    write_private_text(link, "OPENROUTER_API_KEY=rotated\n")
+
+    assert link.is_symlink()
+    assert target.read_text(encoding="utf-8") == "OPENROUTER_API_KEY=rotated\n"
+    assert secrets_dir.stat().st_mode & 0o777 == 0o755, "the link target's directory is not re-permissioned"
+
+
 def test_jsonl_append_survives_a_platform_without_fchmod(tmp_path, platform_without_posix_modes):
     # The route log is appended on every request, so this path failing meant the router could
     # answer /health and list models while every completion raised AttributeError.
@@ -1004,11 +1138,8 @@ def test_synthetic_health_state_survives_a_platform_without_fchmod(tmp_path, pla
 
 
 def test_a_real_fchmod_failure_is_not_swallowed(tmp_path, monkeypatch):
-    """The Windows guard must not turn a genuine permission failure into a silent success.
-
-    These writers carry credentials, so a fallback that leaves a readable file with no warning
-    is worse than a crash.
-    """
+    """The Windows guard must not turn a genuine permission failure into a silent success: a
+    fallback that leaves a readable log with no warning is worse than a crash."""
     from ficelle import json_store
 
     class OsWithFailingFchmod:
@@ -1024,4 +1155,134 @@ def test_a_real_fchmod_failure_is_not_swallowed(tmp_path, monkeypatch):
     monkeypatch.setattr(json_store, "os", OsWithFailingFchmod())
 
     with pytest.raises(PermissionError, match="refused"):
-        json_store.write_private_text(tmp_path / "credentials.env", "OPENROUTER_API_KEY=value\n")
+        json_store.open_private_append(tmp_path / "routes.jsonl")
+
+
+DAY = 24 * 3600
+GONE = "openrouter::retired-model"
+LIVE = "openrouter::live-model"
+OTHER = "groq::other-model"
+
+
+def _presence_store(tmp_path) -> StateStore:
+    store = StateStore(state_path=tmp_path / "state.json", lock_path=tmp_path / "state.lock", backup_dir=tmp_path / "backups")
+    rows = {"ran_at": "2026-10-01T00:00:00+00:00", "status": "pass"}
+    store.write(
+        {
+            "stats": {key: {"requests": 3} for key in (GONE, LIVE, OTHER)},
+            "model_errors": {GONE: {"reason": "timeout"}},
+            "cooldowns": {GONE: {"until": 1}},
+            "benchmark_results": {key: {"ficelle/auto-fast": dict(rows)} for key in (GONE, LIVE, OTHER)},
+            "verified_capabilities": {GONE: {"ficelle/auto-fast": dict(rows)}},
+            "quarantine": {GONE: {"reason": "billing_or_paid"}},
+        }
+    )
+    return store
+
+
+def _reconcile(store, now, *, observed=frozenset({"openrouter"}), listed=frozenset({LIVE})):
+    return store.reconcile_model_presence(observed_sources=set(observed), listed_keys=set(listed), now=now)
+
+
+def _has_entries(state, key):
+    return any(key in (state.get(section) or {}) for section in ("stats", "model_errors", "cooldowns", "benchmark_results", "verified_capabilities"))
+
+
+def test_a_model_absent_past_the_retention_window_loses_its_runtime_entries(tmp_path):
+    store = _presence_store(tmp_path)
+    start = 1_800_000_000.0
+
+    assert _reconcile(store, start) == []  # first absence only starts the clock
+    assert _reconcile(store, start + 29 * DAY) == []
+    assert _has_entries(store.snapshot(), GONE)
+
+    assert _reconcile(store, start + 30 * DAY) == [GONE]
+    state = store.snapshot()
+    assert not _has_entries(state, GONE)
+    # A listed model and an unobserved provider's model keep everything.
+    assert _has_entries(state, LIVE) and _has_entries(state, OTHER)
+    # The billing/paid verdict is a safety record, not evidence: it outlives the prune.
+    assert GONE in state["quarantine"]
+
+
+def test_a_temporary_catalog_gap_never_adds_up_to_the_window(tmp_path):
+    store = _presence_store(tmp_path)
+    start = 1_800_000_000.0
+
+    _reconcile(store, start)
+    _reconcile(store, start + 20 * DAY, listed={LIVE, GONE})  # back in the listing: clock cleared
+    _reconcile(store, start + 25 * DAY)  # gone again: a fresh clock starts here
+    assert _reconcile(store, start + 40 * DAY) == []
+    assert _has_entries(store.snapshot(), GONE)
+    assert _reconcile(store, start + 55 * DAY) == [GONE]
+
+
+def test_a_failed_empty_or_partial_refresh_never_prunes(tmp_path):
+    """The router passes only providers that answered in full; anything else observes nothing."""
+    store = _presence_store(tmp_path)
+    start = 1_800_000_000.0
+    _reconcile(store, start)
+    before = (tmp_path / "state.json").read_bytes()
+
+    # Refresh failed or every provider came back empty/truncated: nothing observed, no write at all.
+    assert _reconcile(store, start + 60 * DAY, observed=set(), listed=set()) == []
+    assert (tmp_path / "state.json").read_bytes() == before
+    # Only another provider answered: openrouter's models are unobserved, their clock frozen.
+    assert _reconcile(store, start + 60 * DAY, observed={"groq"}, listed={OTHER}) == []
+    assert _has_entries(store.snapshot(), GONE)
+
+
+def test_a_stale_snapshot_write_cannot_resurrect_pruned_rows(tmp_path):
+    """The history merge re-adds rows a write lacks; without a tombstone it would undo the prune."""
+    store = _presence_store(tmp_path)
+    start = 1_800_000_000.0
+    _reconcile(store, start)
+    stale = store.snapshot()
+    assert _reconcile(store, start + 31 * DAY) == [GONE]
+
+    store.write(stale)
+    store.update(lambda state: state["stats"].update({LIVE: {"requests": 4}}))
+
+    state = store.snapshot()
+    assert not _has_entries(state, GONE)
+    assert state["stats"][LIVE] == {"requests": 4}
+    assert GONE in state["model_presence"]["pruned"]
+
+    # Relisted: the tombstone goes, and the model can collect evidence again.
+    _reconcile(store, start + 32 * DAY, listed={LIVE, GONE})
+    store.update(lambda state: state["stats"].update({GONE: {"requests": 1}}))
+    assert store.snapshot()["stats"][GONE] == {"requests": 1}
+    assert "model_presence" not in store.snapshot()
+
+
+def test_a_listed_model_sheds_its_presence_marks_without_an_observed_refresh(tmp_path):
+    """Pruning needs a fully observed listing; being listed again must not."""
+    store = _presence_store(tmp_path)
+    start = 1_800_000_000.0
+    _reconcile(store, start)
+    assert _reconcile(store, start + 31 * DAY) == [GONE]
+    _reconcile(store, start + 31 * DAY, listed=set())  # LIVE now has an absence clock too
+
+    assert store.clear_listed_model_presence({GONE, LIVE}) is True
+    assert "model_presence" not in store.snapshot()
+    store.update(lambda state: state["stats"].update({GONE: {"requests": 1}}))
+    assert store.snapshot()["stats"][GONE] == {"requests": 1}
+
+    before = (tmp_path / "state.json").read_bytes()
+    assert store.clear_listed_model_presence({GONE, LIVE}) is False
+    assert (tmp_path / "state.json").read_bytes() == before
+
+
+def test_spend_meter_store_is_private_and_survives_a_corrupt_file(tmp_path):
+    from ficelle.state_store import SpendMeterStore
+
+    store = SpendMeterStore(tmp_path / "provider-spend.json", tmp_path / "provider-spend.lock")
+    store.update(lambda meters: meters.update({"provider:x": {"unit": "requests"}}))
+    assert store.load() == {"provider:x": {"unit": "requests"}}
+    if hasattr(os, "fchmod"):
+        assert (tmp_path / "provider-spend.json").stat().st_mode & 0o777 == 0o600
+
+    (tmp_path / "provider-spend.json").write_text("{not json")
+    assert store.load() == {}
+    store.update(lambda meters: meters.update({"provider:y": {}}))
+    assert store.load() == {"provider:y": {}}

@@ -93,6 +93,32 @@ def test_model_selection_runner_runs_limited_due_quota_probes_and_reloads_state(
     assert [model.id for model in result.candidates] == ["ficelle/openrouter/ok"]
 
 
+def test_model_selection_converts_each_catalog_row_once_per_request(monkeypatch):
+    # The typed conversion deep-copies every row several times (~9 ms on a 600-model catalog), so
+    # building it a second time just to pick the quota-probe candidates doubled that on every request.
+    from ficelle.domain_models import CatalogModel
+
+    converted: list[Any] = []
+    real_from_raw = CatalogModel.from_raw.__func__
+    monkeypatch.setattr(
+        CatalogModel,
+        "from_raw",
+        classmethod(lambda cls, row: converted.append(row) or real_from_raw(cls, row)),
+    )
+    catalog = {
+        "models": [
+            {"id": f"ficelle/openrouter/m{index}", "source": "openrouter", "upstream_id": f"m{index}", "invokable": True}
+            for index in range(3)
+        ]
+        + ["not-a-row"]
+    }
+
+    result = ModelSelectionRunner(make_ports([{}])).select_models_result("ficelle/auto-tools", catalog, {})
+
+    assert len(result.candidates) == 3
+    assert len(converted) == 3
+
+
 def test_model_selection_defers_the_probes_the_inline_limit_drops():
     # The inline probe is what puts a recovered model back into THIS request's candidate list,
     # so it stays on the request thread. What used to be lost is everything past the limit: those
