@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Install Ficelle Core, and optionally Ficelle Pro, without cloning the repository.
 
-This script is intentionally stdlib-only. Bootstrap pinned to public mirror release v0.3.14:
+This script is intentionally stdlib-only. Bootstrap pinned to public mirror release v0.3.15:
 
-    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/77932ecbd1b34b4650a8f69ba59bc2d38a418f2d/scripts/bootstrap-ficelle.py | python3
+    curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/a0a37bc4c8737c47d7a4690fb12bb657ccd99e42/scripts/bootstrap-ficelle.py | python3
 
 Without a license key it installs the versioned open Core from the public GitHub
 release. With ``FICELLE_LICENSE_KEY`` (or the legacy ``FICELLE_INSTALL_TOKEN``)

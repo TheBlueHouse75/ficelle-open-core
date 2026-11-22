@@ -14,7 +14,7 @@ REPOSITORY = "TheBlueHouse75/ficelle-open-core"
 VERSION = "0.3.15"
 CORE_WHEEL = f"ficelle_router-{VERSION}-py3-none-any.whl"
 CORE_SHA256 = "001759a002ca6da1189941853cc4b1906d20a98ca4402080ce930ff889cc0d59"
-BOOTSTRAP_COMMIT = "77932ecbd1b34b4650a8f69ba59bc2d38a418f2d"
+BOOTSTRAP_COMMIT = "a0a37bc4c8737c47d7a4690fb12bb657ccd99e42"
 BOOTSTRAP_PATH = f"/{REPOSITORY}/{BOOTSTRAP_COMMIT}/scripts/bootstrap-ficelle.py"
 
 
