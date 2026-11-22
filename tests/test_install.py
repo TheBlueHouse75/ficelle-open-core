@@ -306,6 +306,22 @@ def test_run_install_dry_run_orders_package_plugin_service_and_smoke(monkeypatch
     assert "Ficelle setup complete." in output
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "100.64.0.7"])
+def test_setup_summary_asks_for_the_api_token_only_off_loopback(monkeypatch, tmp_path, capsys, host):
+    monkeypatch.setattr("ficelle.install.run_preflight", lambda options, target=None: None)
+    monkeypatch.setattr("ficelle.install.copy_plugin_tree", lambda *args, **kwargs: None)
+    options = make_options(tmp_path, dry_run=True, connectors=())
+    options.ficelle_home.mkdir(parents=True)
+    (options.ficelle_home / "config.json").write_text(json.dumps({"host": host}), encoding="utf-8")
+
+    assert run_install(options) == 0
+    client_line = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("OpenAI client:"))
+
+    # Loopback `/v1` trusts the local socket: sending a user after a token there is a false step.
+    assert ("access-token api" in client_line) is (host != "127.0.0.1")
+    assert ('api_key="ficelle-local"' in client_line) is (host == "127.0.0.1")
+
+
 def test_run_install_passes_hermes_home_to_service_and_smokes(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr("ficelle.install.run_preflight", lambda options, target=None: None)
@@ -1452,6 +1468,20 @@ def test_run_install_ignores_legacy_service_and_state(
 
     assert events == []
     assert (legacy / "state.json").read_text(encoding="utf-8") == '{"legacy": true}\n'
+
+
+def test_options_from_args_reuses_the_persisted_active_home(monkeypatch, tmp_path):
+    custom_home = tmp_path / "custom-ficelle"
+    custom_home.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("FICELLE_HOME", raising=False)
+    from ficelle.service import persist_active_service_context
+
+    assert persist_active_service_context(custom_home, tmp_path / ".config" / "ficelle" / "active-home")
+
+    assert options_from_args(build_parser().parse_args([])).ficelle_home == custom_home
+    monkeypatch.setenv("FICELLE_HOME", str(tmp_path / "explicit"))
+    assert options_from_args(build_parser().parse_args([])).ficelle_home == tmp_path / "explicit"
 
 
 def test_options_from_args_resolves_relative_home_paths(monkeypatch, tmp_path):

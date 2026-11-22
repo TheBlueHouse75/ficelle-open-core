@@ -76,6 +76,8 @@ def provider_config_fingerprint(
         "catalog_free_flag_field": provider_cfg.get("catalog_free_flag_field"),
         "free_note": provider_cfg.get("free_note"),
         "catalog_model_defaults": provider_cfg.get("catalog_model_defaults"),
+        "catalog_model_overrides": provider_cfg.get("catalog_model_overrides"),
+        "burn_weight": provider_cfg.get("burn_weight"),
         "model_id_exclude_patterns": provider_cfg.get("model_id_exclude_patterns"),
         "official_free_ids": provider_cfg.get("official_free_ids"),
         "official_free_id_suffixes": provider_cfg.get("official_free_id_suffixes"),

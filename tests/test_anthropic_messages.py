@@ -81,11 +81,14 @@ def test_constants_and_request_translation_cover_multimodal_tools_and_ignored_fi
     assert set(translated.ignored_fields) == {
         "cache_control",
         "context_management",
+        "metadata",
         "thinking",
         "tool_fields",
     }
     body = translated.openai_body
-    assert body["metadata"] == {"user_id": "u"}
+    # Claude Code's `metadata.user_id` carries account and session ids: nothing a third-party
+    # provider needs, so it is announced as dropped instead of forwarded.
+    assert "metadata" not in body
     assert body["messages"][0]["role"] == "system"
     assert body["messages"][1]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
     assert body["messages"][2]["tool_calls"][0]["id"] == "tool-1"
@@ -218,6 +221,7 @@ def test_errors_and_sse_encoder_are_safe_anthropic_shapes():
     assert "raw" not in error["error"]
     assert event_json(encode_anthropic_sse_event("ping", {"type": "ping"}))[0] == "ping"
     assert event_json(anthropic_sse_error_event("api_error", "nope"))[1]["error"]["message"] == "nope"
+    assert event_json(anthropic_sse_error_event("mid_stream_failure", "x", request_id="req"))[1]["error"]["ficelle_request_id"] == "req"
     for status in (408, 409, 504):
         assert translate_openai_error(status, {}, "req")["error"]["type"] == "api_error"
     assert translate_openai_error(402, {}, "req")["error"]["type"] == "billing_error"

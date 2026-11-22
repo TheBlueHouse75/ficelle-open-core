@@ -3,8 +3,9 @@
 Registers one tool, `ficelle_retrieve_compressed`, which fetches the original content behind a
 `<<ficelle:compressed:<hash>>>` marker from a local
 [Ficelle](https://github.com/TheBlueHouse75/ficelle-open-core) router. Ficelle emits those markers
-only when its native live-zone compression is active. The plugin is optional and useful only with
-Ficelle.
+only when its native live-zone compression is active; that compression is part of the paid Ficelle
+Pro edition and is off by default. With Ficelle Core alone, the tool reports that Ficelle Pro is not
+installed. The plugin is optional and useful only with Ficelle.
 
 Requires Hermes 0.22.6 or newer and a running Ficelle Core.
 

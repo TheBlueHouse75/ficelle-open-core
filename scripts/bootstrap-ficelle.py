@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -31,13 +32,13 @@ from email.parser import Parser
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
-CORE_VERSION = "0.3.14"
+CORE_VERSION = "0.3.15"
 DEFAULT_CORE_WHEEL_URL = (
     "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
     f"v{CORE_VERSION}/ficelle_router-{CORE_VERSION}-py3-none-any.whl"
 )
 DEFAULT_CORE_SHA256 = (
-    "be8838e4cfe327577889d7128b4031df32067e5e4b1cc8f5f80da194df39bba3"
+    "001759a002ca6da1189941853cc4b1906d20a98ca4402080ce930ff889cc0d59"
 )
 DEFAULT_WHEEL_URL = f"https://install.ficelle.ai/api/releases/{CORE_VERSION}/wheel"
 PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
@@ -935,7 +936,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         help="Ficelle-owned isolated runtime. It is always used for the installation.",
     )
-    parser.add_argument("--ficelle-home", default=None, help="Ficelle state root. Default: FICELLE_HOME or ~/.ficelle")
+    parser.add_argument("--ficelle-home", default=None, help="Ficelle state root. Default: FICELLE_HOME, the home of a previous setup, or ~/.ficelle")
     parser.add_argument(
         "--connector",
         action="append",
@@ -952,8 +953,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def read_active_home_pointer() -> str | None:
+    """The state root a previous setup persisted (ficelle.service.read_active_service_context).
+
+    Re-implemented here because the bootstrap runs before Ficelle is installed. Without it a
+    re-run on a custom home would install the service for a fresh ~/.ficelle.
+    """
+    # Read and decoded apart: a non-UTF-8 pointer is unreadable, not a plain-path pointer.
+    try:
+        raw = (Path.home() / ".config" / "ficelle" / "active-home").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        payload = json.loads(raw) if raw else None
+    except ValueError:
+        payload = {"ficelle_home": raw}
+    home = Path(str(payload.get("ficelle_home") or "")).expanduser() if isinstance(payload, dict) else None
+    return str(home) if home is not None and home.is_absolute() and home.is_dir() else None
+
+
 def options_from_args(args: argparse.Namespace) -> BootstrapOptions:
-    configured_ficelle_home = args.ficelle_home or os.getenv("FICELLE_HOME")
+    configured_ficelle_home = args.ficelle_home or os.getenv("FICELLE_HOME") or read_active_home_pointer()
     return BootstrapOptions(
         core_wheel_url=args.core_wheel_url,
         core_sha256=args.core_sha256,

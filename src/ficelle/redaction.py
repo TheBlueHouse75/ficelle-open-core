@@ -49,6 +49,9 @@ def redact_sensitive_text(value: Any, limit: int | None = None, *, collapse: boo
     text = str(value or "")
     if limit is not None:
         text = text[:REDACTION_INPUT_LIMIT]
+    # A JSON "\ud83d" parses to a lone surrogate that no UTF-8 writer (route log, response body)
+    # can encode; scrubbed here so every redacted string is safe to write.
+    text = text.encode("utf-8", "replace").decode("utf-8")
     if collapse:
         text = " ".join(text.split())
     if not text:

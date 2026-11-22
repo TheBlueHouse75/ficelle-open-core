@@ -20,8 +20,9 @@ from typing import Any, Mapping, Sequence
 from ficelle.json_store import write_private_text
 from ficelle.connector_registry import load_connectors, register_connector, unregister_connector
 from ficelle.runtime_paths import RuntimePaths, absolute_python, python_child_context, validated_runtime_home
-from ficelle.service import active_home_pointer_path, persist_active_service_context
+from ficelle.service import active_home_pointer_path, persist_active_service_context, read_active_service_context
 from ficelle.url_security import connectable_host, connectable_http_url
+from ficelle.use_cases.admin_security import bind_host_is_loopback
 from ficelle.use_cases.provider_auth import (
     invokable_provider_sources,
     provider_key_setup_commands,
@@ -96,6 +97,12 @@ def default_hermes_home() -> Path:
 
 
 def default_ficelle_home() -> Path:
+    # Same order as the CLI (cli_runtime_context): without the persisted pointer, a re-run of
+    # setup would install the service for a fresh ~/.ficelle and flip the pointer to it.
+    if not os.environ.get("FICELLE_HOME"):
+        persisted = read_active_service_context()
+        if persisted is not None:
+            return persisted
     return RuntimePaths.from_env().ficelle_home
 
 
@@ -1892,10 +1899,17 @@ def run_install(options: InstallOptions) -> int:
     print(f"Local OpenAI-compatible base URL: {base_url}")
     if not key_notice:
         print(f"Verify: `{cli} health` and `{cli} models`.")
-    print(
-        f"OpenAI client: `OpenAI(base_url=\"{base_url}\", "
-        "api_key=os.environ[\"FICELLE_API_KEY\"])` (use the owner API token)."
-    )
+    # Loopback `/v1` trusts the local socket; only another bind needs the owner API token.
+    if bind_host_is_loopback(configured_runtime_config(options.ficelle_home).get("host")):
+        print(
+            f"OpenAI client: `OpenAI(base_url=\"{base_url}\", api_key=\"ficelle-local\")` "
+            "(loopback needs no token; any non-empty value works)."
+        )
+    else:
+        print(
+            f"OpenAI client: `OpenAI(base_url=\"{base_url}\", "
+            f"api_key=os.environ[\"FICELLE_API_KEY\"])` (set it to `{cli} access-token api`)."
+        )
     for connector in options.connectors:
         print(f"Connector installed: {connector}")
     if "hermes" in options.connectors:

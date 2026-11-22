@@ -62,9 +62,10 @@ Haiku maps to `auto-fast`; Sonnet and the generic Claude Code route map to
 model that actually served the request. Ficelle never presents a free upstream
 model as Claude.
 
-`cache_control` and thinking blocks are accepted, ignored, and announced in
+`cache_control`, thinking blocks and `metadata` are accepted, ignored, and announced in
 `X-Ficelle-Dropped-Params`; no prompt caching or Anthropic thinking semantics
-are claimed.
+are claimed. `metadata.user_id` (Claude Code's account and session ids) is not
+forwarded to any upstream provider.
 
 ## Verification
 

@@ -812,6 +812,21 @@
     .pill-row { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
     .pill-row-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); width: 60px; flex: none; }
     .badge.outline { background: transparent; border-color: var(--border-strong); color: var(--text-soft); }
+    /* Remaining-quota gauge: a headline badge + meter, then plain-text reasons. The bar only draws
+       for a fresh provider-reported observation; every other state is text. */
+    .quota-row { align-items: flex-start; }
+    .quota-gauge { flex: 1 1 220px; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+    .quota-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+    .quota-bar { flex: 1 1 90px; min-width: 70px; max-width: 220px; height: 8px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
+    .quota-bar > span { display: block; height: 100%; border-radius: 4px; background: var(--ok); }
+    .quota-bar.warn > span { background: var(--warn); }
+    .quota-bar.danger > span { background: var(--danger); }
+    .quota-detail, .quota-line { font-size: 11.5px; line-height: 1.45; color: var(--text-muted); overflow-wrap: anywhere; }
+    .quota-line.warn { color: var(--warn); }
+    .quota-line.danger { color: var(--danger-text); }
+    .quota-rollup { grid-column: 1 / -1; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 12px; }
+    .quota-rollup-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); }
+    .quota-rollup-note { color: var(--text-muted); font-size: 11.5px; }
     .provider-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 13px; }
     .provider-chips.key-form { align-items: center; }
     .key-input, .key-mask { flex: 1 1 180px; min-width: 0; padding: 6px 9px; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius-xs); }
@@ -892,7 +907,8 @@
     @media (max-width: 1080px) {
       .provider-split { grid-template-columns: 1fr; }
       .prov-list { position: static; max-height: none; flex-direction: row; overflow-x: auto; overflow-y: visible; padding-bottom: 6px; padding-right: 0; }
-      .prov-list-item { flex: 0 0 auto; min-width: 200px; }
+      /* width: auto, or the base width: 100% makes each chip as wide as the strip itself. */
+      .prov-list-item { flex: 0 0 auto; min-width: 200px; width: auto; }
       .prov-pro-cta { flex: 0 0 260px; margin-top: 0; }
     }
     /* A strip of 20 full-width cards is one visible provider and no scroll cue: on phones
@@ -1116,6 +1132,8 @@
     /* Styling comes from .btn.sm; this only keeps the button from stretching in the
        column flex above. */
     .toast .t-action { align-self: flex-start; }
+    /* .btn's display: inline-flex beats the UA [hidden] rule, leaving an empty pill under every toast. */
+    .toast .t-action[hidden] { display: none; }
     .toast .t-close { width: 24px; height: 24px; margin: -4px -6px -4px 2px; align-self: flex-start; font-size: 16px; line-height: 1; color: var(--text-muted); border-color: transparent; background: transparent; }
     .toast .t-close:hover { color: var(--text); }
 
@@ -1254,7 +1272,25 @@
     .req-attempt-up { color: var(--text-soft); }
     .req-attempt-src { color: var(--text-muted); }
     .req-attempt-reason { color: var(--text-soft); }
-    .req-attempt-lat { color: var(--text-muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+    .req-attempt-lat { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+    .req-attempt-timing { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+    .req-attempt-ttft { font-variant-numeric: tabular-nums; }
+
+    /* Time to first token: two compact tables that stack on narrow screens. */
+    .req-ttft-card { margin-bottom: 16px; }
+    .ttft-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+    .ttft-block { min-width: 0; overflow-x: auto; }
+    .ttft-table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+    .ttft-table caption { text-align: left; font-size: 11px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; color: var(--text-muted); padding-bottom: 8px; }
+    .ttft-table th, .ttft-table td { padding: 7px 8px; border-top: 1px solid var(--border); text-align: right; white-space: nowrap; }
+    .ttft-table thead th { border-top: 0; color: var(--text-muted); font-weight: 600; font-size: 11.5px; }
+    .ttft-table th:first-child, .ttft-table td:first-child { text-align: left; }
+    .ttft-table tbody th { font-weight: 600; color: var(--text); white-space: normal; overflow-wrap: anywhere; }
+    .ttft-table td.ttft-none { text-align: left; color: var(--text-muted); font-style: italic; white-space: normal; }
+    .ttft-table td.ttft-n { color: var(--text-muted); }
+    .ttft-table td.ttft-n.is-low { font-style: italic; }
+    .ttft-empty { margin-bottom: 14px; }
+    .ttft-foot { margin: 14px 0 0; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
 
     @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
@@ -1364,6 +1400,7 @@
       .metric-grid { grid-template-columns: 1fr; }
       .req-list-head { display: none; }
       .req-list-footer { flex-direction: column; text-align: center; }
+      .req-timeline-card .card-head { flex-direction: column; align-items: flex-start; }
       .req-table { --req-flags-w: auto; --req-grid-cols: 56px minmax(0, 1fr) auto; }
       .req-row { grid-template-columns: var(--req-grid-cols); gap: 6px 8px; padding: 10px; }
       .req-row .req-time { grid-column: 1; grid-row: 1; }

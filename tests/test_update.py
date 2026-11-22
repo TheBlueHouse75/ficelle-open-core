@@ -760,6 +760,44 @@ def test_apply_update_requires_a_managed_service(
     assert "managed Ficelle service" in status["message"]
 
 
+def test_managed_service_accepts_a_registered_windows_scheduled_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Windows has no plist and no systemd unit, so checking those paths refused every
+    # in-app and CLI update on a working Scheduled Task install.
+    import functools
+
+    from ficelle import cli
+
+    monkeypatch.setattr(cli, "PLIST", tmp_path / "absent.plist")
+    monkeypatch.setattr(cli, "SYSTEMD_UNIT", tmp_path / "absent.service")
+    monkeypatch.setattr(
+        cli,
+        "current_service_backend",
+        functools.partial(cli.current_service_backend, platform_name="win32"),
+    )
+    registered = {"value": True}
+    queries: list[list[str]] = []
+    task_xml = cli.current_service_backend().task_payload()
+
+    def fake_run(cmd, **_kwargs):
+        queries.append(cmd)
+        if not registered["value"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="ERROR: not found")
+        return subprocess.CompletedProcess(cmd, 0, stdout=task_xml, stderr="")
+
+    monkeypatch.setattr(cli, "_run", fake_run)
+
+    backend, managed = update._managed_service()
+    assert backend.name == "scheduled-task"
+    assert managed is True
+    assert queries == [["schtasks", "/Query", "/TN", cli.LABEL, "/XML"]]
+
+    registered["value"] = False
+    assert update._managed_service()[1] is False
+
+
 def test_interrupted_update_recovery_marker_is_durable_and_restores(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -931,6 +969,60 @@ def test_detached_helpers_use_safe_python_and_runtime_cwd(tmp_path, monkeypatch,
     assert kwargs["cwd"] == str(home.absolute())
     assert home.is_dir()
     assert kwargs["start_new_session"] is True
+
+
+# Win32 CreateProcess flags, spelled as their documented values so the tests run off Windows:
+# CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP.
+WINDOWS_BREAKAWAY_FLAGS = 0x01000000 | 0x00000008 | 0x00000200
+
+
+def _windows_helper_setup(tmp_path, monkeypatch, popen):
+    marker = tmp_path / "marker"
+    marker.touch()
+    monkeypatch.setattr(update.sys, "platform", "win32")
+    monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(tmp_path / "home")}))
+    monkeypatch.setattr(update, "queue_update", lambda: {"status": "queued"})
+    monkeypatch.setattr(update, "update_recovery_marker_path", lambda: marker)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    # The real shutil.which reaches for Windows-only APIs once sys.platform says win32.
+    monkeypatch.setattr(update.shutil, "which", lambda name: None)
+    monkeypatch.setattr(update.subprocess, "Popen", popen)
+    statuses = []
+    monkeypatch.setattr(update, "_write_status", lambda payload: statuses.append(payload) or dict(payload))
+    return marker, statuses
+
+
+@pytest.mark.parametrize("operation", ["apply", "recover"])
+def test_windows_detached_helpers_break_away_from_the_scheduled_task_job(tmp_path, monkeypatch, operation):
+    # `schtasks /End` terminates every process in the task's job object: a helper left inside it
+    # dies with the router it is about to restart, half-way through the update.
+    calls = []
+    _windows_helper_setup(tmp_path, monkeypatch, lambda command, **kwargs: calls.append(kwargs))
+
+    assert (update.spawn_update if operation == "apply" else update.spawn_recovery)()
+
+    (kwargs,) = calls
+    assert "start_new_session" not in kwargs
+    assert kwargs["creationflags"] & WINDOWS_BREAKAWAY_FLAGS == WINDOWS_BREAKAWAY_FLAGS
+
+
+@pytest.mark.parametrize("operation", ["apply", "recover"])
+def test_windows_refused_breakaway_points_to_a_terminal_update(tmp_path, monkeypatch, operation):
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Access is denied")
+
+    marker, statuses = _windows_helper_setup(tmp_path, monkeypatch, refuse)
+    terminal_command = f"ficelle update --{'install' if operation == 'apply' else 'recover'}"
+    if operation == "apply":
+        with pytest.raises(update.UpdateUnavailable, match=terminal_command):
+            update.spawn_update()
+    else:
+        with pytest.raises(update.UpdateError, match=terminal_command):
+            update.spawn_recovery()
+    (status,) = statuses
+    assert status["status"] == "failed"
+    assert terminal_command in status["message"]
+    assert marker.exists()
 
 
 @pytest.mark.parametrize("operation", ["apply", "recover"])

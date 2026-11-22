@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ficelle-router"
-version = "0.3.14"
+version = "0.3.15"
 description = "Local OpenAI-compatible strict-zero model router for AI agents"
 readme = "README.md"
 license = "BUSL-1.1"
@@ -29,6 +29,7 @@ ficelle = ["assets/auto-coding-manifest.json", "assets/hermes-plugin/*/*", "asse
 
 # The catalog bootstrap pin carries the SHA-256 of a file that itself pins this wheel's digest, so
 # shipping it inside the wheel would be circular. It stays in the source tree and the public mirror.
+# MANIFEST.in must exclude it too: on its own, this rule does not keep it out of the wheel.
 [tool.setuptools.exclude-package-data]
 ficelle = ["assets/hermes-plugin/*/bootstrap-pin.json"]
 

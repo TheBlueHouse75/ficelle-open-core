@@ -10,8 +10,8 @@ against a live install — please report deltas.
 
 Add Ficelle models to `~/.continue/config.yaml`:
 
-First run `ficelle access-token api`, then paste that value in place of
-`<FICELLE_API_TOKEN>` below. Treat it as a local secret.
+On the default loopback listener any placeholder works as the API key. For a non-loopback bind,
+run `ficelle access-token api` and use that value instead, as a local secret.
 
 ```yaml
 models:
@@ -19,7 +19,7 @@ models:
     provider: openai
     model: ficelle/auto-tools
     apiBase: http://127.0.0.1:8646/v1
-    apiKey: <FICELLE_API_TOKEN>
+    apiKey: ficelle-local
     roles:
       - chat
       - edit
@@ -27,7 +27,7 @@ models:
     provider: openai
     model: ficelle/auto-fast
     apiBase: http://127.0.0.1:8646/v1
-    apiKey: <FICELLE_API_TOKEN>
+    apiKey: ficelle-local
 ```
 
 Older installs using `config.json` take the same fields on a `models` entry

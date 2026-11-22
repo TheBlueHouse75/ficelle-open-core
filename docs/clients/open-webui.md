@@ -11,7 +11,8 @@ against a live install — please report deltas.
 In **Admin Panel → Settings → Connections → OpenAI API**, add a connection:
 
 - API Base URL: `http://127.0.0.1:8646/v1`
-- API Key: the owner token returned by `ficelle access-token api`
+- API Key: any placeholder such as `ficelle-local` on the default loopback listener; for a
+  non-loopback bind, the owner token returned by `ficelle access-token api`
 
 Save, then refresh the model list: the `ficelle/auto-*` profiles appear in the
 picker.

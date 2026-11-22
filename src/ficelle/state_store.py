@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import shutil
 import threading
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from ficelle.json_store import atomic_write_json, ensure_private_dir, load_json
+from ficelle.probe_lock import file_lock
 
 try:
     import fcntl
@@ -20,6 +22,29 @@ except Exception:  # pragma: no cover - Windows fallback for local imports/tests
 
 
 RUNTIME_STATE_HISTORY_KEYS = ("benchmark_results", "verified_capabilities", "quality_feedback")
+
+# Per-model runtime sections, all keyed by `cooldown_key` (`source::upstream_id`), that the
+# catalog-presence prune deletes for a model gone from its provider for good. `quarantine` is
+# deliberately absent: it records a billing/paid verdict, and a model that comes back under the
+# same id must not silently lose it. `quality_feedback` expires on its own TTL.
+PRUNABLE_MODEL_SECTIONS = (
+    "stats",
+    "successes",
+    "model_errors",
+    "cooldowns",
+    "benchmark_results",
+    "verified_capabilities",
+    "request_token_limits",
+    "unsupported_parameters",
+)
+# Owned by `StateStore.reconcile_model_presence` (and `clear_listed_model_presence`, which every
+# catalog publish runs for the models it lists): `first_absent` (key -> ISO time a full
+# listing of the model's provider first lacked it) and `pruned` (key -> ISO time it was pruned,
+# the tombstone that stops a stale whole-state write from resurrecting the deleted rows).
+MODEL_PRESENCE_KEY = "model_presence"
+MODEL_ABSENCE_RETENTION_SECONDS = 30 * 24 * 3600
+# A stale snapshot older than this is not a writer still in flight.
+MODEL_PRUNE_TOMBSTONE_SECONDS = 7 * 24 * 3600
 
 
 @contextmanager
@@ -223,12 +248,45 @@ def merge_runtime_state_for_write(current: Any, incoming: dict[str, Any]) -> dic
             else:
                 merged.pop(key, None)
             continue
+        if current_value == incoming_value:
+            # A mutator that never touched this history key hands back exactly what is stored, and
+            # merging two equal values reproduces them. C-speed equality is far cheaper than the
+            # row-by-row merge that most writes (a spend counter, a cooldown) do not need.
+            continue
         if isinstance(current_value, dict):
             if isinstance(incoming_value, dict):
                 merged[key] = merge_runtime_history_rows(current_value, incoming_value)
             else:
                 merged[key] = copy.deepcopy(current_value)
+    _keep_model_presence_ledger(current, merged)
     return merged
+
+
+def _keep_model_presence_ledger(current: dict[str, Any], merged: dict[str, Any]) -> None:
+    """The presence ledger and its tombstones survive any write but the prune and the publish-time clear.
+
+    Without this, the history merge above would re-add every pruned benchmark row the moment a
+    writer holding a pre-prune snapshot wrote it back, and a stale ledger could restore an
+    absence clock a relisting had already cleared. Only a key the store holds no row for is
+    dropped, so a writer adding to a section never loses an unrelated model.
+    """
+    presence = current.get(MODEL_PRESENCE_KEY)
+    if not isinstance(presence, dict):
+        merged.pop(MODEL_PRESENCE_KEY, None)
+        return
+    merged[MODEL_PRESENCE_KEY] = presence
+    pruned = presence.get("pruned")
+    if not isinstance(pruned, dict) or not pruned:
+        return
+    for section in PRUNABLE_MODEL_SECTIONS:
+        incoming_rows = merged.get(section)
+        if not isinstance(incoming_rows, dict):
+            continue
+        current_rows = current.get(section)
+        current_rows = current_rows if isinstance(current_rows, dict) else {}
+        resurrected = {key for key in pruned if key in incoming_rows and key not in current_rows}
+        if resurrected:
+            merged[section] = {key: value for key, value in incoming_rows.items() if key not in resurrected}
 
 
 @dataclass
@@ -243,6 +301,8 @@ class StateStore:
     fallback_backup_dir: Path | None = None
     thread_lock: threading.RLock = field(default_factory=threading.RLock)
     last_update_reason: str | None = field(default=None, init=False)
+    _shared: tuple[tuple[str, int, int, int], dict[str, Any]] | None = field(default=None, init=False, repr=False)
+    _shared_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @contextmanager
     def lock(self) -> Iterator[None]:
@@ -369,11 +429,66 @@ class StateStore:
                 merged[key] = copy.deepcopy(incoming_value) if isinstance(incoming_value, dict) else copy.deepcopy(current_value)
         return merged
 
+    def shared_snapshot(self) -> dict[str, Any]:
+        """Parse the state file at most once per version of it, for readers that never mutate.
+
+        A request reads the state four times (token caps, selection, per-attempt parameters,
+        competence); each was a full `json.loads`. Keyed on the file's identity because writes
+        publish by rename. The top level is a fresh dict per call, but nested values are shared,
+        so callers must treat them as read-only, as with the catalog document cache. Anything
+        that is not a clean parse of the real file (absent, corrupt, backup recovery) is not cached.
+        """
+        path = self.read_state_path()
+        try:
+            stat = path.stat()
+            signature = (str(path), stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            return self.snapshot()
+        with self._shared_lock:
+            cached = self._shared
+        if cached is not None and cached[0] == signature:
+            return dict(cached[1])
+        try:
+            parsed = json.loads(path.read_text())
+        except Exception:
+            return self.snapshot()
+        if not isinstance(parsed, dict):
+            return self.snapshot()
+        with self._shared_lock:
+            self._shared = (signature, parsed)
+        return dict(parsed)
+
+    def _publish(self, state: dict[str, Any]) -> None:
+        """The one write of the state file, which also drops the parsed-state cache.
+
+        Same-size rewrites inside one mtime tick can share a file signature on some filesystems,
+        so a writer in this process never relies on the signature alone.
+        """
+        atomic_write_json(self.state_path, state, compact=True)
+        with self._shared_lock:
+            self._shared = None
+
+    def _load_for_update(self) -> tuple[Any, dict[str, Any]]:
+        """The stored state plus an independent working copy for the mutator.
+
+        Parsing the text twice costs about a third of `copy.deepcopy` on a ~1 MB state, and the
+        stored copy is what the merge compares against, so the two must not alias.
+        """
+        path = self.read_state_path()
+        try:
+            text = path.read_text()
+            current = json.loads(text)
+            return current, json.loads(text) if isinstance(current, dict) else {}
+        except Exception:
+            # Absent or unreadable: `load` owns the backup recovery and the empty default.
+            current = self.load({})
+            return current, copy.deepcopy(current) if isinstance(current, dict) else {}
+
     def write(self, state: dict[str, Any]) -> None:
         with self.lock():
             self.backup()
             current = self.load({})
-            atomic_write_json(self.state_path, self.merge_for_write(current, state))
+            self._publish(self.merge_for_write(current, state))
 
     def update(
         self,
@@ -382,14 +497,132 @@ class StateStore:
     ) -> dict[str, Any]:
         with self.lock():
             self.backup()
-            current = self.load({})
-            state = copy.deepcopy(current) if isinstance(current, dict) else {}
+            current, state = self._load_for_update()
             updated = mutator(state)
             next_state = updated if isinstance(updated, dict) else state
             merged = self.merge_for_write(current, next_state)
-            atomic_write_json(self.state_path, merged)
+            self._publish(merged)
             self.last_update_reason = reason
             return merged
+
+    def reconcile_model_presence(
+        self,
+        *,
+        observed_sources: set[str],
+        listed_keys: set[str],
+        now: float | None = None,
+        retention_seconds: float = MODEL_ABSENCE_RETENTION_SECONDS,
+    ) -> list[str]:
+        """Delete the runtime entries of models gone from their provider for ``retention_seconds``.
+
+        ``observed_sources`` are the providers whose listing this catalog refresh can trust to be
+        complete (answered, non-empty, not truncated); ``listed_keys`` the ``source::upstream_id``
+        keys they still list. A model of any other provider — failed, disabled, uncredentialed,
+        removed from config — is unobserved: its absence clock neither starts nor clears and it is
+        never pruned, so a refresh that failed or came back empty or partial deletes nothing. A
+        relisting clears the clock, so a temporary catalog gap never adds up to the window.
+
+        Applied without the history merge, which exists to stop stale writers from dropping rows
+        and would otherwise put the deleted ones straight back. Returns the pruned keys.
+        """
+        if not observed_sources:
+            return []
+        reference = time.time() if now is None else now
+        stamp = datetime.fromtimestamp(reference, timezone.utc).isoformat()
+        with self.lock():
+            current, state = self._load_for_update()
+            if not isinstance(current, dict):
+                return []
+            raw_presence = state.get(MODEL_PRESENCE_KEY)
+            presence = raw_presence if isinstance(raw_presence, dict) else {}
+            first_absent = presence.get("first_absent") if isinstance(presence.get("first_absent"), dict) else {}
+            tombstones = presence.get("pruned") if isinstance(presence.get("pruned"), dict) else {}
+            known: set[str] = set(first_absent)
+            for section in PRUNABLE_MODEL_SECTIONS:
+                rows = state.get(section)
+                if isinstance(rows, dict):
+                    known.update(str(key) for key in rows)
+            pruned: list[str] = []
+            next_absent: dict[str, Any] = {}
+            for key in sorted(known):
+                if key.split("::", 1)[0] not in observed_sources:
+                    if key in first_absent:
+                        next_absent[key] = first_absent[key]
+                    continue
+                if key in listed_keys:
+                    continue
+                since = parse_iso_timestamp(first_absent.get(key))
+                if since is None:
+                    next_absent[key] = stamp
+                elif reference - since >= retention_seconds:
+                    pruned.append(key)
+                else:
+                    next_absent[key] = first_absent[key]
+            next_tombstones = {
+                key: value
+                for key, value in tombstones.items()
+                if key not in listed_keys
+                and (parse_iso_timestamp(value) or 0.0) > reference - MODEL_PRUNE_TOMBSTONE_SECONDS
+            }
+            for key in pruned:
+                next_tombstones[key] = stamp
+                for section in PRUNABLE_MODEL_SECTIONS:
+                    rows = state.get(section)
+                    if isinstance(rows, dict):
+                        rows.pop(key, None)
+            if next_absent or next_tombstones:
+                state[MODEL_PRESENCE_KEY] = {"first_absent": next_absent, "pruned": next_tombstones}
+            else:
+                state.pop(MODEL_PRESENCE_KEY, None)
+            if not pruned and state.get(MODEL_PRESENCE_KEY) == current.get(MODEL_PRESENCE_KEY):
+                return []
+            self.backup()
+            self._publish(state)
+            self.last_update_reason = "reconcile_model_presence"
+            return pruned
+
+    def clear_listed_model_presence(self, listed_keys: set[str]) -> bool:
+        """Drop the absence clock and tombstone of every model a catalog about to be published lists.
+
+        Runs on every catalog publish, observed or not: a listed model is present whatever the
+        pruning trust in its provider's listing, and a tombstone left on it would make the
+        merge silently drop each stats, cooldown, benchmark or verified row written for it
+        until a fully observed refresh happened to clear it. Like the prune, it is applied
+        without the history merge, which would put the cleared ledger straight back. Returns
+        whether anything was cleared; a publish with nothing to clear writes nothing.
+        """
+
+        def listed_marks(state: Any) -> bool:
+            presence = state.get(MODEL_PRESENCE_KEY) if isinstance(state, dict) else None
+            if not isinstance(presence, dict):
+                return False
+            return any(
+                isinstance(presence.get(part), dict) and not listed_keys.isdisjoint(presence[part])
+                for part in ("first_absent", "pruned")
+            )
+
+        # The cached snapshot answers the common no-op publish without taking the lock.
+        if not listed_keys or not listed_marks(self.snapshot()):
+            return False
+        with self.lock():
+            current, state = self._load_for_update()
+            if not listed_marks(current):
+                return False
+            presence = state[MODEL_PRESENCE_KEY]
+            next_presence: dict[str, dict[str, Any]] = {}
+            for part in ("first_absent", "pruned"):
+                rows = presence.get(part)
+                next_presence[part] = (
+                    {key: value for key, value in rows.items() if key not in listed_keys} if isinstance(rows, dict) else {}
+                )
+            if any(next_presence.values()):
+                state[MODEL_PRESENCE_KEY] = next_presence
+            else:
+                state.pop(MODEL_PRESENCE_KEY, None)
+            self.backup()
+            self._publish(state)
+            self.last_update_reason = "clear_listed_model_presence"
+            return True
 
     def diagnostics(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
         runtime_state = self.snapshot() if state is None else state
@@ -412,3 +645,38 @@ class StateStore:
                 "latest": state_file_summary(latest_backup) if latest_backup else None,
             },
         }
+
+
+SPEND_METER_DOCUMENT_KEY = "meters"
+
+
+@dataclass
+class SpendMeterStore:
+    """Provider spend meters, kept out of ``state.json`` so the per-request write stays tiny.
+
+    Every upstream call is counted before it leaves (``router.record_upstream_spend``): a request
+    that never answers, or a router that crashes mid-call, has still spent its allowance, and
+    other processes see it through the shared file. That write used to be a full read/merge/
+    rewrite of the whole runtime state for a counter of a few hundred bytes, so its cost grew with
+    the state. This file holds only the meters, behind its own cross-process lock
+    (``probe_lock.file_lock``, so Windows is excluded across processes too), written with the
+    same private permissions and atomic rename as the state. An unreadable file reads as empty:
+    the meters are per-window counts, so the worst case is one window of undercounting, never a
+    failed request.
+    """
+
+    path: Path
+    lock_path: Path
+    thread_lock: threading.RLock = field(default_factory=threading.RLock)
+
+    def load(self) -> dict[str, Any]:
+        document = load_json(self.path, {})
+        meters = document.get(SPEND_METER_DOCUMENT_KEY) if isinstance(document, dict) else None
+        return meters if isinstance(meters, dict) else {}
+
+    def update(self, mutator: Callable[[dict[str, Any]], None]) -> None:
+        ensure_private_dir(self.lock_path.parent)
+        with self.thread_lock, file_lock(self.lock_path, blocking=True):
+            meters = self.load()
+            mutator(meters)
+            atomic_write_json(self.path, {SPEND_METER_DOCUMENT_KEY: meters}, compact=True)

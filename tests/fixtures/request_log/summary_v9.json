@@ -1,0 +1,1344 @@
+{
+ "1h": {
+  "bucket_seconds": 300,
+  "by_reason": [
+   {
+    "ok": 21,
+    "reason": "ok",
+    "total": 21
+   },
+   {
+    "ok": 0,
+    "reason": "timeout",
+    "total": 10
+   },
+   {
+    "ok": 0,
+    "reason": "rate_limited",
+    "total": 10
+   },
+   {
+    "ok": 0,
+    "reason": "upstream_failure",
+    "total": 9
+   },
+   {
+    "ok": 0,
+    "reason": "client_disconnected",
+    "total": 1
+   }
+  ],
+  "by_source": [
+   {
+    "ok": 7,
+    "source": "delta",
+    "total": 9
+   },
+   {
+    "ok": 5,
+    "source": "gamma",
+    "total": 8
+   },
+   {
+    "ok": 4,
+    "source": "alpha",
+    "total": 8
+   },
+   {
+    "ok": 2,
+    "source": "beta",
+    "total": 5
+   },
+   {
+    "ok": 3,
+    "source": "eps",
+    "total": 4
+   },
+   {
+    "ok": 0,
+    "source": "zeta",
+    "total": 1
+   }
+  ],
+  "by_status": [
+   {
+    "ok": 21,
+    "status": 200,
+    "total": 21
+   },
+   {
+    "ok": 0,
+    "status": 502,
+    "total": 11
+   },
+   {
+    "ok": 0,
+    "status": 429,
+    "total": 11
+   },
+   {
+    "ok": 0,
+    "status": 504,
+    "total": 8
+   }
+  ],
+  "context_estimate": {
+   "min_prompt_tokens": 1000,
+   "n": 15,
+   "ratio_p1": 0.0667,
+   "ratio_p10": 0.25,
+   "ratio_p50": 1.025,
+   "ratio_p90": 11.0,
+   "ratio_p99": 13.0,
+   "underestimate_rate": 0.4
+  },
+  "errors": 30,
+  "fallback_count": 15,
+  "latency_p50": 11.91,
+  "latency_p95": 18.74,
+  "ok": 21,
+  "router_overhead": {
+   "n": 34,
+   "p50": 0.01,
+   "p95": 0.018
+  },
+  "savings": {
+   "estimated_saved_usd": 0.02845,
+   "priced_requests": 17,
+   "unpriced_requests": 19
+  },
+  "stream_count": 34,
+  "success_rate": 0.4118,
+  "timeline": [
+   {
+    "bucket": 3999996300,
+    "ok": 0,
+    "total": 0
+   },
+   {
+    "bucket": 3999996600,
+    "ok": 2,
+    "total": 7
+   },
+   {
+    "bucket": 3999996900,
+    "ok": 2,
+    "total": 5
+   },
+   {
+    "bucket": 3999997200,
+    "ok": 4,
+    "total": 6
+   },
+   {
+    "bucket": 3999997500,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3999997800,
+    "ok": 2,
+    "total": 6
+   },
+   {
+    "bucket": 3999998100,
+    "ok": 2,
+    "total": 5
+   },
+   {
+    "bucket": 3999998400,
+    "ok": 3,
+    "total": 5
+   },
+   {
+    "bucket": 3999998700,
+    "ok": 1,
+    "total": 2
+   },
+   {
+    "bucket": 3999999000,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3999999300,
+    "ok": 1,
+    "total": 3
+   },
+   {
+    "bucket": 3999999600,
+    "ok": 3,
+    "total": 8
+   },
+   {
+    "bucket": 3999999900,
+    "ok": 1,
+    "total": 2
+   }
+  ],
+  "total": 51,
+  "ttft": {
+   "by_profile": [
+    {
+     "n": 7,
+     "p50": 0.7,
+     "p75": 1.6,
+     "p95": 2.2,
+     "profile": "ficelle/auto-fast",
+     "state": "ok"
+    },
+    {
+     "n": 7,
+     "p50": 1.0,
+     "p75": 1.5,
+     "p95": 2.3,
+     "profile": "ficelle/auto-tools",
+     "state": "ok"
+    },
+    {
+     "n": 6,
+     "p50": 0.7,
+     "p75": 1.2,
+     "p95": 1.9,
+     "profile": "ficelle/auto-long",
+     "state": "ok"
+    },
+    {
+     "n": 0,
+     "p50": null,
+     "p75": null,
+     "p95": null,
+     "profile": "ficelle/auto-only",
+     "state": "no_streaming_data"
+    }
+   ],
+   "by_source": [
+    {
+     "n": 7,
+     "p50": 2.1,
+     "p75": 2.2,
+     "p95": 2.3,
+     "source": "alpha",
+     "state": "ok"
+    },
+    {
+     "n": 7,
+     "p50": 0.8,
+     "p75": 1.9,
+     "p95": 2.2,
+     "source": "delta",
+     "state": "ok"
+    },
+    {
+     "n": 7,
+     "p50": 0.9,
+     "p75": 1.1,
+     "p95": 2.9,
+     "source": "gamma",
+     "state": "ok"
+    },
+    {
+     "n": 6,
+     "p50": 1.2,
+     "p75": 1.9,
+     "p95": 2.8,
+     "source": "beta",
+     "state": "ok"
+    },
+    {
+     "n": 4,
+     "p50": 0.6,
+     "p75": 1.4,
+     "p95": 1.5,
+     "source": "eps",
+     "state": "ok"
+    },
+    {
+     "n": 0,
+     "p50": null,
+     "p75": null,
+     "p95": null,
+     "source": "zeta",
+     "state": "no_streaming_data"
+    }
+   ],
+   "overall": {
+    "n": 37,
+    "p50": 1.0,
+    "p75": 1.7,
+    "p95": 2.8,
+    "state": "ok"
+   }
+  },
+  "usage": {
+   "completion_tokens": 16319,
+   "prompt_tokens": 110820,
+   "requests": 36
+  },
+  "window_seconds": 3600
+ },
+ "24h": {
+  "bucket_seconds": 3600,
+  "by_reason": [
+   {
+    "ok": 62,
+    "reason": "ok",
+    "total": 62
+   },
+   {
+    "ok": 0,
+    "reason": "upstream_failure",
+    "total": 27
+   },
+   {
+    "ok": 0,
+    "reason": "rate_limited",
+    "total": 21
+   },
+   {
+    "ok": 0,
+    "reason": "timeout",
+    "total": 19
+   },
+   {
+    "ok": 0,
+    "reason": "client_disconnected",
+    "total": 2
+   }
+  ],
+  "by_source": [
+   {
+    "ok": 20,
+    "source": "delta",
+    "total": 27
+   },
+   {
+    "ok": 17,
+    "source": "gamma",
+    "total": 21
+   },
+   {
+    "ok": 7,
+    "source": "alpha",
+    "total": 18
+   },
+   {
+    "ok": 10,
+    "source": "beta",
+    "total": 15
+   },
+   {
+    "ok": 8,
+    "source": "eps",
+    "total": 14
+   },
+   {
+    "ok": 0,
+    "source": "zeta",
+    "total": 1
+   }
+  ],
+  "by_status": [
+   {
+    "ok": 62,
+    "status": 200,
+    "total": 63
+   },
+   {
+    "ok": 0,
+    "status": 502,
+    "total": 29
+   },
+   {
+    "ok": 0,
+    "status": 429,
+    "total": 24
+   },
+   {
+    "ok": 0,
+    "status": 504,
+    "total": 15
+   }
+  ],
+  "context_estimate": {
+   "min_prompt_tokens": 1000,
+   "n": 37,
+   "ratio_p1": 0.0667,
+   "ratio_p10": 0.0667,
+   "ratio_p50": 0.9167,
+   "ratio_p90": 4.0,
+   "ratio_p99": 13.0,
+   "underestimate_rate": 0.5946
+  },
+  "errors": 69,
+  "fallback_count": 46,
+  "latency_p50": 10.27,
+  "latency_p95": 19.14,
+  "ok": 62,
+  "router_overhead": {
+   "n": 88,
+   "p50": 0.008,
+   "p95": 0.018
+  },
+  "savings": {
+   "estimated_saved_usd": 0.149113,
+   "priced_requests": 43,
+   "unpriced_requests": 46
+  },
+  "stream_count": 82,
+  "success_rate": 0.4733,
+  "timeline": [
+   {
+    "bucket": 3999913200,
+    "ok": 1,
+    "total": 2
+   },
+   {
+    "bucket": 3999916800,
+    "ok": 1,
+    "total": 5
+   },
+   {
+    "bucket": 3999920400,
+    "ok": 1,
+    "total": 3
+   },
+   {
+    "bucket": 3999924000,
+    "ok": 2,
+    "total": 3
+   },
+   {
+    "bucket": 3999927600,
+    "ok": 2,
+    "total": 4
+   },
+   {
+    "bucket": 3999931200,
+    "ok": 2,
+    "total": 4
+   },
+   {
+    "bucket": 3999934800,
+    "ok": 4,
+    "total": 5
+   },
+   {
+    "bucket": 3999938400,
+    "ok": 2,
+    "total": 4
+   },
+   {
+    "bucket": 3999942000,
+    "ok": 1,
+    "total": 3
+   },
+   {
+    "bucket": 3999945600,
+    "ok": 1,
+    "total": 4
+   },
+   {
+    "bucket": 3999949200,
+    "ok": 1,
+    "total": 2
+   },
+   {
+    "bucket": 3999952800,
+    "ok": 2,
+    "total": 4
+   },
+   {
+    "bucket": 3999956400,
+    "ok": 0,
+    "total": 2
+   },
+   {
+    "bucket": 3999960000,
+    "ok": 1,
+    "total": 4
+   },
+   {
+    "bucket": 3999963600,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3999967200,
+    "ok": 1,
+    "total": 2
+   },
+   {
+    "bucket": 3999970800,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3999974400,
+    "ok": 1,
+    "total": 2
+   },
+   {
+    "bucket": 3999978000,
+    "ok": 1,
+    "total": 1
+   },
+   {
+    "bucket": 3999981600,
+    "ok": 3,
+    "total": 4
+   },
+   {
+    "bucket": 3999985200,
+    "ok": 0,
+    "total": 2
+   },
+   {
+    "bucket": 3999988800,
+    "ok": 6,
+    "total": 9
+   },
+   {
+    "bucket": 3999992400,
+    "ok": 4,
+    "total": 7
+   },
+   {
+    "bucket": 3999996000,
+    "ok": 17,
+    "total": 41
+   },
+   {
+    "bucket": 3999999600,
+    "ok": 4,
+    "total": 10
+   }
+  ],
+  "total": 131,
+  "ttft": {
+   "by_profile": [
+    {
+     "n": 21,
+     "p50": 0.9,
+     "p75": 1.7,
+     "p95": 2.0,
+     "profile": "ficelle/auto-tools",
+     "state": "ok"
+    },
+    {
+     "n": 15,
+     "p50": 1.5,
+     "p75": 1.8,
+     "p95": 2.5,
+     "profile": "ficelle/auto-fast",
+     "state": "ok"
+    },
+    {
+     "n": 12,
+     "p50": 0.7,
+     "p75": 1.4,
+     "p95": 2.3,
+     "profile": "ficelle/auto-long",
+     "state": "ok"
+    },
+    {
+     "n": 0,
+     "p50": null,
+     "p75": null,
+     "p95": null,
+     "profile": "ficelle/auto-only",
+     "state": "no_streaming_data"
+    }
+   ],
+   "by_source": [
+    {
+     "n": 22,
+     "p50": 1.4,
+     "p75": 1.9,
+     "p95": 2.8,
+     "source": "delta",
+     "state": "ok"
+    },
+    {
+     "n": 19,
+     "p50": 1.5,
+     "p75": 2.0,
+     "p95": 2.3,
+     "source": "alpha",
+     "state": "ok"
+    },
+    {
+     "n": 12,
+     "p50": 0.6,
+     "p75": 1.4,
+     "p95": 1.7,
+     "source": "eps",
+     "state": "ok"
+    },
+    {
+     "n": 9,
+     "p50": 1.6,
+     "p75": 1.9,
+     "p95": 2.8,
+     "source": "beta",
+     "state": "ok"
+    },
+    {
+     "n": 9,
+     "p50": 0.9,
+     "p75": 1.1,
+     "p95": 2.9,
+     "source": "gamma",
+     "state": "ok"
+    },
+    {
+     "n": 0,
+     "p50": null,
+     "p75": null,
+     "p95": null,
+     "source": "zeta",
+     "state": "no_streaming_data"
+    }
+   ],
+   "overall": {
+    "n": 86,
+    "p50": 1.2,
+    "p75": 1.9,
+    "p95": 2.6,
+    "state": "ok"
+   }
+  },
+  "usage": {
+   "completion_tokens": 39627,
+   "prompt_tokens": 385800,
+   "requests": 89
+  },
+  "window_seconds": 86400
+ },
+ "30d": {
+  "bucket_seconds": 86400,
+  "by_reason": [
+   {
+    "ok": 113,
+    "reason": "ok",
+    "total": 113
+   },
+   {
+    "ok": 0,
+    "reason": "upstream_failure",
+    "total": 42
+   },
+   {
+    "ok": 0,
+    "reason": "rate_limited",
+    "total": 35
+   },
+   {
+    "ok": 0,
+    "reason": "timeout",
+    "total": 31
+   },
+   {
+    "ok": 0,
+    "reason": "client_disconnected",
+    "total": 2
+   }
+  ],
+  "by_source": [
+   {
+    "ok": 22,
+    "source": "alpha",
+    "total": 41
+   },
+   {
+    "ok": 29,
+    "source": "delta",
+    "total": 37
+   },
+   {
+    "ok": 24,
+    "source": "gamma",
+    "total": 32
+   },
+   {
+    "ok": 20,
+    "source": "beta",
+    "total": 30
+   },
+   {
+    "ok": 18,
+    "source": "eps",
+    "total": 29
+   },
+   {
+    "ok": 0,
+    "source": "zeta",
+    "total": 1
+   }
+  ],
+  "by_status": [
+   {
+    "ok": 113,
+    "status": 200,
+    "total": 114
+   },
+   {
+    "ok": 0,
+    "status": 502,
+    "total": 41
+   },
+   {
+    "ok": 0,
+    "status": 429,
+    "total": 36
+   },
+   {
+    "ok": 0,
+    "status": 504,
+    "total": 32
+   }
+  ],
+  "context_estimate": {
+   "min_prompt_tokens": 1000,
+   "n": 62,
+   "ratio_p1": 0.0667,
+   "ratio_p10": 0.25,
+   "ratio_p50": 1.0,
+   "ratio_p90": 11.0,
+   "ratio_p99": 13.0,
+   "underestimate_rate": 0.4839
+  },
+  "errors": 110,
+  "fallback_count": 82,
+  "latency_p50": 9.87,
+  "latency_p95": 19.14,
+  "ok": 113,
+  "router_overhead": {
+   "n": 148,
+   "p50": 0.01,
+   "p95": 0.019
+  },
+  "savings": {
+   "estimated_saved_usd": 0.177066,
+   "priced_requests": 68,
+   "unpriced_requests": 85
+  },
+  "stream_count": 144,
+  "success_rate": 0.5067,
+  "timeline": [
+   {
+    "bucket": 3997382400,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3997468800,
+    "ok": 0,
+    "total": 0
+   },
+   {
+    "bucket": 3997555200,
+    "ok": 2,
+    "total": 5
+   },
+   {
+    "bucket": 3997641600,
+    "ok": 1,
+    "total": 1
+   },
+   {
+    "bucket": 3997728000,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3997814400,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3997900800,
+    "ok": 0,
+    "total": 0
+   },
+   {
+    "bucket": 3997987200,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3998073600,
+    "ok": 1,
+    "total": 2
+   },
+   {
+    "bucket": 3998160000,
+    "ok": 0,
+    "total": 3
+   },
+   {
+    "bucket": 3998246400,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3998332800,
+    "ok": 2,
+    "total": 3
+   },
+   {
+    "bucket": 3998419200,
+    "ok": 0,
+    "total": 2
+   },
+   {
+    "bucket": 3998505600,
+    "ok": 1,
+    "total": 1
+   },
+   {
+    "bucket": 3998592000,
+    "ok": 2,
+    "total": 3
+   },
+   {
+    "bucket": 3998678400,
+    "ok": 0,
+    "total": 0
+   },
+   {
+    "bucket": 3998764800,
+    "ok": 1,
+    "total": 1
+   },
+   {
+    "bucket": 3998851200,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3998937600,
+    "ok": 0,
+    "total": 0
+   },
+   {
+    "bucket": 3999024000,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3999110400,
+    "ok": 3,
+    "total": 3
+   },
+   {
+    "bucket": 3999196800,
+    "ok": 0,
+    "total": 3
+   },
+   {
+    "bucket": 3999283200,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3999369600,
+    "ok": 3,
+    "total": 4
+   },
+   {
+    "bucket": 3999456000,
+    "ok": 4,
+    "total": 8
+   },
+   {
+    "bucket": 3999542400,
+    "ok": 3,
+    "total": 11
+   },
+   {
+    "bucket": 3999628800,
+    "ok": 4,
+    "total": 6
+   },
+   {
+    "bucket": 3999715200,
+    "ok": 5,
+    "total": 8
+   },
+   {
+    "bucket": 3999801600,
+    "ok": 6,
+    "total": 12
+   },
+   {
+    "bucket": 3999888000,
+    "ok": 27,
+    "total": 57
+   },
+   {
+    "bucket": 3999974400,
+    "ok": 36,
+    "total": 76
+   }
+  ],
+  "total": 223,
+  "ttft": {
+   "by_profile": [
+    {
+     "n": 32,
+     "p50": 1.4,
+     "p75": 1.8,
+     "p95": 2.4,
+     "profile": "ficelle/auto-tools",
+     "state": "ok"
+    },
+    {
+     "n": 23,
+     "p50": 1.2,
+     "p75": 2.3,
+     "p95": 2.7,
+     "profile": "ficelle/auto-long",
+     "state": "ok"
+    },
+    {
+     "n": 17,
+     "p50": 1.5,
+     "p75": 1.8,
+     "p95": 2.5,
+     "profile": "ficelle/auto-fast",
+     "state": "ok"
+    },
+    {
+     "n": 0,
+     "p50": null,
+     "p75": null,
+     "p95": null,
+     "profile": "ficelle/auto-only",
+     "state": "no_streaming_data"
+    }
+   ],
+   "by_source": [
+    {
+     "n": 29,
+     "p50": 1.7,
+     "p75": 2.5,
+     "p95": 2.9,
+     "source": "delta",
+     "state": "ok"
+    },
+    {
+     "n": 26,
+     "p50": 1.5,
+     "p75": 2.1,
+     "p95": 2.3,
+     "source": "alpha",
+     "state": "ok"
+    },
+    {
+     "n": 23,
+     "p50": 1.8,
+     "p75": 2.4,
+     "p95": 2.8,
+     "source": "beta",
+     "state": "ok"
+    },
+    {
+     "n": 20,
+     "p50": 1.0,
+     "p75": 2.2,
+     "p95": 2.7,
+     "source": "gamma",
+     "state": "ok"
+    },
+    {
+     "n": 19,
+     "p50": 0.9,
+     "p75": 1.5,
+     "p95": 2.3,
+     "source": "eps",
+     "state": "ok"
+    },
+    {
+     "n": 0,
+     "p50": null,
+     "p75": null,
+     "p95": null,
+     "source": "zeta",
+     "state": "no_streaming_data"
+    }
+   ],
+   "overall": {
+    "n": 139,
+    "p50": 1.3,
+    "p75": 2.0,
+    "p95": 2.8,
+    "state": "ok"
+   }
+  },
+  "usage": {
+   "completion_tokens": 67054,
+   "prompt_tokens": 571880,
+   "requests": 153
+  },
+  "window_seconds": 2592000
+ },
+ "7d": {
+  "bucket_seconds": 21600,
+  "by_reason": [
+   {
+    "ok": 87,
+    "reason": "ok",
+    "total": 87
+   },
+   {
+    "ok": 0,
+    "reason": "upstream_failure",
+    "total": 38
+   },
+   {
+    "ok": 0,
+    "reason": "rate_limited",
+    "total": 28
+   },
+   {
+    "ok": 0,
+    "reason": "timeout",
+    "total": 26
+   },
+   {
+    "ok": 0,
+    "reason": "client_disconnected",
+    "total": 2
+   }
+  ],
+  "by_source": [
+   {
+    "ok": 26,
+    "source": "delta",
+    "total": 34
+   },
+   {
+    "ok": 15,
+    "source": "alpha",
+    "total": 30
+   },
+   {
+    "ok": 16,
+    "source": "beta",
+    "total": 26
+   },
+   {
+    "ok": 18,
+    "source": "gamma",
+    "total": 24
+   },
+   {
+    "ok": 12,
+    "source": "eps",
+    "total": 21
+   },
+   {
+    "ok": 0,
+    "source": "zeta",
+    "total": 1
+   }
+  ],
+  "by_status": [
+   {
+    "ok": 87,
+    "status": 200,
+    "total": 88
+   },
+   {
+    "ok": 0,
+    "status": 502,
+    "total": 37
+   },
+   {
+    "ok": 0,
+    "status": 429,
+    "total": 32
+   },
+   {
+    "ok": 0,
+    "status": 504,
+    "total": 24
+   }
+  ],
+  "context_estimate": {
+   "min_prompt_tokens": 1000,
+   "n": 50,
+   "ratio_p1": 0.0667,
+   "ratio_p10": 0.2,
+   "ratio_p50": 0.975,
+   "ratio_p90": 4.0,
+   "ratio_p99": 13.0,
+   "underestimate_rate": 0.52
+  },
+  "errors": 94,
+  "fallback_count": 62,
+  "latency_p50": 9.87,
+  "latency_p95": 19.02,
+  "ok": 87,
+  "router_overhead": {
+   "n": 121,
+   "p50": 0.009,
+   "p95": 0.019
+  },
+  "savings": {
+   "estimated_saved_usd": 0.152607,
+   "priced_requests": 53,
+   "unpriced_requests": 71
+  },
+  "stream_count": 112,
+  "success_rate": 0.4807,
+  "timeline": [
+   {
+    "bucket": 3999391200,
+    "ok": 1,
+    "total": 1
+   },
+   {
+    "bucket": 3999412800,
+    "ok": 1,
+    "total": 2
+   },
+   {
+    "bucket": 3999434400,
+    "ok": 0,
+    "total": 0
+   },
+   {
+    "bucket": 3999456000,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3999477600,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3999499200,
+    "ok": 1,
+    "total": 3
+   },
+   {
+    "bucket": 3999520800,
+    "ok": 1,
+    "total": 2
+   },
+   {
+    "bucket": 3999542400,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3999564000,
+    "ok": 2,
+    "total": 6
+   },
+   {
+    "bucket": 3999585600,
+    "ok": 1,
+    "total": 4
+   },
+   {
+    "bucket": 3999607200,
+    "ok": 0,
+    "total": 0
+   },
+   {
+    "bucket": 3999628800,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3999650400,
+    "ok": 1,
+    "total": 1
+   },
+   {
+    "bucket": 3999672000,
+    "ok": 1,
+    "total": 2
+   },
+   {
+    "bucket": 3999693600,
+    "ok": 2,
+    "total": 2
+   },
+   {
+    "bucket": 3999715200,
+    "ok": 4,
+    "total": 5
+   },
+   {
+    "bucket": 3999736800,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3999758400,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3999780000,
+    "ok": 1,
+    "total": 1
+   },
+   {
+    "bucket": 3999801600,
+    "ok": 3,
+    "total": 6
+   },
+   {
+    "bucket": 3999823200,
+    "ok": 2,
+    "total": 3
+   },
+   {
+    "bucket": 3999844800,
+    "ok": 1,
+    "total": 1
+   },
+   {
+    "bucket": 3999866400,
+    "ok": 0,
+    "total": 2
+   },
+   {
+    "bucket": 3999888000,
+    "ok": 0,
+    "total": 1
+   },
+   {
+    "bucket": 3999909600,
+    "ok": 8,
+    "total": 18
+   },
+   {
+    "bucket": 3999931200,
+    "ok": 11,
+    "total": 22
+   },
+   {
+    "bucket": 3999952800,
+    "ok": 8,
+    "total": 16
+   },
+   {
+    "bucket": 3999974400,
+    "ok": 15,
+    "total": 25
+   },
+   {
+    "bucket": 3999996000,
+    "ok": 21,
+    "total": 51
+   }
+  ],
+  "total": 181,
+  "ttft": {
+   "by_profile": [
+    {
+     "n": 28,
+     "p50": 1.4,
+     "p75": 1.8,
+     "p95": 2.3,
+     "profile": "ficelle/auto-tools",
+     "state": "ok"
+    },
+    {
+     "n": 16,
+     "p50": 1.5,
+     "p75": 1.8,
+     "p95": 2.5,
+     "profile": "ficelle/auto-fast",
+     "state": "ok"
+    },
+    {
+     "n": 16,
+     "p50": 0.7,
+     "p75": 1.4,
+     "p95": 2.4,
+     "profile": "ficelle/auto-long",
+     "state": "ok"
+    },
+    {
+     "n": 0,
+     "p50": null,
+     "p75": null,
+     "p95": null,
+     "profile": "ficelle/auto-only",
+     "state": "no_streaming_data"
+    }
+   ],
+   "by_source": [
+    {
+     "n": 26,
+     "p50": 1.4,
+     "p75": 2.4,
+     "p95": 2.8,
+     "source": "delta",
+     "state": "ok"
+    },
+    {
+     "n": 23,
+     "p50": 1.5,
+     "p75": 2.0,
+     "p95": 2.3,
+     "source": "alpha",
+     "state": "ok"
+    },
+    {
+     "n": 15,
+     "p50": 1.8,
+     "p75": 2.0,
+     "p95": 2.8,
+     "source": "beta",
+     "state": "ok"
+    },
+    {
+     "n": 15,
+     "p50": 1.0,
+     "p75": 2.4,
+     "p95": 2.9,
+     "source": "gamma",
+     "state": "ok"
+    },
+    {
+     "n": 14,
+     "p50": 0.6,
+     "p75": 1.5,
+     "p95": 2.3,
+     "source": "eps",
+     "state": "ok"
+    },
+    {
+     "n": 0,
+     "p50": null,
+     "p75": null,
+     "p95": null,
+     "source": "zeta",
+     "state": "no_streaming_data"
+    }
+   ],
+   "overall": {
+    "n": 110,
+    "p50": 1.3,
+    "p75": 2.0,
+    "p95": 2.8,
+    "state": "ok"
+   }
+  },
+  "usage": {
+   "completion_tokens": 55448,
+   "prompt_tokens": 492630,
+   "requests": 124
+  },
+  "window_seconds": 604800
+ }
+}

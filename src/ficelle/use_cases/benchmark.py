@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ficelle.failures import REQUEST_REJECTION_STATUSES
+from ficelle.failures import REQUEST_REJECTION_STATUSES, UpstreamResponseBudgetExceeded
 from ficelle.provider_admission import ProviderAdmissionRefused
 from ficelle.retry_hints import retry_hint
 from ficelle.use_cases.capability_discovery import (
@@ -17,6 +17,7 @@ from ficelle.use_cases.capability_discovery import (
     ROUTE_REJECTION_VERDICT,
     VERDICT_BASIS_KEY,
     CapabilityDiscoveryJob,
+    ProbeSuccessProblem,
     ProviderProbePacer,
     VERDICT_STREAK_KEY,
     provider_probe_interval_seconds,
@@ -299,7 +300,9 @@ def canary_status_from_benchmark_result(
     summary = result.get("summary") or {}
     if safe_int(summary.get("failed"), 0) > 0:
         return "fail"
-    if safe_int(summary.get("passed"), 0) > 0:
+    # A profile that could not be tested (probe lock held, request budget reserved) is unverified,
+    # so a partial run is not a pass.
+    if safe_int(summary.get("passed"), 0) > 0 and safe_int(summary.get("skipped"), 0) == 0:
         return "pass"
     return "skip"
 
@@ -366,7 +369,8 @@ def run_benchmark_profiles(
         "passed": sum(safe_int(result.get("passed_count"), 0) for result in results),
         "failed": sum(safe_int(result.get("failed_count"), 0) for result in results),
     } if all_candidates else None
-    skipped_profiles = sum(1 for result in results if result.get("status") == "skip")
+    # `skipped` is what `benchmark_profile` answers when another prober holds the lock.
+    skipped_profiles = sum(1 for result in results if result.get("status") in {"skip", "skipped"})
     skipped_candidates = sum(safe_int(result.get("skipped_count"), 0) for result in results)
     if candidate_summary is not None and skipped_candidates:
         candidate_summary["skipped"] = skipped_candidates
@@ -1070,6 +1074,12 @@ class BenchmarkRunner:
     pacer: ProviderProbePacer
     media_error_types: tuple[type[BaseException], ...] = ()
     registry: ProbeRegistry = ProbeRegistry()
+    # Defaults keep a runner built without them behaving as before; the router wires the chat
+    # path's own classifiers so a probe and a real request read the same body the same way.
+    success_problem: Callable[[Any, dict[str, Any]], ProbeSuccessProblem | None] = lambda _payload, _model: None
+    classify_exception: Callable[[Exception, dict[str, Any]], str] = lambda _exc, _model: "unavailable"
+    # Fresh-state answer to "did an earlier probe of this run just block this model?".
+    model_blocked: Callable[[dict[str, Any]], bool] = lambda _model: False
 
     def run_benchmarks(
         self,
@@ -1143,8 +1153,21 @@ class BenchmarkRunner:
         last_result: dict[str, Any] | None = None
         last_skip: dict[str, Any] | None = None
         candidate_results: list[dict[str, Any]] = []
-        for model in candidates:
-            result = self._benchmark_candidate(profile_id, model, body, test_type, expected, config)
+        for index, model in enumerate(candidates):
+            # The list was built once, before any probe ran. A 401 on the first candidate cools its
+            # whole provider, and walking on would spend the free allowance of a key that is already
+            # known dead (capability discovery re-asks per model for the same reason).
+            if index and self.model_blocked(model):
+                result = {
+                    "profile_id": profile_id,
+                    "model_id": model.get("id"),
+                    "source": model.get("source"),
+                    "status": "skip",
+                    "message": "blocked by a cooldown recorded earlier in this run",
+                    "ran_at": self.now_iso(),
+                }
+            else:
+                result = self._benchmark_candidate(profile_id, model, body, test_type, expected, config)
             if all_candidates:
                 candidate_results.append(self.redact_sensitive_json(dict(result)))
                 if result.get("status") == "skip":
@@ -1172,7 +1195,7 @@ class BenchmarkRunner:
                 "message": (
                     f"{passed_count}/{passed_count + failed_count} tested candidates passed"
                     if passed_count + failed_count
-                    else "all candidates skipped before provider dispatch"
+                    else "all candidates skipped without a verdict"
                 ),
                 "candidate_count": len(candidates),
                 "tested_count": passed_count + failed_count,
@@ -1190,7 +1213,7 @@ class BenchmarkRunner:
             return self.redact_sensitive_json(last_result)
         if last_skip is not None:
             skipped = dict(last_skip)
-            skipped["message"] = "all candidates skipped before provider dispatch"
+            skipped["message"] = "all candidates skipped without a verdict"
             return self.redact_sensitive_json(skipped)
         return {
             "profile_id": profile_id,
@@ -1230,6 +1253,21 @@ class BenchmarkRunner:
             if not (200 <= response.status_code < 300):
                 return self._record_http_failure(profile_id, model, response, config, result)
             payload = response.json()
+            problem = self.success_problem(payload, model)
+            if problem is not None:
+                if problem.inconclusive:
+                    result.update({"status": "skip", "message": self.safe_detail(problem.detail)})
+                    return result
+                return self._record_failure(
+                    profile_id,
+                    model,
+                    config,
+                    result,
+                    reason=problem.reason,
+                    status_code=problem.status_code or response.status_code,
+                    response_text=problem.detail,
+                    headers=getattr(response, "headers", None),
+                )
             text = self.extract_message_text(payload)
             passed, message = self.registry.validate_response(test_type, expected, text, payload)
             result.update({
@@ -1258,9 +1296,13 @@ class BenchmarkRunner:
                     }
                 )
                 return result
+            if isinstance(exc, UpstreamResponseBudgetExceeded):
+                # Ficelle's own response retention budget is full: no model is at fault.
+                result.update({"status": "skip", "message": "Ficelle response capacity busy"})
+                return result
             self.set_cooldown(
                 model,
-                "unavailable",
+                self.classify_exception(exc, model),
                 config,
                 detail=f"benchmark {type(exc).__name__}: {exc}",
                 profile_id=profile_id,
@@ -1278,9 +1320,31 @@ class BenchmarkRunner:
         result: dict[str, Any],
     ) -> dict[str, Any]:
         response_text = str(response.text)
-        reason = self.classify_failure(response.status_code, response_text, model)
-        detail = f"benchmark HTTP {response.status_code}: {response_text[:250]}"
-        hint = retry_hint(getattr(response, "headers", None), response_text) if response.status_code in {429, 503} else None
+        return self._record_failure(
+            profile_id,
+            model,
+            config,
+            result,
+            reason=self.classify_failure(response.status_code, response_text, model),
+            status_code=response.status_code,
+            response_text=response_text,
+            headers=getattr(response, "headers", None),
+        )
+
+    def _record_failure(
+        self,
+        profile_id: str,
+        model: dict[str, Any],
+        config: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        reason: str,
+        status_code: int,
+        response_text: str,
+        headers: Any,
+    ) -> dict[str, Any]:
+        detail = f"benchmark HTTP {status_code}: {response_text[:250]}"
+        hint = retry_hint(headers, response_text) if status_code in {429, 503} else None
         if reason in self.route_blocking_reasons:
             self.set_cooldown(
                 model,
@@ -1295,13 +1359,13 @@ class BenchmarkRunner:
             self.record_benchmark_failure(model, reason, profile_id=profile_id, detail=detail)
         result.update({
             "status": "fail",
-            "message": f"HTTP {response.status_code}: {reason}",
+            "message": f"HTTP {status_code}: {reason}",
             "text_preview": self.safe_detail(response_text, 160),
         })
         self.record_benchmark_result(profile_id, model, result)
         if (
             result.get("test_type") == "coding_compatibility"
-            and response.status_code in REQUEST_REJECTION_STATUSES
+            and status_code in REQUEST_REJECTION_STATUSES
             and reason not in self.route_blocking_reasons
         ):
             self.record_verified_capability(profile_id, model, result)
@@ -1424,6 +1488,34 @@ def finish_reason_is_truncation(payload: Any) -> bool:
 def finish_reason_is_error(payload: Any) -> bool:
     """True when the first choice's own `finish_reason` reports an upstream generation failure."""
     return _first_choice_finish_reason(payload) in ERROR_FINISH_REASONS
+
+
+def probe_success_problem(
+    payload: Any,
+    model: dict[str, Any],
+    *,
+    detect_success_error: Callable[[Any, dict[str, Any]], tuple[str, str, int | None] | None],
+) -> ProbeSuccessProblem | None:
+    """Spot an HTTP 2xx probe answer that is an upstream failure, not evidence about the model.
+
+    The same three screens the chat path applies before it trusts a 200 body. Without them a
+    gateway's `{"error": {"code": 429}}` or a reasoning model that spent a 16-token probe budget on
+    thinking read as a wrong answer, and a `failed` capability verdict kept a healthy model out of
+    its profile until a later probe replaced it.
+    """
+    embedded = detect_success_error(payload, model)
+    if embedded is not None:
+        reason, detail, status = embedded
+        return ProbeSuccessProblem(reason, detail, status)
+    if finish_reason_is_error(payload):
+        return ProbeSuccessProblem("upstream_finish_error", 'success response ended with finish_reason "error"')
+    if finish_reason_is_truncation(payload) and not has_deliverable_message(payload):
+        return ProbeSuccessProblem(
+            "truncated_before_content",
+            "probe hit its completion token budget before emitting content",
+            inconclusive=True,
+        )
+    return None
 
 
 def tool_call_arguments(call: dict[str, Any]) -> dict[str, Any]:

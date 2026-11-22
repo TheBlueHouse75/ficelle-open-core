@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ficelle.domain_models import CatalogModel, SelectionPurpose, SelectionResult
-from ficelle.selection import SelectionPolicy, select_models_result_from_typed_rows, typed_catalog_rows
+from ficelle.selection import SelectionPolicy, select_models_result_from_rows, select_models_result_from_typed_rows
 
 
 @dataclass(frozen=True)
@@ -38,8 +38,9 @@ class ModelSelectionRunner:
     ) -> SelectionResult:
         if config is None:
             config = self.ports.load_config()
-        typed_rows = typed_catalog_rows(catalog)
-        models = [raw for _model, raw in typed_rows if raw.get("invokable")]
+        # Only the raw invokable rows are needed to find due probes.
+        raw_models = catalog.get("models", []) if isinstance(catalog, dict) else []
+        models = [raw for raw in raw_models if isinstance(raw, dict) and raw.get("invokable")]
         state = self.ports.fresh_runtime_state()
         due_probe_keys = self.ports.due_quota_probe_keys_for_request(requested_model, models, config, state)
         if due_probe_keys:
@@ -76,11 +77,13 @@ class ModelSelectionRunner:
     ) -> SelectionResult:
         self.ports.apply_verified_capability_ttl(config)
         self.ports.apply_route_on_capability_reference(config)
-        return self.select_models_result_from_typed_rows(
+        rows = catalog.get("models", []) if isinstance(catalog, dict) else []
+        return select_models_result_from_rows(
             requested_model,
-            typed_catalog_rows(catalog),
+            rows if isinstance(rows, list) else [],
             config,
-            state,
+            self.ports.quality_feedback_scoring_state(state, config),
+            self.ports.selection_policy(),
             purpose=purpose,
         )
 
@@ -93,12 +96,11 @@ class ModelSelectionRunner:
         *,
         purpose: SelectionPurpose = "route",
     ) -> SelectionResult:
-        scoring_state = self.ports.quality_feedback_scoring_state(state, config)
         return select_models_result_from_typed_rows(
             requested_model,
             typed_rows,
             config,
-            scoring_state,
+            self.ports.quality_feedback_scoring_state(state, config),
             self.ports.selection_policy(),
             purpose=purpose,
         )

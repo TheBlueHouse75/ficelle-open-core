@@ -774,26 +774,72 @@ def detached_recovery_command() -> list[str]:
     )
 
 
+# The Windows service is a Scheduled Task whose processes share one job object, and the helper's
+# `schtasks /End` terminates the whole job: the helper must leave it or it dies with the router it
+# restarts. start_new_session is POSIX-only. DETACHED_PROCESS already gives a console-less child,
+# so CREATE_NO_WINDOW would add nothing. getattr keeps the documented values where subprocess does
+# not define them (non-Windows test runs).
+_WINDOWS_DETACHED_CREATION_FLAGS = (
+    getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+)
+
+
+def _spawn_detached_helper(command: list[str], *, env: Mapping[str, str], cwd: str) -> None:
+    detach: dict[str, Any] = (
+        {"creationflags": _WINDOWS_DETACHED_CREATION_FLAGS}
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
+    subprocess.Popen(
+        command,
+        env=dict(env),
+        cwd=cwd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **detach,
+    )
+
+
+def _windows_breakaway_refused(exc: BaseException) -> bool:
+    # A job without JOB_OBJECT_LIMIT_BREAKAWAY_OK makes CreateProcess fail with
+    # ERROR_ACCESS_DENIED, which Python raises as PermissionError.
+    return sys.platform == "win32" and isinstance(exc, PermissionError)
+
+
+def _breakaway_refused_message(terminal_command: str) -> str:
+    return (
+        "Windows refused to start the Ficelle update helper outside the Ficelle scheduled task; "
+        f"run `{terminal_command}` from a terminal."
+    )
+
+
 def spawn_update() -> dict[str, Any]:
     """Queue and detach the update helper so the daemon can safely restart itself."""
     try:
         home = validated_runtime_home(_RUNTIME_PATHS.ficelle_home)
         status = queue_update()
-        subprocess.Popen(
+        _spawn_detached_helper(
             detached_update_command(),
             env={**os.environ, "FICELLE_HOME": str(home), "FICELLE_UPDATE_QUEUED": "1", "PYTHONSAFEPATH": "1"},
             cwd=str(home),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
         )
     except (UpdateInProgress, UpdateUnavailable):
         raise
     except Exception as exc:
+        refused = _windows_breakaway_refused(exc)
+        message = (
+            _breakaway_refused_message("ficelle update --install")
+            if refused
+            else "The Ficelle updater could not start."
+        )
         try:
-            _write_status({"status": "failed", "message": "The Ficelle updater could not start."})
+            _write_status({"status": "failed", "message": message})
         except UpdateError:
             pass
+        if refused:
+            raise UpdateUnavailable(message) from exc
         raise UpdateError("the Ficelle updater could not start") from exc
     return status
 
@@ -804,15 +850,19 @@ def spawn_recovery() -> bool:
         return False
     try:
         home = validated_runtime_home(_RUNTIME_PATHS.ficelle_home)
-        subprocess.Popen(
+        _spawn_detached_helper(
             detached_recovery_command(),
             env={**os.environ, "FICELLE_HOME": str(home), "FICELLE_UPDATE_RECOVERY": "1", "PYTHONSAFEPATH": "1"},
             cwd=str(home),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
         )
     except Exception as exc:
+        if _windows_breakaway_refused(exc):
+            message = _breakaway_refused_message("ficelle update --recover")
+            try:
+                _write_status({"status": "failed", "message": message})
+            except UpdateError:
+                pass
+            raise UpdateError(message) from exc
         try:
             _write_status({"status": "failed", "message": "The Ficelle update recovery helper could not start."})
         except UpdateError:
@@ -1351,9 +1401,8 @@ def _verify_pro_core_compatibility(wheel: Path, *, core_version: str) -> None:
 def _managed_service() -> tuple[Any, bool]:
     from ficelle import cli
 
-    paths = cli.service_paths()
-    managed = paths.plist.exists() or paths.systemd_unit.exists()
-    return cli.current_service_backend(), managed
+    backend = cli.current_service_backend()
+    return backend, backend.installed()
 
 
 def _pro_artifact_from_status(status: Mapping[str, Any]) -> ReleaseArtifact | None:

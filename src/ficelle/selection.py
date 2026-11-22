@@ -124,13 +124,44 @@ def select_models_result_from_typed_rows(
     *,
     purpose: SelectionPurpose = "route",
 ) -> SelectionResult:
-    typed_by_row_identity = {id(raw): model for model, raw in typed_rows}
+    return select_models_result_from_rows(
+        requested_model,
+        [raw for _model, raw in typed_rows],
+        config,
+        state,
+        policy,
+        purpose=purpose,
+        typed_by_row_identity={id(raw): model for model, raw in typed_rows},
+    )
+
+
+def select_models_result_from_rows(
+    requested_model: str,
+    rows: list[Any],
+    config: dict[str, Any],
+    state: dict[str, Any],
+    policy: SelectionPolicy,
+    *,
+    purpose: SelectionPurpose = "route",
+    typed_by_row_identity: dict[int, CatalogModel] | None = None,
+) -> SelectionResult:
+    """Select from plain catalog rows, typing only the rows that end up as candidates.
+
+    Typing every row up front (`typed_catalog_rows`) deep-copies the whole catalog on each
+    request although only the candidates reach the `SelectionResult`.
+    """
+    typed_by_row_identity = typed_by_row_identity or {}
+    dict_rows = [raw for raw in rows if isinstance(raw, dict)]
     excluded_reasons = {
-        model.id: "not_invokable"
-        for model, raw in typed_rows
-        if model.id and not raw.get("invokable")
+        model_id: "not_invokable"
+        for raw in dict_rows
+        # Same id coercion as `CatalogModel.from_raw`, without building the model.
+        if not raw.get("invokable") and (model_id := str(raw.get("id") if raw.get("id") is not None else "").strip())
     }
-    invokable_rows = [raw for _model, raw in typed_rows if raw.get("invokable")]
+    invokable_rows = [raw for raw in dict_rows if raw.get("invokable")]
+    profiles = policy.normalized_virtual_profiles(config)
+    canonical_requested_model = policy.canonical_virtual_model_id(requested_model)
+    profile = profiles.get(requested_model) or profiles.get(canonical_requested_model)
     available: list[dict[str, Any]] = []
     for raw_model in invokable_rows:
         model_id = str(raw_model.get("id") or "")
@@ -140,6 +171,12 @@ def select_models_result_from_typed_rows(
                 if model_id:
                     excluded_reasons[model_id] = stale_reason
                 continue
+        if profile and not policy.model_matches_profile_requirements(raw_model, profile):
+            # Decided before the cooldown: a model that can never serve this profile is not what a
+            # refusal is waiting on, so it must not feed the cooldown counts or the Retry-After.
+            if model_id:
+                excluded_reasons[model_id] = "profile_requirements"
+            continue
         on_cd, cooldown_reason = policy.model_on_cooldown(raw_model, state)
         if on_cd:
             if model_id:
@@ -158,24 +195,16 @@ def select_models_result_from_typed_rows(
             continue
         available.append(raw_model)
 
-    profiles = policy.normalized_virtual_profiles(config)
-    canonical_requested_model = policy.canonical_virtual_model_id(requested_model)
-    profile = profiles.get(requested_model) or profiles.get(canonical_requested_model)
     policy_profile_id = (
         policy.canonical_virtual_model_id(str(profile.get("base_profile") or ""))
         if isinstance(profile, dict) and profile.get("base_profile")
         else canonical_requested_model
     )
     if profile:
-        before_profile = {str(model.get("id") or "") for model in available}
-        eligible = [model for model in available if policy.model_matches_profile_requirements(model, profile)]
-        for model_id in before_profile - {str(model.get("id") or "") for model in eligible}:
-            if model_id:
-                excluded_reasons[model_id] = "profile_requirements"
         if profile.get("mode") == "manual_order":
-            candidates = policy.manual_order_candidates(policy_profile_id, eligible, state, profile)
+            candidates = policy.manual_order_candidates(policy_profile_id, available, state, profile)
         else:
-            candidates = policy.sort_available_for_virtual_model(policy_profile_id, eligible, state)
+            candidates = policy.sort_available_for_virtual_model(policy_profile_id, available, state)
     elif canonical_requested_model in policy.virtual_models or requested_model in policy.virtual_models or requested_model in profiles:
         candidates = policy.sort_available_for_virtual_model(canonical_requested_model, available, state)
     else:

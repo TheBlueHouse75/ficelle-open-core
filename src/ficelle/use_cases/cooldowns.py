@@ -1255,9 +1255,13 @@ def set_cooldown_in_state(
     if policy.quota_cooldown:
         quota_key = ports.set_quota_cooldown_in_state(state, model, effective_config, detail) or ""
     if policy.provider_cooldown:
+        provider_rows = state.setdefault("provider_cooldowns", {})
+        previous_provider_row = provider_rows.get(str(policy.provider_cooldown_source or "").strip())
         provider_source = ports.set_provider_cooldown_in_state(
             state, policy.provider_cooldown_source, reason, effective_config, detail
         ) or ""
+        if provider_source and not explicit_retry_after:
+            _keep_longer_block(provider_rows, provider_source, previous_provider_row, reason, ports.now_seconds())
     quarantine = policy.quarantine
     if quarantine and quarantine.reason == "billing_or_paid":
         ports.set_billing_quarantine_in_state(
@@ -1290,6 +1294,7 @@ def set_cooldown_in_state(
         return applied
     cooldowns = state.setdefault("cooldowns", {})
     key = ports.cooldown_key(model)
+    previous_row = cooldowns.get(key)
     seconds_map = effective_config.get("cooldown_seconds") or {}
     base_seconds = int(seconds_map.get(reason) or seconds_map.get("unavailable") or 600)
     now_ts = ports.now_seconds()
@@ -1318,7 +1323,30 @@ def set_cooldown_in_state(
         row["base_seconds"] = base_seconds
         row["reason_repeats"] = repeats
     cooldowns[key] = row
+    if not explicit_retry_after:
+        _keep_longer_block(cooldowns, key, previous_row, reason, now_ts)
     return applied
+
+
+def _keep_longer_block(rows: dict[str, Any], key: str, previous: Any, reason: str, now_ts: float) -> None:
+    """Put back a still-running block of ANOTHER reason that the write just replaced with a shorter one.
+
+    Reasons carry very different windows (`auth_or_credit` 3600s, `network_unreachable` 60s), and the
+    writers assign the row outright, so a failure from a request already in flight when the longer
+    block was written would shorten it and re-earn the dead key's 401 a minute later. The same reason
+    still overwrites — that is the escalation and the retry-after refresh — and a provider's explicit
+    retry hint outranks this, so callers skip it when one was given.
+    """
+    if not isinstance(previous, dict) or previous.get("reason") == reason:
+        return
+    current = rows.get(key)
+    try:
+        previous_until = float(previous.get("until"))
+        current_until = float(current.get("until")) if isinstance(current, dict) else 0.0
+    except (TypeError, ValueError):
+        return
+    if previous_until > now_ts and previous_until > current_until:
+        rows[key] = previous
 
 
 def set_cooldown(

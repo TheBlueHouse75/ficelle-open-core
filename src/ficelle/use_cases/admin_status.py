@@ -4,11 +4,13 @@ import json
 import math
 import re
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, TypeAlias
 
 from ficelle.redaction import redact_sensitive_json
+from ficelle.use_cases.admin_security import bind_host_is_loopback
 from ficelle.url_security import connectable_http_url
 
 
@@ -161,6 +163,14 @@ class AdminStateBuildPorts:
     stale_profile_model_rows: StaleProfileModelRows
     safe_int: SafeInt
     safe_string_list: SafeStringList
+    provider_admission_rows: Callable[[dict[str, Any]], dict[str, dict[str, Any]]]
+    # Scoring inputs for both payloads: the config rules scores depend on (verified-capability
+    # TTL, reference routing), the scoring view of the state, and a context that memoizes
+    # `model_score_explanation` while it is open. `build_admin_status` and
+    # `catalog_with_auto_scores` receive the scoring view as is, without wrapping it again.
+    apply_scoring_config: ApplyConfigRule
+    scoring_state: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+    score_explanation_memo: Callable[[], AbstractContextManager[None]]
 
 
 @dataclass(frozen=True)
@@ -182,6 +192,29 @@ class AdminStatusBuilder:
         )
 
 
+def with_provider_admission(
+    runtime_state: dict[str, Any], rows: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """Attach the admission ledger's snapshot to ``provider_stats[source].admission``.
+
+    Sources the ledger knows nothing about and the state has never seen get no entry: the
+    dashboard reads a missing ``admission`` as "no observation yet", and an invented zeroed
+    record would render as a provider that failed every call.
+    """
+    stats = runtime_state.get("provider_stats")
+    stats = stats if isinstance(stats, dict) else {}
+    for source, row in rows.items():
+        entry = stats.get(source)
+        if entry is None:
+            if row.get("state") == "unknown":
+                continue
+            entry = stats[source] = {"requests": 0, "successes": 0, "failures": 0}
+        if isinstance(entry, dict):
+            entry["admission"] = row
+            runtime_state["provider_stats"] = stats
+    return runtime_state
+
+
 @dataclass(frozen=True)
 class AdminStateBuilder:
     ports: AdminStateBuildPorts
@@ -194,14 +227,21 @@ class AdminStateBuilder:
         if not isinstance(state, dict):
             state = {}
         profiles = self.ports.normalized_virtual_profiles(config)
-        status_payload = self.ports.build_admin_status(catalog, config, state)
+        # Both payloads score every (profile, model) pair they show, mostly the same pairs. The
+        # config rules are applied before the memo opens, so no memoized score predates them;
+        # the builders' own passes over the same config change nothing.
+        self.ports.apply_scoring_config(config)
+        scoring_state = self.ports.scoring_state(state, config)
+        with self.ports.score_explanation_memo():
+            status_payload = self.ports.build_admin_status(catalog, config, scoring_state)
+            scored_catalog = self.ports.catalog_with_auto_scores(catalog, config, scoring_state)
         canary_profiles = self.ports.safe_string_list(
             (config.get("canary") or {}).get("profiles")
         )
         port = self.ports.safe_int(config.get("port"), 8646)
         base_url = connectable_http_url(config.get("host"), port, "/v1")
         return {
-            "catalog": self.ports.catalog_with_auto_scores(catalog, config, state),
+            "catalog": scored_catalog,
             "virtual_profiles": profiles,
             # Ids a virtual model still points at that the catalog dropped. Sent even when
             # empty: the dashboard renders those cards from `virtual_profiles`, and without
@@ -215,7 +255,10 @@ class AdminStateBuilder:
             "compression": status_payload.get("compression") or {},
             "fusion": self.ports.fusion_payload(config, state),
             "settings": self.ports.router_settings_payload(config),
-            "state": self.ports.redact_runtime_state(state),
+            "state": with_provider_admission(
+                self.ports.redact_runtime_state(state),
+                self.ports.provider_admission_rows(config),
+            ),
             "config": {
                 "min_context_length": self.ports.safe_int(
                     config.get("min_context_length"),
@@ -226,6 +269,9 @@ class AdminStateBuilder:
                 "canary_profiles": canary_profiles or list(self.default_canary_profiles),
                 "base_url": base_url,
                 "hermes_base_url": base_url,
+                # `base_url` cannot carry this: a wildcard bind is printed as loopback because
+                # that is where a local client connects, yet it exposes `/v1` to the network.
+                "bind_is_loopback": bind_host_is_loopback(config.get("host")),
             },
         }
 
@@ -243,12 +289,17 @@ def catalog_with_auto_scores(
     apply_verified_capability_ttl(config)
     enriched = json.loads(json.dumps(catalog))
     profiles = normalized_virtual_profiles(config)
-    for model in enriched.get("models", []):
+    source_models = catalog.get("models") if isinstance(catalog.get("models"), list) else []
+    enriched_models = enriched.get("models") if isinstance(enriched.get("models"), list) else []
+    for source_model, model in zip(source_models, enriched_models):
         if not isinstance(model, dict):
             continue
         model["free_access"] = normalized_free_access(model)
+        # Scored on the catalog's own row, not the copy: the copy differs only by the normalized
+        # `free_access`, which scoring does not read, and the shared row is what lets the admin
+        # state build reuse the status build's scores (`AdminStateBuilder.build`).
         details_by_profile = {
-            profile_id: model_score_explanation(str(profile.get("base_profile") or profile_id), model, state)
+            profile_id: model_score_explanation(str(profile.get("base_profile") or profile_id), source_model, state)
             for profile_id, profile in profiles.items()
         }
         model["auto_scores"] = {
@@ -1504,13 +1555,24 @@ def build_admin_status_document(
     profiles = ports.normalized_virtual_profiles(config)
     runtime_state = ports.redact_runtime_state(state)
     runtime_snapshot = build_admin_runtime_snapshot(runtime_state)
+    ranked_by_profile: dict[str, list[dict[str, Any]]] = {}
+
+    def candidates_for_profile(profile_id, available_models, build_state, profile):
+        # Both row builders rank the same pool with the same arguments; ranking scores and sorts
+        # every eligible model, so it runs once per profile and each builder gets its own list.
+        if profile_id not in ranked_by_profile:
+            ranked_by_profile[profile_id] = ports.candidates_for_profile(
+                profile_id, available_models, build_state, profile
+            )
+        return list(ranked_by_profile[profile_id])
+
     profile_rows = build_admin_profile_rows(
         profiles=profiles,
         available_models=availability.available_models,
         policy_models=availability.invokable_models,
         state=state,
         last_routes=runtime_snapshot.last_routes,
-        candidates_for_profile=ports.candidates_for_profile,
+        candidates_for_profile=candidates_for_profile,
         route_competent_candidates=ports.route_competent_candidates,
         candidate_rank_rows=ports.candidate_rank_rows,
         verified_capability_row=ports.verified_capability_row,
@@ -1534,7 +1596,7 @@ def build_admin_status_document(
         available_models=availability.available_models,
         state=state,
         last_routes=runtime_snapshot.last_routes,
-        candidates_for_profile=ports.candidates_for_profile,
+        candidates_for_profile=candidates_for_profile,
         candidate_rank_rows=ports.candidate_rank_rows,
         route_competent_candidates=ports.route_competent_candidates,
         model_history_row=ports.model_history_row,
@@ -1544,7 +1606,8 @@ def build_admin_status_document(
         safe_int=ports.safe_int,
     )
     compression = ports.compression_observability(config, runtime_state)
-    state_diagnostics = ports.runtime_state_diagnostics(runtime_state)
+    # Raw state: the counts only read row timestamps, and `runtime_state` carries no evidence rows.
+    state_diagnostics = ports.runtime_state_diagnostics(state)
 
     health_summary = build_admin_health_summary(
         invokable_model_count=len(availability.invokable_models),

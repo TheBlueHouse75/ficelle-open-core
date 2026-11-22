@@ -15,6 +15,7 @@ from ficelle.service import (
     persist_active_service_context,
     read_active_service_context,
     select_service_backend,
+    windows_command_names_home,
     windows_headless_python,
     windows_task_account,
 )
@@ -61,6 +62,13 @@ def test_active_service_context_reads_plain_home_pointer(
     pointer.write_text(str(ficelle_home), encoding="utf-8")
 
     assert read_active_service_context(pointer) == ficelle_home
+
+
+def test_a_non_utf8_active_home_pointer_reads_as_unreadable(tmp_path):
+    pointer = tmp_path / "active-home"
+    pointer.write_bytes(b"\xff\xfe/not-utf8")
+
+    assert read_active_service_context(pointer) is None
 
 
 def test_select_service_backend_uses_launchagent_on_darwin(tmp_path):
@@ -157,7 +165,7 @@ def _launchagent_backend(
             return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    return select_service_backend(
+    backend = select_service_backend(
         platform_name="darwin",
         paths=paths,
         run_command=run,
@@ -166,6 +174,8 @@ def _launchagent_backend(
         terminate_stale_servers=lambda: [],
         report_stale_servers=lambda _pids: None,
     )
+    backend.pid_alive = lambda _pid: False  # the scripted pid is not a real process
+    return backend
 
 
 def _launchctl_bootouts(calls) -> list[list[str]]:
@@ -365,6 +375,7 @@ def test_systemd_user_restart_reuses_existing_unit(tmp_path):
     assert backend.restart() == 0
     assert calls == [
         ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "stop", paths.systemd_unit.name],
         ["systemctl", "--user", "restart", paths.systemd_unit.name],
     ]
     assert f'Environment="FICELLE_HOME={paths.ficelle_home}"' in paths.systemd_unit.read_text(
@@ -434,6 +445,51 @@ def test_systemd_user_restart_repoints_when_recorded_interpreter_is_unusable(tmp
     assert f"ExecStart={current_python} -m ficelle.router --serve" in paths.systemd_unit.read_text(
         encoding="utf-8"
     )
+
+
+@pytest.mark.parametrize("existing_unit, start_verb", [(True, "restart"), (False, "enable")])
+def test_systemd_user_stops_the_unit_before_sweeping_orphans(tmp_path, existing_unit, start_verb):
+    # The unit's own router matches the stale-server signature: sweeping before `systemctl`
+    # stops it would SIGKILL it after 2 s and cut the router's 20 s shutdown drain short.
+    events: list = []
+    paths = make_paths(tmp_path)
+    if existing_unit:
+        paths.systemd_unit.parent.mkdir(parents=True)
+        paths.systemd_unit.write_text("unit", encoding="utf-8")
+    backend = SystemdUserServiceBackend(
+        paths=paths,
+        run_command=lambda cmd, **kwargs: events.append(tuple(cmd)) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: events.append("sweep") or [],
+        report_stale_servers=lambda _pids: None,
+    )
+
+    assert backend.restart() == 0
+
+    stop = ("systemctl", "--user", "stop", paths.systemd_unit.name)
+    start = next(event for event in events if event[2:3] == (start_verb,))
+    assert events.index(stop) < events.index("sweep") < events.index(start)
+
+
+def test_systemd_unit_quotes_interpreter_paths_systemd_would_split_or_expand(tmp_path):
+    # `$` stays single: systemd substitutes variables in the arguments, never in the executable.
+    spaced = tmp_path / "my 100% $venv" / "bin" / "python"
+    spaced.parent.mkdir(parents=True)
+    spaced.write_text("", encoding="utf-8")
+    paths = replace(make_paths(tmp_path), install_python=spaced)
+    backend = SystemdUserServiceBackend(
+        paths=paths,
+        run_command=lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+
+    backend.write_unit()
+
+    unit = paths.systemd_unit.read_text(encoding="utf-8")
+    assert f'ExecStart="{tmp_path}/my 100%% $venv/bin/python" -m ficelle.router --serve' in unit
+    assert backend.recorded_interpreter() == spaced
 
 
 def test_systemd_user_uninstall_removes_unit_and_reloads(tmp_path):
@@ -758,3 +814,98 @@ def test_recorded_interpreter_probe_cannot_import_caller_package(tmp_path, monke
     assert command == [str(interpreter), "-P", "-c", "import ficelle"]
     assert kwargs["env"]["PYTHONSAFEPATH"] == "1"
     assert Path(kwargs["cwd"]).is_absolute() and kwargs["cwd"] != str(caller)
+
+
+def _registered_task(home: Path) -> str:
+    """The XML `schtasks /Query /XML` prints for the task the backend of `home` registers."""
+    return _windows_backend(replace(make_paths(home.parent), ficelle_home=home)).task_payload()
+
+
+@pytest.mark.parametrize(
+    ("home", "registered", "expected"),
+    [
+        (".ficelle", ".ficelle", True),
+        # list2cmdline quotes an argument holding a space.
+        ("My Home/.ficelle", "My Home/.ficelle", True),
+        # A test router registered under the same per-user task name with another home: an
+        # update must neither stop it nor re-register the task as this home's service.
+        (".ficelle", "canary/.ficelle", False),
+        # `.ficelle-canary` starts with `.ficelle`; only the whole argument names the home.
+        (".ficelle", ".ficelle-canary", False),
+        (".ficelle", "not-xml", False),
+        (".ficelle", "not-registered", False),
+        (".ficelle", "no-schtasks", False),
+    ],
+)
+def test_scheduled_task_installed_requires_the_task_of_this_home(tmp_path, home, registered, expected):
+    # Updates require an installed service. On Windows neither the plist nor the systemd unit
+    # ever exists, and the task XML is written before registration, so only Task Scheduler can
+    # tell, and its task name is per user, not per FICELLE_HOME.
+    paths = replace(make_paths(tmp_path), ficelle_home=tmp_path / home)
+
+    def query(cmd):
+        if registered == "no-schtasks":
+            raise FileNotFoundError("schtasks")
+        if registered == "not-registered":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="ERROR: not found")
+        if registered == "not-xml":
+            return subprocess.CompletedProcess(cmd, 0, stdout="TaskName: com.ficelle.router", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout=_registered_task(tmp_path / registered), stderr="")
+
+    calls = []
+    backend = WindowsScheduledTaskBackend(
+        paths=paths,
+        run_command=lambda cmd, **kwargs: calls.append(cmd) or query(cmd),
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+        account_provider=lambda: "EXAMPLE\\cyril",
+    )
+
+    assert backend.installed() is expected
+    assert calls == [["schtasks", "/Query", "/TN", paths.label, "/XML"]]
+
+
+@pytest.mark.parametrize(
+    ("command", "home", "expected"),
+    [
+        (r"-m ficelle.windows_entry FICELLE_HOME=C:\Users\me\.ficelle", r"C:\Users\me\.ficelle", True),
+        # Another instance whose home only starts with this one's, then a space inside the quotes.
+        (r'-m ficelle.windows_entry "FICELLE_HOME=C:\Users\me\.ficelle canary"', r"C:\Users\me\.ficelle", False),
+        (
+            r'"C:\Program Files\Python\pythonw.exe" -m ficelle.windows_entry "FICELLE_HOME=C:\Users\My Home\.ficelle"',
+            r"C:\Users\My Home\.ficelle",
+            True,
+        ),
+        # Windows paths are case-insensitive: the same home spelled differently is still this one.
+        (r"-m ficelle.windows_entry FICELLE_HOME=c:\users\ME\.Ficelle", r"C:\Users\me\.ficelle", True),
+        ("-m ficelle.windows_entry FICELLE_HOME=C:\\Users\\me\\.ficelle\\", r"C:\Users\me\.ficelle", True),
+        # list2cmdline doubles a trailing backslash before the closing quote.
+        (r'-m ficelle.windows_entry "FICELLE_HOME=C:\Users\My Home\.ficelle\\"', r"C:\Users\My Home\.ficelle", True),
+        (r"-m ficelle.windows_entry FICELLE_HOME=C:\Users\me\.ficelle-canary", r"C:\Users\me\.ficelle", False),
+        (r"-m ficelle.windows_entry", r"C:\Users\me\.ficelle", False),
+    ],
+)
+def test_windows_command_names_home_compares_the_parsed_home_argument(command, home, expected):
+    assert windows_command_names_home(command, Path(home)) is expected
+
+
+def test_launchagent_waits_for_its_draining_router_before_the_stale_sweep(tmp_path, monkeypatch):
+    # `launchctl bootout` returns once SIGTERM is sent. Sweeping right after matched our own
+    # draining router and SIGKILLed it 2 s later, so its 15 s drain never ended requests cleanly;
+    # launchd's unset ExitTimeOut (about 5 s) cut it short too.
+    from ficelle import router, service
+
+    events: list[str] = []
+    polls = iter([True, True, False])
+    monkeypatch.setattr(service.time, "sleep", lambda _s: None)
+    calls: list[list[str]] = []
+    backend = _launchagent_backend(make_paths(tmp_path), calls, ready=True, launchd_pid=4242)
+    backend.pid_alive = lambda pid: events.append(f"poll {pid}") or next(polls)
+    backend.terminate_stale_servers = lambda: events.append("sweep") or []
+
+    assert backend.stop() == 0
+
+    assert events == ["poll 4242", "poll 4242", "poll 4242", "sweep"]
+    assert backend.plist_payload()["ExitTimeOut"] == service.LAUNCHD_EXIT_TIMEOUT_SECONDS
+    assert service.LAUNCHD_EXIT_TIMEOUT_SECONDS > router.SHUTDOWN_DRAIN_SECONDS

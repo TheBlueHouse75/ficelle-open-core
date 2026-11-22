@@ -1,8 +1,8 @@
 import { profileOrder, fusionModelId, profileLabels, profilePresets, CAP_PROFILE, CAP_STATE_META, $, esc, cloneJson, sleep,
-  providerLabel, setProviderLabels, formatContext, formatTokenLimit, formatSeconds, formatDuration, formatUsd, pct, timeAgo, timeChip,
+  providerLabel, setProviderLabels, formatContext, formatTokenLimit, formatSeconds, formatDuration, formatLatency, formatUsd, pct, timeAgo, timeChip,
   hasIn, hasOut, hasParam, runtimeKey, freeAccess, freeModeLabel,
-  providerFreeModeLabel, reasonDescription, reasonLabel, reasonWithCode, showToast, providerKeyRemovalNotice, copyToClipboard } from "./lib.js";
-import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeProfile, dragged, modelFilters, currentView, expandedModels,
+  providerFreeModeLabel, requestContextMeta, contextEstimateCard, CONTEXT_CHANGED_NOTE, reasonDescription, reasonLabel, reasonWithCode, showToast, showError, providerKeyRemovalNotice, providerKeyShadowNotice, copyToClipboard, quotaGauge, quotaRollup, agedQuotaAdmission, quotaExpiresInSeconds, endpointKeyHint } from "./lib.js";
+import { state, stateLoadedAt, auditEntries, draftProfiles, draftFusion, draftSettings, activeProfile, dragged, modelFilters, currentView, expandedModels,
   compressionPayload, setState, setAuditEntries, setDraftProfiles, setDraftFusion, setDraftSettings, setCompressionPayload, setActiveProfile, setDragged, setCurrentView,
   selectedProvider, setSelectedProvider, providerModelFilter,
   requestsPayload, requestsSummary, requestsLive, expandedRequests, requestFilters,
@@ -316,6 +316,26 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       });
     }
     function removeModel(id) { setProfile({ models: currentProfile().models.filter((x) => x !== id) }); }
+    // Exclude/restore save themselves, but a save posts every virtual model. Posting the drafts
+    // would also publish order and mode edits the operator parked on this lane or another one,
+    // behind a toast that names only the exclusion. So the payload is the saved profiles plus the
+    // one change; the drafts keep their other edits and Save still offers them.
+    function exclusionOnlyProfiles(change, laneId = activeProfile) {
+      const profiles = cloneJson(state.virtual_profiles || {});
+      profiles[laneId] ||= cloneJson(draftProfiles[laneId]);
+      change(profiles[laneId]);
+      return profiles;
+    }
+    // Two exclusions clicked before the first POST answers must not both start from the same
+    // saved state, or the second save drops the first. Each payload is built only once the save
+    // before it has resolved and updated `state.virtual_profiles`; saveProfiles never rejects.
+    let exclusionSaveQueue = Promise.resolve();
+    function queueExclusionSave(message, change) {
+      const laneId = activeProfile;
+      const run = () => saveProfiles(message, exclusionOnlyProfiles(change, laneId));
+      exclusionSaveQueue = exclusionSaveQueue.then(run, run);
+      return exclusionSaveQueue;
+    }
     function excludeModel(id) {
       const p = currentProfile();
       const excludedModels = excludedModelIds(p);
@@ -323,11 +343,15 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         showToast("Already excluded from this virtual model.");
         return;
       }
-      if (!setProfile({
-        models: (p.models || []).filter((x) => x !== id),
-        excluded_models: [...excludedModels, id],
-      })) return;
-      saveProfiles("Model excluded from this virtual model.");
+      // One lane edit for the saved profiles and the live draft, so the two cannot drift.
+      const exclude = (lane) => {
+        lane.models = (lane.models || []).filter((x) => x !== id);
+        lane.excluded_models = [...new Set([...(lane.excluded_models || []), id])];
+      };
+      const draft = { models: p.models, excluded_models: excludedModels };
+      exclude(draft);
+      if (!setProfile(draft)) return;
+      queueExclusionSave("Model excluded from this virtual model.", exclude);
     }
     function restoreModel(id) {
       const p = currentProfile();
@@ -336,8 +360,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         showToast("Model is not excluded from this virtual model.");
         return;
       }
-      if (!setProfile({ excluded_models: excludedModels.filter((x) => x !== id) })) return;
-      saveProfiles("Model restored to this virtual model.");
+      const restore = (lane) => { lane.excluded_models = (lane.excluded_models || []).filter((x) => x !== id); };
+      const draft = { excluded_models: excludedModels };
+      restore(draft);
+      if (!setProfile(draft)) return;
+      queueExclusionSave("Model restored to this virtual model.", restore);
     }
     function moveModel(id, off) { const p = currentProfile(); const a = [...p.models]; const i = a.indexOf(id); const j = i + off; if (i < 0 || j < 0 || j >= a.length) return; a.splice(i, 1); a.splice(j, 0, id); setProfile({ models: a }); }
     function reorderModel(id, beforeId) { const p = currentProfile(); const a = p.models.filter((x) => x !== id); const bi = beforeId ? a.indexOf(beforeId) : -1; if (bi >= 0) a.splice(bi, 0, id); else a.push(id); setProfile({ mode: "manual_order", models: a }); }
@@ -802,7 +829,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const previewHtml = preview.length
         ? preview.map((m, i) => { const sc = m.auto_scores?.[activeProfile]; const v = modelVerified(m); return '<div class="hp"><span class="n">' + (i + 1) + ".</span><span>" + esc(m.name || m.upstream_id) + " &middot; " + esc(candidateOrigin(p, m)) + (sc ? ' &middot; <span title="' + scoreTitle(scoreDetails(m)) + '">score ' + Number(sc).toFixed(0) + "</span>" : "") + (v ? " &middot; " + esc(v.status) : "") + "</span></div>"; }).join("")
           + (more > 0 ? '<div class="hp" style="color:var(--text-muted)"><span class="n">+</span><span>' + more + " more usable model" + (more > 1 ? "s" : "") + (manual ? ", further down this list" : ", ranked by score") + "</span></div>" : "")
-        : '<div class="hp"><span>No usable models match this virtual model yet.</span></div>';
+        : '<div class="hp"><span>' + (noProviderConnected() === "no_key"
+          ? 'No provider key yet. <button type="button" class="btn ghost sm" data-open-providers>Add one in Providers</button> to get usable models.'
+          : noProviderConnected() === "disabled"
+            ? 'Every provider with a key is disabled. <button type="button" class="btn ghost sm" data-open-providers>Enable one in Providers</button> to get usable models.'
+            : "No usable models match this virtual model yet.") + "</span></div>";
       // This list is built from the DRAFT, so before it is saved it shows an intention while the
       // router is still executing the last saved order. Said in the present tense either way, it
       // reads as a statement of fact about live routing — which cost a real debugging session:
@@ -825,6 +856,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           '<div class="hint-preview"><span>Built from <code>' + esc(base) + '</code>. It inherits that policy\'s capability evidence and timeout.</span>' +
           (locked ? '<div class="empty" style="text-align:left;margin-top:8px"><strong>Locked.</strong> This ID is preserved, but it is not listed, exported, or routed until Pro is active.</div>' : previewHtml) + '</div>';
       }
+      $("profileHint").querySelector("[data-open-providers]")?.addEventListener("click", () => setView("providers"));
       $("autoModeBtn").classList.toggle("active", p.mode !== "manual_order");
       $("manualModeBtn").classList.toggle("active", p.mode === "manual_order");
       $("autoModeBtn").setAttribute("aria-pressed", p.mode !== "manual_order" ? "true" : "false");
@@ -991,6 +1023,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     // end into one click on another lane. Only claimed when it is actually true: with the
     // requirements out of the way the arrivals would still be filtered by everything else.
     function emptyAvailableNotice() {
+      const unconnected = (state?.catalog?.models || []).length ? "" : noProviderConnected();
+      if (unconnected === "no_key") return "No provider key yet. Add one in Providers to get usable models.";
+      if (unconnected === "disabled") return "Every provider with a key is disabled. Enable one in Providers to get usable models.";
       const generic = "No models match these filters.";
       if (!modelFilters.newOnly) return generic;
       const arrivals = catalogArrivals();
@@ -1125,13 +1160,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const capPop = '<div class="flt-pop-head">Require capability</div>' + CAP_OPTIONS.map(([v, l]) => checkbox(f.caps.has(v), 'data-cap="' + esc(v) + '"', l)).join("");
       const ctxPop = '<div class="flt-pop-head">Minimum context</div>' + tiers.map(([v, l]) => radio(f.minContext === v, "fltctx", 'data-ctx="' + v + '"', l)).join("");
       const sortPop = '<div class="flt-pop-head">Sort by</div>' + SORT_OPTIONS.map(([v, l]) => radio(f.sortKey === v, "fltsort", 'data-sort="' + esc(v) + '"', l)).join("");
-      const trig = (id, popClass, pop) => '<div class="flt" data-flt="' + id + '">' +
-        '<button type="button" class="flt-trigger' + (fltTriggerOn(id) ? " on" : "") + '" data-flt-trigger="' + id + '" aria-haspopup="true" aria-expanded="false">' + fltTriggerLabel(id) + CHEV + "</button>" +
-        '<div class="flt-pop' + (popClass ? " " + popClass : "") + '">' + pop + "</div></div>";
+      // No aria-haspopup: that promises a menu, and these panels hold checkboxes and radios.
+      const trig = (id, popClass, pop, label) => '<div class="flt" data-flt="' + id + '">' +
+        '<button type="button" class="flt-trigger' + (fltTriggerOn(id) ? " on" : "") + '" data-flt-trigger="' + id + '" aria-expanded="false">' + fltTriggerLabel(id) + CHEV + "</button>" +
+        '<div class="flt-pop' + (popClass ? " " + popClass : "") + '" role="group" aria-label="' + esc(label) + '">' + pop + "</div></div>";
 
       $("filterBar").innerHTML =
-        '<div class="flt-row">' + trig("prov", "", provPop) + trig("cap", "", capPop) + trig("ctx", "align-right", ctxPop) + "</div>" +
-        '<div class="flt-row">' + trig("sort", "", sortPop) + newFilterHtml() +
+        '<div class="flt-row">' + trig("prov", "", provPop, "Filter by provider") + trig("cap", "", capPop, "Require capability") + trig("ctx", "align-right", ctxPop, "Minimum context") + "</div>" +
+        '<div class="flt-row">' + trig("sort", "", sortPop, "Sort by") + newFilterHtml() +
         '<button type="button" class="flt-dir" id="fltDir" title="' + dirTitle() + '" aria-label="' + dirTitle() + '">' + dirSvg() + "</button>" +
         '<button type="button" class="flt-reset" id="fltReset" title="Reset filters and sort" aria-label="Reset filters and sort"' + (fltAnyActive() ? "" : ' style="display:none"') + '><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg></button></div>';
       bindFilterBar($("filterBar"));
@@ -1159,9 +1195,28 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       closeFilterPops();
       if (willOpen) { openFilter = id; fltEl.classList.add("open"); const t = fltEl.querySelector(".flt-trigger"); if (t) t.setAttribute("aria-expanded", "true"); }
     }
+    // An open popover covers the model list and defers the background resync, so a keyboard user
+    // needs the ways out a pointer user has: Escape, and tabbing past the last control.
+    function bindFilterPopDismissal(flt) {
+      // A pointer press on an option's label text moves focus to the nearest focusable ancestor
+      // (the <main> container), which would otherwise read as focus leaving the popover mid-click.
+      // Only focus that moves after a keystroke is a keyboard user leaving.
+      let pointerPress = false;
+      flt.addEventListener("pointerdown", () => { pointerPress = true; });
+      flt.addEventListener("keydown", (e) => {
+        pointerPress = false;
+        if (e.key !== "Escape" || !flt.classList.contains("open")) return;
+        closeFilterPops();
+        flt.querySelector(".flt-trigger")?.focus();
+      });
+      flt.addEventListener("focusout", (e) => {
+        if (!pointerPress && flt.classList.contains("open") && e.relatedTarget && !flt.contains(e.relatedTarget)) closeFilterPops();
+      });
+    }
     function bindFilterBar(bar) {
       const f = modelFilters;
       const refresh = () => { renderAvailable(); syncFilterBar(); };
+      bar.querySelectorAll(".flt").forEach(bindFilterPopDismissal);
       bar.querySelectorAll("[data-flt-trigger]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); toggleFilterPop(b.closest(".flt")); }));
       bar.querySelectorAll(".flt-pop").forEach((p) => p.addEventListener("click", (e) => e.stopPropagation()));
       bar.querySelectorAll("[data-prov]").forEach((cb) => cb.addEventListener("change", () => { cb.checked ? f.providers.add(cb.dataset.prov) : f.providers.delete(cb.dataset.prov); refresh(); }));
@@ -1295,6 +1350,29 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       }));
       detailEl.innerHTML = providerDetailHTML(selectedProvider, provs[selectedProvider] || {});
       bindProviderDetailActions(detailEl);
+      armQuotaExpiry(keys);
+    }
+    // A live gauge goes stale on its own (its reset passes, or the report ages out) while nothing
+    // re-reads /admin/state. One timer, armed for the earliest such moment, redraws the gauges.
+    let quotaExpiryTimer = null;
+    function armQuotaExpiry(keys) {
+      clearTimeout(quotaExpiryTimer);
+      quotaExpiryTimer = null;
+      const elapsed = quotaElapsedSeconds();
+      const due = keys.map((src) => quotaExpiresInSeconds(agedQuotaAdmission(providerStats(src)?.admission, elapsed))).filter((v) => v != null);
+      if (!due.length) return;
+      quotaExpiryTimer = setTimeout(() => redrawQuotaGauges(keys), (Math.min(...due) + 1) * 1000);
+    }
+    // Only the gauge and roll-up nodes, from the state already held. Replacing the state
+    // (resyncState) would make untouched drafts read as edits, and it defers while the operator
+    // is busy, which left an expired "Exhausted" on screen. Neither node holds a focusable control.
+    function redrawQuotaGauges(keys) {
+      document.querySelectorAll(".quota-gauge[data-quota-source]").forEach((el) => {
+        el.outerHTML = quotaGaugeHTML(providerStats(el.dataset.quotaSource)?.admission, el.dataset.quotaSource);
+      });
+      const rollup = document.querySelector(".quota-rollup");
+      if (rollup) rollup.outerHTML = quotaRollupHTML(keys.filter((src) => state?.catalog?.providers?.[src]?.invokable));
+      armQuotaExpiry(keys);
     }
 
     // Median of a numeric list (null when empty). Returns the average of the two middle values
@@ -1375,7 +1453,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           note: medLat == null ? "no latency recorded yet" : (latencies.length + " of " + plural(keys.length, "provider", "providers") + " measured" + (fastest ? " &middot; fastest " + esc(providerLabel(fastest.src)) : "")),
           cls: "info" },
       ];
-      el.innerHTML = cards.map(hcardHTML).join("");
+      el.innerHTML = cards.map(hcardHTML).join("") + quotaRollupHTML(keys.filter((src) => provs[src]?.invokable));
     }
 
     // Single source of truth for provider status precedence (disabled → cooldown → quota →
@@ -1425,6 +1503,42 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         + "</button>";
     }
 
+    // Remaining-quota gauge (provider-reported headers, else the declared limit). `quotaGauge` decides
+    // what may be numeric; this only draws it. The OpenRouter budget badge stays separate: it meters
+    // what Ficelle spent, this shows what the provider last said it had left.
+    // Seconds since the state the gauges are drawn from was loaded, so they age while the page stays open.
+    const quotaElapsedSeconds = () => (stateLoadedAt ? Math.max(0, (Date.now() - stateLoadedAt) / 1000) : 0);
+    function quotaGaugeHTML(admission, src) {
+      const g = quotaGauge(admission, quotaElapsedSeconds());
+      const tone = g.tone === "muted" ? "" : " " + g.tone;
+      const bar = g.bar
+        ? '<span class="quota-bar' + tone + '" role="meter" aria-label="Remaining requests, provider-reported estimate" aria-valuemin="0" aria-valuemax="' + esc(String(g.bar.limit)) + '" aria-valuenow="' + esc(String(g.bar.remaining)) + '"><span style="width:' + Math.max(g.bar.remaining > 0 ? 2 : 0, Math.round(g.bar.fraction * 100)) + '%"></span></span>'
+        : "";
+      return '<div class="quota-gauge" data-quota-source="' + esc(src) + '" data-quota-state="' + esc(g.state) + '">'
+        + '<div class="quota-head"><span class="badge' + tone + '">' + esc(g.headline) + "</span>" + bar + "</div>"
+        + '<div class="quota-detail">' + esc(g.detail) + "</div>"
+        + g.lines.map((l) => '<div class="quota-line' + (l.tone === "muted" ? "" : " " + l.tone) + '">' + esc(l.text) + "</div>").join("")
+        + "</div>";
+    }
+
+    // One compact strip under the Providers KPI row: how many providers have a provider-reported
+    // gauge, only a declared limit, a stale report, and which ones are exhausted or low. Hidden
+    // until at least one provider has anything to say, so a fresh start shows no empty box.
+    function quotaRollupHTML(keys) {
+      const bySource = {};
+      keys.forEach((src) => { bySource[src] = providerStats(src)?.admission || null; });
+      const r = quotaRollup(bySource, quotaElapsedSeconds());
+      if (!r.observed && !r.declared_only && !r.stale) return "";
+      const names = (list) => list.map((src) => esc(providerLabel(src))).join(", ");
+      return '<div class="quota-rollup" role="status"><span class="quota-rollup-title">Quota estimates</span>'
+        + '<span class="badge ok">' + r.observed + " provider-reported</span>"
+        + '<span class="badge outline">' + r.declared_only + " declared only</span>"
+        + (r.stale ? '<span class="badge warn">' + r.stale + " stale</span>" : "")
+        + (r.exhausted.length ? '<span class="badge danger">Exhausted: ' + names(r.exhausted) + "</span>" : "")
+        + (r.low.length ? '<span class="badge warn">Low: ' + names(r.low) + "</span>" : "")
+        + '<span class="quota-rollup-note">Held in memory since Ficelle started.</span></div>';
+    }
+
     // Full per-provider detail: the exact card body that used to live in the tile grid, now
     // shown one at a time. Config article (header, bars, chips, note, auth, key form) above the
     // model listing, which is forced open here since it is the panel's dedicated zone.
@@ -1454,7 +1568,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         + (s.state === "disabled" ? "" : '<span class="dot"></span>') + esc(s.label) + "</span>";
       const { accepted } = providerCounts(p);
       // Chip families: Class (static classification), Runtime (usage metrics), Health (incidents).
-      const callsOk = st ? pct(st.successes, st.requests) : null;
+      // A quota observation creates the stats row before any call, and 0 of 0 is not "0% ok".
+      const callsOk = Number(st?.requests) > 0 ? pct(st.successes, st.requests) : null;
       const budget = st?.budget;
       const budgetSpent = Number(budget?.spent);
       const budgetLimit = Number(budget?.limit);
@@ -1474,7 +1589,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           + (budget.period === "month" ? " this month" : " today") + "</span>"
         : "";
       const runtimePills = st
-        ? '<span class="badge ' + (callsOk >= 95 ? "ok" : callsOk >= 80 ? "warn" : "danger") + '">' + callsOk + "% calls ok</span>"
+        ? (callsOk === null ? "" : '<span class="badge ' + (callsOk >= 95 ? "ok" : callsOk >= 80 ? "warn" : "danger") + '">' + callsOk + "% calls ok</span>")
           + (st.latency_ewma != null ? '<span class="badge" title="Average latency (EWMA)">' + Number(st.latency_ewma).toFixed(2) + "s latency</span>" : "")
           + budgetBadge
         : "";
@@ -1520,7 +1635,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
             '<span class="key-mask mono" title="Stored key — only the first and last characters are shown">' + esc(keyMask) + "</span>" +
             storeChip +
             '<button class="btn ghost sm" data-replace-key="' + esc(src) + '">Replace</button>' +
-            '<button class="btn ghost sm" data-remove-key="' + esc(src) + '">Remove key</button>' +
+            '<button class="btn ghost sm danger-text" data-remove-key="' + esc(src) + '">Remove key</button>' +
             '<input type="password" class="key-input is-hidden" data-key-input="' + esc(src) + '" placeholder="Paste new ' + esc(providerLabel(src)) + ' key" autocomplete="off" spellcheck="false" />' +
             '<button class="btn ghost sm is-hidden" data-set-key="' + esc(src) + '">Save</button>' +
           "</div>"
@@ -1550,6 +1665,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           '<div class="pill-rows">' +
             '<div class="pill-row"><span class="pill-row-label">Class</span><span class="badge outline">' + esc(providerFreeModeLabel(p)) + "</span></div>" +
             (runtimePills ? '<div class="pill-row"><span class="pill-row-label">Runtime</span>' + runtimePills + "</div>" : "") +
+            (p.invokable || ["observed", "stale"].includes(st?.admission?.state) ? '<div class="pill-row quota-row"><span class="pill-row-label">Quota</span>' + quotaGaugeHTML(st?.admission, src) + "</div>" : "") +
             (healthPills ? '<div class="pill-row"><span class="pill-row-label">Health</span>' + healthPills + "</div>" : "") +
           "</div>" +
           (p.key_url ? '<div class="provider-keyurl"><a href="' + esc(p.key_url) + '" target="_blank" rel="noopener noreferrer">' + ic(ICONS.external) + "Get your " + esc(providerLabel(src)) + " key</a></div>" : "") +
@@ -2017,14 +2133,29 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         { k: "Context compression", ic: ICONS.compression, v: compressionStatus, note: "mode " + compressionMode + " &middot; ~" + compressionSaved + " tokens saved &middot; " + compressionEntries + " CCR entries <button class=\"btn ghost sm\" data-open-compression>Dashboard</button>", cls: compression.health_digest === "compression_errors_repeated" ? "warn" : "ok" },
         { k: "Watcher", ic: ICONS.watcher, v: "Silent", note: "alerts only when status is not ok &middot; catalog refresh hourly, background auto-benchmark (see Settings)", cls: "ok" }
       ];
+      // Cooldown timers are computed when the state is built, so say when that was.
+      $("guardAsOf").textContent = stateLoadedAt ? "As of " + new Date(stateLoadedAt).toLocaleTimeString() + "." : "";
       $("healthGrid").innerHTML = cards.map(hcardHTML).join("");
       $("healthGrid").querySelectorAll("[data-open-compression]").forEach((b) => b.addEventListener("click", () => setView("compression")));
 
       const guards = [];
-      Object.entries(rt.cooldowns || {}).filter(([, r]) => r?.active).forEach(([key, r]) => guards.push({ title: key.split("::")[1] || key, meta: "Paused " + formatSeconds(r.seconds_remaining) + " - " + reasonLabel(r.reason), detail: reasonDescription(r.reason), kind: "warn", model: key }));
+      // Runtime keys are `source::upstream_id`. Two providers can serve the same upstream id, so
+      // titles name the provider, and a model action resolves the catalog id from the full key
+      // rather than from the bare upstream id.
+      const splitRuntimeKey = (key) => {
+        const at = key.indexOf("::");
+        return at < 0 ? { source: null, upstream: key } : { source: key.slice(0, at), upstream: key.slice(at + 2) };
+      };
+      const keyUpstream = (key) => splitRuntimeKey(key).upstream;
+      const keyTitle = (key, upstream = keyUpstream(key)) => {
+        const { source } = splitRuntimeKey(key);
+        return source === null ? upstream : upstream + " (" + providerLabel(source) + ")";
+      };
+      const catalogIdFor = (key) => (state?.catalog?.models || []).find((m) => runtimeKey(m) === key)?.id || null;
+      Object.entries(rt.cooldowns || {}).filter(([, r]) => r?.active).forEach(([key, r]) => guards.push({ title: keyTitle(key), meta: "Paused " + formatSeconds(r.seconds_remaining) + " - " + reasonLabel(r.reason), detail: reasonDescription(r.reason), kind: "warn", resumeModel: catalogIdFor(key) }));
       Object.entries(rt.provider_cooldowns || {}).filter(([, r]) => r?.active).forEach(([key, r]) => guards.push({ title: providerLabel(key) + " (provider)", meta: "Paused " + formatSeconds(r.seconds_remaining) + " - " + reasonLabel(r.reason), detail: reasonDescription(r.reason), kind: "warn", provider: key }));
       Object.entries(rt.quota_cooldowns || {}).filter(([, r]) => r?.active).forEach(([key, r]) => guards.push({ title: providerLabel(r.source || key) + " (free quota)", meta: "Paused " + formatSeconds(r.seconds_remaining) + " - next probe " + timeAgo(r.next_probe_at_iso || r.next_probe_at).label, kind: "warn", quotaProvider: r.source }));
-      Object.entries(rt.quarantine || {}).forEach(([key, r]) => guards.push({ title: r.upstream_id || key.split("::")[1] || key, meta: compactUpstreamError(r.note || r.reason || "disabled") + " - " + timeAgo(r.set_at).label, detail: r.note, kind: "danger" }));
+      Object.entries(rt.quarantine || {}).forEach(([key, r]) => guards.push({ title: keyTitle(key, r.upstream_id || keyUpstream(key)), meta: compactUpstreamError(r.note || r.reason || "disabled") + " - " + timeAgo(r.set_at).label, detail: r.note, kind: "danger", reenableModel: r.model_id || catalogIdFor(key) }));
       Object.entries(rt.provider_disabled || {}).forEach(([key, r]) => guards.push({ title: providerLabel(key) + " (provider)", meta: "Manually disabled - " + timeAgo(r.set_at).label, detail: "Held out of routing by an operator until re-enabled.", kind: "danger", enableProvider: key }));
       // One upstream model fails the same check in several virtual models; list it once with the
       // affected virtual models instead of repeating the row (and the provider's error) per profile.
@@ -2061,10 +2192,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       });
       $("guardList").innerHTML = guards.length ? guards.map((g) =>
         '<div class="guard-row"><div><div class="g-title">' + esc(g.title) + ' <span class="badge ' + g.kind + '">' + esc(g.badge || (g.kind === "danger" ? "Disabled" : "Paused")) + '</span></div><div class="g-meta" title="' + esc(g.detail || g.meta) + '">' + esc(g.meta) + "</div></div>" +
+        (g.resumeModel ? '<button class="btn ghost sm" data-clear-model="' + esc(g.resumeModel) + '">Resume now</button>' : "") +
+        (g.reenableModel ? '<button class="btn ghost sm" data-unquarantine-model="' + esc(g.reenableModel) + '">Re-enable</button>' : "") +
         (g.provider ? '<button class="btn ghost sm" data-clear-provider="' + esc(g.provider) + '">Resume now</button>' : "") +
         (g.quotaProvider ? '<button class="btn ghost sm" data-probe-provider="' + esc(g.quotaProvider) + '">Probe quota</button>' : "") +
         (g.enableProvider ? '<button class="btn ghost sm" data-enable-provider="' + esc(g.enableProvider) + '">Enable provider</button>' : "") + "</div>"
       ).join("") : '<div class="empty">Nothing held back. Every usable model is in rotation.</div>';
+      $("guardList").querySelectorAll("[data-clear-model]").forEach((b) => b.addEventListener("click", () => clearModelCooldown(b.dataset.clearModel)));
+      $("guardList").querySelectorAll("[data-unquarantine-model]").forEach((b) => b.addEventListener("click", () => updateQuarantine(b.dataset.unquarantineModel, "remove")));
       $("guardList").querySelectorAll("[data-clear-provider]").forEach((b) => b.addEventListener("click", () => clearProviderCooldown(b.dataset.clearProvider)));
       $("guardList").querySelectorAll("[data-probe-provider]").forEach((b) => b.addEventListener("click", () => probeProviderQuota(b.dataset.probeProvider, b)));
       $("guardList").querySelectorAll("[data-enable-provider]").forEach((b) => b.addEventListener("click", () => toggleProvider(b.dataset.enableProvider, true, b)));
@@ -2106,7 +2241,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       return ICONS.auditDefault;
 	    }
 	    function auditTitle(action) {
-	      return ({ "admin.profiles.save": "Saved virtual models", "admin.profiles.prune": "Removed models their provider dropped","admin.fusion.save": "Saved fusion settings", "admin.settings.save": "Saved routing settings", "admin.compression.clear": "Cleared compression store", "admin.canary": "Ran a canary health check", "admin.benchmark": "Ran a benchmark", "admin.quarantine.add": "Disabled a model", "admin.quarantine.remove": "Re-enabled a model", "admin.cooldowns.clear_model": "Resumed a model", "admin.cooldowns.clear_provider": "Resumed a provider", "admin.providers.probe": "Probed provider free quota", "admin.providers.toggle": "Enabled or disabled a provider", "admin.refresh": "Refreshed the model catalog" })[action] || action || "Admin action";
+	      return ({ "admin.profiles.save": "Saved virtual models", "admin.profiles.prune": "Removed models their provider dropped","admin.fusion.save": "Saved fusion settings", "admin.settings.save": "Saved routing settings", "admin.compression.clear": "Cleared compression store", "admin.canary": "Ran a canary health check", "admin.benchmark": "Ran a benchmark", "admin.quarantine.add": "Disabled a model", "admin.quarantine.remove": "Re-enabled a model", "admin.cooldowns.clear_model": "Resumed a model", "admin.cooldowns.clear_provider": "Resumed a provider", "admin.providers.probe": "Probed provider free quota", "admin.providers.toggle": "Enabled or disabled a provider", "admin.refresh": "Refreshed the model catalog", "admin.providers.set_key": "Saved a provider key", "admin.providers.remove_key": "Removed a provider key", "admin.providers.set_account_id": "Saved a provider account id", "admin.rollback": "Restored a saved snapshot", "admin.update.install": "Installed a Ficelle update", "admin.license.activate": "Activated the license", "admin.license.refresh": "Refreshed the license", "admin.license.deactivate": "Deactivated the license", "admin.license.install": "Installed a license", "admin.cooldowns.clear_all": "Resumed every paused model and provider", "admin.quality_feedback.record": "Recorded quality feedback" })[action]
+	        // A server action added later must still read as words, never as a dotted identifier.
+	        || (action ? action.replace(/^admin\./, "").replace(/[._]/g, " ") : "Admin action");
 	    }
 	    function auditMeta(e) {
 	      // renderAudit drops this return value straight into innerHTML, and `model_id` arrives from
@@ -2159,6 +2296,8 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     let requestsSummaryAt = 0;
     let requestsCursor = null;         // index position the rendered list was read at
     let requestsDegraded = false;
+    // What the last read of the index said, so an unread or failed list is not painted as "no traffic".
+    let requestsLoad = { state: "idle", detail: "" };
     let requestsTransport = "paused";
     const REQ_WINDOWS = ["1h", "24h", "7d", "30d"];
     const REQ_LIST_CAP = 200;          // recent rows kept in memory and available to the pager
@@ -2205,11 +2344,30 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     const summaryUrl = () => "/admin/requests/summary?window=" + encodeURIComponent(requestFilters.window || "24h");
     // Toast only on the transition into a degraded state, so a live tail doesn't spam it every tick.
     function noteRequestsDegraded(errorType) {
-      if (errorType && !requestsDegraded) showToast("Request index unavailable: " + errorType);
+      if (errorType && !requestsDegraded) showToast("Request index unavailable: " + errorType, "error");
       requestsDegraded = Boolean(errorType);
+      requestsLoad = errorType ? { state: "error", detail: errorType } : { state: "ok", detail: "" };
+    }
+    // Replaces the "No matching requests" copy while there is nothing to show and the reason is
+    // not an empty window. Rows already on screen stay put when a later refresh fails.
+    function requestsStatusNotice() {
+      if ((requestsPayload?.entries || []).length) return "";
+      if (requestsLoad.state === "loading") return "Loading requests…";
+      if (requestsLoad.state === "error") return "Request index unavailable" + (requestsLoad.detail ? " (" + requestsLoad.detail + ")" : "") + ". Reload, or run `ficelle doctor`.";
+      return "";
     }
     async function loadRequests(after = true) {
-      const [lp, sp] = await Promise.all([loadRequestsList(false), fetchRequestsSummary()]);
+      // Each filter change starts a load; a slow answer for an earlier one must not land over
+      // the filter now on screen, so a response is applied only if the query is still current.
+      const stamp = requestQuery() + "|" + summaryUrl();
+      const isCurrent = () => stamp === requestQuery() + "|" + summaryUrl();
+      let lp, sp;
+      try { [lp, sp] = await Promise.all([loadRequestsList(false), fetchRequestsSummary()]); }
+      catch (e) {
+        if (isCurrent()) { requestsLoad = { state: "error", detail: e.message || String(e) }; if (after) renderRequests(); }
+        throw e;
+      }
+      if (!isCurrent()) return;
       setRequestsSummary(sp);
       requestsSummaryAt = Date.now();
       noteRequestsDegraded(lp?.error_type || sp?.error_type);
@@ -2224,9 +2382,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     // List only. A resync takes this path rather than loadRequests(): the aggregates are the
     // expensive read, and they have their own cadence.
     async function loadRequestsList(after = true) {
-      const r = await fetch("/admin/requests?" + requestQuery(), { cache: "no-store" });
+      const query = requestQuery();
+      const r = await fetch("/admin/requests?" + query, { cache: "no-store" });
       const p = await r.json();
       if (!r.ok) throw new Error(p?.error?.message || "requests failed");
+      if (query !== requestQuery()) return p;  // the filter moved on while this was in flight
       // A full list read supersedes anything the stream queued for the old list.
       requestsPending = [];
       requestsCursor = typeof p?.cursor === "number" ? p.cursor : null;
@@ -2241,9 +2401,10 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       return p || {};
     }
     function enterRequests() {
+      if (requestsLoad.state !== "ok") requestsLoad = { state: "loading", detail: "" };
       renderRequestsFilters();
       renderRequests();
-      loadRequests().catch((e) => showToast(e.message || String(e)));
+      loadRequests().catch(showError);
       if (requestsLive) startRequestsLive();
     }
 
@@ -2261,7 +2422,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     function stopRequestsPolling() { if (requestsTimer) { clearInterval(requestsTimer); requestsTimer = null; } }
     function startRequestsLive() {
       stopRequestsTransport();
-      if (!requestsLive) { setRequestsTransport("paused"); return; }
+      // Async continuations (a filter change, the tab becoming visible again) can resolve after
+      // the operator left; the server hands out only four stream slots.
+      if (!requestsLive || currentView !== "requests") { setRequestsTransport("paused"); return; }
       setRequestsTransport("connecting");
       if (document.hidden) return;  // resumed by the visibilitychange handler
       if (typeof EventSource !== "function") { startRequestsPolling(); return; }
@@ -2338,14 +2501,16 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       }
       if (Date.now() - requestsSummaryAt >= REQ_SUMMARY_MS) {
         requestsSummaryAt = Date.now();  // claim the slot before awaiting so a burst cannot stack fetches
-        fetchRequestsSummary().then((sp) => { setRequestsSummary(sp); renderRequestsSummary(); renderRequestsTimeline(); }).catch(() => {});
+        const url = summaryUrl();
+        fetchRequestsSummary().then((sp) => { if (url !== summaryUrl()) return; setRequestsSummary(sp); renderRequestsSummary(); renderRequestsTtft(); renderRequestsTimeline(); }).catch(() => {});
       }
     }
 
-    function renderRequests() { renderRequestsSummary(); renderRequestsWindow(); renderRequestsTimeline(); renderRequestsList(); }
+    function renderRequests() { renderRequestsSummary(); renderRequestsWindow(); renderRequestsTtft(); renderRequestsTimeline(); renderRequestsList(); }
 
     function renderRequestsSummary() {
       const el = $("requestsSummary"); if (!el) return;
+      if (requestsStatusNotice()) { el.innerHTML = ""; return; }
       const s = requestsSummary || {};
       const total = Number(s.total || 0);
       const rate = s.success_rate == null ? "n/a" : Math.round(Number(s.success_rate) * 100) + "%";
@@ -2382,17 +2547,64 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         { k: "Spent", ic: ICONS.dollar, v: spendTile.v, note: spendTile.note, cls: spendTile.cls },
         { k: "Est. saved", ic: ICONS.dollar, v: priced ? "~" + formatUsd(saved) : "n/a", note: savedNote, cls: "info" },
         { k: "Latency p95", ic: ICONS.latency, v: p95, note: "median " + p50, cls: "info" },
+        { k: "Prompt estimate", ic: ICONS.compression, ...contextEstimateCard(s.context_estimate) },
         { k: "Fallbacks", ic: ICONS.retest, v: fb, note: fb ? "needed a backup model" : "no fallback needed", cls: fb ? "warn" : "ok" },
         { k: "Top error", ic: ICONS.disable, v: top ? reasonLabel(top.reason) : "none", note: top ? (top.total + " in window") : "no errors in window", cls: top ? "danger" : "ok" },
       ];
       el.innerHTML = cards.map(hcardHTML).join("");
     }
 
+    // One table of TTFT percentiles. A group with no streamed observation says so instead of
+    // printing a number: a dash or a zero would read as "fast" for a provider that was never measured.
+    function ttftTableHTML(title, keyField, rows, labelOf) {
+      const body = rows.map((r) => {
+        const n = Number(r.n) || 0;
+        const name = '<th scope="row">' + esc(labelOf(r[keyField])) + "</th>";
+        const few = n > 0 && n < 5;
+        const count = '<td class="ttft-n' + (few ? " is-low" : "") + '"' + (few ? ' title="Few samples: percentiles are indicative only"' : "") + ">" + n + "</td>";
+        if (!n) return "<tr>" + name + '<td class="ttft-none" colspan="3">no streaming data</td>' + count + "</tr>";
+        return "<tr>" + name + "<td>" + formatLatency(r.p50) + "</td><td>" + formatLatency(r.p75) + "</td><td>" + formatLatency(r.p95) + "</td>" + count + "</tr>";
+      }).join("");
+      return '<div class="ttft-block"><table class="ttft-table"><caption>' + esc(title) + "</caption>" +
+        '<thead><tr><th scope="col">' + esc(keyField === "source" ? "Provider" : "Virtual model") + '</th><th scope="col">p50</th><th scope="col">p75</th><th scope="col">p95</th><th scope="col" title="Streamed attempts measured">n</th></tr></thead>' +
+        "<tbody>" + body + "</tbody></table></div>";
+    }
+    function renderRequestsTtft() {
+      const el = $("requestsTtft"); if (!el) return;
+      // While the index is loading or down the list carries the notice; an empty card would only repeat it.
+      const card = el.closest(".req-ttft-card");
+      const notice = requestsStatusNotice();
+      if (card) card.style.display = notice ? "none" : "";
+      if (notice) { el.innerHTML = ""; return; }
+      const t = requestsSummary?.ttft;
+      // A degraded or older payload carries no `ttft` at all; saying so beats an empty card.
+      if (!t) { el.innerHTML = '<div class="empty">Time-to-first-token data is unavailable.</div>'; return; }
+      const byProvider = t.by_source || [];
+      const byProfile = t.by_profile || [];
+      const measured = Number(t.overall?.n) || 0;
+      const note = measured
+        ? ""
+        : '<div class="empty ttft-empty">No streaming data in this window. Percentiles appear once a streamed response delivers its first token.</div>';
+      const tables = (byProvider.length || byProfile.length)
+        ? '<div class="ttft-grid">' +
+          ttftTableHTML("By provider", "source", byProvider, (k) => providerLabel(k)) +
+          ttftTableHTML("By virtual model", "profile", byProfile, (k) => profileLabels[k]?.[0] || k) +
+          "</div>"
+        : "";
+      const oh = requestsSummary?.router_overhead;
+      const ohN = Number(oh?.n) || 0;
+      const overhead = ohN
+        ? "Router overhead &middot; median " + esc(formatLatency(oh.p50)) + " &middot; p95 " + esc(formatLatency(oh.p95)) + " over " + ohN + " requests"
+        : "Router overhead &middot; no data yet";
+      el.innerHTML = note + tables +
+        '<p class="ttft-foot">' + overhead + " &mdash; Ficelle&#39;s own time (route preparation, pre-dispatch, bookkeeping); the provider&#39;s wait is not included.</p>";
+    }
+
     function renderRequestsWindow() {
       const wEl = $("requestsWindow"); if (!wEl) return;
       wEl.innerHTML = '<div class="segmented" role="group" aria-label="Summary window">' +
         REQ_WINDOWS.map((w) => '<button type="button" data-req-window="' + w + '"' + (requestFilters.window === w ? ' class="active"' : "") + ">" + w + "</button>").join("") + "</div>";
-      wEl.querySelectorAll("[data-req-window]").forEach((b) => b.addEventListener("click", () => { requestFilters.window = b.dataset.reqWindow; loadRequests().catch((e) => showToast(e.message)); }));
+      wEl.querySelectorAll("[data-req-window]").forEach((b) => b.addEventListener("click", () => { requestFilters.window = b.dataset.reqWindow; loadRequests().catch(showError); }));
     }
 
     function renderRequestsTimeline() {
@@ -2402,6 +2614,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       // rebuild the DOM under the pointer or keyboard focus and drop the tooltip mid-read. This also comes
       // before the empty state so an expiring last bucket waits for pointer leave.
       if ($("reqChart")?.matches(":hover, :focus-within")) return;
+      if (requestsStatusNotice()) { stopChartResizeWatch(); el.innerHTML = ""; return; }
       if (!buckets.some((b) => Number(b.total || 0) > 0)) {
         stopChartResizeWatch();
         el.innerHTML = '<div class="empty">No requests in this window yet.</div>';
@@ -2624,7 +2837,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       // A live tail is filtered server-side, so a filter change has to reopen it.
       const apply = () => {
         requestsVisibleCount = REQ_PAGE_SIZE;
-        return loadRequests().then(() => { if (requestsLive) startRequestsLive(); }).catch((e) => showToast(e.message));
+        return loadRequests().then(() => { if (requestsLive) startRequestsLive(); }).catch(showError);
       };
       $("reqProfile").addEventListener("change", (e) => { f.profile = e.target.value; apply(); });
       $("reqSource").addEventListener("change", (e) => { f.source = e.target.value; apply(); });
@@ -2642,7 +2855,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const focusedRow = document.activeElement?.closest?.("[data-req-id]");
       const restoreRequestId = focusRequestId || focusedRow?.dataset.reqId || null;
       if (!rows.length) {
-        el.innerHTML = '<div class="empty">No matching requests yet. Route a request — or relax the filters — to see traffic here.</div>';
+        el.innerHTML = '<div class="empty">' + esc(requestsStatusNotice() || "No matching requests yet. Route a request — or relax the filters — to see traffic here.") + "</div>";
         renderRequestsListFooter(0);
         return;
       }
@@ -2706,16 +2919,18 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         ? '<span class="badge warn" title="' + esc(attemptChainSummary(e)) + '">' + (e.fallback ? "fallback " : "") + Number(e.attempt_count) + "×</span>"
         : (e.fallback ? '<span class="badge warn">fallback</span>' : "");
       const stream = e.stream ? '<span class="req-stream" title="streamed response">≋</span>' : "";
-      const rowLabel = [t.label, profileLabels[e.profile]?.[0] || e.profile || "unknown virtual model", e.source ? providerLabel(e.source) : "unknown provider", e.upstream_id || e.model_id || "unknown upstream", "status " + String(e.status ?? "unknown"), reasonText, lat + " latency"].join(", ");
+      // Set only when the size filter moved the first choice, so a quiet row stays quiet.
+      const ctxChanged = e.context_changed_selection ? '<span class="badge info" title="' + esc(CONTEXT_CHANGED_NOTE) + '">ctx</span>' : "";
+      const rowLabel = [t.label, profileLabels[e.profile]?.[0] || e.profile || "unknown virtual model", e.source ? providerLabel(e.source) : "unknown provider", e.upstream_id || e.model_id || "unknown upstream", "status " + String(e.status ?? "unknown"), reasonText, lat + " latency"].concat(e.context_changed_selection ? [CONTEXT_CHANGED_NOTE] : []).join(", ");
       const head = '<div class="req-row' + (open ? " is-open" : "") + '" data-req-id="' + esc(e.request_id) + '" role="button" tabindex="0" aria-label="' + esc(rowLabel) + '" aria-expanded="' + (open ? "true" : "false") + '" aria-controls="' + panelId + '">' +
         '<span class="req-time" title="' + esc(t.title) + '">' + esc(t.label) + "</span>" +
         '<span class="req-profile">' + esc(profileLabels[e.profile]?.[0] || e.profile || "—") + "</span>" +
         '<span class="req-prov">' + esc(e.source ? providerLabel(e.source) : "—") + "</span>" +
         '<span class="req-up mono">' + esc(e.upstream_id || e.model_id || "—") + "</span>" +
         statusBadge +
-        '<span class="req-reason">' + esc(reasonText) + errType + "</span>" +
+        '<span class="req-reason"' + (ok ? "" : ' title="' + esc(reasonDescription(e.reason)) + '"') + ">" + esc(reasonText) + errType + "</span>" +
         '<span class="req-lat">' + esc(lat) + "</span>" +
-        '<span class="req-flags">' + tries + stream + "</span>" +
+        '<span class="req-flags">' + ctxChanged + tries + stream + "</span>" +
         "</div>";
       return '<div class="req-item' + (isNew ? " is-new" : "") + '" role="listitem">' + head + (open ? reqDetailHTML(e, panelId) : "") + "</div>";
     }
@@ -2725,6 +2940,17 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       return attempts
         .map((a) => (a.source ? providerLabel(a.source) : "?") + " " + String(a.status ?? a.reason ?? "—"))
         .join(" → ");
+    }
+    // First-token chip beside the attempt latency. Only an attempt that streamed a delta has one:
+    // a buffered attempt's first byte is its whole latency, so it would read as a fast TTFT.
+    function reqAttemptTimingHTML(a, latencyText) {
+      const hasFirst = a.first_delta_seconds != null;
+      if (!hasFirst && !latencyText) return "";
+      const pre = a.router_pre_dispatch_seconds != null ? " Router pre-dispatch " + formatLatency(a.router_pre_dispatch_seconds) + "." : "";
+      const chip = hasFirst
+        ? '<span class="badge info req-attempt-ttft" title="' + esc("Time from the provider request to the first answer or reasoning text sent to the client." + pre) + '">first token ' + esc(formatLatency(a.first_delta_seconds)) + "</span>"
+        : "";
+      return '<span class="req-attempt-timing">' + chip + (latencyText ? '<span class="req-attempt-lat">' + esc(latencyText) + "</span>" : "") + "</span>";
     }
     function reqDetailHTML(e, panelId = requestPanelId(e.request_id)) {
       const attempts = e.attempts || [];
@@ -2751,20 +2977,38 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
           '<span class="mono req-attempt-up">' + esc(a.upstream || a.model || "—") + "</span>" +
           '<span class="req-attempt-src">' + esc(a.source ? providerLabel(a.source) : "—") + "</span>" +
           '<span class="badge ' + acls + '">' + esc(String(a.status ?? a.reason ?? "—")) + "</span>" +
-          '<span class="req-attempt-reason">' + esc(reasonWithCode(a.reason)) + (a.error_type ? " · " + esc(a.error_type) : "") + esc(timeoutText) + "</span>" +
-          (al ? '<span class="req-attempt-lat">' + esc(al) + "</span>" : "") +
+          '<span class="req-attempt-reason" title="' + esc(reasonDescription(a.reason)) + '">' + esc(reasonWithCode(a.reason)) + (a.error_type ? " · " + esc(a.error_type) : "") + esc(timeoutText) + "</span>" +
+          reqAttemptTimingHTML(a, al) +
           "</div>";
       }).join("") : '<div class="req-attempt"><span class="req-attempt-reason">No per-attempt detail recorded.</span></div>';
       const meta = ["request " + esc(e.request_id)];
       if (e.competence) meta.push("competence " + esc(e.competence));
       if (e.candidate_count != null) meta.push(Number(e.candidate_count) + " candidates");
-      if (e.prompt_tokens_estimate != null) meta.push("~" + formatContext(e.prompt_tokens_estimate) + " tok");
-      if (e.excluded_for_context > 0) meta.push(Number(e.excluded_for_context) + " too small for prompt");
+      for (const note of requestContextMeta(e)) meta.push(esc(note));
+      if (e.context_changed_selection) meta.push(esc(CONTEXT_CHANGED_NOTE));
       if (e.compression_status) meta.push("compression " + esc(e.compression_status));
+      if (e.router_overhead_seconds != null) meta.push("router overhead " + esc(formatLatency(e.router_overhead_seconds)));
+      // A refusal runs no attempt, so these are the only record of what blocked the request.
+      const blocked = Object.entries(e.refusal?.excluded || {}).map(([why, n]) => Number(n) + " " + why.replaceAll("_", " "));
+      if (e.refusal?.block_reason) blocked.push(String(e.refusal.block_reason).replaceAll("_", " ") + (e.refusal.scope ? " (" + e.refusal.scope + " scope)" : ""));
+      if (blocked.length) meta.push("blocked: " + esc(blocked.join(", ")));
+      if (e.retry_after_seconds > 0) meta.push("retry in " + esc(formatSeconds(e.retry_after_seconds)));
       return '<div class="req-detail" id="' + panelId + '" role="region" aria-label="Request attempt details"><div class="req-detail-meta mono">' + meta.join(" · ") + "</div>" +
         '<div class="req-chain">' + chain + "</div></div>";
     }
 
+    // A fresh install: providers are listed but none can serve a request. Without this every
+    // lane reads "0 usable" and the rail talks about guardrails, with no hint that a key is the missing step.
+    // Why no provider can serve, for the first-run hints: "no_key" only when no provider holds a
+    // key at all, "disabled" when every one that does is switched off (adding a key would not help),
+    // "" when one serves or the cause is shown elsewhere (cooldown, unreadable store).
+    function noProviderConnected() {
+      const rows = Object.entries(state?.catalog?.providers || {});
+      if (!rows.length || rows.some(([, p]) => p.invokable)) return "";
+      const keyed = rows.filter(([, p]) => p.key_source);
+      if (keyed.length && keyed.every(([src, p]) => p.enabled === false || providerManuallyDisabled(src))) return "disabled";
+      return rows.every(([, p]) => !p.key_source && !credentialsUnreadable(p.auth_reason)) ? "no_key" : "";
+    }
     function renderNavCounts() {
       const provs = state?.catalog?.providers || {};
       const rt = state?.state || {};
@@ -2784,15 +3028,21 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const healthy = canary.status === "pass" && !guardCount;
       $("railDot").className = "health-dot " + (healthy ? "ok" : "watch");
       $("railHealthMain").textContent = healthy ? "Healthy" : "Needs a look";
-      $("railHealthSub").textContent = healthy ? "canary green" : guardCount + " guardrails active";
+      $("railHealthSub").textContent = healthy ? "canary green"
+        : noProviderConnected() === "no_key" ? "No provider key yet"
+        : noProviderConnected() === "disabled" ? "Every keyed provider disabled"
+        : guardCount ? guardCount + " guardrails active"
+        : (canary.status ? "canary " + canary.status : "canary not run yet");
     }
 
 	    function render() {
 	      if (!state) return;
 	      setProviderLabels(state.provider_labels);
+	      $("endpointKeyHint").innerHTML = endpointKeyHint(state.config?.bind_is_loopback);
 	      renderUpdateBanner();
 	      renderLicenseNoticeBanner();
 	      renderPaidModelBanner();
+	      renderAuthCooldownBanner();
 	      renderPruneBanner();
 	      renderNewModelsBanner();
 	      syncNoticeCenter();
@@ -2864,6 +3114,33 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         '<button class="btn ghost sm" type="button" id="paidModelDismissBtn">Got it</button></div>';
       $("paidModelReviewBtn").addEventListener("click", () => reviewPaidModelNotice(notice, { dismiss: true }));
       $("paidModelDismissBtn").addEventListener("click", () => { writeDismissed(PAID_MODEL_NOTICE_KEY, notice.id); banner.hidden = true; });
+    }
+    // The one failure only the operator can fix: a rejected key cools the whole provider and
+    // fallback hides it from clients. Dismissed per cooldown id, so a later rejection speaks up again.
+    // The ids are a list: with one slot, dismissing a second provider brought the first one back.
+    const AUTH_COOLDOWN_NOTICE_KEY = "ficelle.dismissedAuthCooldowns";
+    function renderAuthCooldownBanner() {
+      const banner = $("authCooldownBanner");
+      if (!banner) return;
+      banner.hidden = true;
+      let dismissed = [];
+      try { dismissed = JSON.parse(readDismissed(AUTH_COOLDOWN_NOTICE_KEY) || "[]"); } catch { /* unreadable: show them all */ }
+      if (!Array.isArray(dismissed)) dismissed = [];
+      // Notices refresh every 15 s; a cooldown that lapsed since then must not read as "-12s".
+      const active = (state?.notices?.auth_cooldowns || []).filter((n) => n.until > Date.now() / 1000);
+      const notice = active.find((n) => !dismissed.includes(n.id));
+      if (!notice) return;
+      const provider = providerLabel(notice.provider);
+      banner.hidden = false;
+      banner.innerHTML = '<div class="update-copy"><div class="update-title">' + esc(provider) + " rejected Ficelle's credentials</div>" +
+        '<div class="update-detail">Ficelle paused all of ' + esc(provider) + " for " + esc(formatSeconds(notice.until - Date.now() / 1000)) +
+        " and routes around it, so requests still succeed with a smaller pool. Check the key or the account's credit, then clear the provider pause.</div></div>" +
+        '<div class="update-actions"><button class="btn sm" type="button" id="authCooldownFixBtn">Open provider</button>' +
+        '<button class="btn ghost sm" type="button" id="authCooldownDismissBtn">Got it</button></div>';
+      $("authCooldownFixBtn").addEventListener("click", () => { setSelectedProvider(notice.provider); setView("providers"); render(); });
+      // Only ids still active are kept, so the stored list stays as short as the cooldowns.
+      const kept = dismissed.filter((id) => active.some((n) => n.id === id));
+      $("authCooldownDismissBtn").addEventListener("click", () => { writeDismissed(AUTH_COOLDOWN_NOTICE_KEY, JSON.stringify([...kept, notice.id])); renderAuthCooldownBanner(); });
     }
     function maybeShowPaidModelToast() {
       const notice = latestPaidModelNotice();
@@ -3067,9 +3344,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       try {
         const r = await fetch("/admin/notices", { cache: "no-store" });
         if (!r.ok) return;
+        const licenseNotice = JSON.stringify(state.notices?.license ?? null);
         state.notices = await r.json();
+        // An open License page must not keep showing the status the banner just contradicted.
+        if (currentView === "license" && JSON.stringify(state.notices?.license ?? null) !== licenseNotice) renderLicense();
         renderLicenseNoticeBanner();
         renderPaidModelBanner();
+        renderAuthCooldownBanner();
         renderNewModelsBanner();
         maybeShowPaidModelToast();
         if (resyncCatalog) void resyncIfCatalogRepublished(state.notices.catalog);
@@ -3083,7 +3364,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
     function startUpdateStatusPolling() {
       void refreshUpdateStatus();
       if (updateStatusTimer) return;
-      updateStatusTimer = setInterval(() => { void refreshUpdateStatus(); void refreshNotices(); }, 15000);
+      updateStatusTimer = setInterval(() => { void refreshUpdateStatus(); void refreshNotices(); void refreshRunningBenchmark(); }, 15000);
     }
 
     /* ---------- background state resync ----------
@@ -3101,18 +3382,16 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
        Putting the heavy state endpoint on an interval would still waste local work for a catalog
        that is republished at most hourly. */
     let resyncInFlight = false;
-    // The catalog identity currently on screen. A full-state payload carries the same published
-    // catalog document as /admin/notices, but with the models rather than a precomputed count, so
-    // this accepts both shapes. Left untouched whenever a reload is skipped or fails, so a change
-    // seen while the operator was busy stays pending instead of being silently swallowed.
+    // The catalog identity currently on screen: the publish timestamp, shared by /admin/state and
+    // /admin/notices. Not the model count — /admin/state filters out providers that cannot route,
+    // so an unchanged catalog would never match the raw file and every poll would reload.
+    // Left untouched whenever a reload is skipped or fails, so a change seen while the operator
+    // was busy stays pending instead of being silently swallowed.
     // `undefined` means no state has rendered yet; `null` means it rendered without a usable
     // marker, in which case a valid notice must reload instead of silently becoming the baseline.
     let renderedCatalogMarker;
     function catalogMarker(c) {
-      if (!c || typeof c !== "object") return null;
-      const generatedAt = typeof c.generated_at === "string" ? c.generated_at : "";
-      const modelCount = Number.isInteger(c.model_count) ? c.model_count : (Array.isArray(c.models) ? c.models.length : null);
-      return generatedAt && modelCount !== null ? generatedAt + "|" + modelCount : null;
+      return c && typeof c === "object" && typeof c.generated_at === "string" && c.generated_at ? c.generated_at : null;
     }
 
     // Called on every notices poll (15s), plus when the tab comes back. A marker that has not
@@ -3146,7 +3425,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const el = document.activeElement;
       if (el && typeof el.closest === "function" && el.closest(RESYNC_REBUILT_CONTAINERS)) return true;
       if (openFilter) return true;
-      if (benchmarkRunInFlight || serverBenchmarkRunning()) return true;
+      // The server-side flag is deliberately not a disturbance: it is what refreshRunningBenchmark
+      // waits to see cleared, so deferring on it would keep a finished run on screen forever.
+      if (benchmarkRunInFlight) return true;
       if ($("saveBtn")?.classList.contains("is-loading")) return true;
       return false;
     }
@@ -3169,6 +3450,27 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       if (snapshot.y) window.scrollTo(0, snapshot.y);
     }
 
+    // Cooldowns and quarantines are computed when /admin/state is built and the page never polls it,
+    // so Health and Providers would keep reporting what was true when the tab loaded. Entering
+    // either view re-reads the state once it has aged; the poll stays off for the same cost reason
+    // as above, and resyncState still defers to whatever the operator is doing.
+    const STATE_FRESH_MS = 30000;
+    function refreshStaleState() {
+      if (Date.now() - stateLoadedAt >= STATE_FRESH_MS) return resyncState();
+    }
+
+    // A tab that booted (or was opened) while a benchmark was already running never sees the job
+    // end: nothing it polls carries the job, so Retest would stay disabled and the catalog resync
+    // would stay deferred until some other action reloaded the state. The page that started the
+    // run clears its own marker; this is for every other tab.
+    let benchmarkJobCheckedAt = 0;
+    const BENCHMARK_JOB_POLL_MS = 60000;
+    async function refreshRunningBenchmark() {
+      if (!serverBenchmarkRunning() || benchmarkRunInFlight || Date.now() - benchmarkJobCheckedAt < BENCHMARK_JOB_POLL_MS) return;
+      benchmarkJobCheckedAt = Date.now();
+      await resyncState();
+    }
+
     async function resyncState(marker) {
       if (!state || resyncInFlight || document.hidden || resyncWouldDisturb()) return;
       resyncInFlight = true;
@@ -3186,6 +3488,9 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         // is also what prunes dead ids out of the saved profiles, so a clean tab would look
         // edited, keep the pruned id, and offer to save it back.
         const dirty = new Set(unsavedProfileIds());
+        // /admin/state does not carry the notices; without them render() hides every banner
+        // until the next notices poll.
+        next.notices = state.notices;
         setState(next);
         // Preserve only the profiles the operator actually edited. Save posts every profile, so
         // keeping a clean old draft could otherwise put back a model the new catalog just pruned
@@ -3199,7 +3504,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         // reload matters: a state payload we cannot derive a marker from would otherwise anchor
         // `null`, and every later notice would differ from it — turning the poll into a reload
         // loop, which is the one outcome worse than the stale data this all exists to fix.
-        renderedCatalogMarker = catalogMarker(next.catalog) || marker;
+        renderedCatalogMarker = catalogMarker(next.catalog) || marker || renderedCatalogMarker;
       } catch (_) {
         // Transient local failure — the marker is left pending, so the next poll retries.
       } finally {
@@ -3214,7 +3519,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         if (!r.ok) throw new Error(p?.error?.message || "Update check failed.");
         state.update = p;
         renderUpdateBanner();
-      } catch (e) { showToast(e.message || "Update check failed."); }
+      } catch (e) { showToast(e.message || "Update check failed.", "error"); }
     }
 
     async function installUpdate() {
@@ -3229,7 +3534,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         await pollUntilUpdateReady(180000);
       } catch (e) {
         updateInstallInFlight = false;
-        showToast(e.message || "The update could not start.");
+        showToast(e.message || "The update could not start.", "error");
         try { await loadState(); } catch (_) { renderUpdateBanner(); }
       }
     }
@@ -3246,7 +3551,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
             if (update.status === "failed") {
               updateInstallInFlight = false;
               renderUpdateBanner();
-              showToast(update.message || "The update failed.");
+              showToast(update.message || "The update failed.", "error");
               return;
             }
             if (["installed", "up_to_date"].includes(update.status)) {
@@ -3277,13 +3582,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      health: { eyebrow: "Observe", title: "Health", desc: "Canary status and the guardrails currently holding models or providers out of rotation." },
 	      performance: { eyebrow: "Observe", title: "Performance", desc: "What actually happened: winning models, fallbacks, success rates, and latency per virtual model." },
 	      requests: { eyebrow: "Observe", title: "Requests", desc: "Every routed request, newest first: virtual model, provider, upstream model, outcome, error type, and latency — with health aggregates over a window." },
-	      audit: { eyebrow: "Observe", title: "Audit", desc: "Every local change, newest first. Virtual model saves can be undone." },
+	      audit: { eyebrow: "Observe", title: "Audit", desc: "The latest local changes, newest first. Virtual model saves can be undone." },
       export: { eyebrow: "Ship it", title: "Export", desc: "Generate a generic OpenAI-compatible client configuration. No provider secrets included." }
     };
     const proUpgradeMeta = { eyebrow: "Upgrade", title: "Ficelle Pro", desc: "Add the maintained provider pack, Fusion, and native compression to this installation." };
     function setView(name) {
       name = String(name).split("?")[0];  // tolerate a deep-link query, e.g. #/license?key=…
       if (!viewMeta[name]) name = "routing";
+      const licenseToggled = (name === "license") !== (currentView === "license");
       setCurrentView(name);
       document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.dataset.view === name));
       let currentNavItem = null;
@@ -3302,9 +3608,13 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("viewActions").innerHTML = viewActions(name);
       bindViewActions(name);
       syncLongRunningActions();
+      if (name === "health" || name === "providers") void refreshStaleState();
       if (name === "requests") enterRequests(); else stopRequestsLive();
       // The snippet is static and cheap, so build it on entry instead of asking for a click.
-      if (name === "export") exportConfig(true).catch((e) => showToast(e.message));
+      if (name === "export") exportConfig(true).catch(showError);
+      // Navigation never runs render(), yet the License page refetches its status only when it
+      // sees itself go from hidden to shown, so it is rendered on leaving as well as entering.
+      if (licenseToggled && state) renderLicense();
       if (location.hash !== "#/" + name) history.replaceState(null, "", "#/" + name);
       window.scrollTo(0, 0);
       if (currentNavItem && window.matchMedia("(max-width: 1080px)").matches) {
@@ -3318,7 +3628,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      if (name === "fusion") return state?.pro_entitled ? btn("saveFusionBtn", "Save settings", true, ic(ICONS.save)) : "";
 	      if (name === "settings") return btn("saveSettingsBtn", "Save settings", true, ic(ICONS.save));
 	      if (name === "compression") return state?.pro_entitled ? btn("reloadCompressionBtn", "Reload", false, ic(ICONS.refresh)) + btn("saveCompressionBtn", "Save settings", true, ic(ICONS.save)) : "";
-	      if (name === "health") return btn("canaryBtn", "Run canary", true, ic(ICONS.canary));
+	      if (name === "health") return btn("reloadHealthBtn", "Reload", false, ic(ICONS.refresh)) + btn("canaryBtn", "Run canary", true, ic(ICONS.canary));
       if (name === "audit") return btn("reloadAuditBtn", "Reload", false, ic(ICONS.refresh));
       if (name === "requests") return btn("reloadRequestsBtn", "Reload", false, ic(ICONS.refresh)) + requestLiveButtonHTML();
       if (name === "export") return btn("buildExportBtn", "Rebuild", false, ic(ICONS.export));
@@ -3336,23 +3646,29 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 		      else if (name === "settings") $("saveSettingsBtn").addEventListener("click", saveSettings);
 	      else if (name === "compression") {
 	        if (state?.pro_entitled) {
-	          $("reloadCompressionBtn").addEventListener("click", () => loadCompression().then(() => showToast("Compression dashboard reloaded.")).catch((e) => showToast(e.message)));
+	          $("reloadCompressionBtn").addEventListener("click", () => loadCompression().then(() => showToast("Compression dashboard reloaded.")).catch(showError));
 	          $("saveCompressionBtn").addEventListener("click", saveCompression);
 	        }
 	      }
-	      else if (name === "health") $("canaryBtn").addEventListener("click", runCanary);
-      else if (name === "audit") $("reloadAuditBtn").addEventListener("click", () => loadAudit().then(() => showToast("Audit reloaded.")).catch((e) => showToast(e.message)));
+	      else if (name === "health") {
+	        $("reloadHealthBtn").addEventListener("click", () => loadState().then(() => showToast("Health reloaded.")).catch(showError));
+	        $("canaryBtn").addEventListener("click", runCanary);
+	      }
+      else if (name === "audit") $("reloadAuditBtn").addEventListener("click", () => loadAudit().then(() => showToast("Audit reloaded.")).catch(showError));
       else if (name === "requests") {
-        $("reloadRequestsBtn").addEventListener("click", () => loadRequests().then(() => showToast("Requests reloaded.")).catch((e) => showToast(e.message)));
+        $("reloadRequestsBtn").addEventListener("click", () => loadRequests().then(() => showToast("Requests reloaded.")).catch(showError));
         $("liveRequestsBtn").addEventListener("click", toggleRequestsLive);
       }
-      else if (name === "export") $("buildExportBtn").addEventListener("click", () => exportConfig().catch((e) => showToast(e.message)));
+      else if (name === "export") $("buildExportBtn").addEventListener("click", () => exportConfig().catch(showError));
       // The header is rebuilt on every view switch, so the fresh Save buttons need their state.
       syncSettingsSaveButtons();
     }
 
     /* ---------- data + actions ---------- */
-	    async function loadState(preserveUnrelatedDrafts = false) {
+	    // Every refresh after the first keeps unsaved drafts: an action button (Refresh catalog,
+	    // Retest, Disable, a key save…) ends in this call, and a Retest runs for minutes while the
+	    // operator keeps editing. Only the boot load has nothing to preserve and seeds from the server.
+	    async function loadState(boot = false) {
 	      // Only this fetch can say "the daemon is not up yet"; everything below runs after it
 	      // answered. bootstrapState reads `bootRetryable` rather than sniffing the error type,
 	      // because a TypeError thrown by loadAudit or render() would otherwise be mistaken for
@@ -3369,9 +3685,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	      // Read the live drafts only after the asynchronous fetch. An operator may switch views
 	      // and keep editing while the refresh is in flight; an earlier snapshot would erase that
 	      // work when the response lands.
-	      const dirtyProfiles = preserveUnrelatedDrafts ? new Set(unsavedProfileIds()) : new Set();
-	      const preservedFusion = preserveUnrelatedDrafts ? cloneJson(draftFusion) : null;
-	      const preservedSettings = preserveUnrelatedDrafts ? cloneJson(draftSettings) : null;
+	      const dirtyProfiles = boot ? new Set() : new Set(unsavedProfileIds());
+	      // Only a draft that differs from the state it was seeded from is an edit worth keeping;
+	      // an untouched one must take the new values, or another tab's save reads as pending here.
+	      const preservedFusion = boot || draftMatchesSaved(draftFusion, state?.fusion?.config) ? null : cloneJson(draftFusion);
+	      const preservedSettings = boot || draftMatchesSaved(draftSettings, state?.settings?.config) ? null : cloneJson(draftSettings);
 	      setState(nextState);
 	      seedProfileDrafts(dirtyProfiles);
 	      setDraftFusion(preservedFusion ?? cloneJson(state.fusion?.config || {}));
@@ -3409,7 +3727,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       }
     }
     async function loadAudit(after = true) {
-      const r = await fetch("/admin/audit?limit=12", { cache: "no-store" }); const p = await r.json();
+      const r = await fetch("/admin/audit?limit=50", { cache: "no-store" }); const p = await r.json();
       if (!r.ok) throw new Error(p?.error?.message || "audit failed"); setAuditEntries(p.entries || []);
       if (after) { renderAudit(); renderNavCounts(); }
     }
@@ -3429,11 +3747,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        setCompressionPayload({ observability: {}, events: [], event_count: 0 });
 	      }
     }
-    async function saveProfiles(successMessage) {
+    async function saveProfiles(successMessage, profiles = draftProfiles) {
       const toastMessage = typeof successMessage === "string" ? successMessage : "Virtual models saved.";
       const btn = $("saveBtn"); setButtonLoading(btn, true);
       try {
-        const submittedProfiles = cloneJson(draftProfiles);
+        const submittedProfiles = cloneJson(profiles);
         const r = await fetch("/admin/profiles", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ virtual_profiles: submittedProfiles }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "save failed");
         // The write is already durable at this point. Reflect that response immediately so a
@@ -3454,7 +3772,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         // canonical state so a newly created profile (or a changed base) previews the same order
         // routing already uses, while keeping unsaved Fusion/Settings work from other views.
         try {
-          await loadState(true);
+          await loadState();
         } catch (e) {
           render();
           showToast(toastMessage + " Score preview refresh failed; reload to retry.");
@@ -3464,7 +3782,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         // render() ran while the button still carried is-loading, which syncSaveButton
         // refuses to touch — so re-sync once the spinner is off, or the count would
         // survive its own save.
-      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(btn, false); syncSaveButton(); }
+      } catch (e) { showError(e); } finally { setButtonLoading(btn, false); syncSaveButton(); }
     }
 
     let editingCustomProfileId = null;
@@ -3551,11 +3869,11 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       await saveProfiles("Custom virtual model deleted.");
     }
 	    async function rollbackProfiles(id) {
-	      if (!id || !window.confirm("Undo to this saved snapshot?")) return;
+	      if (!id || !window.confirm("Restore every virtual model to how it was before this change? Anything saved after it will be overwritten.")) return;
 	      try { const r = await fetch("/admin/profiles/rollback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audit_id: id }) });
 	        const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "undo failed");
 	        state.virtual_profiles = p.virtual_profiles; setDraftProfiles(cloneJson(p.virtual_profiles)); showToast("Virtual models restored."); await loadAudit(false); render();
-	      } catch (e) { showToast(e.message || String(e)); }
+	      } catch (e) { showError(e); }
 	    }
 	    // saveFusion delegates to the closed pack; it no-ops (resolves undefined) when the
 	    // Pro module is absent (no fusion form rendered).
@@ -3567,7 +3885,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "fusion undo failed");
 	        state.fusion = { config: p.fusion, observability: p.observability }; setDraftFusion(cloneJson(p.fusion));
 	        showToast("Fusion settings restored."); await loadAudit(false); render();
-	      } catch (e) { showToast(e.message || String(e)); }
+	      } catch (e) { showError(e); }
 	    }
 	    async function saveRouterSettings(buttonId, successMessage, failureMessage, options = {}) {
 	      const btn = $(buttonId); setButtonLoading(btn, true);
@@ -3580,7 +3898,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 		        if (options.refreshCompression) await Promise.all([loadAudit(false), loadOptionalCompression()]);
 	        else await loadAudit(false);
 	        render();
-	      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(btn, false); syncSettingsSaveButtons(); }
+	      } catch (e) { showError(e); } finally { setButtonLoading(btn, false); syncSettingsSaveButtons(); }
 	    }
 	    async function saveSettings() {
 	      await saveRouterSettings("saveSettingsBtn", "Routing settings saved.", "settings save failed");
@@ -3592,7 +3910,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
 	        const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "settings undo failed");
 	        state.settings = p.settings; setDraftSettings(cloneJson(p.settings.config));
 	        showToast("Routing settings restored."); await loadAudit(false); render();
-	      } catch (e) { showToast(e.message || String(e)); }
+	      } catch (e) { showError(e); }
 	    }
 	    // saveCompression delegates to the closed pack (the Save button calls it); no-op on a
 	    // core-only install. Retrieve/clear are wired entirely inside the Pro retrieval UI (pro-views.js).
@@ -3601,7 +3919,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       const b = $("refreshBtn"); setButtonLoading(b, true);
       try { const r = await fetch("/admin/refresh", { method: "POST" }); const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "refresh failed");
         showToast("Catalog refreshed: " + (p.summary?.model_count || 0) + " models."); await loadState();
-      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(b, false); }
+      } catch (e) { showError(e); } finally { setButtonLoading(b, false); }
     }
     async function runBenchmark() {
       if (benchmarkRunInFlight) return;
@@ -3611,7 +3929,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "benchmark failed");
         const candidates = p.summary?.candidates;
         showToast(candidates ? ("Benchmark candidates " + (candidates.passed || 0) + "/" + (candidates.tested || 0) + " passed.") : ("Benchmark " + (p.summary?.passed || 0) + "/" + (p.summary?.total || 0) + " passed.")); await loadState();
-      } catch (e) { showToast(e.message || String(e)); } finally { benchmarkRunInFlight = false; if (state?.state?.admin_jobs?.benchmark) delete state.state.admin_jobs.benchmark; syncLongRunningActions(); }
+      } catch (e) { showError(e); } finally { benchmarkRunInFlight = false; if (state?.state?.admin_jobs?.benchmark) delete state.state.admin_jobs.benchmark; syncLongRunningActions(); }
     }
     async function runModelBenchmark(id, btn) {
       if (benchmarkingModels.has(id)) return; // already testing this model — ignore repeat clicks
@@ -3624,14 +3942,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const cr = (res.candidate_results || [])[0] || null;
         if (cr) showToast("Benchmark " + (cr.status === "pass" ? "passed" : "failed") + (cr.latency_seconds != null ? " in " + Number(cr.latency_seconds).toFixed(2) + "s" : "") + (cr.message ? ": " + cr.message : ""));
         else showToast(res.message || "Benchmark: no result");
-      } catch (e) { showToast(e.message || String(e)); }
+      } catch (e) { showError(e); }
       finally {
         // Clear the id before the refresh so loadState()'s re-render drops the spinner. The
         // setButtonLoading here is the fallback that unsticks the button if loadState() — and thus
         // the re-render — fails; delete() runs on every path so a thrown fetch never strands the id.
         benchmarkingModels.delete(id);
         setButtonLoading(btn, false);
-        loadState().catch((e) => showToast("State refresh failed: " + (e.message || String(e))));
+        loadState().catch((e) => showToast("State refresh failed: " + (e.message || String(e)), "error"));
       }
     }
     async function runCanary() {
@@ -3639,30 +3957,30 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       try { const r = await fetch("/admin/canary", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "canary failed");
         showToast("Canary " + p.canary_status + ": " + (p.summary?.passed || 0) + "/" + (p.summary?.total || 0) + " passed."); await loadState();
-      } catch (e) { showToast(e.message || String(e)); } finally { setButtonLoading(b, false); }
+      } catch (e) { showError(e); } finally { setButtonLoading(b, false); }
     }
     async function clearModelCooldown(id) {
       try { const r = await fetch("/admin/cooldowns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "clear", scope: "model", model_id: id }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed"); showToast(p.changed ? "Model resumed." : "No active pause."); await loadState();
-      } catch (e) { showToast(e.message || String(e)); }
+      } catch (e) { showError(e); }
     }
     async function clearProviderCooldown(src) {
       try { const r = await fetch("/admin/cooldowns", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "clear", scope: "provider", source: src }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed"); showToast(p.changed ? "Provider resumed." : "No active pause."); await loadState();
-      } catch (e) { showToast(e.message || String(e)); }
+      } catch (e) { showError(e); }
     }
     async function probeProviderQuota(src, btn) {
       setButtonLoading(btn, true);
       try { const r = await fetch("/admin/providers/probe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source: src }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed"); showToast("Quota probe checked " + Number((p.results || []).length) + " cooldowns."); await loadState();
-      } catch (e) { showToast(e.message || String(e)); }
+      } catch (e) { showError(e); }
       finally { setButtonLoading(btn, false); }
     }
     async function toggleProvider(src, enable, btn) {
       setButtonLoading(btn, true);
       try { const r = await fetch("/admin/providers/toggle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source: src, action: enable ? "enable" : "disable" }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed"); showToast(providerLabel(src) + (enable ? " enabled." : " disabled.")); await loadState();
-      } catch (e) { showToast(e.message || String(e)); }
+      } catch (e) { showError(e); }
       finally { setButtonLoading(btn, false); }
     }
     function adminToken() { return document.querySelector('meta[name="ficelle-admin-token"]')?.content || ""; }
@@ -3674,8 +3992,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         // `hint` carries the way out of a refusal the server cannot resolve itself (a secret
         // store that would not take the key). It rides beside `message` rather than inside it
         // because the message is truncated server-side, which would cut the actionable half.
-        const p = await r.json(); if (!r.ok) throw new Error([p?.error?.message, p?.error?.hint].filter(Boolean).join(" — ") || "failed"); if (input) input.value = ""; showToast(providerLabel(src) + " key saved."); await loadState();
-      } catch (e) { showToast(e.message || String(e)); }
+        const p = await r.json(); if (!r.ok) throw new Error([p?.error?.message, p?.error?.hint].filter(Boolean).join(" — ") || "failed"); if (input) input.value = "";
+        // The save succeeded but resolution still prefers an older key (process env, login keychain): say so instead of reporting a rotation that never takes effect.
+        if (p.shadowed_by) showToast(providerKeyShadowNotice(providerLabel(src), src, p.shadowed_by), "warn");
+        else showToast(providerLabel(src) + " key saved.");
+        await loadState();
+      } catch (e) { showError(e); }
     }
     async function postProviderAccountId(src, body) {
       const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/account-id", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify(body) });
@@ -3693,16 +4015,18 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const resolvedFrom = p.auth?.account_id_source;
         showToast(providerLabel(src) + " account id saved" + (resolvedFrom && resolvedFrom !== ".env" ? " — a " + resolvedFrom + " value still takes precedence." : "."), resolvedFrom && resolvedFrom !== ".env" ? "warn" : undefined);
         await loadState();
-      } catch (e) { showToast(e.message || String(e), "error"); }
+      } catch (e) { showError(e); }
     }
     async function removeProviderAccountId(src) {
       try {
         await postProviderAccountId(src, { remove: true });
         showToast(providerLabel(src) + " account id removed.");
         await loadState();
-      } catch (e) { showToast(e.message || String(e), "error"); }
+      } catch (e) { showError(e); }
     }
     async function removeProviderKey(src) {
+      // Ficelle cannot bring a deleted key back, and the button sits next to Replace.
+      if (!window.confirm("Remove the stored " + providerLabel(src) + " key? Its models stop routing until you add a key again. Ficelle cannot recover it.")) return;
       try { const r = await fetch("/admin/providers/" + encodeURIComponent(src) + "/key", { method: "POST", headers: { "Content-Type": "application/json", "X-Ficelle-Admin-Token": adminToken() }, body: JSON.stringify({ remove: true }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed");
         const removed = Array.isArray(p.removed) ? p.removed : [];
@@ -3714,12 +4038,12 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         const notice = providerKeyRemovalNotice(providerLabel(src), removed, stillResolvedFrom, unverified);
         showToast(notice.message, notice.level);
         await loadState();
-      } catch (e) { showToast(e.message || String(e), "error"); }
+      } catch (e) { showError(e); }
     }
     async function updateQuarantine(id, action) {
       try { const r = await fetch("/admin/quarantine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: id, action, reason: "manual", note: "manual admin change" }) });
         const p = await r.json(); if (!r.ok) throw new Error(p?.error?.message || "failed"); showToast(action === "remove" ? "Model re-enabled." : "Model disabled."); await loadState();
-      } catch (e) { showToast(e.message || String(e)); }
+      } catch (e) { showError(e); }
     }
     async function exportConfig(quiet = false) {
       const output = $("configExport");
@@ -3835,14 +4159,14 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       $("minContextSelect").addEventListener("change", (e) => setProfile({ requirements: { min_context: Number(e.target.value) } }));
       $("newCustomProfileBtn").addEventListener("click", () => openCustomProfileDialog());
       $("editCustomProfileBtn").addEventListener("click", () => openCustomProfileDialog(activeProfile));
-      $("duplicateCustomProfileBtn").addEventListener("click", () => duplicateCustomProfile().catch((e) => showToast(e.message || String(e), "error")));
+      $("duplicateCustomProfileBtn").addEventListener("click", () => duplicateCustomProfile().catch((e) => showError(e)));
       $("copyCustomProfileIdBtn").addEventListener("click", () => copyToClipboard(activeProfile, "Custom model ID copied."));
-      $("deleteCustomProfileBtn").addEventListener("click", () => deleteCustomProfile().catch((e) => showToast(e.message || String(e), "error")));
-      $("customProfileForm").addEventListener("submit", (e) => submitCustomProfile(e).catch((err) => showToast(err.message || String(err), "error")));
+      $("deleteCustomProfileBtn").addEventListener("click", () => deleteCustomProfile().catch((e) => showError(e)));
+      $("customProfileForm").addEventListener("submit", (e) => submitCustomProfile(e).catch((err) => showError(err)));
       $("closeCustomProfileDialogBtn").addEventListener("click", closeCustomProfileDialog);
       $("cancelCustomProfileBtn").addEventListener("click", closeCustomProfileDialog);
       $("searchInput").addEventListener("input", renderAvailable);
-      $("copyExportBtn").addEventListener("click", () => copyExport().catch((e) => showToast(e.message)));
+      $("copyExportBtn").addEventListener("click", () => copyExport().catch(showError));
       initEndpointCard();
       // Closing or reloading with a draft in memory silently discards it. The browser
       // shows its own generic wording here; the text is ignored by every modern engine.
@@ -3940,7 +4264,7 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
       try {
         while (Date.now() < deadline) {
           try {
-            await loadState();
+            await loadState(true);
             $("bootNotice").classList.remove("is-waiting");
             $("bootNotice").hidden = true;
             if ($("bootStatus").textContent) $("bootStatus").textContent = "Ficelle service ready.";
@@ -3962,6 +4286,6 @@ import { state, auditEntries, draftProfiles, draftFusion, draftSettings, activeP
         main.removeAttribute("aria-busy");
       }
       bootNotice("Can't reach the Ficelle service. Check it with `ficelle status`, then reload this page.");
-      showToast(lastError ? (lastError.message || String(lastError)) : "Loading the router state failed.");
+      showToast(lastError ? (lastError.message || String(lastError)) : "Loading the router state failed.", "error");
     }
     bootstrapState();

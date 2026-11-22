@@ -47,10 +47,12 @@ class ModelScoreExplanationPorts:
 
 # Success rate of a model with no usable history, and the value a decayed one converges back to.
 NEUTRAL_SUCCESS_RATE = 0.72
-# Below one effective observation the decayed counters no longer support a verdict, so the model
-# reads as unknown instead of drifting toward the smoothing prior (0.5) — which would rank a model
-# idle for weeks BELOW one nobody has ever called.
-MIN_SCORED_OBSERVATIONS = 1.0
+# Observations' worth of weight the neutral rate carries in the smoothed success rate. Shrinking
+# toward the neutral rate, not toward 0.5, is what keeps the curve continuous: a model that has
+# never been called, one whose evidence has decayed away and one with a handful of clean wins all
+# sit on the same line, so a success can only raise the rate and an idle model is never ranked
+# BELOW one nobody has ever called by a threshold it happened to cross.
+SUCCESS_RATE_PRIOR_OBSERVATIONS = 4.0
 # Latency at which a model scores exactly 0.5, and the scale of the whole curve. Free upstreams
 # routinely answer in tens of seconds, so it is deliberately generous.
 LATENCY_REFERENCE_SECONDS = 15.0
@@ -116,17 +118,19 @@ def success_rate_for_model(model: dict[str, Any], state: dict[str, Any], *, port
     else:
         successes = float(ports.safe_int(record.get("successes"), 0))
         failures = float(ports.safe_int(record.get("failures"), 0))
-    total = successes + failures
-    if total < MIN_SCORED_OBSERVATIONS:
-        return NEUTRAL_SUCCESS_RATE
     # Bayesian-ish smoothing: avoid over-trusting a single lucky call.
-    return (successes + 2.0) / (total + 4.0)
+    return (successes + SUCCESS_RATE_PRIOR_OBSERVATIONS * NEUTRAL_SUCCESS_RATE) / (
+        successes + failures + SUCCESS_RATE_PRIOR_OBSERVATIONS
+    )
 
 
 def latency_score_for_model(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> float:
     record = _stats_record(model, state, ports=ports)
     latency = record.get("latency_ewma")
-    if latency is None:
+    # A probe-only model has `probe_latency_ewma` and no routing latency on purpose (an 8-token probe
+    # says nothing about a real request), but its probe successes also wrote the legacy record, which
+    # would hand it the fastest score in the pool through this fallback.
+    if latency is None and record.get("probe_latency_ewma") is None:
         legacy = ((state.get("successes") or {}).get(ports.cooldown_key(model)) or {}) if isinstance(state, dict) else {}
         latency = legacy.get("latency_seconds")
     try:
