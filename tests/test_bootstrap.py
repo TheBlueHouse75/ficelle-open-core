@@ -206,6 +206,24 @@ def test_options_resolve_relative_homes_from_current_directory(monkeypatch, tmp_
     assert options.ficelle_home_explicit is True
 
 
+def test_options_keep_symbolic_link_homes_for_installer_validation(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "real-home"
+    target.mkdir()
+    ficelle_home = tmp_path / "ficelle-link"
+    hermes_home = tmp_path / "hermes-link"
+    ficelle_home.symlink_to(target, target_is_directory=True)
+    hermes_home.symlink_to(target, target_is_directory=True)
+    args = bootstrap.build_parser().parse_args(
+        ["--ficelle-home", ficelle_home.name, "--hermes-home", hermes_home.name],
+    )
+
+    options = bootstrap.options_from_args(args)
+
+    assert options.ficelle_home == ficelle_home
+    assert options.hermes_home == hermes_home
+
+
 def test_options_mark_environment_home_explicit(monkeypatch, tmp_path):
     configured_home = tmp_path / "environment-home"
     monkeypatch.setenv("FICELLE_HOME", str(configured_home))

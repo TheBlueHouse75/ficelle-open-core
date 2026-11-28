@@ -29,7 +29,7 @@ from ficelle.failures import (
     provider_error_codes,
     status_for_error_codes,
 )
-from ficelle.runtime_paths import absolute_python, validated_runtime_home
+from ficelle.runtime_paths import RuntimeHomeError, absolute_python, validated_runtime_home
 from ficelle.json_store import atomic_write_json as write_atomic_json
 from ficelle.json_store import ensure_private_dir, ensure_private_fd, open_private_append
 from ficelle.probe_lock import (
@@ -4335,7 +4335,10 @@ def install_weekly_schedule(
     if max_duration_seconds is not None and max_duration_seconds <= 0:
         raise SyntheticHealthError("max_duration_seconds must be positive")
     path = plist_path or schedule_plist_path()
-    ficelle_home = validated_runtime_home(ficelle_home)
+    try:
+        ficelle_home = validated_runtime_home(ficelle_home)
+    except RuntimeHomeError as exc:
+        raise SyntheticHealthError(str(exc)) from exc
     path = path.expanduser().absolute()
     arguments = [absolute_python(sys.executable), "-P", "-m", "ficelle.cli", "synthetic-health", "run", "--depth", "deep", "--json"]
     if max_duration_seconds is not None:

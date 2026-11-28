@@ -168,6 +168,17 @@ import { state, stateLoadedAt, auditEntries, draftProfiles, draftFusion, draftSe
         return String(a.id || "").localeCompare(String(b.id || ""));
       });
     }
+    // The router's auto order (`selection.sort_available_for_virtual_model`): stale rows last,
+    // then the evidence tier, then the score order above.
+    function sortForRouting(profileId, models) {
+      const rank = (m) => [Number(Boolean(m.catalog_stale)), Number(m.auto_score_details?.[profileId]?.evidence_tier ?? 1)];
+      const scored = sortByScore(profileId, models);
+      const position = new Map(scored.map((m, index) => [m, index]));
+      return scored.sort((a, b) => {
+        const [as, at] = rank(a), [bs, bt] = rank(b);
+        return as - bs || at - bt || position.get(a) - position.get(b);
+      });
+    }
     function policyCandidateIdSet(profileId) {
       if (profilePolicyId(profileId) !== "ficelle/auto-coding") return null;
       const policyIds = state?.profiles?.[profilePolicyId(profileId)]?.policy_candidate_ids;
@@ -179,10 +190,12 @@ import { state, stateLoadedAt, auditEntries, draftProfiles, draftFusion, draftSe
       let eligible = (state?.catalog?.models || []).filter((m) => m.invokable && !excluded.has(String(m.id)) && !modelQuarantine(m) && !modelCooldown(m) && !providerCooldown(m.source) && !modelQuotaCooldown(m) && matchesReq(m, profile.requirements || {}));
       const policyIds = policyCandidateIdSet(profileId);
       if (policyIds) eligible = eligible.filter((model) => policyIds.has(String(model.id)));
-      if (profile.mode !== "manual_order") return sortByScore(profileId, eligible);
+      // auto-coding keeps its certification order server-side; the score order stays its preview.
+      const sortAuto = profilePolicyId(profileId) === "ficelle/auto-coding" ? sortByScore : sortForRouting;
+      if (profile.mode !== "manual_order") return sortAuto(profileId, eligible);
       const byId = new Map(eligible.map((m) => [m.id, m])); const head = []; const seen = new Set();
       for (const id of profile.models || []) { const m = byId.get(id); if (!m || seen.has(m.id)) continue; head.push(m); seen.add(m.id); }
-      const tail = profile.auto_tail === false ? [] : sortByScore(profileId, eligible.filter((m) => !seen.has(m.id)));
+      const tail = profile.auto_tail === false ? [] : sortAuto(profileId, eligible.filter((m) => !seen.has(m.id)));
       return [...head, ...tail];
     }
     const candidateOrigin = (profile, m) => profile.mode !== "manual_order" ? "auto" : ((profile.models || []).includes(m.id) ? "manual" : "auto-fill");

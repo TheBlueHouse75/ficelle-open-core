@@ -323,6 +323,7 @@ def catalog_with_auto_scores(
 # candidate, in `top_candidates` — both also in `/admin/status.json`.
 ADMIN_SCORE_DETAIL_FIELDS: tuple[str, ...] = (
     "score_base",
+    "evidence_tier",
     "evidence_status",
     "evidence_reason",
     "last_evidence_at",

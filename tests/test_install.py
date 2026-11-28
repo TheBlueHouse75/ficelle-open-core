@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1996,6 +1997,7 @@ def test_remove_refuses_empty_root_home_and_unscoped_client_homes(tmp_path, monk
         "/var/backups", "/private/var/backups", "/var/www", "/private/var/www",
         "/var/local", "/private/var/local", "/var/crash", "/private/var/crash",
         "/var/vm", "/private/var/vm",
+        "/var/audit", "/private/var/audit",
     ) for tree in (tree, tree.upper()) for suffix in ("", "/x", "/x/y")],
     "/PRIVATE/ETC/ssh", "/LIBRARY/x", "/USR/LOCAL/bin", "/PRIVATE/VAR",
     "/tmp", "/private/tmp", "/var", "/private/var", "/Users", "/home", "/opt",
@@ -2010,6 +2012,7 @@ def test_validated_client_home_refuses_system_subtrees_and_unscoped_roots(path):
     "/Users/test-user/hermes", "/home/test-user/hermes",
     "/private/var/folders/zz/test-user/T/hermes", "/var/folders/zz/test-user/T/hermes",
     "/tmp/ficelle-test/hermes", "/private/tmp/ficelle-test/hermes",
+    "/var/tmp/hermes", "/private/var/tmp/hermes",
     "/opt/ficelle-test/hermes", "/opt/hermes", "/usr-local/hermes",
     "/opt/homebrew-other/hermes", "/var/library/hermes",
     "/srv/hermes", "/mnt/data/hermes", "/media/disk/hermes",
@@ -2360,7 +2363,7 @@ def test_install_children_ignore_caller_modules_and_preserve_stdin(
         assert not home.exists()
 
 
-def test_install_rejects_symlink_home_before_normalizing_or_spawning(tmp_path, monkeypatch):
+def test_install_rejects_symlink_home_before_normalizing_or_spawning(tmp_path, monkeypatch, capsys):
     from ficelle import install
 
     real_home = tmp_path / "real-home"
@@ -2369,8 +2372,61 @@ def test_install_rejects_symlink_home_before_normalizing_or_spawning(tmp_path, m
     home.symlink_to(real_home, target_is_directory=True)
     args = install.build_parser().parse_args(["--ficelle-home", str(home), "--skip-package"])
     monkeypatch.setattr(install, "run_preflight", lambda *a: pytest.fail("unsafe home"))
-    with pytest.raises(OSError, match="symbolic link"):
-        install.run_install(install.options_from_args(args))
+    assert install.run_install(install.options_from_args(args)) == 1
+    assert "symbolic link" in capsys.readouterr().err
+
+
+def test_install_module_reports_group_writable_home_without_a_traceback(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    home.chmod(0o775)
+    source = Path(__file__).resolve().parents[1] / "src"
+    result = subprocess.run(
+        [sys.executable, "-B", "-P", "-m", "ficelle.install", "--ficelle-home", str(home), "--preflight-only"],
+        cwd=tmp_path,
+        env={"HOME": str(tmp_path), "PYTHONPATH": str(source), "PYTHONSAFEPATH": "1"},
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 1
+    assert "group- or other-writable" in result.stderr
+    assert "chmod go-w" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert str(home) not in result.stderr
+
+
+def test_install_reports_home_refusal_when_a_later_python_child_revalidates(tmp_path, monkeypatch, capsys):
+    from ficelle import install
+
+    options = make_options(tmp_path, target="core", skip_package=True, dry_run=False)
+    options.ficelle_home.mkdir()
+    monkeypatch.setattr(install, "run_preflight", lambda options: options.ficelle_home.chmod(0o775))
+    monkeypatch.setattr(install, "ensure_dedicated_keychain", lambda options: None)
+    monkeypatch.setattr(install.subprocess, "run", lambda *a, **kw: pytest.fail("must refuse before spawning"))
+
+    assert install.run_install(options) == 1
+    assert "chmod go-w" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("preflight_only", [False, True])
+def test_hermes_install_refuses_a_symlink_home_in_preflight(tmp_path, monkeypatch, capsys, preflight_only):
+    from ficelle import install
+
+    target = tmp_path / "real-hermes"
+    target.mkdir()
+    home = tmp_path / "linked-hermes"
+    home.symlink_to(target, target_is_directory=True)
+    ficelle_home = tmp_path / "ficelle"
+    argv = ["--connector", "hermes", "--hermes-home", str(home), "--ficelle-home", str(ficelle_home)]
+    if preflight_only:
+        argv.append("--preflight-only")
+    monkeypatch.setattr(install, "probe_target_python", lambda *a: pytest.fail("must refuse at preflight entry"))
+
+    assert install.main(argv) == 1
+    assert "Hermes client home must not be a symbolic link" in capsys.readouterr().err
+    assert list(target.iterdir()) == []
+    assert not ficelle_home.exists()
+    assert load_connectors(ficelle_home) == {}
 
 
 def test_package_commands_make_local_paths_absolute_before_changing_cwd(tmp_path, monkeypatch):
@@ -2414,6 +2470,9 @@ def test_real_python_import_probe_ignores_caller_ficelle(tmp_path, monkeypatch, 
     planted.write_text("raise RuntimeError('caller shadow executed')\n")
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    # The real package must come from somewhere other than the caller's directory, whether or
+    # not this interpreter has it installed (the open-core suite runs it from `src` alone).
+    monkeypatch.setenv("PYTHONPATH", str(Path(install.__file__).resolve().parents[1]))
     result = install.run_python_probe(sys.executable, "import ficelle; print(ficelle.__file__)")
     assert result.returncode == 0, result.stderr
     assert str(tmp_path) not in result.stdout
@@ -2465,3 +2524,46 @@ def test_install_child_uses_private_cwd_when_valid_home_is_not_searchable(tmp_pa
     )
     assert calls[0]["env"]["FICELLE_HOME"] == str(home)
     assert not Path(calls[0]["cwd"]).exists()
+
+
+@pytest.mark.parametrize("arguments", [
+    ["-I", "-m", "ficelle.cli", "health"],
+    ["-P", "-m", "ficelle.cli", "health"],
+    ["-X", "dev", "-c", "print('ready')", "-P"],
+])
+def test_install_python_children_keep_safe_path_with_other_flags(tmp_path, monkeypatch, arguments):
+    from ficelle import install
+
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    def run(command, *, cwd, env, **kwargs):
+        assert Path(cwd) != tmp_path and Path(cwd).stat().st_mode & 0o777 == 0o700
+        assert env["PYTHONSAFEPATH"] == "1"
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(install.subprocess, "run", run)
+    assert install.run_command(
+        ["venv/bin/python", *arguments], dry_run=False, env={"FICELLE_HOME": str(tmp_path / "missing")},
+    ).returncode == 0
+
+    expected = arguments if arguments[0] == "-P" else ["-P", *arguments]
+    assert calls == [[str(tmp_path / "venv/bin/python"), *expected]]
+
+
+@pytest.mark.parametrize("command", [
+    ["uv", "--quiet", "pip", "install", "example"],
+    ["python", "-I", "script.py", "-m", "argument"],
+])
+def test_install_leaves_commands_without_a_python_module_or_code_selector_unchanged(monkeypatch, command):
+    from ficelle import install
+
+    def run(argv, **kwargs):
+        assert argv == command
+        assert "cwd" not in kwargs
+        assert kwargs["env"] == {"FICELLE_HOME": "home"}
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(install.subprocess, "run", run)
+    assert install.run_command(command, dry_run=False, env={"FICELLE_HOME": "home"}).returncode == 0

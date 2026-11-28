@@ -19,7 +19,13 @@ from typing import Any, Mapping, Sequence
 
 from ficelle.json_store import write_private_text
 from ficelle.connector_registry import load_connectors, register_connector, unregister_connector
-from ficelle.runtime_paths import RuntimePaths, absolute_python, python_child_context, validated_runtime_home
+from ficelle.runtime_paths import (
+    RuntimeHomeError,
+    RuntimePaths,
+    absolute_python,
+    python_child_context,
+    validated_runtime_home,
+)
 from ficelle.service import active_home_pointer_path, persist_active_service_context, read_active_service_context
 from ficelle.url_security import connectable_host, connectable_http_url
 from ficelle.use_cases.admin_security import bind_host_is_loopback
@@ -160,10 +166,24 @@ def run_command(
     input_text: str | None = None,
 ) -> CommandResult:
     command = list(command)
-    python_command = len(command) > 1 and command[1] in {"-m", "-c"}
+    python_command = False
+    safe_path = False
+    arguments = iter(command[1:])
+    for argument in arguments:
+        if argument in {"-m", "-c"}:
+            python_command = True
+            break
+        if argument in {"-", "--"} or not argument.startswith("-"):
+            break
+        if argument == "-P":
+            safe_path = True
+        if argument in {"-W", "-X", "--check-hash-based-pycs"}:
+            # These options can take a separate value before the execution mode.
+            next(arguments, None)
     if python_command:
         command[0] = absolute_python(command[0])
-        command.insert(1, "-P")
+        if not safe_path:
+            command.insert(1, "-P")
     printable = " ".join(command)
     env_hint = ""
     if env:
@@ -734,6 +754,8 @@ def probe_target_python(python: str) -> CommandResult:
 def collect_preflight_checks(
     options: InstallOptions,
 ) -> list[PreflightCheck]:
+    if "hermes" in options.connectors:
+        validated_client_home(options.hermes_home)
     checks: list[PreflightCheck] = []
     checks.append(
         PreflightCheck(
@@ -1252,6 +1274,7 @@ _SYSTEM_CLIENT_HOME_TREES = frozenset(
         "/var/backups", "/private/var/backups", "/var/www", "/private/var/www",
         "/var/local", "/private/var/local", "/var/crash", "/private/var/crash",
         "/var/vm", "/private/var/vm",
+        "/var/audit", "/private/var/audit",
     )
 )
 
@@ -1775,6 +1798,14 @@ def offer_first_key_capture(
 
 
 def run_install(options: InstallOptions) -> int:
+    try:
+        return _run_install(options)
+    except RuntimeHomeError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+
+def _run_install(options: InstallOptions) -> int:
     options = replace(
         options, python=absolute_python(options.python),
         package=absolute_package_reference(options.package),
@@ -1816,6 +1847,8 @@ def run_install(options: InstallOptions) -> int:
     # any client-owned path can be touched.
     for connector in options.connectors:
         if connector == "hermes":
+            # Core setup can take time. Revalidate before touching Hermes or recording its home.
+            options = replace(options, hermes_home=validated_client_home(options.hermes_home))
             previous = load_connectors(options.ficelle_home).get("hermes") or {}
             previous_metadata = previous.get("metadata")
             previous_metadata = previous_metadata if isinstance(previous_metadata, dict) else {}
@@ -1997,7 +2030,11 @@ def options_from_args(args: argparse.Namespace) -> InstallOptions:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return run_install(options_from_args(args))
+    try:
+        return run_install(options_from_args(args))
+    except ClientHomeError as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

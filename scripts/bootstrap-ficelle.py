@@ -32,13 +32,13 @@ from email.parser import Parser
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
-CORE_VERSION = "0.3.15"
+CORE_VERSION = "0.3.16"
 DEFAULT_CORE_WHEEL_URL = (
     "https://github.com/TheBlueHouse75/ficelle-open-core/releases/download/"
     f"v{CORE_VERSION}/ficelle_router-{CORE_VERSION}-py3-none-any.whl"
 )
 DEFAULT_CORE_SHA256 = (
-    "001759a002ca6da1189941853cc4b1906d20a98ca4402080ce930ff889cc0d59"
+    "8ba20eca9342a77f9d7aa6d200dc6dfc822b18907e0016da9ed4af1de9b884a6"
 )
 DEFAULT_WHEEL_URL = f"https://install.ficelle.ai/api/releases/{CORE_VERSION}/wheel"
 PRO_RUNTIME_REQUIREMENTS = ("cryptography>=42",)
@@ -983,10 +983,10 @@ def options_from_args(args: argparse.Namespace) -> BootstrapOptions:
         python=args.python,
         venv=Path(args.venv).expanduser().resolve(),
         connectors=tuple(dict.fromkeys(args.connector)),
-        ficelle_home=Path(
-            configured_ficelle_home or Path.home() / ".ficelle"
-        ).expanduser().resolve(),
-        hermes_home=Path(args.hermes_home).expanduser().resolve(),
+        ficelle_home=Path(os.path.abspath(
+            Path(configured_ficelle_home or Path.home() / ".ficelle").expanduser(),
+        )),
+        hermes_home=Path(os.path.abspath(Path(args.hermes_home).expanduser())),
         backup_existing=not args.no_backup,
         skip_service=args.skip_service,
         skip_smoke=args.skip_smoke,

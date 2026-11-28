@@ -43,7 +43,7 @@ from ficelle import __version__ as CORE_VERSION
 from ficelle.json_store import atomic_write_json, load_json
 from ficelle.probe_lock import file_lock
 from ficelle.redaction import sanitize_error_detail
-from ficelle.runtime_paths import RuntimePaths, absolute_python, validated_runtime_home
+from ficelle.runtime_paths import RuntimeHomeError, RuntimePaths, absolute_python, validated_runtime_home
 from ficelle.url_security import uses_secure_http_transport
 
 
@@ -70,10 +70,15 @@ ACTIVE_UPDATE_STATUSES = frozenset({"queued", "installing", "restarting"})
 _SHA256_LENGTH = 64
 _CHECK_LOCK = threading.Lock()
 _RUNTIME_PATHS = RuntimePaths.from_env()
+_recovery_home_failure: dict[str, Any] | None = None
 
 
 class UpdateError(Exception):
     """A key-free update error suitable for CLI and admin status output."""
+
+
+class _RecoveryHomeRefused(UpdateError):
+    """The recovery failure was published in memory because the home is unsafe."""
 
 
 class UpdateInProgress(UpdateError):
@@ -498,6 +503,9 @@ def _status_base() -> dict[str, Any]:
 
 
 def read_update_status() -> dict[str, Any]:
+    failure = _recovery_home_failure
+    if failure is not None:
+        return failure.copy()
     path = update_status_path()
     payload = load_json(path, None)
     if not isinstance(payload, dict):
@@ -665,25 +673,36 @@ def check_for_updates(
                 return _status_snapshot(error_payload, existing=existing)
 
 
+def _try_pending_recovery() -> bool:
+    """Return whether recovery is pending, retrying a refused home only after validation."""
+    if _recovery_home_failure is not None:
+        try:
+            _validated_recovery_home(create=False)
+        except (FileNotFoundError, UpdateError):
+            return True
+    if not update_recovery_marker_path().exists():
+        return False
+    try:
+        spawn_recovery()
+    except Exception:
+        # Recovery must not prevent the router from becoming ready. Keep the marker for retry.
+        pass
+    return True
+
+
 def update_check_loop() -> None:
     """Background checker: delayed once at startup, then periodic and non-blocking."""
     if os.getenv("FICELLE_DISABLE_UPDATE_CHECK") == "1":
         return
-    if update_recovery_marker_path().exists():
-        try:
-            spawn_recovery()
-        except Exception:
-            # The marker remains durable so the next service start or check cycle can retry the
-            # detached recovery helper; recovery must not prevent the router from becoming ready.
-            pass
+    _try_pending_recovery()
     time.sleep(UPDATE_CHECK_START_DELAY_SECONDS)
     while True:
-        status = read_update_status()
-        recovery_pending = update_recovery_marker_path().exists()
+        recovery_pending = False
+        status = _status_base()
         try:
-            if recovery_pending:
-                spawn_recovery()
-            else:
+            recovery_pending = _try_pending_recovery()
+            if not recovery_pending:
+                status = read_update_status()
                 status = check_for_updates()
         except Exception:
             # The serving process must never depend on the release endpoint.
@@ -825,6 +844,8 @@ def spawn_update() -> dict[str, Any]:
             env={**os.environ, "FICELLE_HOME": str(home), "FICELLE_UPDATE_QUEUED": "1", "PYTHONSAFEPATH": "1"},
             cwd=str(home),
         )
+    except RuntimeHomeError as exc:
+        raise UpdateError(str(exc)) from exc
     except (UpdateInProgress, UpdateUnavailable):
         raise
     except Exception as exc:
@@ -844,12 +865,29 @@ def spawn_update() -> dict[str, Any]:
     return status
 
 
+def _validated_recovery_home(*, create: bool = True) -> Path:
+    global _recovery_home_failure
+    try:
+        home = validated_runtime_home(_RUNTIME_PATHS.ficelle_home, create=create)
+    except RuntimeHomeError as exc:
+        message = str(exc)
+        if _recovery_home_failure is None or _recovery_home_failure["message"] != message:
+            # The status writer would follow a symlink or change an unsafe home's permissions.
+            # Publish the failure to status readers without writing into that directory.
+            _recovery_home_failure = _status_snapshot(
+                {"status": "failed", "message": message}, existing={},
+            )
+        raise _RecoveryHomeRefused(message) from exc
+    _recovery_home_failure = None
+    return home
+
+
 def spawn_recovery() -> bool:
     """Start recovery outside the router so the service can restart safely."""
     if not update_recovery_marker_path().exists():
         return False
+    home = _validated_recovery_home()
     try:
-        home = validated_runtime_home(_RUNTIME_PATHS.ficelle_home)
         _spawn_detached_helper(
             detached_recovery_command(),
             env={**os.environ, "FICELLE_HOME": str(home), "FICELLE_UPDATE_RECOVERY": "1", "PYTHONSAFEPATH": "1"},
@@ -1356,6 +1394,7 @@ def recover_interrupted_update() -> bool:
     if not update_recovery_marker_path().exists():
         return False
     try:
+        _validated_recovery_home(create=False)
         with exclusive_update_lock(wait=False):
             with exclusive_package_install_lock(wait=False):
                 return _recover_interrupted_update_locked()
@@ -1430,6 +1469,7 @@ def _apply_update_locked(
     opener: Callable[[urllib.request.Request, float], Any] | None = None,
 ) -> int:
     if update_recovery_marker_path().exists():
+        _validated_recovery_home(create=False)
         _recover_interrupted_update_locked()
         status = read_update_status()
     if not bool(status.get("update_available")) or not status.get("core_wheel_url"):
@@ -1543,9 +1583,17 @@ def apply_update(
 ) -> int:
     """Apply the queued update and return a process-style exit code."""
     try:
+        try:
+            _validated_recovery_home(create=False)
+        except FileNotFoundError:
+            print("Ficelle home was not found. Run ficelle-setup first.", file=sys.stderr)
+            return 1
         with exclusive_update_lock(wait=True):
             with exclusive_package_install_lock(wait=False):
                 return _apply_update_locked(read_update_status(), opener=opener)
+    except _RecoveryHomeRefused as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except Exception as exc:
         message = str(exc) if isinstance(exc, (UpdateError, UpdateUnavailable)) else "The Ficelle update failed."
         try:

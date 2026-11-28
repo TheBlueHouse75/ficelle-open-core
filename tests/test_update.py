@@ -44,6 +44,7 @@ class _Response:
 @pytest.fixture(autouse=True)
 def isolate_update_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(tmp_path)}))
+    monkeypatch.setattr(update, "_recovery_home_failure", None)
 
 
 @pytest.fixture(autouse=True)
@@ -717,6 +718,82 @@ def test_update_check_loop_requests_detached_recovery(
     assert sleeps == [update.UPDATE_CHECK_START_DELAY_SECONDS, update.UPDATE_ERROR_RETRY_SECONDS]
 
 
+@pytest.mark.parametrize(("kind", "message"), [
+    ("symlink", "Use the real directory"),
+    ("group-writable", "chmod go-w"),
+])
+def test_pending_recovery_waits_for_a_refused_home_to_be_fixed(tmp_path, monkeypatch, kind, message):
+    home = tmp_path / "home"
+    real_home = tmp_path / "real-home" if kind == "symlink" else home
+    real_home.mkdir(mode=0o700)
+    if kind == "symlink":
+        home.symlink_to(real_home, target_is_directory=True)
+    else:
+        home.chmod(0o775)
+    monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
+    marker = update.update_recovery_marker_path()
+    marker.parent.mkdir()
+    marker.write_text("pending", encoding="utf-8")
+    monkeypatch.setattr(update, "check_for_updates", lambda: pytest.fail("recovery is pending"))
+
+    attempts = []
+    spawns = []
+    spawn_recovery = update.spawn_recovery
+
+    def record_attempt():
+        attempts.append(True)
+        return spawn_recovery()
+
+    monkeypatch.setattr(update, "spawn_recovery", record_attempt)
+    monkeypatch.setattr(update, "detached_recovery_command", lambda: ["recovery"])
+    monkeypatch.setattr(update, "_spawn_detached_helper", lambda command, **kw: spawns.append(kw["cwd"]))
+
+    class StopLoop(Exception):
+        pass
+
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 5:
+            assert marker.read_text(encoding="utf-8") == "pending"
+            assert attempts == [True, True]
+            assert spawns == [str(home)]
+            assert update.read_update_status()["status"] != "failed"
+            raise StopLoop
+
+        assert attempts == [True]
+        assert spawns == []
+        status = update.public_update_status()
+        assert status["status"] == "failed"
+        assert message in status["message"]
+        assert str(home) not in status["message"]
+        assert not update.update_status_path().exists()
+        if len(sleeps) == 4:
+            assert not home.exists()
+            (tmp_path / "real-home").rename(home)
+            home.chmod(0o700)
+            return
+        assert marker.read_text(encoding="utf-8") == "pending"
+        if len(sleeps) == 1:
+            with pytest.raises(update.UpdateError, match=message) as refused:
+                update.recover_interrupted_update()
+            assert str(refused.value) == status["message"]
+            assert not update.update_lock_path().exists()
+        if len(sleeps) == 3:
+            if kind == "symlink":
+                home.unlink()
+            else:
+                assert home.stat().st_mode & 0o777 == 0o775
+                home.rename(tmp_path / "real-home")
+
+    monkeypatch.setattr(update.time, "sleep", sleep)
+
+    with pytest.raises(StopLoop):
+        update.update_check_loop()
+    assert sleeps == [update.UPDATE_CHECK_START_DELAY_SECONDS] + [update.UPDATE_ERROR_RETRY_SECONDS] * 4
+
+
 def test_update_package_lock_is_shared_with_pro_installer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -758,6 +835,63 @@ def test_apply_update_requires_a_managed_service(
     status = update.read_update_status()
     assert status["status"] == "failed"
     assert "managed Ficelle service" in status["message"]
+
+
+@pytest.mark.parametrize(("kind", "message"), [
+    ("symlink", "Use the real directory"),
+    pytest.param("group-writable", "chmod go-w", marks=pytest.mark.skipif(
+        not hasattr(update.os, "getuid"), reason="POSIX home permissions",
+    )),
+])
+def test_apply_update_refuses_recovery_in_an_unsafe_home(tmp_path, monkeypatch, capsys, kind, message):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
+    purelib = tmp_path / "purelib"
+    monkeypatch.setattr(update.sysconfig, "get_paths", lambda: {"purelib": str(purelib)})
+    backup = update.update_recovery_backup_dir() / "0-ficelle"
+    backup.mkdir(parents=True)
+    entries = [update._BackupEntry(purelib / "ficelle", backup)]
+    update._write_recovery_marker(entries, target_version=NEXT_VERSION)
+    marker = update.update_recovery_marker_path()
+    marker_contents = marker.read_bytes()
+    real_home = tmp_path / "real-home"
+    if kind == "symlink":
+        home.rename(real_home)
+        home.symlink_to(real_home, target_is_directory=True)
+    else:
+        home.chmod(0o775)
+
+    restored = []
+    monkeypatch.setattr(update, "_restore_installed_packages", lambda value, **_kwargs: restored.append(value))
+    monkeypatch.setattr(update, "_managed_service", lambda: (None, False))
+
+    assert update.apply_update() == 1
+    status = update.read_update_status()
+    assert status["status"] == "failed"
+    assert message in status["message"]
+    assert str(home) not in status["message"]
+    assert capsys.readouterr().err.strip() == status["message"]
+    assert not update.update_lock_path().exists()
+    assert not update.package_install_lock_path().exists()
+    assert not update.update_status_path().exists()
+    assert marker.read_bytes() == marker_contents
+    assert restored == []
+
+    with pytest.raises(update.UpdateError, match=message):
+        update._apply_update_locked({})
+    assert not update.update_status_path().exists()
+    assert marker.read_bytes() == marker_contents
+    assert restored == []
+
+    if kind == "symlink":
+        home.unlink()
+        real_home.rename(home)
+    else:
+        home.chmod(0o700)
+    assert update.recover_interrupted_update() is True
+    assert restored == [entries]
+    assert not marker.exists()
 
 
 def test_managed_service_accepts_a_registered_windows_scheduled_task(
@@ -1114,21 +1248,13 @@ def test_detached_helpers_revalidate_existing_home(tmp_path, monkeypatch, operat
         assert calls == []
 
 
-@pytest.mark.parametrize("failure", ["mkdir", "validation", "spawn"])
 @pytest.mark.parametrize("status_writable", [True, False])
-def test_recovery_start_failure_reports_failed_without_losing_marker(tmp_path, monkeypatch, failure, status_writable):
+def test_recovery_spawn_failure_reports_failed_without_losing_marker(tmp_path, monkeypatch, status_writable):
     marker = tmp_path / "marker"
     marker.touch()
     home = tmp_path / "home"
     monkeypatch.setattr(update, "update_recovery_marker_path", lambda: marker)
     monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
-    if failure == "mkdir":
-        home.parent.joinpath("blocked").touch()
-        home = home.parent / "blocked" / "home"
-        monkeypatch.setattr(update, "_RUNTIME_PATHS", RuntimePaths.from_env(environ={"FICELLE_HOME": str(home)}))
-    elif failure == "validation":
-        home.mkdir(mode=0o775)
-        home.chmod(0o775)
     calls = []
     def spawn(*args, **kwargs):
         calls.append(args)
@@ -1144,7 +1270,7 @@ def test_recovery_start_failure_reports_failed_without_losing_marker(tmp_path, m
         update.spawn_recovery()
     assert "sensitive" not in str(caught.value)
     assert statuses == [{"status": "failed", "message": "The Ficelle update recovery helper could not start."}]
-    assert bool(calls) is (failure == "spawn")
+    assert len(calls) == 1
     assert marker.exists()
 
 

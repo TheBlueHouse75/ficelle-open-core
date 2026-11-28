@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 from xml.sax.saxutils import escape as xml_escape
 
-from ficelle.runtime_paths import absolute_python, python_child_context
+from ficelle.runtime_paths import absolute_python, python_child_context, validated_runtime_home
 
 
 LOG_FILE_NAME = "ficelle.log"
@@ -155,7 +155,7 @@ class ServicePaths:
 
 
 def service_environment(paths: ServicePaths) -> dict[str, str]:
-    return {"FICELLE_HOME": str(paths.ficelle_home)}
+    return {"FICELLE_HOME": str(paths.ficelle_home), "PYTHONSAFEPATH": "1"}
 
 
 def _systemd_environment_line(name: str, value: str) -> str:
@@ -254,7 +254,7 @@ class LaunchAgentServiceBackend:
     def plist_payload(self) -> dict[str, object]:
         return {
             "Label": self.paths.label,
-            "ProgramArguments": [str(self.paths.install_python), "-m", "ficelle.router", "--serve"],
+            "ProgramArguments": [str(self.paths.install_python), "-P", "-m", "ficelle.router", "--serve"],
             "RunAtLoad": True,
             "KeepAlive": {"SuccessfulExit": False},
             "ExitTimeOut": LAUNCHD_EXIT_TIMEOUT_SECONDS,
@@ -284,7 +284,7 @@ class LaunchAgentServiceBackend:
         return result
 
     def install(self) -> int:
-        self.paths.ficelle_home.mkdir(parents=True, exist_ok=True)
+        validated_runtime_home(self.paths.ficelle_home, create=True)
         self.paths.log_dir.mkdir(parents=True, exist_ok=True)
         self.paths.plist.parent.mkdir(parents=True, exist_ok=True)
         with self.paths.plist.open("wb") as fh:
@@ -459,7 +459,7 @@ class SystemdUserServiceBackend:
                 "Type=simple",
                 f"WorkingDirectory={str(self.paths.ficelle_home).replace('%', '%%')}",
                 *environment,
-                f"ExecStart={_systemd_exec_word(str(self.paths.install_python))} -m ficelle.router --serve",
+                f"ExecStart={_systemd_exec_word(str(self.paths.install_python))} -P -m ficelle.router --serve",
                 "Restart=on-failure",
                 "RestartSec=2",
                 "",
@@ -473,7 +473,7 @@ class SystemdUserServiceBackend:
         return self.run_command(["systemctl", "--user", "daemon-reload"])
 
     def write_unit(self) -> subprocess.CompletedProcess[str]:
-        self.paths.ficelle_home.mkdir(parents=True, exist_ok=True)
+        validated_runtime_home(self.paths.ficelle_home, create=True)
         self.paths.log_dir.mkdir(parents=True, exist_ok=True)
         write_text_file(self.paths.systemd_unit, self.unit_payload())
         return self.daemon_reload()
@@ -496,7 +496,7 @@ class SystemdUserServiceBackend:
                     parsed = shlex.split(command)
                 except ValueError:
                     return None
-                if len(parsed) == 1:
+                if len(parsed) == 1 or (len(parsed) == 2 and parsed[1] == "-P"):
                     # Undo the specifier doubling of _systemd_exec_word.
                     command = parsed[0].replace("%%", "%")
                 elif not Path(command).exists():
@@ -721,11 +721,11 @@ class WindowsScheduledTaskBackend:
         return self.paths.ficelle_home / f"{self.paths.label}.task.xml"
 
     def entry_arguments(self) -> list[str]:
-        # Task Scheduler cannot set per-task environment variables, so the service context
-        # travels as NAME=VALUE assignments (systemd's Environment= shape) that
-        # ficelle.windows_entry republishes; service_environment() is the one definition.
-        return ["-m", "ficelle.windows_entry"] + [
-            f"{name}={value}" for name, value in service_environment(self.paths).items()
+        # Task Scheduler has no per-task environment. The wrapper republishes only the
+        # service home, and -P enables safe-path mode before the wrapper runs.
+        return [
+            "-P", "-m", "ficelle.windows_entry",
+            f"FICELLE_HOME={service_environment(self.paths)['FICELLE_HOME']}",
         ]
 
     def task_payload(self) -> str:
@@ -779,7 +779,7 @@ class WindowsScheduledTaskBackend:
 """
 
     def write_task_definition(self) -> None:
-        self.paths.ficelle_home.mkdir(parents=True, exist_ok=True)
+        validated_runtime_home(self.paths.ficelle_home, create=True)
         self.paths.log_dir.mkdir(parents=True, exist_ok=True)
         # schtasks expects the exported-task encoding: UTF-16 with a BOM.
         write_text_file(self.task_xml, self.task_payload(), encoding="utf-16")

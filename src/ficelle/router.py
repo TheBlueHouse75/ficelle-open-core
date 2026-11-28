@@ -1325,6 +1325,14 @@ GATE_CAPABILITY_BY_PROFILE = {
     "ficelle/auto-audio": "audio",
 }
 
+
+def evidence_tier_applies(profile_id: str) -> bool:
+    """Composite gated profiles (orchestrator, compression, long) rank by evidence tier: their
+    probe exercises the whole job. A capability-gated profile already routes only on its own
+    verdict, and the others' probes (`exact_text` for fast and multimodal) do not measure it."""
+    canonical = canonical_virtual_model_id(profile_id)
+    return canonical in GATED_PROFILES and canonical not in GATE_CAPABILITY_BY_PROFILE
+
 # auto-multimodal's competence is the OR of these modality profiles: a pass on any one
 # satisfies the gate; exclusion needs every claimed modality to have failed.
 MULTIMODAL_MODALITY_PROFILES = {
@@ -3888,6 +3896,14 @@ class NullSecretStore(SecretStore):
         return None
 
 
+# Longest secret `security add-generic-password -w` stores from its interactive prompt; it keeps
+# the first 128 and still answers rc=0 (measured with ASCII on macOS 26, 28/11/2026: a 313-character
+# Kilo JWT was stored cut). Counted in bytes, the safe reading for a non-ASCII secret.
+SECURITY_PROMPT_MAX_BYTES = 128
+# `security -i` reads each command line into a 4 KiB buffer.
+SECURITY_INTERACTIVE_MAX_LINE_BYTES = 4095
+
+
 def keychain_store_write(service: str, secret: str) -> tuple[bool, str | None]:
     """Write a secret to the macOS login Keychain in the user session (``-U`` updates
     an existing item, enabling rotation). Never raises.
@@ -3899,14 +3915,35 @@ def keychain_store_write(service: str, secret: str) -> tuple[bool, str | None]:
     CLI-only: a launchd daemon must not call this — writing to the login keychain from
     the background daemon can pop a blocking GUI prompt (incident 2026-06-16, R9). The
     server-side write path targets a non-interactive store or the ``.env`` file."""
+    account = os.getenv("USER") or ""
     try:
+        if len(secret.encode("utf-8")) <= SECURITY_PROMPT_MAX_BYTES:
+            # `-w` with no value prompts on stdin, keeping the secret out of a same-user `ps`; it
+            # prompts twice and answers rc=0 even when the two differ, so it is sent twice.
+            argv = ["security", "add-generic-password", "-a", account, "-s", service, "-U", "-w"]
+            commands = f"{secret}\n{secret}\n"
+        else:
+            # The prompt would cut it. `security -i` reads the whole command from stdin, still off
+            # argv, but re-splits it with shell-like quoting: refuse what that would mangle rather
+            # than store a different key.
+            commands = f'add-generic-password -a "{account}" -s "{service}" -U -w "{secret}"\n'
+            unquotable = any(
+                char in '"\\' or char.isspace() or not char.isprintable()
+                for value in (account, service, secret)
+                for char in value
+            )
+            # A longer line is cut at the buffer and the rest run as another command, after the
+            # first has already overwritten the stored key with a truncated one.
+            if unquotable or len(commands.encode("utf-8")) > SECURITY_INTERACTIVE_MAX_LINE_BYTES:
+                return False, (
+                    f"keys longer than {SECURITY_PROMPT_MAX_BYTES} bytes must be shorter than "
+                    f"{SECURITY_INTERACTIVE_MAX_LINE_BYTES} bytes and contain no quotes, "
+                    "backslashes, spaces or control characters"
+                )
+            argv = ["security", "-i"]
         result = subprocess.run(
-            # `-w` with no value reads the secret from stdin: passing it in argv put it in the
-            # output of any same-user `ps` for the lifetime of the call. It prompts TWICE for
-            # confirmation, and answers rc=0 even when the two do not match — so sending the
-            # secret once "succeeds" while storing nothing. Verified live, both ways.
-            ["security", "add-generic-password", "-a", os.getenv("USER") or "", "-s", service, "-U", "-w"],
-            input=f"{secret}\n{secret}\n",
+            argv,
+            input=commands,
             text=True,
             capture_output=True,
             timeout=10,
@@ -4526,6 +4563,16 @@ def provider_credential_identities(config: dict[str, Any]) -> dict[str, str | No
             else None
         )
     return identities
+
+
+def provider_endpoint_identities(config: dict[str, Any]) -> dict[str, str | None]:
+    """The configured `base_url` of each provider, as written (templates unresolved)."""
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    return {
+        str(source): (str(provider_cfg.get("base_url")) if provider_cfg.get("base_url") else None)
+        for source, provider_cfg in providers.items()
+        if isinstance(provider_cfg, dict)
+    }
 
 
 # External credential resolvers (R4): optional integration hooks consulted as the
@@ -7427,6 +7474,19 @@ def _refresh_catalog_for_effective_config(config: dict[str, Any]) -> dict[str, A
         else set()
     )
     catalog["credential_identities"] = current_identities
+    # A preserved row's free-access proof holds for the endpoint that listed it: once the
+    # operator points a provider elsewhere, its cached rows must not route to the new URL
+    # while that URL's listing fails. Recorded per publish; a catalog written before this map
+    # existed compares as unchanged.
+    current_endpoints = provider_endpoint_identities(config)
+    previous_endpoints = previous_catalog.get("provider_endpoints")
+    if isinstance(previous_endpoints, dict):
+        changed_sources |= {
+            source
+            for source, endpoint in current_endpoints.items()
+            if source in previous_endpoints and previous_endpoints.get(source) != endpoint
+        }
+    catalog["provider_endpoints"] = current_endpoints
     decision_baseline = (
         {
             **previous_catalog,
@@ -7924,6 +7984,13 @@ def selection_retry_after_seconds(
         if reason in {"cooldown", "provider_cooldown", "quota_cooldown"}
     }
     if not cooldown_exclusions:
+        # Stale rows come back with the first refresh that reaches their providers; the
+        # request path retries one at most this often. Without a hint, Hermes retried at once.
+        # Only when staleness is the whole story: a quarantine next to it is not lifted by
+        # a refresh.
+        reasons = set(selection.excluded_reasons.values())
+        if reasons == {"stale_catalog"}:
+            return int(CATALOG_REQUEST_REFRESH_BACKOFF_SECONDS)
         return None
     state = load_runtime_state()
     now = time.time()
@@ -8871,6 +8938,7 @@ def model_score_explanation(requested_model: str, model: dict[str, Any], state: 
             scoring=model_scoring_ports(),
             evidence=model_evidence_ports(),
             model_has_any=model_has_any,
+            evidence_tier_applies=evidence_tier_applies,
         ),
     )
     if memo is None:
@@ -8910,11 +8978,16 @@ def sort_available_for_virtual_model(requested_model: str, available: list[dict[
             )
         )
         return ordered
+    # One explanation per model feeds both the score and the evidence tier of the sort key.
+    explanations = {
+        id(model): model_score_explanation(requested_model, model, state) for model in available
+    }
     return sort_available_for_virtual_model_policy(
         requested_model,
         available,
         state,
-        model_auto_score=model_auto_score,
+        model_auto_score=lambda _requested, model, _state: explanations[id(model)]["score_total_raw"],
+        evidence_tier=lambda _requested, model, _state: explanations[id(model)]["evidence_tier"],
         safe_int=safe_int,
         safe_float=safe_float,
         cooldown_key=cooldown_key,
@@ -9427,6 +9500,10 @@ def model_route_competence(profile_id: str, model: dict[str, Any], state: dict[s
 # grace it serves with `catalog_stale: true` exposed; past it, its mutable pricing evidence
 # is too old to trust and the row is excluded until a refresh revalidates it. Half the
 # default catalog TTL: several bounded-backoff refresh retries fit inside one grace.
+#
+# The grace starts where a fresh catalog's own trust ends, `stale_since` (the evidence's
+# generation) plus the TTL: measured from the generation alone, the first failed refresh,
+# which only runs at ~TTL age, had already spent it.
 DEFAULT_CATALOG_STALE_GRACE_SECONDS = 1800
 
 
@@ -9449,7 +9526,10 @@ def stale_catalog_block_reason(
     if stale_epoch is None:
         # A stale row whose proof age cannot be established fails closed.
         return "stale_catalog"
-    return "stale_catalog" if time.time() - stale_epoch > grace else None
+    # Same fallback as `catalog_refresh_interval_seconds`: a malformed TTL must not turn a
+    # routable request into an error on this per-row path.
+    max_evidence_age = safe_int(config.get("catalog_ttl_seconds") or 3600, 3600) + grace
+    return "stale_catalog" if time.time() - stale_epoch > max_evidence_age else None
 
 
 # How long a learned "this model rejects this sampling knob" verdict stands before it is
@@ -12570,15 +12650,7 @@ def discovery_priority_candidates(
     profile = profiles.get(canonical_virtual_model_id(profile_id))
     if isinstance(profile, dict):
         return candidates_for_profile(profile_id, models, state, profile)
-    return sort_available_for_virtual_model_policy(
-        profile_id,
-        models,
-        state,
-        model_auto_score=model_auto_score,
-        safe_int=safe_int,
-        safe_float=safe_float,
-        cooldown_key=cooldown_key,
-    )
+    return sort_available_for_virtual_model(profile_id, models, state)
 
 
 def discovery_priority_ports(config: dict[str, Any] | None) -> DiscoveryPriorityPorts:
@@ -15656,8 +15728,23 @@ def catalog_refresh_interval_seconds(config: dict[str, Any]) -> int:
     return min(max(60, ttl - 120), ttl - 1)
 
 
-# First retry delay for a failed catalog warm; doubles up to the normal refresh interval.
+# First retry delay for a failed catalog warm or a degraded refresh; doubles up to the cap below.
 CATALOG_WARM_RETRY_MIN_SECONDS = 5.0
+# Ceiling on a catalog retry delay (failed warm, rejected refresh, merge that kept stale
+# rows): doubling up to the full interval ended a long outage with a ~58 min wait. Listings
+# cost no tokens and degraded refreshes are rare, so 5 min is cheap.
+CATALOG_DEGRADED_RETRY_MAX_SECONDS = 300.0
+
+
+def _catalog_has_stale_rows(catalog: Any) -> bool:
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    return any(isinstance(row, dict) and row.get("catalog_stale") for row in models or [])
+
+
+def _degraded_catalog_retry_seconds(previous: float | None, interval: float) -> float:
+    if previous is None:
+        return CATALOG_WARM_RETRY_MIN_SECONDS
+    return min(previous * 2, interval, CATALOG_DEGRADED_RETRY_MAX_SECONDS)
 
 
 def record_catalog_refresh_error(
@@ -15713,15 +15800,16 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
     while True:
         try:
             refresh_capability_oracle_if_stale(config)
-            load_or_refresh_catalog(config)
+            warmed = load_or_refresh_catalog(config)
             refresh_provider_budgets(effective_runtime_config(config))
             break
         except Exception as exc:  # never let the warm crash the serving process
             record_catalog_refresh_error(f"initial catalog warm failed: {safe_detail(exc)}")
             print(f"initial catalog warm failed: {exc}; retrying in {backoff:.0f}s", flush=True)
             time.sleep(backoff)
-            backoff = min(backoff * 2, catalog_refresh_interval_seconds(config))
-    retry_backoff: float | None = None
+            backoff = _degraded_catalog_retry_seconds(backoff, catalog_refresh_interval_seconds(config))
+    # A warm that published a merge is as degraded as a later one.
+    retry_backoff: float | None = CATALOG_WARM_RETRY_MIN_SECONDS if _catalog_has_stale_rows(warmed) else None
     while True:
         interval = catalog_refresh_interval_seconds(config)
         time.sleep(min(retry_backoff, interval) if retry_backoff is not None else interval)
@@ -15737,23 +15825,24 @@ def catalog_refresh_loop(config: dict[str, Any]) -> None:
             #
             # Still not the TTL reload shared with routing (_load_or_refresh_catalog_for_
             # effective_config): a chat call must never rewrite the user's config.
-            refresh_catalog(config)
+            catalog = refresh_catalog(config)
         except CatalogRefreshRejectedError as exc:
             # Already recorded in state by the reject itself. The active catalog is intact,
             # so retry sooner than a full interval — bounded backoff, like the initial warm.
-            retry_backoff = (
-                CATALOG_WARM_RETRY_MIN_SECONDS
-                if retry_backoff is None
-                else min(retry_backoff * 2, interval)
-            )
+            retry_backoff = _degraded_catalog_retry_seconds(retry_backoff, interval)
             print(f"periodic catalog refresh rejected: {exc}; retrying in {retry_backoff:.0f}s", flush=True)
         except Exception as exc:
             retry_backoff = None
             record_catalog_refresh_error(f"periodic catalog refresh failed: {safe_detail(exc)}")
             print(f"periodic catalog refresh failed: {exc}", flush=True)
         else:
-            retry_backoff = None
             record_catalog_refresh_error(None)
+            # A merged publish carries a fresh `generated_at`: nothing else revisits it for an
+            # hour while its preserved rows age toward their grace.
+            degraded = _catalog_has_stale_rows(catalog)
+            retry_backoff = _degraded_catalog_retry_seconds(retry_backoff, interval) if degraded else None
+            if degraded:
+                print(f"periodic catalog refresh kept last-known-good rows; retrying in {retry_backoff:.0f}s", flush=True)
 
 
 LICENSE_REFRESH_CHECK_SECONDS = 6 * 3600

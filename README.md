@@ -187,15 +187,15 @@ its own HTTPS manifest with `FICELLE_UPDATE_MANIFEST_URL`. The compact manifest 
 
 ```json
 {
-  "version": "0.3.15",
-  "release_url": "https://github.com/TheBlueHouse75/ficelle-open-core/releases/tag/v0.3.15",
+  "version": "0.3.16",
+  "release_url": "https://github.com/TheBlueHouse75/ficelle-open-core/releases/tag/v0.3.16",
   "core": {
-    "wheel_url": "https://downloads.example/ficelle_router-0.3.15-py3-none-any.whl",
+    "wheel_url": "https://downloads.example/ficelle_router-0.3.16-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>"
   },
   "pro": {
     "wheel_url": "https://install.ficelle.ai/api/releases/latest/wheel",
-    "filename": "ficelle_pro-0.3.15-py3-none-any.whl",
+    "filename": "ficelle_pro-0.3.16-py3-none-any.whl",
     "sha256": "<64 hexadecimal characters>",
     "authorization": "entitlement"
   }
