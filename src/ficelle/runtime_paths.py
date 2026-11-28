@@ -80,23 +80,38 @@ class RuntimePaths:
         )
 
 
+class RuntimeHomeError(OSError):
+    """A home validation failure with a path-free user message."""
+
+
 def validated_runtime_home(home: Path, *, create: bool = True) -> Path:
     """Return an absolute home safe to use as a Python child working directory."""
     home = Path(os.path.abspath(home.expanduser()))
     try:
-        info = os.lstat(home)
+        try:
+            info = os.lstat(home)
+        except FileNotFoundError:
+            if not create:
+                raise
+            home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            info = os.lstat(home)
     except FileNotFoundError:
-        if not create:
-            raise
-        home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        info = os.lstat(home)
+        raise
+    except OSError as exc:
+        raise RuntimeHomeError("Ficelle could not access its home directory. Check its permissions.") from exc
     if not stat.S_ISDIR(info.st_mode):
-        raise OSError("Ficelle home must be a directory, not a symbolic link or file.")
+        raise RuntimeHomeError(
+            "Ficelle home must be a directory, not a symbolic link or file. "
+            "Use the real directory or point FICELLE_HOME to it."
+        )
     if hasattr(os, "getuid"):
         if info.st_uid != os.getuid():
-            raise OSError("Ficelle home must be owned by the current user.")
+            raise RuntimeHomeError("Ficelle home must be owned by the current user. Check its ownership.")
         if info.st_mode & 0o022:
-            raise OSError("Ficelle home must not be group- or other-writable.")
+            raise RuntimeHomeError(
+                "Ficelle home must not be group- or other-writable. "
+                "Use chmod go-w on the directory."
+            )
     return home
 
 

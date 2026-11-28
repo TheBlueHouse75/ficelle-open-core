@@ -43,6 +43,9 @@ class ModelScoreExplanationPorts:
         quality_feedback_summary_for_model
     )
     quality_feedback_routing_enabled: Callable[[str, dict[str, Any]], bool] = quality_feedback_routing_enabled
+    # Profiles whose candidates rank by `profile_evidence_tier`; every other profile reports the
+    # neutral tier, so ordering there stays score-only.
+    evidence_tier_applies: Callable[[str], bool] = lambda _profile_id: False
 
 
 # Success rate of a model with no usable history, and the value a decayed one converges back to.
@@ -101,6 +104,15 @@ def _positive_stat(record: dict[str, Any], field: str) -> float | None:
 
 
 def success_rate_for_model(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> float:
+    successes, failures = observed_outcomes(model, state, ports=ports)
+    # Bayesian-ish smoothing: avoid over-trusting a single lucky call.
+    return (successes + SUCCESS_RATE_PRIOR_OBSERVATIONS * NEUTRAL_SUCCESS_RATE) / (
+        successes + failures + SUCCESS_RATE_PRIOR_OBSERVATIONS
+    )
+
+
+def observed_outcomes(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> tuple[float, float]:
+    """Real routed successes and failures, decayed to now."""
     record = ((state.get("stats") or {}).get(ports.cooldown_key(model)) or {}) if isinstance(state, dict) else {}
     # Decayed counters when present: cumulative lifetime totals let a model coast on wins from
     # weeks ago (on this install, half the models last ran 48 days back) or stay punished for
@@ -118,10 +130,7 @@ def success_rate_for_model(model: dict[str, Any], state: dict[str, Any], *, port
     else:
         successes = float(ports.safe_int(record.get("successes"), 0))
         failures = float(ports.safe_int(record.get("failures"), 0))
-    # Bayesian-ish smoothing: avoid over-trusting a single lucky call.
-    return (successes + SUCCESS_RATE_PRIOR_OBSERVATIONS * NEUTRAL_SUCCESS_RATE) / (
-        successes + failures + SUCCESS_RATE_PRIOR_OBSERVATIONS
-    )
+    return successes, failures
 
 
 def latency_score_for_model(model: dict[str, Any], state: dict[str, Any], *, ports: ModelScoringPorts) -> float:
@@ -388,6 +397,22 @@ def benchmark_adjustment_parts(
     }
 
 
+def profile_evidence_tier(verified_bonus: float, benchmark_bonus: float, observed_successes: float) -> int:
+    """Where a candidate ranks before its score: 0 proven, 1 unproven, 2 disproven.
+
+    The 0.72 default success rate of a never-called model outscored models that had passed the
+    profile's probe, so proof orders first. Real routed successes are proof too: a probe pass
+    must not jump a model production already relies on. Only a capability verdict disproves: a
+    failing benchmark row can be a timeout, which the score already penalizes.
+    """
+    if verified_bonus < 0:
+        return 2
+    if verified_bonus > 0 or benchmark_bonus > 0 or observed_successes >= 1:
+        return 0
+    return 1
+
+
+
 def model_score_explanation(
     requested_model: str,
     model: dict[str, Any],
@@ -461,6 +486,15 @@ def model_score_explanation(
     return {
         "score_base": round(score, 1),
         "score_adjustment": round(parts["score_adjustment"], 1),
+        "evidence_tier": (
+            profile_evidence_tier(
+                parts["verified_bonus"],
+                parts["benchmark_bonus"],
+                observed_outcomes(model, state, ports=ports.scoring)[0],
+            )
+            if ports.evidence_tier_applies(requested_model)
+            else 1
+        ),
         "score_total_raw": score_total,
         "score_total": round(score_total, 1),
         "score_total_without_quality": score_total_without_quality,

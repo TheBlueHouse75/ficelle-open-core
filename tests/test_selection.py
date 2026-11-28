@@ -269,6 +269,29 @@ def test_sort_available_for_virtual_model_uses_score_failures_context_and_id_tie
     ]
 
 
+def test_rows_kept_from_a_failed_listing_rank_behind_fresh_ones_whatever_their_score():
+    # Their provider was just unreachable: spending the first attempt on one, ahead of a
+    # freshly listed model, fails a request the old exclusion would have served.
+    models = [
+        model_row("ficelle/openrouter/stale-best", upstream_id="stale-best", catalog_stale=True),
+        model_row("ficelle/openrouter/fresh-weaker", upstream_id="fresh-weaker"),
+    ]
+    scores = {"ficelle/openrouter/stale-best": 95.0, "ficelle/openrouter/fresh-weaker": 60.0}
+
+    ordered = sort_available_for_virtual_model_policy(
+        "ficelle/auto-tools",
+        models,
+        {},
+        model_auto_score=lambda _requested, model, _state: scores[str(model["id"])],
+        safe_int=lambda value, default: int(value) if value is not None else default,
+        safe_float=lambda value, default: float(value) if value is not None else default,
+        cooldown_key=lambda model: f"{model.get('source')}::{model.get('upstream_id')}",
+        now_epoch=lambda: 1_000_000.0,
+    )
+
+    assert [model["id"] for model in ordered] == ["ficelle/openrouter/fresh-weaker", "ficelle/openrouter/stale-best"]
+
+
 def test_manual_order_candidates_deduplicates_profile_models_and_sorts_auto_tail():
     eligible = [
         model_row("ficelle/openrouter/tail-b"),

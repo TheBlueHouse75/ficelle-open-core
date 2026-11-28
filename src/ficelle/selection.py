@@ -48,8 +48,10 @@ def sort_available_for_virtual_model(
     safe_float: Callable[[Any, float], float],
     cooldown_key: Callable[[dict[str, Any]], str],
     now_epoch: Callable[[], float] = time.time,
+    evidence_tier: Callable[[str, dict[str, Any], dict[str, Any]], int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Rank a profile's candidates by score, then by the tie-breaks below.
+    """Rank a profile's candidates by evidence tier (`model_scoring.profile_evidence_tier`), then
+    by score, then by the tie-breaks below. The tier only reorders: no candidate is excluded.
 
     An expired `failed` verdict is handled by the score alone (`model_scoring`: its penalty does
     not decay), not by a demotion key here — one mechanism, so nothing has to be cancelled out
@@ -58,8 +60,13 @@ def sort_available_for_virtual_model(
     stats = state.get("stats") if isinstance(state.get("stats"), dict) else {}
     now = now_epoch()
     ordered = list(available)
+
     ordered.sort(
         key=lambda model: (
+            # A row kept from a failed listing serves as backup: within its grace it is
+            # routable, but its provider was just unreachable, so fresh rows go first.
+            bool(model.get("catalog_stale")),
+            evidence_tier(requested_model, model, state) if evidence_tier is not None else 0,
             -model_auto_score(requested_model, model, state),
             # The same recency-weighted count the score already subtracts, read from the ledger.
             failure_penalty_weight(stats.get(cooldown_key(model)), now),

@@ -3269,6 +3269,11 @@ class ChatCompletionRouter:
                 retry_after_seconds=retry_after_seconds,
             )
         capability = "tool-capable model" if body.get("tools") else "model"
+        message = f"no invokable free {capability} available for {safe_requested}"
+        if set(excluded_counts) == {"stale_catalog"}:
+            # Every candidate was ruled out for one reason, and it is not the models: their
+            # free-access evidence is too old to prove them free right now.
+            message += ": the model catalog is stale and could not be revalidated by a refresh"
         return self._refusal_response(
             body,
             request,
@@ -3277,7 +3282,7 @@ class ChatCompletionRouter:
             status=503,
             reason="no_available_model",
             error_type="no_available_model",
-            message=f"no invokable free {capability} available for {safe_requested}",
+            message=message,
             refusal_details={"excluded": bounded} if bounded else None,
             retry_after_seconds=retry_after_seconds,
         )

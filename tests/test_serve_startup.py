@@ -152,7 +152,7 @@ def test_catalog_refresh_loop_keeps_catalog_fresh(monkeypatch):
     calls: list = []
     monkeypatch.setattr(router, "refresh_capability_oracle_if_stale", lambda config: calls.append(("oracle", None)))
     monkeypatch.setattr(router, "load_or_refresh_catalog", lambda config, force=False: calls.append(("warm", force)))
-    monkeypatch.setattr(router, "refresh_catalog", lambda config: calls.append(("refresh", True)))
+    monkeypatch.setattr(router, "refresh_catalog", lambda config: calls.append(("refresh", True)) or {"models": []})
     monkeypatch.setattr(router, "refresh_provider_budgets", lambda config: None)
 
     sleeps: list = []

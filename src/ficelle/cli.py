@@ -22,7 +22,7 @@ from ficelle.connector_registry import (
     SUPPORTED_CONNECTORS,
     unregister_connector,
 )
-from ficelle.runtime_paths import RuntimePaths, absolute_python, python_child_context
+from ficelle.runtime_paths import RuntimeHomeError, RuntimePaths, absolute_python, python_child_context
 from ficelle.url_security import connectable_http_url
 from ficelle.service import (
     SERVER_COMMAND_SIGNATURES,
@@ -676,8 +676,12 @@ def cmd_connectors(args: argparse.Namespace) -> int:
         ]
         if args.connector == "hermes" and args.client_home:
             command.extend(("--hermes-home", os.path.abspath(Path(args.client_home).expanduser())))
-        with python_child_context(FICELLE_HOME) as (cwd, env):
-            return subprocess.run(command, check=False, cwd=cwd, env=env).returncode
+        try:
+            with python_child_context(FICELLE_HOME) as (cwd, env):
+                return subprocess.run(command, check=False, cwd=cwd, env=env).returncode
+        except RuntimeHomeError as exc:
+            print(exc, file=sys.stderr)
+            return 1
     if action == "remove":
         if args.connector == "hermes":
             from ficelle.install import remove_hermes_connector
@@ -1215,8 +1219,14 @@ def main(argv: list[str] | None = None) -> int:
         for profile_id in args.profile:
             canary_args.extend(["--canary-profile", profile_id])
         return router.main_args(canary_args)
-    if args.command in {"install", "start"}:
-        returncode = install_service()
+    if args.command in {"install", "start", "restart"}:
+        try:
+            if args.command == "restart":
+                return restart_service()
+            returncode = install_service()
+        except RuntimeHomeError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         if returncode == 0:
             print(f"Ficelle serves {router_url('/v1')}. Next: `ficelle doctor --text`.")
         return returncode
@@ -1224,8 +1234,6 @@ def main(argv: list[str] | None = None) -> int:
         return uninstall_service()
     if args.command == "stop":
         return stop_service()
-    if args.command == "restart":
-        return restart_service()
     if args.command == "status":
         return managed_service_status()
     if args.command == "doctor":

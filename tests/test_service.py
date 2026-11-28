@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import shlex
 import subprocess
 import sys
 
@@ -89,7 +91,10 @@ def test_select_service_backend_uses_launchagent_on_darwin(tmp_path):
     assert ["launchctl", "bootstrap", "gui/501", str(paths.plist)] in calls
     payload = backend.plist_payload()
     assert payload["WorkingDirectory"] == str(paths.ficelle_home)
-    assert payload["EnvironmentVariables"] == {"FICELLE_HOME": str(paths.ficelle_home)}
+    assert payload["ProgramArguments"] == [str(paths.install_python), "-P", "-m", "ficelle.router", "--serve"]
+    assert payload["EnvironmentVariables"] == {
+        "FICELLE_HOME": str(paths.ficelle_home), "PYTHONSAFEPATH": "1",
+    }
     assert payload["StandardOutPath"] == str(paths.log_dir / "ficelle.log")
     assert "HERMES_HOME" not in payload["EnvironmentVariables"]
 
@@ -112,9 +117,10 @@ def test_select_service_backend_uses_systemd_user_on_linux(tmp_path):
     assert backend.install() == 0
     assert paths.systemd_unit.exists()
     unit = paths.systemd_unit.read_text(encoding="utf-8")
-    assert "ExecStart=" + sys.executable + " -m ficelle.router --serve" in unit
+    assert "ExecStart=" + sys.executable + " -P -m ficelle.router --serve" in unit
     assert f"WorkingDirectory={paths.ficelle_home}" in unit
     assert f'Environment="FICELLE_HOME={paths.ficelle_home}"' in unit
+    assert 'Environment="PYTHONSAFEPATH=1"' in unit
     assert "HERMES_HOME" not in unit
     assert ["systemctl", "--user", "daemon-reload"] in calls
     assert ["systemctl", "--user", "enable", "--now", paths.systemd_unit.name] in calls
@@ -135,6 +141,7 @@ def test_launchagent_ignores_client_home_environment(tmp_path):
 
     assert backend.plist_payload()["EnvironmentVariables"] == {
         "FICELLE_HOME": str(paths.ficelle_home),
+        "PYTHONSAFEPATH": "1",
     }
 
 
@@ -335,7 +342,9 @@ def test_service_keeps_all_artifacts_under_ficelle_home(tmp_path):
     assert payload["StandardOutPath"] == str(
         paths.ficelle_home / "logs" / "ficelle.log"
     )
-    assert payload["EnvironmentVariables"] == {"FICELLE_HOME": str(paths.ficelle_home)}
+    assert payload["EnvironmentVariables"] == {
+        "FICELLE_HOME": str(paths.ficelle_home), "PYTHONSAFEPATH": "1",
+    }
     assert backend.install() == 0
     assert paths.ficelle_home.is_dir()
     assert (paths.ficelle_home / "logs").is_dir()
@@ -384,7 +393,8 @@ def test_systemd_user_restart_reuses_existing_unit(tmp_path):
     assert read_active_service_context(paths.active_home_pointer) == paths.ficelle_home
 
 
-def test_systemd_user_restart_reuses_the_interpreter_recorded_in_the_unit(tmp_path, capsys):
+@pytest.mark.parametrize("safe_path", [False, True])
+def test_systemd_user_restart_reuses_the_interpreter_recorded_in_the_unit(tmp_path, capsys, safe_path):
     installed_python = tmp_path / "venv-A" / "bin" / "python"
     installed_python.parent.mkdir(parents=True)
     installed_python.write_text("", encoding="utf-8")
@@ -401,6 +411,9 @@ def test_systemd_user_restart_reuses_the_interpreter_recorded_in_the_unit(tmp_pa
         report_stale_servers=lambda _pids: None,
     )
     assert installed.install() == 0
+    if not safe_path:
+        unit = paths.systemd_unit.read_text(encoding="utf-8")
+        paths.systemd_unit.write_text(unit.replace(" -P -m ", " -m "), encoding="utf-8")
 
     restarted = SystemdUserServiceBackend(
         paths=replace(paths, install_python=current_python),
@@ -412,7 +425,7 @@ def test_systemd_user_restart_reuses_the_interpreter_recorded_in_the_unit(tmp_pa
     assert restarted.restart() == 0
 
     unit = paths.systemd_unit.read_text(encoding="utf-8")
-    assert f"ExecStart={installed_python} -m ficelle.router --serve" in unit
+    assert f"ExecStart={installed_python} -P -m ficelle.router --serve" in unit
     assert "reusing the interpreter" in capsys.readouterr().out
 
 
@@ -442,7 +455,7 @@ def test_systemd_user_restart_repoints_when_recorded_interpreter_is_unusable(tmp
         report_stale_servers=lambda _pids: None,
     )
     assert restarted.restart() == 0
-    assert f"ExecStart={current_python} -m ficelle.router --serve" in paths.systemd_unit.read_text(
+    assert f"ExecStart={current_python} -P -m ficelle.router --serve" in paths.systemd_unit.read_text(
         encoding="utf-8"
     )
 
@@ -488,7 +501,7 @@ def test_systemd_unit_quotes_interpreter_paths_systemd_would_split_or_expand(tmp
     backend.write_unit()
 
     unit = paths.systemd_unit.read_text(encoding="utf-8")
-    assert f'ExecStart="{tmp_path}/my 100%% $venv/bin/python" -m ficelle.router --serve' in unit
+    assert f'ExecStart="{tmp_path}/my 100%% $venv/bin/python" -P -m ficelle.router --serve' in unit
     assert backend.recorded_interpreter() == spaced
 
 
@@ -557,8 +570,9 @@ def test_scheduled_task_install_registers_and_runs_the_task(tmp_path):
     payload = backend.task_xml.read_text(encoding="utf-16")
     assert '<?xml version="1.0" encoding="UTF-16"?>' in payload
     assert "<UserId>EXAMPLE\\cyril</UserId>" in payload
-    assert "-m ficelle.windows_entry" in payload
+    assert "-P -m ficelle.windows_entry" in payload
     assert f"FICELLE_HOME={paths.ficelle_home}" in payload
+    assert "PYTHONSAFEPATH=" not in payload
     assert f"<WorkingDirectory>{paths.ficelle_home}</WorkingDirectory>" in payload
     assert "<LogonTrigger>" in payload
     assert "<RunLevel>LeastPrivilege</RunLevel>" in payload
@@ -575,10 +589,68 @@ def test_scheduled_task_passes_only_ficelle_context_as_assignment(tmp_path):
     backend = _windows_backend(paths)
 
     assert backend.entry_arguments() == [
+        "-P",
         "-m",
         "ficelle.windows_entry",
         f"FICELLE_HOME={paths.ficelle_home}",
     ]
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
+def test_generated_service_command_reaches_router_serve(tmp_path, monkeypatch, platform):
+    from ficelle import router, windows_entry
+
+    paths = make_paths(tmp_path)
+    backend = select_service_backend(
+        platform_name=platform,
+        paths=paths,
+        run_command=lambda *_args, **_kwargs: pytest.fail("command generation must not start a service"),
+        uid_provider=lambda: "1000",
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+    monkeypatch.setenv("FICELLE_HOME", str(tmp_path / "other-home"))
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    # The router module may already be imported by another test.
+    monkeypatch.setattr(router, "CONFIG_PATH", paths.ficelle_home / "config.json")
+    served = []
+    monkeypatch.setattr(router, "serve", lambda _config: served.append(os.environ["FICELLE_HOME"]))
+
+    if platform == "win32":
+        safe_path, module_flag, module, *argv = backend.entry_arguments()
+        assert (safe_path, module_flag, module) == ("-P", "-m", "ficelle.windows_entry")
+        original_stdout, original_stderr = sys.stdout, sys.stderr
+        try:
+            assert windows_entry.main(argv) == 0
+        finally:
+            if sys.stdout is not original_stdout:
+                sys.stdout.close()
+            if sys.stderr is not original_stderr:
+                sys.stderr.close()
+            sys.stdout, sys.stderr = original_stdout, original_stderr
+    else:
+        if platform == "darwin":
+            payload = backend.plist_payload()
+            command = payload["ProgramArguments"]
+            environment = payload["EnvironmentVariables"].items()
+        else:
+            entries = backend.unit_payload().splitlines()
+            command = shlex.split(next(
+                line.removeprefix("ExecStart=") for line in entries if line.startswith("ExecStart=")
+            ))
+            environment = (
+                shlex.split(line.removeprefix("Environment="))[0].split("=", 1)
+                for line in entries if line.startswith("Environment=")
+            )
+        for name, value in environment:
+            monkeypatch.setenv(name, value)
+        assert os.environ["PYTHONSAFEPATH"] == "1"
+        _, safe_path, module_flag, module, *argv = command
+        assert (safe_path, module_flag, module) == ("-P", "-m", "ficelle.router")
+        assert router.main_args(argv) == 0
+
+    assert served == [str(paths.ficelle_home)]
 
 
 def test_scheduled_task_stop_and_uninstall_use_schtasks(tmp_path):
@@ -595,7 +667,8 @@ def test_scheduled_task_stop_and_uninstall_use_schtasks(tmp_path):
     assert not backend.task_xml.exists()
 
 
-def test_scheduled_task_restart_reuses_the_interpreter_recorded_in_xml(tmp_path, capsys):
+@pytest.mark.parametrize("safe_path", [False, True])
+def test_scheduled_task_restart_reuses_the_interpreter_recorded_in_xml(tmp_path, capsys, safe_path):
     installed_python = tmp_path / "venv-A" / "python.exe"
     installed_python.parent.mkdir(parents=True)
     installed_python.write_text("", encoding="utf-8")
@@ -606,6 +679,9 @@ def test_scheduled_task_restart_reuses_the_interpreter_recorded_in_xml(tmp_path,
 
     installed = _windows_backend(replace(paths, install_python=installed_python))
     assert installed.install() == 0
+    if not safe_path:
+        payload = installed.task_xml.read_text(encoding="utf-16")
+        installed.task_xml.write_text(payload.replace("-P -m ", "-m "), encoding="utf-16")
 
     restarted = _windows_backend(replace(paths, install_python=current_python))
     assert restarted.restart() == 0
@@ -681,6 +757,40 @@ def test_scheduled_task_install_persists_active_context(tmp_path):
     assert read_active_service_context(paths.active_home_pointer) == paths.ficelle_home
 
 
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="requires POSIX file modes")
+@pytest.mark.parametrize(("platform", "writer"), [
+    ("darwin", "install"),
+    ("linux", "write_unit"),
+    ("win32", "write_task_definition"),
+])
+def test_service_writers_refuse_a_symlink_and_create_a_private_home(tmp_path, platform, writer):
+    paths = make_paths(tmp_path)
+    target = tmp_path / "real-home"
+    target.mkdir()
+    paths.ficelle_home.symlink_to(target, target_is_directory=True)
+    calls = []
+    backend = select_service_backend(
+        platform_name=platform,
+        paths=paths,
+        run_command=lambda cmd, **kwargs: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""),
+        uid_provider=lambda: "501",
+        wait_for_ready=lambda: True,
+        terminate_stale_servers=lambda: [],
+        report_stale_servers=lambda _pids: None,
+    )
+
+    with pytest.raises(OSError, match="symbolic link"):
+        getattr(backend, writer)()
+    assert list(target.iterdir()) == []
+    assert not paths.plist.exists()
+    assert not paths.systemd_unit.exists()
+    assert calls == []
+
+    paths.ficelle_home.unlink()
+    getattr(backend, writer)()
+    assert paths.ficelle_home.stat().st_mode & 0o777 == 0o700
+
+
 def test_windows_task_account_prefers_username_over_getpass_chain(monkeypatch):
     # MSYS2/Git Bash export LOGNAME/USER, which getpass.getuser() would prefer even
     # though schtasks cannot map those names to a Windows account.
@@ -737,7 +847,8 @@ def _launchagent(paths, run_command):
     )
 
 
-def test_restart_reuses_the_interpreter_the_plist_already_records(tmp_path, capsys):
+@pytest.mark.parametrize("flags", [[], ["-P"]])
+def test_restart_reuses_the_interpreter_the_plist_already_records(tmp_path, capsys, flags):
     # AGENTS.md warns the agent must run under the Python setup used, and the CLI honoured that
     # at setup then re-decided it on every restart from sys.executable. Running `ficelle restart`
     # from a second install or an ephemeral uvx environment silently repointed the service.
@@ -750,7 +861,7 @@ def test_restart_reuses_the_interpreter_the_plist_already_records(tmp_path, caps
     paths = make_paths(tmp_path)
     paths.plist.parent.mkdir(parents=True, exist_ok=True)
     with paths.plist.open("wb") as handle:
-        plistlib.dump({"ProgramArguments": [str(installed_python), "-m", "ficelle.router", "--serve"]}, handle)
+        plistlib.dump({"ProgramArguments": [str(installed_python), *flags, "-m", "ficelle.router", "--serve"]}, handle)
 
     backend = _launchagent(paths, lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
     assert backend.paths.install_python != installed_python, "precondition: a different interpreter is running"

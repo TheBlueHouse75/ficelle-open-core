@@ -758,6 +758,23 @@ def test_weekly_schedule_is_disabled_until_installed_and_uses_same_cli(tmp_path:
     assert calls[-1][:2] == ["launchctl", "bootstrap"]
 
 
+def test_weekly_schedule_refuses_a_symlink_home(tmp_path: Path) -> None:
+    target = tmp_path / "real-home"
+    target.mkdir()
+    home = tmp_path / "linked-home"
+    home.symlink_to(target, target_is_directory=True)
+    plist = tmp_path / "schedule.plist"
+
+    with pytest.raises(synthetic_health.SyntheticHealthError, match="symbolic link.*real directory"):
+        synthetic_health.install_weekly_schedule(
+            home, weekday=2, hour=3, minute=15, platform="darwin", plist_path=plist,
+            run_command=lambda *a, **kw: pytest.fail("must refuse before invoking launchctl"),
+        )
+
+    assert not plist.exists()
+    assert list(target.iterdir()) == []
+
+
 def test_service_down_run_writes_durable_incomplete_artifacts(monkeypatch: Any, tmp_path: Path) -> None:
     router = FakeRouter()
     router.ROUTE_LOG_PATH = tmp_path / "routes.jsonl"

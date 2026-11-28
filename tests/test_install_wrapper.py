@@ -16,26 +16,28 @@ install_wrapper = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(install_wrapper)
 
 
+@pytest.mark.parametrize("venv_exists", [True, False])
 def test_source_wrapper_orders_editable_pip_options_before_the_checkout(
     monkeypatch,
     tmp_path: Path,
+    venv_exists: bool,
 ) -> None:
-    python = tmp_path / "venv" / "bin" / "python"
-    python.parent.mkdir(parents=True)
-    python.touch()
-    calls: list[list[str]] = []
-
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append(command)
-        return subprocess.CompletedProcess(command, 0)
-
-    monkeypatch.setattr(install_wrapper.subprocess, "run", run)
+    python = install_wrapper.venv_python(tmp_path / "venv")
+    if venv_exists:
+        python.parent.mkdir(parents=True)
+        python.touch()
+    monkeypatch.chdir(tmp_path)
+    calls = _record_runs(monkeypatch)
 
     result = install_wrapper.main(["--venv", str(tmp_path / "venv"), "--non-interactive"])
 
     assert result == 0
+    if not venv_exists:
+        created = calls.pop(0)
+        assert created[2:] == ["-m", "venv", str(tmp_path / "venv")]
     assert calls[1] == [
         str(python),
+        "-P",
         "-m",
         "pip",
         "install",
@@ -43,12 +45,21 @@ def test_source_wrapper_orders_editable_pip_options_before_the_checkout(
         "-e",
         str(install_wrapper.ROOT),
     ]
+    assert calls[2][2:] == ["-m", "pip", "check"]
+    assert calls[3][2:4] == ["-m", "ficelle.install"]
 
 
 def _record_runs(monkeypatch) -> list[list[str]]:
     calls: list[list[str]] = []
+    caller = Path.cwd().resolve()
 
-    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    def run(command: list[str], *, cwd: str, env: dict[str, str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        private_cwd = Path(cwd)
+        assert private_cwd.resolve() != caller
+        assert private_cwd.stat().st_mode & 0o777 == 0o700
+        assert not list(private_cwd.iterdir())
+        assert command[1] == "-P"
+        assert env["PYTHONSAFEPATH"] == "1"
         calls.append(command)
         return subprocess.CompletedProcess(command, 0)
 
@@ -73,7 +84,7 @@ def test_source_wrapper_read_only_modes_never_create_or_modify_the_owned_venv(
     # A missing venv python must not be executed: that was a FileNotFoundError.
     assert len(calls) == 1
     assert calls[0][0] == (str(python) if venv_exists else sys.executable)
-    assert calls[0][1:3] == ["-m", "ficelle.install"]
+    assert calls[0][1:4] == ["-P", "-m", "ficelle.install"]
     assert flag in calls[0]
     assert not {"pip", "venv"} & set(calls[0])
 
@@ -84,16 +95,25 @@ def test_source_wrapper_installs_a_caller_supplied_package_instead_of_the_checko
     python = install_wrapper.venv_python(tmp_path / "venv")
     python.parent.mkdir(parents=True)
     python.touch()
+    monkeypatch.chdir(tmp_path)
     calls = _record_runs(monkeypatch)
 
     result = install_wrapper.main(
-        ["--venv", str(tmp_path / "venv"), "--package", "dist/ficelle_router-1.0-py3-none-any.whl", "--no-editable"]
+        [
+            "--venv", str(tmp_path / "venv"),
+            "--package", "dist/ficelle_router-1.0-py3-none-any.whl",
+            "--ficelle-home", "state", "--hermes-home=client",
+            "--no-editable",
+        ]
     )
 
     assert result == 0
     assert len(calls) == 1
     assert calls[0].count("--package") == 1
-    assert "dist/ficelle_router-1.0-py3-none-any.whl" in calls[0]
+    assert calls[0][1:3] == ["-P", "-c"]
+    assert str(tmp_path / "dist/ficelle_router-1.0-py3-none-any.whl") in calls[0]
+    assert str(tmp_path / "state") in calls[0]
+    assert str(tmp_path / "client") in calls[0]
     assert "--skip-package" not in calls[0]
 
 

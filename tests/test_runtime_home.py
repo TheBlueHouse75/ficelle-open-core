@@ -23,6 +23,16 @@ def test_runtime_home_creates_missing_directory_privately(tmp_path):
     assert stat.S_IMODE(home.stat().st_mode) == 0o700
 
 
+def test_runtime_home_replaces_filesystem_diagnostics_with_a_path_free_message(tmp_path):
+    parent = tmp_path / "file"
+    parent.touch()
+
+    with pytest.raises(runtime_paths.RuntimeHomeError, match="Check its permissions") as refused:
+        runtime_paths.validated_runtime_home(parent / "home")
+
+    assert str(parent) not in str(refused.value)
+
+
 @pytest.mark.parametrize("kind", ["group-writable", "other-writable", "symlink", "file", "foreign-owner"])
 def test_runtime_home_refuses_unsafe_existing_directory(tmp_path, monkeypatch, kind):
     home = tmp_path / "home"
