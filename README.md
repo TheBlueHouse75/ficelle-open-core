@@ -54,11 +54,11 @@ raw numbers: [the benchmark write-up](https://ficelle.ai/blog/free-vs-paid-llm-b
 
 ## Quick start
 
-The following bootstrap is pinned to the public mirror commit for release v0.3.15. It installs
+The following bootstrap is pinned to the public mirror commit for release v0.3.16. It installs
 open Core:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/a0a37bc4c8737c47d7a4690fb12bb657ccd99e42/scripts/bootstrap-ficelle.py | python3
+curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/e12cc1b38c3c1492729e0cc528f005eec1d6d8ba/scripts/bootstrap-ficelle.py | python3
 ~/.local/bin/ficelle doctor --text
 ```
 
@@ -69,7 +69,7 @@ key in shell history, enter it silently before running the same safe command:
 (
   read -s FICELLE_LICENSE_KEY
   export FICELLE_LICENSE_KEY
-  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/a0a37bc4c8737c47d7a4690fb12bb657ccd99e42/scripts/bootstrap-ficelle.py | python3
+  curl -fsSL https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/e12cc1b38c3c1492729e0cc528f005eec1d6d8ba/scripts/bootstrap-ficelle.py | python3
 )
 ```
 

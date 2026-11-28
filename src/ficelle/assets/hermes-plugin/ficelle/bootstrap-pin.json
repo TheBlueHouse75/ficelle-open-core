@@ -1,9 +1,9 @@
 {
-  "bootstrap_sha256": "a6f76ff983b52be2c16a71513461bb5d36243caa792660af38f53bffee5a2008",
-  "bootstrap_url": "https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/a0a37bc4c8737c47d7a4690fb12bb657ccd99e42/scripts/bootstrap-ficelle.py",
+  "bootstrap_sha256": "a6c7f223c8f47f321c99b591e08d212f45aef75d7cde9802f12978b3b91ae8f5",
+  "bootstrap_url": "https://raw.githubusercontent.com/TheBlueHouse75/ficelle-open-core/e12cc1b38c3c1492729e0cc528f005eec1d6d8ba/scripts/bootstrap-ficelle.py",
   "core_version_range": {
     "max_exclusive": "0.4.0",
     "min": "0.3.0"
   },
-  "release_tag": "v0.3.15"
+  "release_tag": "v0.3.16"
 }
